@@ -302,3 +302,10 @@ def test_concurrency_config_accepts_boundary_values() -> None:
     ConcurrencyConfig(
         max_in_flight=1, per_model={CLAIRIC: 1}, default_per_model=1, recover_after=1
     )
+
+
+def test_models_that_normalise_to_the_same_id_are_rejected() -> None:
+    with pytest.raises(ValueError, match="more than once"):
+        ConcurrencyConfig(per_model={"clef": 4, CLEF: 8})
+    with pytest.raises(ValueError, match="more than once"):
+        Prices({"clairic": 0.1, CLAIRIC: 0.2})

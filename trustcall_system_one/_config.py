@@ -17,7 +17,12 @@ class _FrozenMap(Mapping[str, V]):
     """An immutable, hashable mapping with model ids normalised to full ids."""
 
     def __init__(self, items: Mapping[str, V]) -> None:
-        self._data = {normalize_model_id(k): v for k, v in items.items()}
+        self._data: dict[str, V] = {}
+        for key, value in items.items():
+            full = normalize_model_id(key)
+            if full in self._data:
+                raise ValueError(f"model {full} is listed more than once")
+            self._data[full] = value
         self._hash = hash(frozenset(self._data.items()))
 
     def __getitem__(self, key: str) -> V:

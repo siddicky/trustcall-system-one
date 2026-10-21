@@ -7,7 +7,6 @@ import math
 import os
 import random
 import time
-import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -100,14 +99,16 @@ class Transport(Protocol):
 
 @dataclass
 class _LoopState:
-    """Limiter bookkeeping for one event loop."""
+    """Per-event-loop limiter state: occupancy and the wake-up Condition.
 
-    limits: dict[str, int] = field(default_factory=dict)
-    streaks: dict[str, int] = field(default_factory=dict)
-    active: dict[str, int] = field(default_factory=dict)
-    generations: dict[str, int] = field(default_factory=dict)
+    The Condition is created with the state and never replaced: replacing it
+    while a waiter still sleeps on the old one would lose that waiter's
+    wake-ups.
+    """
+
     in_flight: int = 0
-    cond: asyncio.Condition | None = None
+    active: dict[str, int] = field(default_factory=dict)
+    cond: asyncio.Condition = field(default_factory=asyncio.Condition)
     wake_tasks: set["asyncio.Task[None]"] = field(default_factory=set)
 
 
@@ -123,9 +124,11 @@ class AdaptiveLimiter:
     generation at acquisition, and ``on_rate_limited`` ignores a 429 from an
     older generation, so a burst of concurrent 429s halves the limit once.
 
-    All state is kept per running event loop (and, outside any loop, in one
-    detached state), so the caps apply per loop and one limiter can be reused
-    from several loops without sharing a ``Condition``.
+    What the limiter has learned (current limits, success streaks and
+    generations) is shared by every event loop. Occupancy and the wake-up
+    ``Condition`` are per running loop, so the caps apply per loop; state for
+    loops that have since closed is dropped when a new loop first uses the
+    limiter.
     """
 
     def __init__(self, config: ConcurrencyConfig | None = None) -> None:
@@ -135,10 +138,10 @@ class AdaptiveLimiter:
             config: Concurrency settings; defaults to ``ConcurrencyConfig()``.
         """
         self._config = config or ConcurrencyConfig()
-        self._states: weakref.WeakKeyDictionary[
-            asyncio.AbstractEventLoop, _LoopState
-        ] = weakref.WeakKeyDictionary()
-        self._detached = _LoopState()
+        self._limits: dict[str, int] = {}
+        self._streaks: dict[str, int] = {}
+        self._generations: dict[str, int] = {}
+        self._states: dict[asyncio.AbstractEventLoop, _LoopState] = {}
 
     @property
     def max_in_flight(self) -> int:
@@ -147,27 +150,31 @@ class AdaptiveLimiter:
 
     @property
     def in_flight(self) -> int:
-        """Number of slots currently held on the running loop."""
-        return self._state().in_flight
-
-    def _state(self) -> _LoopState:
+        """Number of slots currently held on the running loop (0 outside one)."""
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            return self._detached
+            return 0
+        state = self._states.get(loop)
+        return state.in_flight if state else 0
+
+    def _state(self) -> _LoopState:
+        loop = asyncio.get_running_loop()
         state = self._states.get(loop)
         if state is None:
+            for stale in [lp for lp in self._states if lp.is_closed()]:
+                del self._states[stale]
             state = self._states[loop] = _LoopState()
         return state
 
     def limit(self, model: str) -> int:
         """Return the model's current concurrency limit."""
         model = normalize_model_id(model)
-        return self._state().limits.get(model, self._config.limit_for(model))
+        return self._limits.get(model, self._config.limit_for(model))
 
     def generation(self, model: str) -> int:
         """Return how many times the model's limit has been halved."""
-        return self._state().generations.get(normalize_model_id(model), 0)
+        return self._generations.get(normalize_model_id(model), 0)
 
     def on_rate_limited(self, model: str, generation: int | None = None) -> bool:
         """Halve the model's limit (floor 1) and reset its success streak.
@@ -183,12 +190,11 @@ class AdaptiveLimiter:
         if not self._config.adaptive:
             return False
         model = normalize_model_id(model)
-        state = self._state()
-        state.streaks[model] = 0
-        if generation is not None and generation != state.generations.get(model, 0):
+        self._streaks[model] = 0
+        if generation is not None and generation != self.generation(model):
             return False
-        state.limits[model] = max(1, self.limit(model) // 2)
-        state.generations[model] = state.generations.get(model, 0) + 1
+        self._limits[model] = max(1, self.limit(model) // 2)
+        self._generations[model] = self.generation(model) + 1
         return True
 
     def on_success(self, model: str) -> None:
@@ -196,27 +202,31 @@ class AdaptiveLimiter:
         if not self._config.adaptive:
             return
         model = normalize_model_id(model)
-        state = self._state()
-        streak = state.streaks.get(model, 0) + 1
+        streak = self._streaks.get(model, 0) + 1
         if streak >= self._config.recover_after:
             streak = 0
             cap = self._config.limit_for(model)
-            state.limits[model] = min(cap, self.limit(model) + 1)
-            self._schedule_wake(state)
-        state.streaks[model] = streak
+            self._limits[model] = min(cap, self.limit(model) + 1)
+            self._schedule_wake()
+        self._streaks[model] = streak
 
-    def _schedule_wake(self, state: _LoopState) -> None:
+    def _schedule_wake(self) -> None:
         # Notifying a Condition needs its lock, which a synchronous caller
         # cannot await, so hand the notification to a task on the loop.
-        cond = state.cond
-        if cond is None or state is self._detached:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
             return
+        state = self._states.get(loop)
+        if state is None:
+            return
+        cond = state.cond
 
         async def notify() -> None:
             async with cond:
                 cond.notify_all()
 
-        task = asyncio.get_running_loop().create_task(notify())
+        task = loop.create_task(notify())
         state.wake_tasks.add(task)
         task.add_done_callback(state.wake_tasks.discard)
 
@@ -233,8 +243,6 @@ class AdaptiveLimiter:
         """
         model = normalize_model_id(model)
         state = self._state()
-        if state.cond is None:
-            state.cond = asyncio.Condition()
         cond = state.cond
         async with cond:
             await cond.wait_for(
@@ -245,7 +253,7 @@ class AdaptiveLimiter:
             )
             state.in_flight += 1
             state.active[model] = state.active.get(model, 0) + 1
-            generation = state.generations.get(model, 0)
+            generation = self.generation(model)
         try:
             yield generation
         finally:
@@ -260,12 +268,8 @@ class AdaptiveLimiter:
                     # cannot run and strand one that can.
                     cond.notify_all()
             except asyncio.CancelledError:
-                self._schedule_wake(state)
+                self._schedule_wake()
                 raise
-            finally:
-                if state.in_flight == 0 and state.cond is cond:
-                    # Idle: drop the Condition (it pins its loop once used).
-                    state.cond = None
 
 
 _DEFAULT_TIMEOUT = httpx.Timeout(60.0, connect=10.0)
@@ -354,13 +358,17 @@ class CloudflareTransport:
     If the server asks for a wait longer than ``max_retry_after`` the call
     fails at once with ``retry_after`` set on the error.
 
-    Event loops: the httpx client this transport creates, and the limiter's
-    state, are kept per running event loop, so one transport can be used from
-    several loops (for example repeated ``asyncio.run`` calls) and the
-    concurrency caps apply per loop. Call ``aclose()`` inside each loop that
-    used the transport, or ``close()`` once no loop is running. A client
-    passed in as ``client`` is used for every loop and is the caller's to
-    manage.
+    Event loops: one transport is meant to be used from one long-lived loop
+    (the extractor's sync bridge keeps a persistent loop thread for this). The
+    httpx client it creates is bound to the loop that first used it, and the
+    limiter's occupancy counters are per loop, so the concurrency caps apply
+    per loop. Close an owned client inside its loop, with ``await
+    transport.aclose()`` or ``async with CloudflareTransport() as transport:``.
+    Using the transport from a further loop is supported (it gets its own
+    client and starts from the limits already learned, and state belonging to
+    loops that have closed is dropped), but a client left open when its loop
+    closes cannot be closed afterwards. A client passed in as ``client`` is
+    used for every loop and is the caller's to manage.
     """
 
     def __init__(
@@ -425,9 +433,7 @@ class CloudflareTransport:
         self._base_url = base_url
         self._gateway = gateway
         self._injected_client = client
-        self._clients: weakref.WeakKeyDictionary[
-            asyncio.AbstractEventLoop, httpx.AsyncClient
-        ] = weakref.WeakKeyDictionary()
+        self._clients: dict[asyncio.AbstractEventLoop, httpx.AsyncClient] = {}
         self._timeout = timeout
         self._max_retries = max_retries
         self._backoff_base = backoff_base
@@ -457,24 +463,25 @@ class CloudflareTransport:
             await client.aclose()
 
     def close(self) -> None:
-        """Close every owned client from synchronous code, best effort.
+        """Close owned clients from synchronous code, best effort.
 
-        Safe to call when no loop is running; each client is closed on a
-        temporary loop and failures are ignored (a client whose own loop has
-        already been closed may not be able to release its connections).
-        Clients are tracked weakly by loop, so those of loops that have been
-        garbage-collected are already gone. Does nothing while a loop is
-        running in this thread: use ``aclose()``.
+        Each client whose loop is not running is closed on a temporary loop
+        and failures are ignored (a client whose own loop has already been
+        closed may not be able to release its connections). Clients whose loop
+        is running are left alone, so this does nothing from inside a running
+        loop: use ``aclose()`` there. It is not thread-safe against a loop
+        that starts running in another thread while it executes.
         """
         try:
             asyncio.get_running_loop()
         except RuntimeError:
             pass
         else:
-            return
-        clients = list(self._clients.values())
-        self._clients.clear()
-        for client in clients:
+            return  # asyncio.run cannot nest; the caller should await aclose()
+        for loop, client in list(self._clients.items()):
+            if loop.is_running():
+                continue
+            del self._clients[loop]
             if not client.is_closed:
                 with contextlib.suppress(Exception):  # best effort
                     asyncio.run(client.aclose())
@@ -485,6 +492,11 @@ class CloudflareTransport:
         loop = asyncio.get_running_loop()
         client = self._clients.get(loop)
         if client is None:
+            # First use from this loop: forget clients of closed loops. They
+            # cannot be awaited any more, so dropping the reference is all
+            # that can be done.
+            for stale in [lp for lp in self._clients if lp.is_closed()]:
+                del self._clients[stale]
             cap = self._concurrency.max_in_flight
             client = httpx.AsyncClient(
                 timeout=self._timeout,

@@ -710,12 +710,12 @@ def test_cloudflare_transport_satisfies_protocol() -> None:
     assert isinstance(CloudflareTransport(), Transport)
 
 
-def test_transport_works_from_two_event_loops_with_independent_state() -> None:
+def test_transport_works_from_two_event_loops_and_keeps_learned_limits() -> None:
     transport, _ = make(ok(), err(429), ok(), ok())
 
     async def first_loop() -> tuple[int, int]:
         await run(transport)
-        await run(transport)  # 429 then ok: halves in this loop only
+        await run(transport)  # 429 then ok: halves
         return transport.limiter.limit(CLAIRIC), transport.limiter.in_flight
 
     async def second_loop() -> tuple[int, int]:
@@ -723,7 +723,40 @@ def test_transport_works_from_two_event_loops_with_independent_state() -> None:
         return transport.limiter.limit(CLAIRIC), transport.limiter.in_flight
 
     assert asyncio.run(first_loop()) == (16, 0)
-    assert asyncio.run(second_loop()) == (32, 0)  # untouched by the first loop
+    # A new loop starts from the limits already learned, with its own counters.
+    assert asyncio.run(second_loop()) == (16, 0)
+
+
+def test_sequential_asyncio_runs_with_aclose_leave_no_accumulated_state() -> None:
+    transport = CloudflareTransport(account_id="a", api_token="t")
+
+    async def use() -> None:
+        async with transport.limiter.slot(CLAIRIC):
+            pass
+        transport._get_client()
+        await transport.aclose()
+
+    for _ in range(5):
+        asyncio.run(use())
+        assert transport._clients == {}
+    # Only the most recent loop's counters are kept; older closed loops are
+    # dropped when a new loop first uses the limiter.
+    assert len(transport.limiter._states) == 1
+
+
+def test_clients_and_limiter_state_of_closed_loops_are_evicted() -> None:
+    transport = CloudflareTransport(account_id="a", api_token="t")
+
+    async def use() -> None:
+        async with transport.limiter.slot(CLAIRIC):
+            transport._get_client()  # never closed by the caller
+
+    for _ in range(5):
+        asyncio.run(use())
+    assert len(transport._clients) == 1
+    assert len(transport.limiter._states) == 1
+    transport.close()
+    assert transport._clients == {}
 
 
 def test_owned_clients_are_per_loop_and_close_works_without_a_loop() -> None:
@@ -845,19 +878,25 @@ def test_limiter_can_be_built_outside_a_loop_and_reused_across_loops() -> None:
     assert limiter.in_flight == 0
 
 
-def test_limiter_state_is_independent_per_loop() -> None:
+def test_learned_limits_are_shared_across_loops_but_occupancy_is_not() -> None:
     limiter = AdaptiveLimiter(ConcurrencyConfig(per_model={CLAIRIC: 8}))
+    seen: list[int] = []
 
-    async def halve() -> int:
+    async def halve() -> None:
         limiter.on_rate_limited(CLAIRIC)
-        return limiter.limit(CLAIRIC)
+        async with limiter.slot(CLAIRIC):
+            seen.append(limiter.in_flight)
 
-    async def read() -> int:
-        return limiter.limit(CLAIRIC)
+    async def read() -> None:
+        seen.append(limiter.limit(CLAIRIC))
+        seen.append(limiter.in_flight)
 
-    assert asyncio.run(halve()) == 4
-    assert asyncio.run(read()) == 8
-    assert limiter.limit(CLAIRIC) == 8  # detached state, also untouched
+    asyncio.run(halve())
+    asyncio.run(read())
+    assert seen == [1, 4, 0]
+    assert limiter.limit(CLAIRIC) == 4  # also readable with no loop running
+    assert limiter.in_flight == 0
+    assert limiter.generation(CLAIRIC) == 1
 
 
 async def _max_concurrency(
@@ -994,6 +1033,57 @@ async def test_slot_is_released_when_the_body_raises_or_is_cancelled() -> None:
     assert limiter.in_flight == 0
     async with limiter.slot(CLAIRIC):  # still usable
         assert limiter.in_flight == 1
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        ConcurrencyConfig(max_in_flight=1),
+        ConcurrencyConfig(per_model={CLAIRIC: 1}),
+    ],
+    ids=["global-1", "per-model-1"],
+)
+async def test_waiter_is_woken_while_another_task_cycles_the_slot(
+    config: ConcurrencyConfig,
+) -> None:
+    # Regression: the limiter used to replace its Condition when idle, which
+    # lost the wake-up of a waiter when a newcomer took the freed slot first.
+    limiter = AdaptiveLimiter(config)
+    finished: list[str] = []
+
+    async def task_a() -> None:
+        for _ in range(5):
+            async with limiter.slot(CLAIRIC):
+                await asyncio.sleep(0)
+        finished.append("A")
+
+    async def task_b() -> None:
+        async with limiter.slot(CLAIRIC):
+            finished.append("B")
+
+    a = asyncio.create_task(task_a())
+    await asyncio.sleep(0)
+    b = asyncio.create_task(task_b())
+    await asyncio.wait_for(asyncio.gather(a, b), timeout=2)
+    assert sorted(finished) == ["A", "B"]
+    assert limiter.in_flight == 0
+
+
+async def test_transport_waiter_is_not_starved_by_sequential_runs() -> None:
+    transport, _ = make(ok(), concurrency=ConcurrencyConfig(max_in_flight=1))
+
+    async def task_a() -> None:
+        for _ in range(3):
+            await run(transport)
+
+    async def task_b() -> TransportResponse:
+        return await run(transport)
+
+    a = asyncio.create_task(task_a())
+    await asyncio.sleep(0)
+    b = asyncio.create_task(task_b())
+    await asyncio.wait_for(asyncio.gather(a, b), timeout=2)
+    assert transport.limiter.in_flight == 0
 
 
 async def test_transport_respects_global_limit_under_load() -> None:

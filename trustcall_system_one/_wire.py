@@ -111,7 +111,8 @@ _CLEF_QUESTION_ID = StringConstraints(pattern=r"^[A-Za-z0-9_.\-]{1,100}$")
 
 _ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 
-_IMAGE_TYPES = frozenset({"image/png", "image/jpeg", "image/webp"})
+_IMAGE_TYPES = frozenset({"image/png", "image/jpeg", "image/jpg", "image/webp"})
+_ASCII_WHITESPACE = {ord(c): None for c in "\r\n\t "}
 _MAX_IMAGE_BYTES = 4 * 1024 * 1024
 _MAX_TOTAL_IMAGE_BYTES = 8 * 1024 * 1024
 _MAX_CLAIRIC_BODY_BYTES = 16 * 1024 * 1024
@@ -149,7 +150,10 @@ def _decoded_size(content_type: str, payload: str) -> int:
             f"image type must be one of {sorted(_IMAGE_TYPES)}, got {content_type!r}"
         )
     try:
-        size = len(base64.b64decode(payload, validate=True))
+        # MIME-wrapped base64 contains line breaks; they are not data.
+        size = len(
+            base64.b64decode(payload.translate(_ASCII_WHITESPACE), validate=True)
+        )
     except (binascii.Error, ValueError):
         raise ValueError("image data is not valid base64") from None
     if size > _MAX_IMAGE_BYTES:
@@ -405,7 +409,12 @@ def _is_int_list(value: Any) -> bool:
 
 
 class ClairicAnswer(_Response):
-    """One Clairic answer. ``value`` is ``None`` when the input does not say."""
+    """One Clairic answer. ``value`` is ``None`` when the input does not say.
+
+    ``span`` and ``spans`` are typed leniently (any list of ints) because the
+    published schema has no length constraint; consumers that need a
+    ``[start, end]`` pair must check ``len(span) == 2`` themselves.
+    """
 
     type: str
     value: Any
@@ -467,7 +476,7 @@ def _clip_probability(value: Any) -> Any:
         if -_PROBABILITY_TOLERANCE <= value <= 1 + _PROBABILITY_TOLERANCE:
             return min(1.0, max(0.0, float(value)))
         raise ValueError(f"probability {value!r} is outside [0, 1]")
-    return value
+    raise ValueError(f"a probability must be a number, got {value!r}")
 
 
 Probability = Annotated[float, BeforeValidator(_clip_probability)]

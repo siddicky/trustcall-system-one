@@ -643,7 +643,10 @@ def test_probabilities_within_rounding_noise_are_clipped() -> None:
     assert answers["c"].confidence == 1.0
 
 
-@pytest.mark.parametrize("bad", [1.001, -0.001, 2, float("nan"), "0.5x", True])
+@pytest.mark.parametrize(
+    "bad",
+    [1.001, -0.001, 2, float("nan"), "0.5x", True, "1.5", "0.5", "1", None, [0.5]],
+)
 def test_probabilities_outside_tolerance_are_rejected(bad: Any) -> None:
     body = {
         "model": "clef",
@@ -794,7 +797,7 @@ def b64_image(size: int, content_type: str = "image/png") -> dict[str, str]:
 
 
 @pytest.mark.parametrize(
-    "content_type", ["image/png", "image/jpeg", "image/webp", "IMAGE/PNG"]
+    "content_type", ["image/png", "image/jpeg", "image/jpg", "image/webp", "IMAGE/PNG"]
 )
 def test_image_types_accepted(content_type: str) -> None:
     ClairicRequest.model_validate(clairic(images=[b64_image(3, content_type)]))
@@ -815,7 +818,7 @@ def test_other_image_types_rejected(content_type: str) -> None:
         )
 
 
-@pytest.mark.parametrize("payload", ["AAA", "!!!!", "AA AA", "AAAA\n"])
+@pytest.mark.parametrize("payload", ["AAA", "!!!!", "AA=A", "AAAA="])
 def test_invalid_base64_rejected(payload: str) -> None:
     with pytest.raises(ValidationError, match="base64"):
         ClairicRequest.model_validate(
@@ -864,3 +867,18 @@ def test_clef_body_limit_is_thirteen_mib() -> None:
         ClefRequest.model_validate(clef(state="a" * (13 * MIB)))
     # Fine for Clairic, too big for Clef: the two limits differ.
     ClairicRequest.model_validate(clairic(state="a" * (14 * MIB)))
+
+
+def test_mime_wrapped_base64_is_accepted() -> None:
+    raw = b64(300)
+    wrapped = "\r\n".join(raw[i : i + 76] for i in range(0, len(raw), 76)) + "\r\n"
+    assert "\n" in wrapped
+    ClairicRequest.model_validate(
+        clairic(images=[{"content_type": "image/png", "base64": wrapped}])
+    )
+    ClairicRequest.model_validate(clairic(images=[f"data:image/png;base64,{wrapped}"]))
+    # Whitespace stripping must not make otherwise invalid data valid.
+    with pytest.raises(ValidationError, match="base64"):
+        ClairicRequest.model_validate(
+            clairic(images=[{"content_type": "image/png", "base64": "AA\nA"}])
+        )
