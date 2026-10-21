@@ -1,5 +1,6 @@
 """Tests for the wire models: request constraints and response parsing."""
 
+import base64
 from typing import Any
 
 import pytest
@@ -199,7 +200,7 @@ def test_clairic_images_limit() -> None:
 
 
 def test_image_forms() -> None:
-    ClairicRequest.model_validate(clairic(images=["DATA:image/png;base64,AA"]))
+    ClairicRequest.model_validate(clairic(images=["DATA:image/png;base64,AAAA"]))
     ClairicRequest.model_validate(
         clairic(images=[{"content_type": "image/png", "base64": "AAAA"}])
     )
@@ -457,7 +458,7 @@ def test_parse_documented_clairic_response() -> None:
     invoice = parsed.answers["invoice_number"]
     assert invoice.type == "text"
     assert invoice.value == "INV-2291"
-    assert invoice.span == (8, 16)
+    assert invoice.span == [8, 16]
     assert invoice.p_null == pytest.approx(3.8e-10)
     assert invoice.confidence == 1.0
 
@@ -467,7 +468,7 @@ def test_parse_documented_clairic_response() -> None:
 
     contacts = parsed.answers["contacts"]
     assert contacts.value == ["Dana Ruiz", "Priya Shah"]
-    assert contacts.spans == [(120, 129), (131, 141)]
+    assert contacts.spans == [[120, 129], [131, 141]]
     assert contacts.span is None
     assert contacts.p_null is None
 
@@ -587,6 +588,72 @@ def test_parse_clef_response() -> None:
     assert score_answer.confidence == 0.5
 
 
+@pytest.mark.parametrize(
+    "span", ["8-16", [1.5, 2], ["a", "b"], [[1, 2]], [True, 2], {"s": 1}, 7]
+)
+def test_malformed_span_does_not_fail_the_response(span: Any) -> None:
+    answer = {"type": "text", "value": "x", "span": span, "spans": span}
+    parsed = parse_clairic({**DOCUMENTED_CLAIRIC, "answers": {"a": answer}})
+    assert parsed.answers["a"].span is None
+    assert parsed.answers["a"].value == "x"
+
+
+def test_spans_of_any_length_are_accepted() -> None:
+    answer = {"type": "list", "value": [], "span": [1, 2, 3], "spans": [[1], [2, 3, 4]]}
+    parsed = parse_clairic({**DOCUMENTED_CLAIRIC, "answers": {"a": answer}})
+    assert parsed.answers["a"].span == [1, 2, 3]
+    assert parsed.answers["a"].spans == [[1], [2, 3, 4]]
+
+
+def test_spans_with_a_bad_item_become_none() -> None:
+    answer = {"type": "list", "value": [], "spans": [[1, 2], ["x"]]}
+    parsed = parse_clairic({**DOCUMENTED_CLAIRIC, "answers": {"a": answer}})
+    assert parsed.answers["a"].spans is None
+
+
+def test_probabilities_within_rounding_noise_are_clipped() -> None:
+    body = {
+        "model": "clef",
+        "answers": {
+            "n": {"type": "noul", "noul": 1.0000005},
+            "m": {"type": "noul", "noul": -5e-7},
+            "c": {
+                "type": "choice",
+                "choice": "a",
+                "probabilities": {"a": 1.0000005, "b": -1e-7},
+                "confidence": 1.0000009,
+            },
+            "s": {
+                "type": "score",
+                "score": 0.0,
+                "legend": {},
+                "probabilities": {"0": 1.0},
+                "confidence": 1,
+            },
+        },
+        "usage": {"input_tokens": 1, "output_tokens": 0},
+    }
+    answers = parse_clef(body).answers
+    assert isinstance(answers["n"], NoulAnswer)
+    assert answers["n"].noul == 1.0
+    assert isinstance(answers["m"], NoulAnswer)
+    assert answers["m"].noul == 0.0
+    assert isinstance(answers["c"], ChoiceAnswer)
+    assert answers["c"].probabilities == {"a": 1.0, "b": 0.0}
+    assert answers["c"].confidence == 1.0
+
+
+@pytest.mark.parametrize("bad", [1.001, -0.001, 2, float("nan"), "0.5x", True])
+def test_probabilities_outside_tolerance_are_rejected(bad: Any) -> None:
+    body = {
+        "model": "clef",
+        "answers": {"q": {"type": "noul", "noul": bad}},
+        "usage": {"input_tokens": 1, "output_tokens": 0},
+    }
+    with pytest.raises(ModelResponseError):
+        parse_clef(body)
+
+
 def test_clef_missing_noul_raises_with_raw() -> None:
     body = {
         "model": "clef",
@@ -665,3 +732,135 @@ def test_model_id_constants() -> None:
     assert CLAIRIC == "@cf/cloudflare/clairic"
     assert CLEF == "@cf/cloudflare/clef"
     assert CLEF_FLASH == "@cf/cloudflare/clef-flash"
+
+
+# --------------------------------------------------------------------------- #
+# Numeric strictness, dates and instructions
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("bound", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_numbers_are_rejected(bound: float) -> None:
+    for key in ("min", "max", "step"):
+        spec = {"type": "estimate", "min": 0, "max": 1, key: bound}
+        with pytest.raises(ValidationError):
+            ClairicField.model_validate(spec)
+
+
+@pytest.mark.parametrize("key", ["min", "max", "step", "decimals", "horizon"])
+def test_booleans_are_rejected_where_numbers_are_expected(key: str) -> None:
+    spec = {"type": "forecast", "min": 0, "max": 1, "horizon": 2, key: True}
+    with pytest.raises(ValidationError, match="not a boolean"):
+        ClairicField.model_validate(spec)
+
+
+@pytest.mark.parametrize(
+    "date_text",
+    [
+        "2026-1-5",
+        "20260105",
+        "2026-01-05T00:00",
+        "\u0662\u0660\u0662\u0666-\u0660\u0661-\u0660\u0665",
+        "2026-13-01",
+        "2026-01-05\n",
+    ],
+)
+def test_bounds_must_be_strict_iso_dates(date_text: str) -> None:
+    with pytest.raises(ValidationError, match="ISO date"):
+        ClairicField.model_validate({"type": "estimate", "min": date_text, "max": 3})
+
+
+def test_whitespace_instructions_are_rejected() -> None:
+    for blank in ("   ", "\n\t"):
+        with pytest.raises(ValidationError):
+            ClefRequest.model_validate(
+                clef(questions={"q": noul_q(instructions=blank)})
+            )
+
+
+# --------------------------------------------------------------------------- #
+# Image and body size limits
+# --------------------------------------------------------------------------- #
+
+MIB = 1024 * 1024
+
+
+def b64(size: int) -> str:
+    return base64.b64encode(b"\0" * size).decode()
+
+
+def b64_image(size: int, content_type: str = "image/png") -> dict[str, str]:
+    return {"content_type": content_type, "base64": b64(size)}
+
+
+@pytest.mark.parametrize(
+    "content_type", ["image/png", "image/jpeg", "image/webp", "IMAGE/PNG"]
+)
+def test_image_types_accepted(content_type: str) -> None:
+    ClairicRequest.model_validate(clairic(images=[b64_image(3, content_type)]))
+    ClairicRequest.model_validate(
+        clairic(images=[f"data:{content_type};base64,{b64(3)}"])
+    )
+
+
+@pytest.mark.parametrize(
+    "content_type", ["image/gif", "image/svg+xml", "text/plain", ""]
+)
+def test_other_image_types_rejected(content_type: str) -> None:
+    with pytest.raises(ValidationError, match="image type"):
+        ClairicRequest.model_validate(clairic(images=[b64_image(3, content_type)]))
+    with pytest.raises(ValidationError, match="image type"):
+        ClefRequest.model_validate(
+            clef(images=[f"data:{content_type};base64,{b64(3)}"])
+        )
+
+
+@pytest.mark.parametrize("payload", ["AAA", "!!!!", "AA AA", "AAAA\n"])
+def test_invalid_base64_rejected(payload: str) -> None:
+    with pytest.raises(ValidationError, match="base64"):
+        ClairicRequest.model_validate(
+            clairic(images=[{"content_type": "image/png", "base64": payload}])
+        )
+    with pytest.raises(ValidationError, match="base64"):
+        ClairicRequest.model_validate(
+            clairic(images=[f"data:image/png;base64,{payload}"])
+        )
+
+
+def test_data_url_must_be_base64() -> None:
+    with pytest.raises(ValidationError, match="data:image/png;base64"):
+        ClairicRequest.model_validate(clairic(images=["data:image/png,AAAA"]))
+
+
+def test_single_image_limit_is_four_mib_decoded() -> None:
+    ClairicRequest.model_validate(clairic(images=[b64_image(4 * MIB)]))
+    with pytest.raises(ValidationError, match="4 MiB"):
+        ClairicRequest.model_validate(clairic(images=[b64_image(4 * MIB + 1)]))
+    with pytest.raises(ValidationError, match="4 MiB"):
+        ClefRequest.model_validate(
+            clef(images=[f"data:image/webp;base64,{b64(4 * MIB + 1)}"])
+        )
+
+
+def test_total_image_limit_is_eight_mib_decoded() -> None:
+    ClairicRequest.model_validate(clairic(images=[b64_image(4 * MIB)] * 2))
+    with pytest.raises(ValidationError, match="8 MiB"):
+        ClairicRequest.model_validate(
+            clairic(images=[b64_image(4 * MIB)] * 2 + [b64_image(1)])
+        )
+    with pytest.raises(ValidationError, match="8 MiB"):
+        ClefRequest.model_validate(clef(images=[b64_image(3 * MIB)] * 3))
+
+
+def test_clairic_body_limit_is_sixteen_mib() -> None:
+    ClairicRequest.model_validate(clairic(state="a" * (16 * MIB - 1000)))
+    with pytest.raises(ValidationError, match="request body"):
+        ClairicRequest.model_validate(clairic(state="a" * (16 * MIB)))
+
+
+def test_clef_body_limit_is_thirteen_mib() -> None:
+    ClefRequest.model_validate(clef(state="a" * (13 * MIB - 1000)))
+    with pytest.raises(ValidationError, match="request body"):
+        ClefRequest.model_validate(clef(state="a" * (13 * MIB)))
+    # Fine for Clairic, too big for Clef: the two limits differ.
+    ClairicRequest.model_validate(clairic(state="a" * (14 * MIB)))

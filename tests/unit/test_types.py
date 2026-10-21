@@ -10,6 +10,7 @@ from trustcall_system_one import (
     CLEF_FLASH,
     CallRecord,
     ConcurrencyConfig,
+    CostReport,
     Prices,
     Usage,
 )
@@ -89,16 +90,40 @@ def test_merge_and_add() -> None:
     assert a.by_model[CLAIRIC].input_tokens == 655
 
     a.merge(b)
-    assert dataclasses.asdict(a) == dataclasses.asdict(total) | {
-        "by_model": dataclasses.asdict(a)["by_model"]
-    }
     assert a.requests == 3
+    assert a.input_tokens == 667
+    assert a.by_model[CLAIRIC].input_tokens == 660
+    assert a.by_model[CLEF].input_tokens == 7
     assert a.by_kind["gate"].requests == 2
+    assert a.by_kind["extract"].requests == 1
+    # merge copies leaf values rather than aliasing b's.
+    a.by_model[CLEF].input_tokens = 0
+    assert b.by_model[CLEF].input_tokens == 7
 
 
 def test_add_rejects_other_types() -> None:
     with pytest.raises(TypeError):
         Usage() + 1  # type: ignore[operator]
+
+
+def test_call_record_error_and_status_default_to_none() -> None:
+    record = CallRecord(model=CLAIRIC, kind="extract")
+    assert record.error is None
+    assert record.status_code is None
+    failed = CallRecord(
+        model=CLEF, kind="gate", error="HTTP 503", status_code=503, retries=6
+    )
+    assert (failed.error, failed.status_code, failed.retries) == ("HTTP 503", 503, 6)
+
+
+def test_call_record_kind_is_the_call_kind_literal() -> None:
+    from typing import get_args, get_type_hints
+
+    from trustcall_system_one import CallKind, CallMeta
+
+    assert get_type_hints(CallRecord)["kind"] == CallKind
+    assert get_type_hints(CallMeta)["kind"] == CallKind
+    assert "extract" in get_args(CallKind)
 
 
 def test_call_record_is_frozen_and_holds_fields() -> None:
@@ -124,20 +149,28 @@ def test_prices_default_is_clairic_only() -> None:
     assert dict(Prices().per_million_input) == {CLAIRIC: 0.10}
 
 
-def test_cost_is_numeric_for_clairic_only_usage() -> None:
+def test_cost_is_complete_for_clairic_only_usage() -> None:
     usage = Usage()
     usage.add_call(
         CLAIRIC, "extract", ClairicUsage(input_tokens=2_000_000, output_tokens=0)
     )
-    assert Prices().cost(usage) == pytest.approx(0.20)
+    report = Prices().cost(usage)
+    assert report.usd == pytest.approx(0.20)
+    assert report.unpriced_models == ()
+    assert report.complete is True
 
 
-def test_cost_is_none_once_unpriced_clef_usage_is_present() -> None:
+def test_cost_sums_priced_models_and_lists_unpriced_ones() -> None:
     usage = Usage()
-    usage.add_call(CLAIRIC, "extract", CLAIRIC_USAGE)
-    assert Prices().cost(usage) is not None
+    usage.add_call(
+        CLAIRIC, "extract", ClairicUsage(input_tokens=1_000_000, output_tokens=0)
+    )
+    assert Prices().cost(usage).complete
     usage.add_call(CLEF, "gate", ClefUsage(input_tokens=10, output_tokens=0))
-    assert Prices().cost(usage) is None
+    report = Prices().cost(usage)
+    assert report.usd == pytest.approx(0.10)  # priced models only
+    assert report.unpriced_models == (CLEF,)
+    assert report.complete is False
 
 
 def test_cost_with_configured_clef_price() -> None:
@@ -147,26 +180,80 @@ def test_cost_with_configured_clef_price() -> None:
     )
     usage.add_call(CLEF, "gate", ClefUsage(input_tokens=500_000, output_tokens=0))
     prices = Prices({CLAIRIC: 0.10, CLEF: 0.20})
-    assert prices.cost(usage) == pytest.approx(0.10 + 0.10)
+    report = prices.cost(usage)
+    assert report.usd == pytest.approx(0.10 + 0.10)
+    assert report.complete
     # A different Clef variant still needs its own price.
     usage.add_call(CLEF_FLASH, "gate", ClefUsage(input_tokens=1, output_tokens=0))
-    assert prices.cost(usage) is None
-    assert Prices({CLAIRIC: 0.1, CLEF: 0.2, CLEF_FLASH: 0.05}).cost(usage) is not None
+    partial = prices.cost(usage)
+    assert partial.unpriced_models == (CLEF_FLASH,)
+    assert not partial.complete
+    full = Prices({CLAIRIC: 0.1, CLEF: 0.2, CLEF_FLASH: 0.05}).cost(usage)
+    assert full.complete
+    assert full.usd == pytest.approx(0.1 + 0.1 + 0.05 / 1_000_000)
+
+
+def test_bare_model_names_are_normalised_to_full_ids() -> None:
+    usage = Usage()
+    usage.add_call("clef", "gate", ClefUsage(input_tokens=1_000_000, output_tokens=0))
+    usage.add_call(CLEF, "gate", ClefUsage(input_tokens=1_000_000, output_tokens=0))
+    assert list(usage.by_model) == [CLEF]
+    assert usage.by_model[CLEF].requests == 2
+    # A bare price key matches a full-id usage and vice versa.
+    prices = Prices({"clef": 0.5})
+    assert dict(prices.per_million_input) == {CLEF: 0.5}
+    report = prices.cost(usage)
+    assert report.complete
+    assert report.usd == pytest.approx(1.0)
+    manual = Usage()
+    manual.by_model["clef"] = Usage(input_tokens=1_000_000, requests=1)
+    assert prices.cost(manual).usd == pytest.approx(0.5)
+    assert Prices({CLEF: 0.5}).cost(manual).complete
 
 
 def test_cost_ignores_unpriced_models_without_input_tokens() -> None:
     usage = Usage()
     usage.by_model[CLEF] = Usage(requests=1)  # no input tokens
     usage.add_call(CLAIRIC, "extract", CLAIRIC_USAGE)
-    assert Prices().cost(usage) == pytest.approx(655 * 0.10 / 1_000_000)
+    report = Prices().cost(usage)
+    assert report.complete
+    assert report.usd == pytest.approx(655 * 0.10 / 1_000_000)
 
 
-def test_cost_of_empty_usage_is_zero() -> None:
-    assert Prices().cost(Usage()) == 0.0
+def test_cost_of_empty_usage_is_zero_and_complete() -> None:
+    assert Prices().cost(Usage()) == CostReport(0.0, (), True)
 
 
-def test_cost_without_breakdown_cannot_be_priced() -> None:
-    assert Prices().cost(Usage(input_tokens=5)) is None
+def test_cost_without_breakdown_is_unattributed() -> None:
+    report = Prices().cost(Usage(input_tokens=5))
+    assert report.usd == 0.0
+    assert report.unpriced_models == ("(unattributed)",)
+    assert not report.complete
+
+
+def test_cost_report_is_frozen() -> None:
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        CostReport(0.0, (), True).usd = 1.0  # type: ignore[misc]
+
+
+def test_prices_validation() -> None:
+    for bad in (-0.01, float("nan"), float("inf")):
+        with pytest.raises(ValueError):
+            Prices({CLAIRIC: bad})
+    assert Prices({CLAIRIC: 0.0}).cost(Usage()).complete
+
+
+def test_prices_are_hashable_and_immutable() -> None:
+    a, b = Prices({CLAIRIC: 0.1}), Prices({"clairic": 0.1})
+    assert a == b
+    assert hash(a) == hash(b)
+    assert len({a, b, Prices({CLAIRIC: 0.2})}) == 2
+    with pytest.raises(TypeError):
+        a.per_million_input[CLAIRIC] = 1.0  # type: ignore[index]
+    source = {CLAIRIC: 0.1}
+    prices = Prices(source)
+    source[CLAIRIC] = 9.0  # later changes to the caller's dict do not leak in
+    assert prices.per_million_input[CLAIRIC] == 0.1
 
 
 def test_concurrency_defaults() -> None:
@@ -180,3 +267,38 @@ def test_concurrency_defaults() -> None:
     assert ConcurrencyConfig(per_model={CLAIRIC: 4}).limit_for(CLAIRIC) == 4
     with pytest.raises(dataclasses.FrozenInstanceError):
         config.adaptive = False  # type: ignore[misc]
+
+
+def test_concurrency_config_is_hashable_and_immutable() -> None:
+    a = ConcurrencyConfig(per_model={"clef": 4})
+    b = ConcurrencyConfig(per_model={CLEF: 4})
+    assert a == b
+    assert hash(a) == hash(b)
+    assert a.per_model["clef"] == 4
+    assert a.limit_for("clef") == 4
+    assert a.limit_for(CLEF) == 4
+    assert a.limit_for(CLAIRIC) == 32  # not listed: the default
+    assert len({ConcurrencyConfig(), ConcurrencyConfig(), a}) == 2
+    with pytest.raises(TypeError):
+        a.per_model[CLEF] = 1  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"max_in_flight": 0},
+        {"default_per_model": 0},
+        {"recover_after": 0},
+        {"per_model": {CLAIRIC: 0}},
+        {"per_model": {CLAIRIC: 4, CLEF: -1}},
+    ],
+)
+def test_concurrency_config_rejects_invalid_values(kwargs: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        ConcurrencyConfig(**kwargs)  # type: ignore[arg-type]
+
+
+def test_concurrency_config_accepts_boundary_values() -> None:
+    ConcurrencyConfig(
+        max_in_flight=1, per_model={CLAIRIC: 1}, default_per_model=1, recover_after=1
+    )

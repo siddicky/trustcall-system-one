@@ -2,17 +2,28 @@
 
 import copy
 import inspect
+import json
+import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from typing import Any
+from typing import Any, Literal
 
 from trustcall_system_one._wire import (
+    CLAIRIC,
+    CLEF,
+    CLEF_FLASH,
+    ChoiceAnswer,
+    ChoiceQuestion,
     ClairicRequest,
+    ClairicResponse,
     ClefRequest,
+    ClefResponse,
+    ScoreAnswer,
+    ScoreQuestion,
     body_model,
     parse_clairic,
     parse_clef,
 )
-from trustcall_system_one.transport import CallMeta
+from trustcall_system_one.transport import CallMeta, TransportResponse
 
 __all__ = [
     "FakeTransport",
@@ -30,17 +41,80 @@ Handler = Callable[
 ]
 
 
+_FULL_IDS = (CLAIRIC, CLEF, CLEF_FLASH)
+
+
+def _unhandled(model: str, meta: CallMeta, payload: Any, why: str) -> AssertionError:
+    return AssertionError(
+        f"FakeTransport: {why}\n  model: {model}\n  meta: {meta}\n  payload: {payload}"
+    )
+
+
+def _check_clairic_response(
+    request: ClairicRequest, response: ClairicResponse, model: str
+) -> str | None:
+    if response.model.strip() not in (body_model(model), model):
+        return f"response model {response.model!r} does not match {model}"
+    if set(response.answers) != set(request.fields):
+        return (
+            f"answer keys {sorted(response.answers)} differ from the requested "
+            f"fields {sorted(request.fields)}"
+        )
+    return None
+
+
+def _check_clef_response(
+    request: ClefRequest, response: ClefResponse, model: str
+) -> str | None:
+    if response.model != body_model(model):
+        return f"response model {response.model!r} must be {body_model(model)!r}"
+    if set(response.answers) != set(request.questions):
+        return (
+            f"answer keys {sorted(response.answers)} differ from the asked "
+            f"questions {sorted(request.questions)}"
+        )
+    for qid, question in request.questions.items():
+        answer = response.answers[qid]
+        if answer.type != question.type:
+            return f"{qid}: answered as {answer.type} but asked as {question.type}"
+        if isinstance(question, ChoiceQuestion) and isinstance(answer, ChoiceAnswer):
+            options = set(question.criteria)
+            if answer.choice not in options:
+                return (
+                    f"{qid}: choice {answer.choice!r} is not one of {sorted(options)}"
+                )
+            if not set(answer.probabilities) <= options:
+                return f"{qid}: probabilities name options that were not offered"
+        if isinstance(question, ScoreQuestion) and isinstance(answer, ScoreAnswer):
+            levels = {str(i) for i in range(len(question.criteria))}
+            if set(answer.probabilities) != levels:
+                return f"{qid}: probabilities must be keyed {sorted(levels)}"
+    return None
+
+
 class FakeTransport:
     """A ``Transport`` that answers from a handler and validates both sides.
 
-    The request is validated against the published request schema before the
-    handler runs and the handler's response is validated after, so tests fail
-    on malformed traffic. An invalid request raises pydantic's
-    ``ValidationError``; an invalid response raises ``ModelResponseError``.
+    It is deliberately at least as strict as the real API and
+    ``CloudflareTransport``:
+
+    * ``model`` must be a full ``@cf/...`` id, and must agree with the body's
+      ``model`` selector.
+    * The payload is JSON round-tripped (``allow_nan=False``, as httpx does)
+      and validated in strict mode, so lax coercions and values that cannot be
+      encoded fail here instead of in production.
+    * The response must parse, carry exactly the requested field or question
+      ids, and, for Clef, answer each question with its own type, with
+      options and levels that were actually offered.
+
+    An invalid request raises pydantic's ``ValidationError`` (or ``TypeError``
+    / ``ValueError`` when it cannot be JSON-encoded), an invalid response
+    raises ``ModelResponseError`` and a response inconsistent with its request
+    raises ``AssertionError``.
 
     Attributes:
         calls: Every ``(model, payload, meta)`` seen, in order. Payloads are
-            deep copies taken before the handler ran.
+            the JSON round-tripped copies taken before the handler ran.
     """
 
     def __init__(self, handler: Handler) -> None:
@@ -54,11 +128,6 @@ class FakeTransport:
         self._handler = handler
         self.calls: list[tuple[str, dict[str, Any], CallMeta]] = []
 
-    @property
-    def last_retries(self) -> int:
-        """Always 0; the fake never retries."""
-        return 0
-
     async def run(
         self,
         model: str,
@@ -66,7 +135,7 @@ class FakeTransport:
         *,
         meta: CallMeta,
         timeout: float | None = None,
-    ) -> dict[str, Any]:
+    ) -> TransportResponse:
         """Validate the request, call the handler, validate and return the body.
 
         Args:
@@ -76,36 +145,67 @@ class FakeTransport:
             timeout: Ignored.
 
         Returns:
-            The handler's response body.
+            The handler's response body, with ``retries=0``.
 
         Raises:
-            AssertionError: If the handler returns ``None`` or raises ``KeyError``.
+            ValueError: If ``model`` is not a full id of a System One model.
+            AssertionError: If the handler returns ``None`` or raises
+                ``KeyError``, or its response does not fit the request.
         """
-        body = copy.deepcopy(dict(payload))
+        if model not in _FULL_IDS:
+            raise ValueError(
+                f"unknown System One model: {model!r}; FakeTransport needs a "
+                f"full id, one of {_FULL_IDS}"
+            )
+        try:
+            text = json.dumps(payload, allow_nan=False)
+        except (TypeError, ValueError):
+            self.calls.append((model, copy.deepcopy(dict(payload)), meta))
+            raise
+        body: dict[str, Any] = json.loads(text)
         self.calls.append((model, body, meta))
-        is_clairic = body_model(model) == "clairic"
-        if is_clairic:
-            ClairicRequest.model_validate(body)
-        else:
-            ClefRequest.model_validate(body)
 
-        unhandled = AssertionError(
-            f"FakeTransport: unhandled call\n  model: {model}\n  meta: {meta}\n"
-            f"  payload: {body}"
-        )
+        clairic_request: ClairicRequest | None = None
+        clef_request: ClefRequest | None = None
+        if body_model(model) == "clairic":
+            clairic_request = ClairicRequest.model_validate_json(text, strict=True)
+            selector = clairic_request.model
+        else:
+            clef_request = ClefRequest.model_validate_json(text, strict=True)
+            selector = clef_request.model
+        if body_model(selector.strip()) != body_model(model):
+            raise _unhandled(
+                model, meta, body, f"URL model does not match body model {selector!r}"
+            )
+
+        started = time.perf_counter()
         try:
             result = self._handler(model, copy.deepcopy(body), meta)
             if inspect.isawaitable(result):
                 result = await result
         except KeyError as exc:
-            raise unhandled from exc
+            raise _unhandled(model, meta, body, "unhandled call") from exc
         if result is None:
-            raise unhandled
-        if is_clairic:
-            parse_clairic(result)
+            raise _unhandled(model, meta, body, "unhandled call")
+
+        problem: str | None
+        if clairic_request is not None:
+            problem = _check_clairic_response(
+                clairic_request, parse_clairic(result), model
+            )
         else:
-            parse_clef(result)
-        return result
+            assert clef_request is not None
+            problem = _check_clef_response(clef_request, parse_clef(result), model)
+        if problem is not None:
+            raise _unhandled(
+                model, meta, body, f"response does not fit the request: {problem}"
+            )
+        return TransportResponse(
+            body=result,
+            retries=0,
+            duration_ms=(time.perf_counter() - started) * 1000,
+            status_code=200,
+        )
 
 
 def clairic_answer(
@@ -237,18 +337,25 @@ def clef_response(
     answers: Mapping[str, dict[str, Any]],
     *,
     input_tokens: int = 100,
-    model: str = "clef",
+    model: Literal["clef", "clef-flash"] = "clef",
 ) -> dict[str, Any]:
     """Build a schema-valid Clef response body.
 
     Args:
         answers: Answers keyed by question id.
         input_tokens: Reported input tokens.
-        model: The model name echoed in the body.
+        model: The model echoed in the body. It must match the request's body
+            model, which ``FakeTransport`` checks, so a handler serving
+            ``clef-flash`` passes ``model="clef-flash"``.
 
     Returns:
         The response body.
+
+    Raises:
+        ValueError: If ``model`` is not ``"clef"`` or ``"clef-flash"``.
     """
+    if model not in ("clef", "clef-flash"):
+        raise ValueError(f"model must be 'clef' or 'clef-flash', got {model!r}")
     return {
         "model": model,
         "answers": dict(answers),

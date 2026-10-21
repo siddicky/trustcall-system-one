@@ -5,12 +5,16 @@ forbid unknown keys so malformed payloads fail in tests; responses allow extra
 keys for forward compatibility but require every documented required key.
 """
 
+import base64
+import binascii
+import re
 from collections.abc import Mapping
 from datetime import date
 from typing import Annotated, Any, Literal, Union
 
 from pydantic import (
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
     StringConstraints,
@@ -45,6 +49,7 @@ __all__ = [
     "ScoreAnswer",
     "ScoreQuestion",
     "body_model",
+    "normalize_model_id",
     "parse_clairic",
     "parse_clef",
 ]
@@ -81,12 +86,37 @@ def body_model(model_id: str) -> str:
         raise ValueError(f"unknown System One model: {model_id!r}") from None
 
 
+_FULL_IDS: dict[str, str] = {
+    "clairic": CLAIRIC,
+    "clef": CLEF,
+    "clef-flash": CLEF_FLASH,
+}
+
+
+def normalize_model_id(model: str) -> str:
+    """Return the full ``@cf/...`` id for a bare System One name.
+
+    Full ids and unknown names are returned unchanged, so custom model ids can
+    still be used as accounting keys.
+    """
+    return _FULL_IDS.get(model, model)
+
+
 JsonLike = Union[str, dict[str, Any], list[Any]]  # noqa: UP007 - runtime alias
 """A string, object or array as accepted by Clef ``state`` and ``instructions``."""
 
 _IMAGE_DATA_URL = StringConstraints(pattern=r"^[Dd][Aa][Tt][Aa]:")
 _CLAIRIC_FIELD_NAME = StringConstraints(pattern=r"^[A-Za-z_][A-Za-z0-9_.\-]{0,63}$")
 _CLEF_QUESTION_ID = StringConstraints(pattern=r"^[A-Za-z0-9_.\-]{1,100}$")
+
+_ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+
+_IMAGE_TYPES = frozenset({"image/png", "image/jpeg", "image/webp"})
+_MAX_IMAGE_BYTES = 4 * 1024 * 1024
+_MAX_TOTAL_IMAGE_BYTES = 8 * 1024 * 1024
+_MAX_CLAIRIC_BODY_BYTES = 16 * 1024 * 1024
+_MAX_CLEF_BODY_BYTES = 13 * 1024 * 1024
+_DATA_URL = re.compile(r"data:([^;,]*)((?:;[^;,]*)*),(.*)", re.IGNORECASE | re.DOTALL)
 
 _DURATION_UNITS = frozenset(
     {"seconds", "minutes", "hours", "days", "weeks", "months", "years"}
@@ -113,6 +143,48 @@ class Base64Image(_Request):
 Image = Union[Annotated[str, _IMAGE_DATA_URL], Base64Image]  # noqa: UP007
 
 
+def _decoded_size(content_type: str, payload: str) -> int:
+    if content_type.strip().lower() not in _IMAGE_TYPES:
+        raise ValueError(
+            f"image type must be one of {sorted(_IMAGE_TYPES)}, got {content_type!r}"
+        )
+    try:
+        size = len(base64.b64decode(payload, validate=True))
+    except (binascii.Error, ValueError):
+        raise ValueError("image data is not valid base64") from None
+    if size > _MAX_IMAGE_BYTES:
+        raise ValueError("an image may be at most 4 MiB decoded")
+    return size
+
+
+def _validate_images(images: list[Image] | None) -> list[Image] | None:
+    """Enforce the documented image limits before anything is sent.
+
+    The documented megapixel limit (16 MP per Clef image) is not enforced: it
+    would need an image decoder, which this package deliberately does not
+    depend on, and the API rejects oversized images with a clear error.
+    """
+    total = 0
+    for image in images or []:
+        if isinstance(image, Base64Image):
+            total += _decoded_size(image.content_type, image.base64)
+            continue
+        match = _DATA_URL.fullmatch(image)
+        params = [p.strip().lower() for p in match.group(2).split(";")] if match else []
+        if match is None or "base64" not in params:
+            raise ValueError("image data URLs must look like data:image/png;base64,...")
+        total += _decoded_size(match.group(1), match.group(3))
+    if total > _MAX_TOTAL_IMAGE_BYTES:
+        raise ValueError("images may total at most 8 MiB decoded")
+    return images
+
+
+def _check_body_size(request: BaseModel, limit: int) -> None:
+    size = len(request.model_dump_json(exclude_none=True, by_alias=True).encode())
+    if size > limit:
+        raise ValueError(f"request body is {size} bytes; the limit is {limit}")
+
+
 # --------------------------------------------------------------------------- #
 # Clairic request
 # --------------------------------------------------------------------------- #
@@ -137,9 +209,14 @@ class ClairicField(_Request):
     integer: bool | None = None
     decimals: int | None = Field(default=None, ge=0, le=6)
     items: Literal["text", "number", "date"] | None = None
-    min: float | int | str | None = None
-    max: float | int | str | None = None
-    step: float | int | Literal["month", "year"] | None = None
+    min: Annotated[float, Field(allow_inf_nan=False)] | int | str | None = None
+    max: Annotated[float, Field(allow_inf_nan=False)] | int | str | None = None
+    step: (
+        Annotated[float, Field(allow_inf_nan=False)]
+        | int
+        | Literal["month", "year"]
+        | None
+    ) = None
     scale: Literal["linear", "log"] | None = None
     null_threshold: float | None = Field(default=None, gt=0, le=1)
     horizon: int | None = Field(default=None, ge=1, le=64)
@@ -148,11 +225,22 @@ class ClairicField(_Request):
         | None
     ) = None
 
+    @field_validator(
+        "decimals", "horizon", "null_threshold", "min", "max", "step", mode="before"
+    )
+    @classmethod
+    def _reject_bool(cls, value: Any) -> Any:
+        if isinstance(value, bool):
+            raise ValueError("a number is required, not a boolean")
+        return value
+
     @field_validator("min", "max")
     @classmethod
     def _check_bound(cls, value: float | int | str | None) -> float | int | str | None:
         if isinstance(value, str):
             try:
+                if not _ISO_DATE.fullmatch(value):
+                    raise ValueError
                 date.fromisoformat(value)
             except ValueError:
                 raise ValueError("a string bound must be an ISO date") from None
@@ -208,10 +296,13 @@ class ClairicRequest(_Request):
     reference_date: str | None = None
     options: ClairicOptions | None = None
 
+    _check_images = field_validator("images")(_validate_images)
+
     @model_validator(mode="after")
     def _check_state(self) -> Self:
         if not self.state and not self.images:
             raise ValueError("state must be non-empty unless images are sent")
+        _check_body_size(self, _MAX_CLAIRIC_BODY_BYTES)
         return self
 
 
@@ -221,7 +312,7 @@ class ClairicRequest(_Request):
 
 
 def _non_empty_instructions(value: JsonLike) -> JsonLike:
-    if not value:
+    if not (value.strip() if isinstance(value, str) else value):
         raise ValueError("instructions must be a non-empty string, object or array")
     return value
 
@@ -288,6 +379,13 @@ class ClefRequest(_Request):
     )
     images: list[Image] | None = Field(default=None, max_length=4)
 
+    _check_images = field_validator("images")(_validate_images)
+
+    @model_validator(mode="after")
+    def _check_size(self) -> Self:
+        _check_body_size(self, _MAX_CLEF_BODY_BYTES)
+        return self
+
 
 # --------------------------------------------------------------------------- #
 # Responses
@@ -300,6 +398,12 @@ class _Response(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+def _is_int_list(value: Any) -> bool:
+    return isinstance(value, list) and all(
+        isinstance(item, int) and not isinstance(item, bool) for item in value
+    )
+
+
 class ClairicAnswer(_Response):
     """One Clairic answer. ``value`` is ``None`` when the input does not say."""
 
@@ -308,8 +412,8 @@ class ClairicAnswer(_Response):
     guess: Any = None
     p_null: float | None = None
     confidence: float | None = None
-    span: tuple[int, int] | None = None
-    spans: list[tuple[int, int]] | None = None
+    span: list[int] | None = None
+    spans: list[list[int]] | None = None
     mean: Any = None
     median: Any = None
     p10: Any = None
@@ -318,6 +422,17 @@ class ClairicAnswer(_Response):
     p_above: float | None = None
     quantiles: list[Any] | None = None
     steps: list[Any] | None = None
+
+    @field_validator("span", mode="before")
+    @classmethod
+    def _lenient_span(cls, value: Any) -> Any:
+        return value if _is_int_list(value) else None
+
+    @field_validator("spans", mode="before")
+    @classmethod
+    def _lenient_spans(cls, value: Any) -> Any:
+        ok = isinstance(value, list) and all(_is_int_list(item) for item in value)
+        return value if ok else None
 
 
 class ClairicUsage(_Response):
@@ -341,14 +456,28 @@ class ClairicResponse(_Response):
     usage: ClairicUsage
 
 
+_PROBABILITY_TOLERANCE = 1e-6
+
+
+def _clip_probability(value: Any) -> Any:
+    """Clip values within rounding noise of [0, 1]; reject anything further out."""
+    if isinstance(value, bool):
+        raise ValueError("a probability must be a number, not a boolean")
+    if isinstance(value, (int, float)):
+        if -_PROBABILITY_TOLERANCE <= value <= 1 + _PROBABILITY_TOLERANCE:
+            return min(1.0, max(0.0, float(value)))
+        raise ValueError(f"probability {value!r} is outside [0, 1]")
+    return value
+
+
+Probability = Annotated[float, BeforeValidator(_clip_probability)]
+
+
 class NoulAnswer(_Response):
     """Probability that a noul question's answer is yes."""
 
     type: Literal["noul"]
-    noul: float = Field(ge=0, le=1)
-
-
-Probability = Annotated[float, Field(ge=0, le=1)]
+    noul: Probability
 
 
 class ChoiceAnswer(_Response):

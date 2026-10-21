@@ -18,7 +18,17 @@ class TrustcallSystemOneError(Exception):
 
 
 class TransportError(TrustcallSystemOneError):
-    """Base class for HTTP and transport failures."""
+    """Base class for HTTP and transport failures.
+
+    Attributes:
+        status_code: HTTP status, if a response was received.
+        body: The decoded response body, if any.
+        retries: Retries performed before giving up (set by the transport).
+        retry_after: Seconds the server asked the client to wait, if it did.
+    """
+
+    retries: int = 0
+    retry_after: float | None = None
 
     def __init__(
         self,

@@ -256,19 +256,29 @@ re-validate; then `strict` raises `ExtractionValidationError`, otherwise the rec
 
 ## Transport and wire (`transport.py`, `_wire.py`)
 
-- `Transport` protocol: `async run(model, payload, *, meta: CallMeta, timeout) -> dict`.
-  `CallMeta{kind, schema, entity, field, scope}` routes fakes and becomes AI Gateway
-  `cf-aig-metadata`.
+- `Transport` protocol: `async run(model, payload, *, meta: CallMeta, timeout) ->
+  TransportResponse`. `CallMeta{kind, schema, entity, field, scope}` routes fakes and becomes
+  AI Gateway `cf-aig-metadata` (optional via `send_metadata`; `entity` can be a person's
+  name). `TransportResponse{body, retries, duration_ms, status_code}` is a frozen dataclass:
+  `body` is the bare response object and the rest feeds `CallRecord` (`retries`,
+  `duration_ms`, `status_code`). A failed call raises a `TransportError` that carries
+  `status_code`, `retries` and `retry_after`; the engine records those plus the message in
+  `CallRecord.error`.
 - `CloudflareTransport`: `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN` (fallback
   `CLOUDFLARE_AUTH_TOKEN`), optional `base_url` / `gateway=`; httpx async client; timeout
   60 s (connect 10 s); retries on 408/429/5xx/transport errors honouring `Retry-After`, else
   decorrelated jitter; unwraps the REST `{success, result, errors, messages}` envelope and
   accepts bare objects; errors `AuthError`, `BadRequestError` (with CF `errors[]`),
   `RateLimitError`, `ServerError`, `ModelResponseError`.
-- Concurrency: 64 in flight per invoke, 32 per model, adaptive (halve on 429, +1 per 20
-  successes). Sync `invoke` runs `ainvoke` on a private event-loop thread.
+- Concurrency: 64 in flight per transport per event loop (shared across invokes and batch),
+  32 per model, adaptive (halve on 429, at most once per generation so a burst of 429s halves
+  once, +1 per 20 successes). The slot is released while a retry backs off. Limiter state and
+  the httpx client are kept per event loop. Sync `invoke` runs `ainvoke` on a private
+  event-loop thread.
 - Wire models mirror the published schemas exactly (requests `extra="forbid"`, responses
-  `extra="allow"`). Clairic answer requires `type`, `value`; response requires `answers`,
+  `extra="allow"`). Requests forbid unknown keys deliberately, which is stricter than the
+  published schemas, to catch our own typos; they also enforce the documented image and body
+  size limits before sending. Clairic answer requires `type`, `value`; response requires `answers`,
   `truncated`, `usage`. Clef answers: `{type:"noul", noul}`,
   `{type:"choice", choice, probabilities, confidence}`,
   `{type:"score", score, legend, probabilities, confidence}`; Clef body `model` is
@@ -277,8 +287,10 @@ re-validate; then `strict` raises `ExtractionValidationError`, otherwise the rec
   tokens), narrow `input` to mention windows when over, and warn when
   `usage.input_tokens ≥ 0.97 × 65,536`.
 - Usage per call into `CallRecord`s and a `Usage` total by model and by kind. `Prices`
-  defaults to Clairic $0.10/M only; Clef's price isn't published, so `cost_usd` is `None`
-  unless the caller configures it.
+  defaults to Clairic $0.10/M only; Clef's price isn't published, so `Prices.cost(usage)`
+  returns a frozen `CostReport{usd, unpriced_models, complete}`: `usd` sums the priced models
+  only, and `complete` is false (with the models listed) until the caller configures a price
+  for every model that used input tokens.
 - Experimental, off: Workers AI queue mode (`queueRequest` + `request_id`) behind a live
   probe — the Clairic schema has no batch properties, so it may be unsupported.
 

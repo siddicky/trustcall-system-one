@@ -2,10 +2,32 @@
 
 import dataclasses
 from dataclasses import dataclass
+from typing import Literal
 
-from trustcall_system_one._wire import ClairicUsage, ClefUsage
+from trustcall_system_one._wire import ClairicUsage, ClefUsage, normalize_model_id
 
-__all__ = ["CallRecord", "Usage"]
+__all__ = ["CallKind", "CallRecord", "Usage"]
+
+CallKind = Literal[
+    "presence",
+    "discover",
+    "count",
+    "coref",
+    "qualify",
+    "match",
+    "delete",
+    "extract",
+    "crosscheck",
+    "clef_fields",
+    "attribution",
+    "reask",
+    "null_check",
+    "adjudicate",
+    "list_dedup",
+    "gate",
+    "repair",
+    "raw",
+]
 
 _TOKEN_FIELDS = (
     "state_tokens",
@@ -44,7 +66,8 @@ class Usage:
         """Record one successful call.
 
         Args:
-            model: Full model id the call went to.
+            model: Model id the call went to; bare names are stored as the full
+                ``@cf/...`` id.
             kind: The ``CallMeta.kind`` of the call.
             usage: The ``usage`` object parsed from the response.
         """
@@ -58,7 +81,7 @@ class Usage:
             requests=1,
         )
         self._add_totals(call)
-        self.by_model.setdefault(model, Usage())._add_totals(call)
+        self.by_model.setdefault(normalize_model_id(model), Usage())._add_totals(call)
         self.by_kind.setdefault(kind, Usage())._add_totals(call)
 
     def merge(self, other: "Usage") -> None:
@@ -83,10 +106,14 @@ class Usage:
 
 @dataclass(frozen=True)
 class CallRecord:
-    """One transport call, as logged on a result."""
+    """One transport call, as logged on a result.
+
+    ``error`` is the failure message for a call that raised (``None`` on
+    success) and ``status_code`` the HTTP status when one was received.
+    """
 
     model: str
-    kind: str
+    kind: CallKind
     schema: str = ""
     entity: str | None = None
     field: str | None = None
@@ -95,3 +122,5 @@ class CallRecord:
     usage: dict[str, int] = dataclasses.field(default_factory=dict)
     duration_ms: float = 0.0
     retries: int = 0
+    error: str | None = None
+    status_code: int | None = None

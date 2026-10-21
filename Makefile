@@ -19,6 +19,7 @@ evals:
 	TRUSTCALL_S1_LIVE=1 uv run pytest -m eval tests/evals
 
 lint:
+	uv lock --check
 	uv run ruff check .
 	uv run ruff format --check .
 	uv run mypy
