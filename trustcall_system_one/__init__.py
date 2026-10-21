@@ -1,6 +1,18 @@
 """Validated extraction and JSON-Patch updates on Cloudflare System One models."""
 
-from trustcall_system_one._config import ConcurrencyConfig, CostReport, Prices
+from trustcall_system_one._compile import (
+    FieldSpec,
+    SchemaPlan,
+    compile_schema,
+    s1_field,
+)
+from trustcall_system_one._config import (
+    ConcurrencyConfig,
+    CostReport,
+    GateConfig,
+    Limits,
+    Prices,
+)
 from trustcall_system_one._errors import (
     AuthError,
     BadRequestError,
@@ -35,9 +47,13 @@ __all__ = [
     "ConcurrencyConfig",
     "CostReport",
     "ExtractionValidationError",
+    "FieldSpec",
+    "GateConfig",
+    "Limits",
     "ModelResponseError",
     "Prices",
     "RateLimitError",
+    "SchemaPlan",
     "ServerError",
     "StateTruncatedError",
     "Transport",
@@ -46,4 +62,6 @@ __all__ = [
     "TrustcallSystemOneError",
     "Usage",
     "__version__",
+    "compile_schema",
+    "s1_field",
 ]

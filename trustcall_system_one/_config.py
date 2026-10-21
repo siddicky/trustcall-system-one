@@ -3,12 +3,12 @@
 import math
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
-from typing import TypeVar
+from typing import Literal, TypeVar
 
 from trustcall_system_one._types import Usage
 from trustcall_system_one._wire import CLAIRIC, CLEF, CLEF_FLASH, normalize_model_id
 
-__all__ = ["ConcurrencyConfig", "CostReport", "Prices"]
+__all__ = ["ConcurrencyConfig", "CostReport", "GateConfig", "Limits", "Prices"]
 
 V = TypeVar("V")
 
@@ -151,3 +151,107 @@ class Prices:
         return CostReport(
             usd=total, unpriced_models=tuple(sorted(unpriced)), complete=not unpriced
         )
+
+
+def _check_probability(name: str, value: float) -> None:
+    """Require ``value`` to be a real number in ``(0, 1]``."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number, got {value!r}")
+    if not math.isfinite(value) or not 0 < value <= 1:
+        raise ValueError(f"{name} must be in (0, 1], got {value!r}")
+
+
+@dataclass(frozen=True)
+class GateConfig:
+    """Thresholds that decide whether a model answer is accepted.
+
+    The instance is immutable and hashable, so it can be part of a compile
+    cache key. Every probability-like threshold must lie in ``(0, 1]``.
+
+    Attributes:
+        required_null_threshold: Clairic ``null_threshold`` for required fields.
+        optional_null_threshold: Clairic ``null_threshold`` for optional fields
+            and fields with defaults.
+        min_confidence: Minimum Clairic answer confidence to accept a value.
+        min_choice_prob: Minimum probability of the chosen Clef option.
+        min_choice_confidence: Minimum Clef choice or score confidence.
+        noul_margin: A noul answer must be at least this far from 0.5 to count
+            as yes or no; closer answers abstain. Must be in ``[0, 0.5)``.
+        add_threshold: Change-gate probability needed to add a value.
+        replace_threshold: Change-gate probability needed to replace a value.
+        remove_threshold: Change-gate probability needed to remove a value.
+        allow_null_removals: Whether a null answer may remove an existing value.
+    """
+
+    required_null_threshold: float = 0.7
+    optional_null_threshold: float = 0.3
+    min_confidence: float = 0.5
+    min_choice_prob: float = 0.55
+    min_choice_confidence: float = 0.5
+    noul_margin: float = 0.15
+    add_threshold: float = 0.55
+    replace_threshold: float = 0.6
+    remove_threshold: float = 0.85
+    allow_null_removals: bool = False
+
+    def __post_init__(self) -> None:
+        """Validate every threshold."""
+        for name in (
+            "required_null_threshold",
+            "optional_null_threshold",
+            "min_confidence",
+            "min_choice_prob",
+            "min_choice_confidence",
+            "add_threshold",
+            "replace_threshold",
+            "remove_threshold",
+        ):
+            _check_probability(name, getattr(self, name))
+        margin = self.noul_margin
+        if isinstance(margin, bool) or not isinstance(margin, (int, float)):
+            raise ValueError(f"noul_margin must be a number, got {margin!r}")
+        if not math.isfinite(margin) or not 0 <= margin < 0.5:
+            raise ValueError(f"noul_margin must be in [0, 0.5), got {margin!r}")
+        if not isinstance(self.allow_null_removals, bool):
+            raise ValueError("allow_null_removals must be a bool")
+
+
+@dataclass(frozen=True)
+class Limits:
+    """Structural limits applied while compiling a schema.
+
+    The instance is immutable and hashable.
+
+    Attributes:
+        max_depth: Deepest nesting of sub-models that is expanded; deeper or
+            recursive fields are skipped with a warning.
+        any_policy: What to do with ``Any`` and untyped mappings: ``"skip"``
+            them (pydantic supplies the default) or ask for ``"text"``.
+        estimate_for_bounded_numbers: Emit a Clairic ``estimate`` field for a
+            number with both a lower and an upper bound.
+        max_instruction_chars: Longest instruction string sent to a model.
+    """
+
+    max_depth: int = 8
+    any_policy: Literal["skip", "text"] = "skip"
+    estimate_for_bounded_numbers: bool = False
+    max_instruction_chars: int = 600
+
+    def __post_init__(self) -> None:
+        """Validate the limits."""
+        if isinstance(self.max_depth, bool) or not isinstance(self.max_depth, int):
+            raise ValueError("max_depth must be an int")
+        if self.max_depth < 1:
+            raise ValueError("max_depth must be at least 1")
+        if self.any_policy not in ("skip", "text"):
+            raise ValueError(
+                f"any_policy must be 'skip' or 'text', got {self.any_policy!r}"
+            )
+        if not isinstance(self.estimate_for_bounded_numbers, bool):
+            raise ValueError("estimate_for_bounded_numbers must be a bool")
+        if isinstance(self.max_instruction_chars, bool) or not isinstance(
+            self.max_instruction_chars, int
+        ):
+            raise ValueError("max_instruction_chars must be an int")
+        if self.max_instruction_chars < 20:
+            raise ValueError("max_instruction_chars must be at least 20")
