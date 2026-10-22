@@ -85,10 +85,14 @@ def question(text: str, kind: str = "noul", **extra: Any) -> Body:
 
 
 def focus(label: str, text: str, spans: str = "") -> str:
-    line = f"The input mentions {label} as: {spans}.\n" if spans else ""
+    line = (
+        f"The entity is mentioned in the input at characters {spans}.\n"
+        if spans
+        else ""
+    )
     return (
-        f'<focus schema="Person" entity="{label}">\nAnswer each field for {label} '
-        f"only.\n{line}</focus>\n<input>\n{text}\n</input>"
+        f'<focus schema="Person" entity="{label}">\nAnswer each field for the '
+        f"entity named above only.\n{line}</focus>\n<input>\n{text}\n</input>"
     )
 
 
@@ -529,10 +533,10 @@ async def test_the_focused_entity_is_found_by_its_mention_spans() -> None:
     )
     fields = {"name": {"type": "text"}}
     for spans, wanted in (
-        ("at characters 0-4", "sings"),
-        ("at characters 12-16", "dances"),
+        ("0-4", "sings"),
+        ("12-16", "dances"),
     ):
-        state = focus("Emma", text, f'"Emma" {spans}')
+        state = focus("Emma", text, spans)
         answers = await ask(world, "extract", clairic=True, state=state, fields=fields)
         assert answers["name"]["value"] == wanted
 
@@ -1134,16 +1138,12 @@ async def test_the_world_resolves_the_label_first_and_refuses_a_mismatch() -> No
     fields = {"name": {"type": "text"}}
     # the label and the spans agree: fine
     emma = TEXT.index("Emma Thompson")
-    state = focus(
-        "Emma Thompson", TEXT, f'"Emma Thompson" at characters {emma}-{emma + 13}'
-    )
+    state = focus("Emma Thompson", TEXT, f"{emma}-{emma + 13}")
     answers = await ask(world, "extract", clairic=True, state=state, fields=fields)
     assert answers["name"]["value"] == "Emma Thompson"
     # the label names Emma, the spans are Michael's: that is a bug in the request
     michael = TEXT.index("Michael Chen")
-    state = focus(
-        "Emma Thompson", TEXT, f'"Michael Chen" at characters {michael}-{michael + 12}'
-    )
+    state = focus("Emma Thompson", TEXT, f"{michael}-{michael + 12}")
     with pytest.raises(AssertionError, match="belong to 'Michael Chen'"):
         await ask(world, "extract", clairic=True, state=state, fields=fields)
 

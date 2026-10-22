@@ -137,7 +137,7 @@ def test_limits_accept_valid_values() -> None:
 def test_verify_defaults() -> None:
     verify = VerifyConfig()
     assert verify.attribution is True
-    assert (verify.attribution_keep, verify.attribution_drop) == (0.6, 0.3)
+    assert (verify.attribution_keep, verify.attribution_drop) == (0.75, 0.4)
     assert verify.reask_low_confidence is True
     assert verify.low_confidence == 0.85
     assert verify.borderline_null is True
@@ -167,7 +167,7 @@ def test_verify_is_frozen_hashable_and_comparable() -> None:
         {"attribution_keep": 1.5},
         {"attribution_keep": float("nan")},
         {"attribution_keep": True},
-        {"attribution_drop": 0.7},  # above keep
+        {"attribution_drop": 0.8},  # above keep
         {"low_confidence": 0},
         {"null_confirm_yes": 0.3},  # below null_confirm_no
         {"adjudicate_min": 2},

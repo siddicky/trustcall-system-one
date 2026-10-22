@@ -243,6 +243,18 @@ class ClairicField(_Request):
             raise ValueError("a number is required, not a boolean")
         return value
 
+    @model_validator(mode="after")
+    def _list_has_no_null_threshold(self) -> "ClairicField":
+        """Reject ``null_threshold`` on a list field.
+
+        Observed against the live API (error 3030, HTTP 422: "list fields don't
+        take 'null_threshold'"); the published input schema does not say so. A list
+        answer has no ``p_null`` either.
+        """
+        if self.type == "list" and self.null_threshold is not None:
+            raise ValueError("list fields don't take 'null_threshold'")
+        return self
+
     @field_validator("min", "max")
     @classmethod
     def _check_bound(cls, value: float | int | str | None) -> float | int | str | None:

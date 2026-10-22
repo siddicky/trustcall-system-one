@@ -689,6 +689,15 @@ class Extractor:
             _note_failure(exc, run)
             raise
         results: list[ResultRecord] = [r for o in outcomes for r in o.records]
+        if not any(r.valid and r.value is not None for r in results):
+            # an empty `responses` with nothing in `warnings` explains nothing
+            for record in (r for r in results if not r.valid):
+                who = f" ({record.entity.label})" if record.entity else ""
+                shown = "; ".join(record.errors[:3]) or "it failed validation"
+                run.warn(
+                    f"no_valid_record: the {record.schema_name} record{who} is "
+                    f"invalid, so `responses` is empty: {shown}"
+                )
         handled = {h for o in outcomes for h in o.handled}
         return ExtractionResult(
             records=tuple(results),

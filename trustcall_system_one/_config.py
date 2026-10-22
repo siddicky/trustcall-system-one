@@ -351,8 +351,8 @@ class VerifyConfig:
     """
 
     attribution: bool = True
-    attribution_keep: float = 0.6
-    attribution_drop: float = 0.3
+    attribution_keep: float = 0.75
+    attribution_drop: float = 0.4
     reask_low_confidence: bool = True
     low_confidence: float = 0.85
     borderline_null: bool = True

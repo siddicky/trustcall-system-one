@@ -190,21 +190,23 @@ def entity_focus(
         mentions: Its mentions as ``(text, span)``, spans in the original input.
 
     Returns:
-        The opening tag (``<focus schema="Person" entity="Emma Thompson">``) and
-        the lines that name the entity and where the input mentions it.
+        The opening tag (``<focus schema="Person" entity="Emma Thompson">``, the
+        one place the label is written) and the lines that say whom to answer
+        for and, when the offsets are known, where the input mentions the entity
+        (never the mention texts themselves).
     """
     header = f'<focus schema="{_attribute(schema)}" entity="{_attribute(label)}">'
     lines = [
-        f"Answer each field for {label} only. "
+        "Answer each field for the entity named above only. "
         f"Ignore facts about any other {kind.lower()}."
     ]
-    if mentions:
-        cited = ", ".join(
-            f'"{_attribute(text)}"'
-            + (f" at characters {span[0]}-{span[1]}" if span else "")
-            for text, span in mentions
-        )
-        lines.append(f"The input mentions {label} as: {cited}.")
+    # Offsets only: the header must not quote the mention texts. Clairic answers
+    # with a span, and a quoted name in the header is a place a span can start at
+    # (a live answer began in the quote and ended in the input, so its value held
+    # the header's tail and the input tag).
+    cited = ", ".join(f"{span[0]}-{span[1]}" for _, span in mentions if span)
+    if cited:
+        lines.append(f"The entity is mentioned in the input at characters {cited}.")
     return header, tuple(lines)
 
 

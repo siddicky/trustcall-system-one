@@ -600,20 +600,26 @@ async def test_every_entity_is_asked_with_its_own_focus_header() -> None:
     emma = by_entity["e0"]["state"]
     assert emma.startswith('<focus schema="Person" entity="Emma Thompson">\n')
     assert (
-        "Answer each field for Emma Thompson only. Ignore facts about any other person."
-        in emma
-    )
+        "Answer each field for the entity named above only. Ignore facts about any "
+        "other person."
+    ) in emma
     first = TEXT.index("Emma Thompson")
     second = TEXT.index("Emma got")
     assert (
-        f'The input mentions Emma Thompson as: "Emma Thompson" at characters '
-        f'{first}-{first + 13}, "Emma" at characters {second}-{second + 4}.'
+        f"The entity is mentioned in the input at characters "
+        f"{first}-{first + 13}, {second}-{second + 4}."
     ) in emma
+    # the header names the entity once and never quotes its mentions: Clairic once
+    # began a span at a quoted name in the header and ended it in the input
+    header = emma[: emma.index("</focus>")]
+    assert header.count("Emma Thompson") == 1
+    assert header.count("Emma") == 1  # not "Emma" on its own either
     assert emma.index("</focus>") < emma.index("<input>")
     assert TEXT in emma
     sarah = by_entity["e3"]["state"]
     assert sarah.startswith('<focus schema="Person" entity="Sarah">\n')
-    assert "Answer each field for Sarah only." in sarah
+    assert sarah.index("</focus>") < sarah.index("<input>")
+    assert sarah[: sarah.index("</focus>")].count("Sarah") == 1
 
 
 async def test_instructions_are_templated_with_the_entity_label() -> None:
@@ -792,8 +798,8 @@ async def test_two_emmas_are_told_apart_by_spans_in_every_request() -> None:
     world = two_emmas()
     await invoke(world)
     extracts = {meta.entity: payload for _, payload, meta in of_kind(world, "extract")}
-    assert "at characters 0-4" in extracts["e0"]["state"]
-    assert "at characters 0-4" not in extracts["e1"]["state"]
+    assert "at characters 0-4." in extracts["e0"]["state"]
+    assert "at characters 0-4." not in extracts["e1"]["state"]
     attribution = {
         meta.entity: payload for _, payload, meta in of_kind(world, "attribution")
     }
@@ -1572,7 +1578,7 @@ async def test_a_windowed_state_cites_no_offsets_in_its_focus_header() -> None:
     ((_, reask, _),) = of_kind(world, "reask")
     state = reask["state"]
     assert "…" in state  # only windows of the input are in it
-    assert 'The input mentions Sarah as: "Sarah", "Sarah".' in state
+    assert "is mentioned" not in state  # no offsets for a windowed state
     assert "at characters" not in state
     full = of_kind(world, "extract")[0][1]["state"]
     assert "at characters 0-5" in full  # the whole input keeps its offsets
@@ -2254,3 +2260,46 @@ def test_a_warning_about_an_entity_names_it() -> None:
     info = EntityInfo(key="e3", label="Ann Lee")
     Ctx(run=run, plan=plan, text="x", label="Ann Lee", info=info).warn("odd")
     assert run.warnings == ["plain", "Ann Lee (e3): odd"]
+
+
+async def test_a_name_whose_span_starts_in_the_header_is_never_kept() -> None:
+    """Replays the shape of a live Clairic answer.
+
+    The header quoted the mention, and Clairic returned a span that began there and
+    ended in the input: the value held header text and the input tag, and the library
+    only noted ``span_outside_input``. Now the answer is rejected, and the repair asks
+    again.
+    """
+    text = "Priya Raman is moving to our Lisbon office. Tom Becker joins as lead."
+    world = FakeWorld(text)
+    for name in ("Priya Raman", "Tom Becker"):
+        world.entity(name, schema=Person, mentions=[name], fields={"name": name})
+    inner = world.handler
+
+    def garbled(model: str, payload: Body, meta: CallMeta) -> Any:
+        response: Any = inner(model, payload, meta)
+        state = payload["state"]
+        if meta.kind != "extract" or "name" not in payload["fields"]:
+            return response
+        label = state.split('entity="')[1].split('"')[0]
+        if label != "Priya Raman":
+            return response
+        start = state.index(label)  # the label in the header's opening tag
+        end = state.index(label, state.index("<input>")) + len(label)
+        answer = response["answers"]["name"]
+        answer["span"] = [start, end]
+        answer["value"] = answer["guess"] = state[start:end]
+        return response
+
+    transport = FakeTransport(route(default=inner, extract=garbled))
+    extractor = create_extractor([Many(Person, identity="name")], transport=transport)
+    result = await extractor.ainvoke(text)
+    priya = next(
+        r for r in result.records if r.entity and r.entity.label == "Priya Raman"
+    )
+    assert priya.valid and priya.value is not None
+    assert priya.value.name == "Priya Raman"  # type: ignore[attr-defined]
+    assert "</focus>" not in repr(priya.after) and "<input>" not in repr(priya.after)
+    assert any(r.reason == "span_outside_input" for r in priya.rejected) or any(
+        "span_outside_input" in w for w in priya.fields["name"].warnings
+    )

@@ -31,6 +31,7 @@ from trustcall_system_one import (
     Many,
     One,
     Prices,
+    RepairConfig,
     ResultRecord,
     ServerError,
     StateTruncatedError,
@@ -1649,17 +1650,48 @@ async def test_spans_are_unknown_with_a_warning_when_the_input_cannot_be_found()
     assert "span_unknown" in record.fields["name"].warnings
 
 
-async def test_a_span_outside_the_input_block_is_dropped_with_a_note() -> None:
+async def test_a_span_outside_the_input_block_is_rejected() -> None:
     script = Script()
     script.clairic = {
         "name": ca("text", "Ada", span=[2, 6]),  # inside <focus>
         "age": ca("number", 36),
     }
-    result = await make_extractor([Person], script).ainvoke("Ada is 36.")
-    answer = result.records[0].fields["name"]
-    assert answer.span is None
-    assert answer.value == "Ada"
-    assert "span_outside_input" in answer.warnings
+    result = await make_extractor(
+        [Person], script, repair=RepairConfig(enabled=False)
+    ).ainvoke("Ada is 36.")
+    record = result.records[0]
+    answer = record.fields["name"]
+    assert answer.value is None and answer.rejected_reason == "span_outside_input"
+    assert not record.valid  # a required field cannot be filled from the header
+    assert [(r.path, r.reason) for r in record.rejected] == [
+        ("/name", "span_outside_input")
+    ]
+
+
+async def test_a_span_that_starts_in_the_header_and_ends_in_the_input_is_rejected() -> (
+    None
+):
+    """The shape of a live Clairic answer: the value held header text and tags."""
+    from trustcall_system_one._render import render_clairic
+
+    text = "Ada is 36."
+    state = render_clairic(text, label="the Person")
+    header_name = state.text.index("Answer only about the Person.") + 14
+    inside = state.input_span[0]
+    script = Script()
+    script.clairic = {
+        "name": ca(
+            "text", state.text[header_name : inside + 3], span=[header_name, inside + 3]
+        ),
+        "age": ca("number", 36),
+    }
+    result = await make_extractor(
+        [Person], script, repair=RepairConfig(enabled=False)
+    ).ainvoke(text)
+    record = result.records[0]
+    assert record.fields["name"].value is None
+    assert record.fields["name"].rejected_reason == "span_outside_input"
+    assert "</focus>" not in repr(record.after)
 
 
 # --------------------------------------------------------------------------- #
@@ -2072,3 +2104,33 @@ def test_batch_return_exceptions_through_the_bridge() -> None:
             extractor.batch(["Ada is 12."])
     finally:
         extractor.close()
+
+
+async def test_an_invalid_record_with_no_responses_is_explained_in_the_warnings() -> (
+    None
+):
+    """A live run returned ``responses == ()`` and ``warnings == ()`` for one."""
+    script = Script()
+    script.clairic = {
+        "name": ca("text", None, p_null=0.99),  # a required field the text lacks
+        "age": ca("number", 36),
+    }
+    result = await make_extractor(
+        [Person], script, repair=RepairConfig(enabled=False)
+    ).ainvoke("Someone is 36.")
+    assert result.responses == () and not result.records[0].valid
+    (warning,) = [w for w in result.warnings if w.startswith("no_valid_record")]
+    assert "the Person record" in warning
+    assert "name" in warning  # the first error is named
+
+
+async def test_no_such_warning_when_a_valid_record_is_returned() -> None:
+    script = Script()
+    script.clairic = {
+        "name": ca("text", "Ada", find="Ada"),
+        "age": ca("number", 36),
+    }
+    result = await make_extractor([Person], script).ainvoke("Ada is 36.")
+    assert result.responses and not any(
+        w.startswith("no_valid_record") for w in result.warnings
+    )

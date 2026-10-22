@@ -2072,7 +2072,8 @@ def _build_spec(
             fields["integer"] = options["integer"]
         if "decimals" in options and "decimals" not in fields:
             fields["decimals"] = options["decimals"]
-        fields["null_threshold"] = draft.null_threshold
+        if fields["type"] != "list":  # the API refuses it for a list (HTTP 422)
+            fields["null_threshold"] = draft.null_threshold
         try:
             clairic_field = ClairicField(instructions=instructions, **fields)
         except ValueError as exc:

@@ -17,6 +17,7 @@ Clef-engine answers are not verified further; they are decisions already.
 import dataclasses
 import enum
 import json
+import math
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -226,7 +227,8 @@ class Ctx:
             )
             + suffix
         }
-        if null_threshold is not None:
+        # a list field takes no null_threshold (the API refuses it)
+        if null_threshold is not None and spec.clairic.type != "list":
             update["null_threshold"] = null_threshold
         return spec.clairic.model_copy(update=update)
 
@@ -873,6 +875,8 @@ def display(value: Any) -> str:
         return str(value.value)
     if isinstance(value, (list, tuple, set, frozenset)):
         return "; ".join(display(item) for item in value)
+    if isinstance(value, float) and math.isfinite(value) and value == int(value):
+        return str(int(value))  # a total of 1080.0 is asked about as 1080
     return str(value)
 
 
@@ -1043,6 +1047,21 @@ async def resolve(
                 guess=coerced.guess,
                 lost=tuple(echo_lost),
             )
+    if coerced.ok and rendered is not None:
+        coerced, outside, everything = _drop_outside(rendered, coerced)
+        echo_lost.extend(outside)
+        if everything:
+            return Resolved(
+                ok=False,
+                reason="span_outside_input",
+                detail="the answer's span is not inside the input block (it lies "
+                "in the focus header or the blocks around the input)",
+                raw=raw,
+                p_null=coerced.p_null,
+                confidence=coerced.confidence,
+                guess=coerced.guess,
+                lost=tuple(echo_lost),
+            )
     span = _map_span(rendered, coerced.span, notes)
     spans: tuple[Span, ...] | None = None
     if coerced.spans is not None:
@@ -1086,6 +1105,53 @@ async def resolve(
         origin=origin,
         lost=tuple(lost),
     )
+
+
+def _drop_outside(
+    rendered: RenderedState, coerced: Coerced
+) -> tuple[Coerced, list[tuple[int, str, str]], bool]:
+    """Throw away what is not read from the input block.
+
+    A text answer's span must lie ENTIRELY inside the verbatim input: one that starts
+    in the ``<focus>`` header (which names the entity) and ends in the input is not
+    a quote of the input and would put header text in the value. A list is judged
+    element by element, like ``_drop_echoes``.
+
+    Returns:
+        The answer without such elements, the dropped elements as ``(position in the
+        model's answer list, "span_outside_input", detail)`` and whether nothing is
+        left of the answer.
+    """
+    value = coerced.value
+    if isinstance(value, list):
+        spans = coerced.spans
+        if spans is None or len(spans) != len(value):
+            return coerced, [], False
+        keep = [i for i, pair in enumerate(spans) if rendered.to_original(pair)]
+        if len(keep) == len(value):
+            return coerced, [], False
+        before = coerced.kept if coerced.kept is not None else tuple(range(len(value)))
+        lost = [
+            (
+                before[i],
+                "span_outside_input",
+                f"{value[i]!r} points outside the input block",
+            )
+            for i in range(len(value))
+            if i not in keep
+        ]
+        if not keep:
+            return coerced, lost, True
+        kept = replace(
+            coerced,
+            value=[value[i] for i in keep],
+            spans=tuple(spans[i] for i in keep),
+            kept=tuple(before[i] for i in keep),
+        )
+        return kept, lost, False
+    if coerced.span is not None and rendered.to_original(coerced.span) is None:
+        return coerced, [], True
+    return coerced, [], False
 
 
 def _drop_echoes(
@@ -1491,10 +1557,13 @@ async def _borderline_one(ctx: Ctx, st: FieldState, answers: dict[str, Answer]) 
 # Attribution
 # --------------------------------------------------------------------------- #
 
-_ATTR_TRUE = "The input states this about the entity `entity.label`."
+_ATTR_TRUE = (
+    "The input states this about the entity `entity.label`, or directly implies "
+    "it (simple arithmetic on stated figures, or date math)."
+)
 _ATTR_FALSE = (
-    "The input does not state this about `entity.label`: it says something "
-    "else, concerns another entity, or does not say it."
+    "The input does not state or directly imply this about `entity.label`: it "
+    "says something else, concerns another entity, or does not say it."
 )
 
 
@@ -1503,10 +1572,15 @@ def _attribution_question(
 ) -> NoulQuestion:
     text = display(value)
     if element:
-        instructions = f'Does `input` state this about `entity.label`: "{text}"?'
+        instructions = (
+            "Does `input` state or directly imply (including simple arithmetic "
+            f'from stated figures) this about `entity.label`: "{text}"?'
+        )
     else:
         instructions = (
-            f'Does `input` state that {description} of `entity.label` is "{text}"?'
+            "Does `input` state or directly imply (including simple arithmetic "
+            f"from stated figures, or date math) that {description} of "
+            f'`entity.label` is "{text}"?'
         )
     return NoulQuestion(
         type="noul",

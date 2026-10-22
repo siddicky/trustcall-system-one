@@ -141,7 +141,9 @@ async def test_attribution_asks_one_noul_per_value_in_one_request() -> None:
     questions = call[1]["questions"]
     assert sorted(questions) == ["attr.age", "attr.city", "attr.name"]
     assert questions["attr.city"]["instructions"] == (
-        'Does `input` state that city of `entity.label` is "London"?'
+        "Does `input` state or directly imply (including simple arithmetic from "
+        "stated figures, or date math) that city of `entity.label` is "
+        '"London"?'
     )
     assert call[1]["state"] == {
         "input": TEXT,
@@ -166,10 +168,21 @@ async def test_attribution_below_drop_removes_the_value() -> None:
 
 async def test_attribution_at_or_above_keep_keeps_the_value() -> None:
     script = person_script()
-    script.attribution = {"attr.city": 0.6}
+    script.attribution = {"attr.city": 0.75}
     record = await run_person(script)
     assert person(record).city == "London"
-    assert record.fields["city"].attribution_p == 0.6
+    assert record.fields["city"].attribution_p == 0.75
+
+
+async def test_a_bleed_at_0_62_is_no_longer_kept() -> None:
+    """A live run kept another person's city at 0.62, just over the old 0.6."""
+    script = person_script()
+    script.attribution = {"attr.city": [0.62, 0.3]}
+    script.reask = {"city": ca("text", "London", find="London")}
+    record = await run_person(script, verify=VerifyConfig(borderline_null=False))
+    assert record.fields["city"].rejected_reason == "attribution"
+    assert record.fields["city"].reask is True  # the middle band re-checks first
+    assert kinds(script.transport).count("attribution") == 2
 
 
 async def test_middle_band_reasks_in_isolation_then_checks_again() -> None:
@@ -237,14 +250,14 @@ async def test_list_elements_are_attributed_one_by_one() -> None:
     script.attribution = {
         "attr.notes.0": 0.9,
         "attr.notes.1": 0.05,
-        "attr.notes.2": 0.7,
+        "attr.notes.2": 0.8,
     }
     extractor = make_extractor([Notes], script)
     result = await extractor.ainvoke(text)
     record = result.records[0]
     assert record.value == Notes(notes=["red", "blue"])
     answer = record.fields["notes"]
-    assert answer.attribution_p == (0.9, 0.05, 0.7)
+    assert answer.attribution_p == (0.9, 0.05, 0.8)
     assert answer.spans is not None
     assert [text[a:b] for a, b in answer.spans] == ["red", "blue"]
     assert [(r.path, r.reason) for r in record.rejected] == [
@@ -253,7 +266,8 @@ async def test_list_elements_are_attributed_one_by_one() -> None:
     assert answer.warnings == ("dropped 1 element(s): attribution",)
     (call,) = script.calls("attribution")
     assert call[1]["questions"]["attr.notes.1"]["instructions"] == (
-        'Does `input` state this about `entity.label`: "green"?'
+        "Does `input` state or directly imply (including simple arithmetic from "
+        'stated figures) this about `entity.label`: "green"?'
     )
 
 
@@ -410,7 +424,9 @@ async def test_reasked_values_go_through_attribution_again() -> None:
     (call,) = script.calls("attribution")
     assert (
         call[1]["questions"]["attr.city"]["instructions"]
-        == 'Does `input` state that city of `entity.label` is "Paris"?'
+        == "Does `input` state or directly imply (including simple arithmetic from "
+        "stated figures, or date math) that city of `entity.label` is "
+        '"Paris"?'
     )
     assert record.fields["city"].rejected_reason == "attribution"
 
@@ -993,3 +1009,60 @@ async def test_reasked_near_identical_text_still_agrees() -> None:
     record = (await make_extractor([Who], script).ainvoke(text)).records[0]
     assert isinstance(record.value, Who) and record.value.name is not None
     assert script.calls("adjudicate") == []
+
+
+def test_a_re_ask_of_a_list_field_does_not_put_a_null_threshold_on_the_wire() -> None:
+    """``model_copy`` skips validation, so the copy has to leave it out itself."""
+    from trustcall_system_one._run import Run
+    from trustcall_system_one._verify import Ctx
+    from trustcall_system_one.testing import FakeTransport
+
+    class Tagged(BaseModel):
+        """Something with tags."""
+
+        name: str
+        tags: list[str] = []
+
+    plan = compile_schema(Tagged)
+    ctx = Ctx(
+        run=Run(transport=FakeTransport(lambda *a: None)),
+        plan=plan,
+        text="x",
+        label="the Tagged",
+    )
+    tags, name = plan.spec(("tags",)), plan.spec(("name",))
+    assert ctx.clairic_field(tags, null_threshold=0.95).null_threshold is None
+    assert ctx.clairic_field(tags).null_threshold is None
+    assert ctx.clairic_field(name, null_threshold=0.95).null_threshold == 0.95
+
+
+def test_values_are_shown_to_the_attribution_question_the_way_they_read() -> None:
+    assert display(1080.0) == "1080"  # a float total is not "1080.0"
+    assert display(12.5) == "12.5"
+    assert display(float("inf")) == "inf"
+    assert display([1.0, 2.5]) == "1; 2.5"
+
+
+async def test_attribution_accepts_what_the_input_directly_implies() -> None:
+    """A live run rejected total=1080, stated as parts (4 x $250 + $80), at p=0.04."""
+
+    class Invoice(BaseModel):
+        invoice_number: str
+        total: float = Field(description="the amount due including shipping")
+
+    text = "Invoice INV-2291: 4 pallets at $250.00 each, shipping $80.00."
+    script = Script()
+    script.clairic = {
+        "invoice_number": ca("text", "INV-2291", find="INV-2291"),
+        "total": ca("number", 1080),  # computed: stated only as its parts
+    }
+    result = await make_extractor([Invoice], script).ainvoke(text)
+    (call,) = script.calls("attribution")
+    question = call[1]["questions"]["attr.total"]
+    assert question["instructions"] == (
+        "Does `input` state or directly imply (including simple arithmetic from "
+        "stated figures, or date math) that the amount due including shipping of "
+        '`entity.label` is "1080"?'
+    )
+    assert "directly implies it" in question["criteria"]["true"]
+    assert result.records[0].valid

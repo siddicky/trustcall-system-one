@@ -205,8 +205,9 @@ async def test_nested_instructions_carry_the_parent_context() -> None:
     (attribution,) = script.calls("attribution")
     question = attribution[1]["questions"]["attr.author.address.city"]
     assert question["instructions"] == (
-        "Does `input` state that city (author → address) of `entity.label` "
-        'is "Portland"?'
+        "Does `input` state or directly imply (including simple arithmetic from "
+        "stated figures, or date math) that city (author → address) of "
+        '`entity.label` is "Portland"?'
     )
     # the presence question is asked with the sub-model's own context
     (_, payload, meta) = script.calls("presence")[1]

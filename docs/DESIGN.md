@@ -201,6 +201,8 @@ class Extractor:  # frozen; per-invoke state lives in _Run
   reasons `inserts_disabled | updates_disabled | ambiguous_match | not_qualified |
   conflict_update_delete | validation_failed | empty_after_verification`. Records ordered by
   first mention, deletes last.
+  A run whose records are all invalid (so `responses` is empty) adds a `no_valid_record` warning
+  per invalid record that names it and its first errors.
 
 ## Schema compiler (`_compile.py`)
 
@@ -378,11 +380,15 @@ schema title: "Person").
    (`insert_one`: groups, unions, Clef typed fields, verification ladder incl. attribution,
    repair loop) concurrently, without asking presence again. The Clairic focus header names the
    schema, the entity and its mention spans:
-   `<focus schema="Person" entity="Emma Thompson">` / "Answer each field for Emma Thompson
-   only. Ignore facts about any other person." / `The input mentions Emma Thompson as: "Emma
-   Thompson" at characters 11-24, "Emma" at characters 131-135.` Instructions are templated with
+   `<focus schema="Person" entity="Emma Thompson">` / "Answer each field for the entity named
+   above only. Ignore facts about any other person." / `The entity is mentioned in the input at
+   characters 11-24, 131-135.` The header names the entity ONCE and never quotes a mention: the
+   first live run showed Clairic starting a text span at a quoted name in the header and ending
+   it in the input, so the value held header text and the input tag. As a second line of defence
+   a text or list answer whose span is not ENTIRELY inside the input block is rejected
+   (`span_outside_input`; per element for a list) and never kept. Instructions are templated with
    the label ("Emma Thompson's full name"). The offsets are those of the whole input, so a request
-   whose state holds only windows of it names the mentions without offsets. Every Clef state about
+   whose state holds only windows of it has no mentions line. Every Clef state about
    the entity (attribution, null check, typed fields, sub-model presence, repair) is `{"input",
    "entity": {"label", "mentions": [{"text", "span", "context"}]}}`, mentions with spans and a short
    context so that two entities with the same label stay apart. An over-budget input is narrowed to
@@ -397,8 +403,12 @@ schema title: "Person").
    `validation_failed`, in first-mention order) and the warnings; `responses` holds the valid
    models in the same order.
 7. **Attribution (default on):** Clef `noul` per non-null value and per list element: "Does
-   `input` state that {desc} of `entity.label` is '{value}'?" ≥ 0.6 keep, < 0.3 drop
-   (`attribution`), between → isolated re-ask then one more check. On updates an op must pass
+   `input` state or directly imply (including simple arithmetic from stated figures, or date
+   math) that {desc} of `entity.label` is '{value}'?" (a computed value such as a total stated
+   only as its parts is a legitimate answer; an integral float is shown as `1080`, not `1080.0`)
+   ≥ 0.75 keep, < 0.4 drop (`attribution`), between → isolated re-ask then one more check. The
+   0.75/0.4 defaults come from one live observation (a bleed kept at 0.62); they are guesses to be
+   tuned by the evals harness (M10a). On updates an op must pass
    **both** attribution (right entity) and the change gate (new vs. record).
 8. **Matching (`_match.py`, `apply_collection`)**, for a `Many(S)` with existing records of S (the
    `ExistingRecord`s of S, plus a claimed `"__any__"` one). `MatchConfig(accept=0.6,
@@ -808,7 +818,11 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
   `truncated`, `usage`. Clef answers: `{type:"noul", noul}`,
   `{type:"choice", choice, probabilities, confidence}`,
   `{type:"score", score, legend, probabilities, confidence}`; Clef body `model` is
-  `clef`/`clef-flash` while the URL uses `@cf/cloudflare/...`.
+  `clef`/`clef-flash` while the URL uses `@cf/cloudflare/...`. **Observed constraint, stricter
+  than the published schema:** a Clairic `list` field takes no `null_threshold` (HTTP 422, error
+  3030, "list fields don't take 'null_threshold'"; a list answer has no `p_null` either). The
+  compiler never emits it for a list, `Ctx.clairic_field` leaves it out of re-asks, and
+  `ClairicField` rejects it, so `FakeTransport` catches it offline. Every other type accepts it.
 - Clef truncates long state **silently**: estimate size before sending (budget 56K of 64K
   tokens), narrow `input` to mention windows when over, and warn when
   `usage.input_tokens ≥ 0.97 × 65,536`.

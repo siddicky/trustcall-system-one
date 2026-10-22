@@ -572,9 +572,10 @@ class FakeWorld:
     value may be a model instance (for a union choice).
 
     How the focused entity is found: for Clairic the ``<focus ... entity="...">``
-    header (``schema`` and ``entity`` attributes and the ``at characters a-b``
-    spans of its mention line), for Clef ``state.entity`` (``label`` and the
-    ``mentions`` with a ``span`` or, where the input was narrowed, a ``context``).
+    header (``schema`` and ``entity`` attributes and the ``a-b`` offsets of its
+    ``is mentioned in the input at characters`` line), for Clef ``state.entity``
+    (``label`` and the ``mentions`` with a ``span`` or, where the input was
+    narrowed, a ``context``).
     The label comes first (the entity's label or one of its mention texts); the
     mention spans settle which of several entities share it, and a label that
     names one entity while the spans belong to another is an ``AssertionError``, as
@@ -997,12 +998,10 @@ class FakeWorld:
         if isinstance(state, str):
             found = re.search(r'<focus[^>]*\bentity="([^"]*)"', state)
             label = found.group(1) if found else None
-            line = re.search(r"The input mentions [^\n]*? as: ([^\n]*)", state)
+            line = re.search(r"is mentioned in the input at characters ([^\n]*)", state)
             cited = [
                 (int(a), int(b))
-                for a, b in re.findall(
-                    r"at characters (\d+)-(\d+)", line.group(1) if line else ""
-                )
+                for a, b in re.findall(r"(\d+)-(\d+)", line.group(1) if line else "")
             ]
             return self._resolve(meta.schema, label, cited)
         entity = state.get("entity") if isinstance(state, dict) else None

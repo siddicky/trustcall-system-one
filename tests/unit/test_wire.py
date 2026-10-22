@@ -144,6 +144,29 @@ def test_null_threshold_accepted(threshold: float) -> None:
     ClairicField.model_validate({"type": "text", "null_threshold": threshold})
 
 
+@pytest.mark.parametrize("kind", ["text", "number", "date", "time", "datetime"])
+def test_null_threshold_is_accepted_on_the_other_types(kind: str) -> None:
+    ClairicField.model_validate({"type": kind, "null_threshold": 0.5})
+
+
+def test_a_list_field_takes_no_null_threshold() -> None:
+    """Observed live (error 3030, HTTP 422); the published schema does not say so."""
+    with pytest.raises(
+        ValidationError, match="list fields don't take 'null_threshold'"
+    ):
+        ClairicField.model_validate(
+            {"type": "list", "items": "text", "null_threshold": 0.5}
+        )
+    ClairicField.model_validate({"type": "list", "items": "text"})
+    # so a whole request is refused before it is sent
+    with pytest.raises(ValidationError, match="null_threshold"):
+        ClairicRequest.model_validate(
+            clairic(
+                fields={"f": {"type": "list", "items": "text", "null_threshold": 0.3}}
+            )
+        )
+
+
 @pytest.mark.parametrize("threshold", [0, -0.1, 1.01])
 def test_null_threshold_rejected(threshold: float) -> None:
     with pytest.raises(ValidationError):

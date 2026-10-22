@@ -1049,7 +1049,10 @@ async def _ask_clairic(
     )
     answer, anchored = asked[wire]
     resolved = await resolve(ctx, spec, answer, anchored, target.type_answer)
-    if "span_outside_input" in resolved.notes:
+    if (
+        "span_outside_input" in resolved.notes
+        or resolved.reason == "span_outside_input"
+    ):
         return fail("the answer was read from the blocks after the input, not from it")
     rejection = accept(spec, resolved, null_threshold=ask.threshold)
     if rejection is not None:

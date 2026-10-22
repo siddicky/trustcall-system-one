@@ -360,10 +360,9 @@ def test_an_entity_focus_names_the_schema_the_entity_and_its_mentions() -> None:
     rendered = render_clairic(TEXT, label="ignored", focus=focus)
     assert rendered.text == (
         '<focus schema="Person" entity="Ada Lovelace">\n'
-        "Answer each field for Ada Lovelace only. Ignore facts about any other "
-        "person.\n"
-        'The input mentions Ada Lovelace as: "Ada Lovelace" at characters 0-12, '
-        '"Ada" at characters 44-47.\n'
+        "Answer each field for the entity named above only. Ignore facts about any "
+        "other person.\n"
+        "The entity is mentioned in the input at characters 0-12, 44-47.\n"
         "</focus>\n"
         "<input>\n"
         f"{TEXT}\n"
@@ -380,7 +379,8 @@ def test_an_entity_focus_without_spans_or_mentions_still_names_the_entity() -> N
     focus = entity_focus("Person", "Person", 'Ada "the Countess"', [("Ada", None)])
     header, lines = focus
     assert header == '<focus schema="Person" entity="Ada \'the Countess\'">'
-    assert lines[1] == 'The input mentions Ada "the Countess" as: "Ada".'
+    assert len(lines) == 1  # no offsets: no line, and no quoted mention either
+    assert "Ada" not in lines[0]
     assert len(entity_focus("Person", "Person", "Ada", [])[1]) == 1
 
 

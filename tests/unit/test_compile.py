@@ -64,12 +64,15 @@ def text(instructions: str = DESC, **extra: Any) -> dict[str, Any]:
 
 
 def numeric(kind: str = "number", **extra: Any) -> dict[str, Any]:
-    return {
+    spec = {
         "type": kind,
         "instructions": extra.pop("instructions", DESC),
         "null_threshold": REQUIRED_THRESHOLD,
         **extra,
     }
+    if kind == "list":  # the API refuses a null_threshold on a list field
+        del spec["null_threshold"]
+    return spec
 
 
 def make_enum(name: str, size: int) -> Any:
@@ -229,6 +232,22 @@ def test_clairic_rows(
     assert spec.clef is None
     assert spec.wire_name == "f"
     assert spec.instructions == expected["instructions"]
+
+
+def test_a_list_field_never_carries_a_null_threshold() -> None:
+    """The live API answers HTTP 422 to ``list`` + ``null_threshold`` (error 3030)."""
+    for annotation in (list[str], list[int], tuple[str, ...], set[int], list[Color]):
+        spec = spec_for(annotation)
+        assert "null_threshold" not in clairic_dict(spec)
+        assert spec.clairic is not None and spec.clairic.null_threshold is None
+        # the spec itself still holds the threshold the answer is judged by
+        assert spec.null_threshold == REQUIRED_THRESHOLD
+    # an explicit s1_field threshold does not get onto the wire either
+    spec = spec_for(list[str], json_schema_extra=s1_field(null_threshold=0.9))
+    assert "null_threshold" not in clairic_dict(spec)
+    # every other Clairic type still has one
+    for plain in (str, int, dt.date, float):
+        assert clairic_dict(spec_for(plain))["null_threshold"] == (REQUIRED_THRESHOLD)
 
 
 def test_decimal_places_over_six_are_clamped_with_a_warning() -> None:
