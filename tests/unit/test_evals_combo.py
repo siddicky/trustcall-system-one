@@ -161,6 +161,19 @@ def test_the_default_suite_is_the_29_dev_cases() -> None:
         suites.load_suite("nope")
 
 
+def test_the_real_holdout_file_is_the_30_case_suite() -> None:
+    from evals.holdout_cases import HOLDOUT_CASES, SUITE_NAME, holdout_cases
+
+    assert SUITE_NAME == "holdout" and "holdout" in suites.SUITES
+    loaded = suites.load_suite(SUITE_NAME)
+    assert len(loaded) == 30
+    assert [c.id for c in loaded] == [c.id for c in HOLDOUT_CASES]
+    assert [c.id for c in loaded] == [c.id for c in holdout_cases()]
+    assert [c.id for c in cli.select_cases(None, None, "holdout")] == [
+        c.id for c in HOLDOUT_CASES
+    ]
+
+
 def test_a_missing_holdout_file_is_a_clear_error(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

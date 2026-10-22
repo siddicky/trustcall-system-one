@@ -30,8 +30,13 @@ uv run python -m evals.holdout_cases
 ```
 
 or from Python: `from evals.holdout_cases import HOLDOUT_CASES` and pass the list to
-`evals.runner.run_suite`. (A `--suite holdout` option of `python -m evals` selects
-the same list, where the command line has one.)
+`evals.runner.run_suite`. `--suite holdout` of `python -m evals` (`run`, `list`,
+`combo`) selects the same 30 cases through `evals/suites.py`:
+
+```bash
+uv run python -m evals run --suite holdout --quiet
+uv run python -m evals combo --suite holdout --quiet
+```
 
 ### Rule: never tune on the holdout
 

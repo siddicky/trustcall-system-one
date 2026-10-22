@@ -24,7 +24,8 @@ def load_suite(name: str = DEFAULT_SUITE) -> list[Case]:
 
     Raises:
         ValueError: If the suite is unknown, or ``holdout`` is asked for while
-            ``evals/holdout_cases.py`` does not exist (or has no ``CASES`` list).
+            ``evals/holdout_cases.py`` does not exist (or has no cases). The file
+            exports ``HOLDOUT_CASES``, ``holdout_cases()`` and ``SUITE_NAME``.
     """
     if name == DEFAULT_SUITE:
         return list(CASES)
@@ -37,12 +38,17 @@ def load_suite(name: str = DEFAULT_SUITE) -> list[Case]:
             raise
         raise ValueError(
             "the holdout suite needs evals/holdout_cases.py, which does not exist "
-            "yet; it exports CASES (a list of evals.model.Case)"
+            "yet; it exports HOLDOUT_CASES (a list of evals.model.Case)"
         ) from None
-    found = getattr(module, "CASES", None) or getattr(module, "HOLDOUT_CASES", None)
+    loader = getattr(module, "holdout_cases", None)
+    found = (
+        loader()
+        if callable(loader)
+        else getattr(module, "HOLDOUT_CASES", None) or getattr(module, "CASES", None)
+    )
     if not found:
         raise ValueError(
-            "evals/holdout_cases.py has no cases: it must export CASES (or "
-            "HOLDOUT_CASES), a non-empty list of evals.model.Case"
+            "evals/holdout_cases.py has no cases: it must export holdout_cases() "
+            "(or HOLDOUT_CASES), a non-empty list of evals.model.Case"
         )
     return list(found)
