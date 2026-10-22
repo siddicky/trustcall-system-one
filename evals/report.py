@@ -8,7 +8,13 @@ from typing import Any
 from evals.runner import SuiteResult, aggregate
 from trustcall_system_one.testing import scrub
 
-__all__ = ["suite_markdown", "sweep_markdown", "write_suite", "write_sweep"]
+__all__ = [
+    "combo_record",
+    "suite_markdown",
+    "sweep_markdown",
+    "write_suite",
+    "write_sweep",
+]
 
 
 def _pct(value: float | None) -> str:
@@ -42,6 +48,16 @@ def suite_markdown(suite: SuiteResult) -> str:
         f"Extraction: {suite.extraction or 'scripted world'}; "
         f"decisions: {suite.decisions or 'scripted world'}",
         "",
+        *(
+            [f"Combination: `{suite.combo.describe()}`", ""]
+            if suite.combo is not None
+            else []
+        ),
+        *(
+            [f"Suite: {suite.suite}" + (f"; tag: {suite.tag}" if suite.tag else ""), ""]
+            if suite.suite != "default" or suite.tag
+            else []
+        ),
         *(
             [
                 f"Clef provider: {suite.clef_provider}"
@@ -100,6 +116,30 @@ def suite_markdown(suite: SuiteResult) -> str:
     return "\n".join(lines) + "\n"
 
 
+def combo_record(suite: SuiteResult) -> dict[str, Any] | None:
+    """The combination a suite ran on, for ``results.json``: the spec and its labels.
+
+    ``spec`` is the spec as given, ``key`` its canonical form (two specs with the same
+    key behave the same), ``labels`` the labels of the spec plus what answered
+    extraction and decisions, and ``companies`` who saw the text. ``None`` for a run
+    on the usual provider settings.
+    """
+    spec = suite.combo
+    if spec is None:
+        return None
+    return {
+        "spec": spec.model_dump(),
+        "key": spec.key(),
+        "describe": spec.describe(),
+        "labels": {
+            **spec.labels,
+            "extraction": suite.extraction,
+            "decisions": suite.decisions,
+        },
+        "companies": list(spec.companies()),
+    }
+
+
 def write_suite(suite: SuiteResult, out: Path) -> tuple[Path, Path]:
     """Write ``results.json`` and ``summary.md`` into ``out``."""
     out.mkdir(parents=True, exist_ok=True)
@@ -111,6 +151,9 @@ def write_suite(suite: SuiteResult, out: Path) -> tuple[Path, Path]:
         "decisions": suite.decisions,
         "clef_provider": suite.clef_provider,
         "clef_fallback": suite.clef_fallback,
+        "suite": suite.suite,
+        "tag": suite.tag,
+        "combo": combo_record(suite),
         "overrides": dict(suite.overrides),
         "aggregate": aggregate(suite.results),
         "skipped": suite.skipped,

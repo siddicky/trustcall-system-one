@@ -1632,6 +1632,146 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
 - Experimental, off: Workers AI queue mode (`queueRequest` + `request_id`) behind a live
   probe — the Clairic schema has no batch properties, so it may be unsupported.
 
+### Mixing providers per call kind and field type
+
+`RoutingTransport` routes by MODEL only, and `system_one_transport` / `TRUSTCALL_S1_PROVIDER`,
+`TRUSTCALL_S1_CLEF_PROVIDER` and `TRUSTCALL_S1_CLEF_FALLBACK` choose whole providers. To find which provider
+is best for which decision, three wrappers and a declarative spec (`trustcall_system_one.combos`) route
+finer, and the evals sweep them. Everything here is explicit: naming a provider in a routing config or a spec
+is the opt-in; no key in the environment ever routes text anywhere, and nothing reads
+`TRUSTCALL_S1_PROVIDER` and the like when a spec decides.
+
+- **`KindRoutingTransport(routes, default)`.** Every engine call carries `CallMeta.kind`. A key is a call
+  kind (`attribution`, `gate`, `extract`...), a model (`clairic`, `clef`, `clef-flash`, full ids; `clef`
+  covers `clef-flash` unless it has its own key) or `kind@model` (`repair@clairic`: `repair` and `raw` are
+  asked of both models). **The most specific key wins: `kind@model`, then `kind`, then `model`, then
+  `default`.** The call is passed on unchanged. A request the routed transport cannot serve (a Clairic
+  call on the Decisions API, a `forecast` field on Jev) is refused by it locally, as with
+  `RoutingTransport`; only a request with images moves, and only to a default that can serve it
+  (`rerouted_from`, and the engine warns). Failures are never retried or resent: the error comes out
+  tagged with the `provider` of the transport that raised it (`_routed_through`), and
+  `classify_failure(exc)` asks THAT transport, so a `FallbackTransport` around the router, and the engine's
+  containment of a size refusal (`Run._contains`), see the right category. The engine fits a Clef request
+  before it knows its kind (`Run.clef_batch(model)`, `Run.clef_budget`), so **`max_questions` and
+  `state_token_budget` are the smallest limits of the transports that may be asked the model** (a route of
+  a Clairic-only kind does not narrow Clef and the other way round; a transport that does not serve the
+  model is not counted). `serves(model, payload)` is true when every transport that may be picked can serve
+  it; without a payload, when at least one can. `aclose`, `close` and `sensitive_values` cover every member
+  once. `provider`/`served_model` provenance and `partial_usage` pass through untouched (the same error
+  object).
+- **`FieldTypeRoutingTransport(routes, default)`** splits a Clairic request by the `type` of its fields (the
+  `ClairicField.type` literals, plus `list:text|number|date`, which beats `list`) and sends each partition to
+  its routed transport; two types on one transport share a request, and a request whose fields all go to one
+  transport is passed on unchanged (the same payload object). Every partition carries **the same `state`**
+  (and images, `reference_date`, `options`), so each provider's spans index the same text and stay exact.
+  The answers are merged **in field order**, `usage` is summed (token fields, `passes`, a reported `cost`),
+  `truncated` is true when any partition's is, and `state_text` is the text the partitions share (the
+  shortest when one read only the beginning: `reanchor` then maps the spans inside that prefix and drops
+  the rest, and `truncated` makes the engine ask again on chunks; texts that are not prefixes of one another
+  lose the spans of the partitions that disagree with the first, with a `field_type_routing` warning).
+  **Accounting:** the merged body carries `routing.partitions` (provider, served model, field count, usage,
+  retries, duration, status, request id of each part), and `Run.call_clairic` logs one `CallRecord` per
+  partition under ITS provider and model (so `Usage.by_model` and the evals' cost estimate are per provider)
+  instead of one for the sum; a replay of a recording carries it too, since it is in the body. Nothing is
+  sent unless every partition `serves` its part; images that one partition cannot take send the request
+  whole to the default (if it can). **A failure in one partition after another answered, or while another
+  was in flight, is uncertain**, the same pattern as TypeSafe's split Clef request: the partitions run under
+  `gather_all`, the error goes through `_blame` (a sibling that may have run is the error that is raised),
+  carries `maybe_sent`, and, when a partition had answered, `partial_usage` = what the answered partitions
+  used plus the failed one's own, so the engine neither contains it (`is_size_rejection` is false for a
+  charged request) nor resends the siblings, `classify_failure` says `uncertain` (not for a
+  `BadRequestError`, which never falls back, but `may_have_run` is true) and the engine logs the siblings'
+  errors and cancellations. The failed call is logged as one record with the summed usage, under the failed
+  partition's provider (a per-partition breakdown of a failure is not kept).
+- **`CalibratedTransport(inner, shifts, *, by_provider=None)`** applies a **monotone logit shift** to the
+  probabilities of Clef answers of the listed call kinds, so a provider can be calibrated to the thresholds
+  the engine was tuned on without changing them (see "Provider calibration" above: Experiential scored a
+  line item at 0.21 where Cloudflare would not). `noul`: `sigmoid(logit(p) + shift)` (positive: yes is
+  likelier). `choice` and `score`: the shift moves the logit of the leading option, the other options keep
+  their proportions and share the rest (so the probabilities sum to 1 again; a positive shift makes the
+  model surer of its pick, a negative one less sure), `choice` becomes the most probable option again (ties
+  keep the original pick; a leader pushed below the runner-up hands the pick over), `confidence` follows (it
+  stays equal to the top probability when it was, else it is shifted itself) and a score is recomputed as
+  the probability-weighted level. **Left alone:** probabilities of exactly 0 or 1, an answer flagged `hard`
+  (a bare pick of the Decisions API is capped at 0.8 on purpose so that it cannot authorise a removal; a
+  calibration must not lift it past `gates.remove_threshold`), Clairic answers, anything malformed. The
+  default is no shift: a kind without one, or with 0, returns the very same response object. A calibrated
+  response gets the warning `calibration_applied: <kind> logit shift <+x>` (once per run, no text). Shifts
+  are limited to +-10, keys are checked against `CallKind`. `by_provider` (response `provider` to kind to
+  shift) lets one wrapper calibrate each provider of a router, and **the wrapper can sit outside a
+  `RecordingTransport` or `CassetteTransport`** (they keep each provider's raw answer and its `provider`):
+  a recording made under one calibration replays under another, which is what makes the calibration search
+  cheap.
+- **Combination specs (`ComboSpec`, `build_combo_transport`, `load_combo`).** A pydantic model (a dict, JSON,
+  or YAML when PyYAML is installed): `extraction` (Clairic default provider), `extraction_by_type`,
+  `decision` (Clef default provider), `by_kind` (kind or `kind@model` to provider, any kind), `calibration`
+  (provider to kind to shift), `options` (the `create_extractor` knobs as `group.field` overrides, the same
+  parser as the evals: `combos.extractor_options`), `only` and free `labels`. Providers are `cloudflare`,
+  `experiential-clef`, `decisions` and `typesafe`. The stack, outside in: `CalibratedTransport` (only if the
+  spec calibrates), `KindRoutingTransport` (`by_kind`, plus `clairic` and `clef` as the two defaults, and
+  Cloudflare, if the spec names it, as the `default` that takes pictured requests), and
+  `FieldTypeRoutingTransport` for Clairic (if `extraction_by_type` is not empty). One provider is the
+  transport itself. Only the providers the spec names are created. `spec.canonical()` drops what the
+  defaults already say (so `spec.key()` is equal for specs that route alike: the search relies on it).
+  **Validation** refuses unknown providers, call kinds, field types, options and `kind@model` pairs that are
+  never asked (`attribution@clairic`), and every combination in which a provider would be given what it does
+  not serve: a Clef-only provider (`experiential-clef`, `decisions`) as `extraction`, for a field type, or
+  for a Clairic kind (`extract`, `crosscheck`, `reask`, `discover`, `count`; `repair` and `raw` are both
+  and must say `repair@clef`), Jev for `forecast` fields, and a calibration of a Clairic kind or of a
+  provider the spec never uses. **The rule about mixing:** `system_one_transport(provider="typesafe")`
+  refuses another Clef provider and a Clef fallback, because there they would send text somewhere the user
+  did not name; a spec names every provider, so mixing is allowed and those two rules are not kept (and a
+  spec has no fallback: nothing in it can send a request twice). What is kept is about safety and
+  capability, plus a latch for the TypeSafe-only guarantee: with `"only": "typesafe"` (any provider) a spec
+  that names another provider anywhere is refused, so a search over candidates can be made unable to send
+  text elsewhere. `spec.companies()` lists who will see the text (`decisions` is OpenAI behind Experiential
+  Labs), and the evals print it before a live run. Jev as the default `extraction` with `forecast` fields
+  unmapped fails locally on a forecast request, as TypeSafe alone does.
+- **Evals.** `python -m evals combo --spec spec.json [--live] [--record DIR] [--tag NAME] [--cases ...]
+  [--case-tag ...] [--suite default|holdout] [--replay DIR]`: the scoring is unchanged, `results.json` gets
+  `combo` (`spec` as given, `key`, `describe`, `labels` = the spec's labels plus the `extraction` /
+  `decisions` labels, `companies`), `suite` and `tag`; `--record DIR` writes the cassettes to `DIR/NAME`
+  (the tag, else the spec's name). Offline each provider is the case's scripted world (`Settings.members`
+  lets a test make a provider better at one kind); live needs the credentials of the providers the spec
+  names (`CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_API_TOKEN`, `EXPERIENTIAL_API_KEY`, `TYPESAFE_API_KEY`; the
+  error names the variables, never values). The calibration wraps the recorder and the cassette, as above.
+  `--suite holdout` reads `evals/holdout_cases.py` (`CASES`); a missing file is a one-line error, not a
+  traceback. `CaseResult` gained `output_tokens` and `by_provider` (requests and tokens per provider, from
+  the call log, failed calls included) and `aggregate` gained `op_f1` and `output_tokens`.
+- **`python -m evals search`** (`evals/search.py`): a greedy coordinate search from `--base spec.json` over
+  the dimensions of `--order` (default: presence/qualify/count, coref, match/match_confirm,
+  attribution/stated/null_check, gate/novelty/list_dedup/relative_edit, clef_fields, verify
+  (crosscheck/reask/adjudicate), then `extract:<type>` for each field type; `extract` and `other` can be
+  named too). For each dimension it tries each candidate of `--providers` (applied to the kinds it can
+  serve) from the CURRENT best and keeps the one that improves the objective: **more cases passed, then
+  op F1, then value accuracy, then fewer bleed + wrong deletes; bleed or wrong deletes going up is a veto**
+  whatever else improved. **Dev suite only** (`--suite holdout` is refused: check the winner with `combo
+  --spec <out>/best.json --suite holdout`). `--max-runs` (new evaluations) and `--budget-usd` stop BETWEEN
+  trials (the budget compares spent + the dearest trial so far; the base always runs; with `--live` it
+  needs a `--price provider=IN:OUT` per candidate, USD per million tokens, since a budget that cannot be
+  priced cannot bind). Cost = tokens per provider x price, plus the cost the providers reported when some
+  provider has no price (`~` in the table when a used provider has neither). **Nothing is retried:** a case
+  that fails is a failed case with its error in the table, a trial that raises is an `error` row and the
+  search goes on (the base's failure ends it: there is nothing to compare with), and a combination
+  (`spec.key()`) is run once, also across `--resume DIR`, which reloads `search.json` (a different suite or
+  case list is refused) and replays the same decisions from the cache. `--live` needs `--providers`
+  (naming them is the opt-in). Output: `search.json`, `leaderboard.md` (every spec tried: result, pass,
+  op F1, value accuracy, bleed, wrong deletes, requests, tokens, cost, seconds per case; the failures of the
+  best; what was not run and why), `best.json` (a spec file), and `trials/NN-<change>/results.json`.
+  **`--calibrate`** then grid-searches a logit shift per (provider, kind) (`--grid -1.5:1.5:0.5`,
+  `--calibrate-kinds`), the provider being the one that answers the kind in the best spec; the first shift
+  that improves the objective is kept. With `--replay` of the best combination's cassettes the raw answers
+  are replayed and only the requests that the shift changes go live.
+- **Left out on purpose:** a `FallbackTransport` in a spec; per-kind (not per-model) `max_questions` (the
+  engine sizes a request before it knows its kind, so the smallest limit among candidates applies to all
+  Clef requests of the stack: Decisions in the mix limits every Clef request to 32 questions and Jev to
+  24k tokens of state); a per-partition breakdown of a failed split call; calibrating Clairic's `p_null`;
+  a search over `options`; a PyYAML dependency (JSON needs nothing).
+- **Tests:** `test_kind_routing.py`, `test_field_type_routing.py`, `test_calibration.py`, `test_combos.py`
+  and `test_evals_combo.py` (the search picks, from scripted providers that are each wrong about
+  different kinds, the provider that is right for each; the veto, the budget, `--max-runs`, resume,
+  no retry, the calibration grid, the suite and its missing file).
+
 ## TypeSafe-only provider (`TypeSafeTransport`, `_typesafe.py`)
 
 TypeSafe's **Jev** (`POST https://api.typesafe.ai/v1/systemone`, `Authorization: Bearer <key>`)

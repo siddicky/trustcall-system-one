@@ -61,6 +61,7 @@ from trustcall_system_one._types import (
 from trustcall_system_one._version import __version__
 from trustcall_system_one._wire import CLAIRIC, CLEF, CLEF_FLASH
 from trustcall_system_one.transport import (
+    CalibratedTransport,
     CallMeta,
     CloudflareTransport,
     DecisionsTransport,
@@ -68,6 +69,8 @@ from trustcall_system_one.transport import (
     EscalationRequest,
     ExperientialTransport,
     FallbackTransport,
+    FieldTypeRoutingTransport,
+    KindRoutingTransport,
     RoutingTransport,
     Transport,
     TransportResponse,
@@ -87,6 +90,7 @@ __all__ = [
     "AmbiguousMatchError",
     "AuthError",
     "BadRequestError",
+    "CalibratedTransport",
     "CallKind",
     "CallMeta",
     "CallRecord",
@@ -109,7 +113,9 @@ __all__ = [
     "FieldAnswer",
     "FieldGroup",
     "FieldSpec",
+    "FieldTypeRoutingTransport",
     "GateConfig",
+    "KindRoutingTransport",
     "Limits",
     "Many",
     "MatchConfig",
