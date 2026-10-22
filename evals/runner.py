@@ -7,13 +7,15 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from evals.configs import build_options
 from evals.model import Case, CaseResult
 from evals.scoring import score
 from trustcall_system_one import (
+    CallMeta,
     Transport,
+    TransportResponse,
     clef_fallback_from_env,
     clef_fallback_on_from_env,
     clef_provider_from_env,
@@ -29,6 +31,7 @@ from trustcall_system_one.combos import (
     provider_label,
 )
 from trustcall_system_one.testing import CassetteTransport, RecordingTransport, scrub
+from trustcall_system_one.transport import classify_failure
 
 __all__ = [
     "Settings",
@@ -260,6 +263,61 @@ def _replayed(cassettes: Sequence[CassetteTransport]) -> dict[str, dict[str, flo
     return out
 
 
+class _Replaying:
+    """A cassette that answers for ``member`` and says what ``member`` says.
+
+    ``run`` replays from the cassette; ``serves``, ``classify_failure`` and
+    ``sensitive_values`` are the member's, so that a router above it (images that a
+    provider cannot take, the category of a failure) decides as it does with the
+    provider itself. The limits are the cassette's (what was recorded).
+    """
+
+    def __init__(self, cassette: CassetteTransport, member: Transport) -> None:
+        self._cassette = cassette
+        self._inner = member  # what a close reaches
+
+    @property
+    def provider(self) -> str | None:
+        """The provider the cassette stands for."""
+        return self._cassette.provider
+
+    async def run(
+        self,
+        model: str,
+        payload: Mapping[str, Any],
+        *,
+        meta: CallMeta,
+        timeout: float | None = None,
+    ) -> TransportResponse:
+        """Replay the call."""
+        return await self._cassette.run(model, payload, meta=meta, timeout=timeout)
+
+    def max_questions(self, model: str) -> int:
+        """The limit the cassette was recorded with."""
+        return self._cassette.max_questions(model)
+
+    def state_token_budget(self, model: str) -> int | None:
+        """The state budget the cassette was recorded with."""
+        return self._cassette.state_token_budget(model)
+
+    def serves(self, model: str, payload: Mapping[str, Any] | None = None) -> bool:
+        """Whether the member can serve the request."""
+        serves = getattr(self._inner, "serves", None)
+        return bool(serves(model, payload)) if callable(serves) else True
+
+    def classify_failure(self, exc: Exception) -> str | None:
+        """The member's category of a failure."""
+        classify = getattr(self._inner, "classify_failure", None)
+        if callable(classify):
+            return cast("str | None", classify(exc))
+        return classify_failure(exc)
+
+    def sensitive_values(self) -> tuple[str, ...]:
+        """The credentials passed explicitly to the member."""
+        sensitive = getattr(self._inner, "sensitive_values", None)
+        return tuple(sensitive()) if callable(sensitive) else ()
+
+
 def _combo_stack(
     case: Case,
     settings: Settings,
@@ -298,7 +356,9 @@ def _combo_stack(
                 provider=provider_label(provider),
             )
             cassettes.append(cassette)
-            return cassette
+            # a replay with nothing behind it cannot say what its provider serves:
+            # the routers above ask the member the recording stands for
+            return cassette if settings.live else _Replaying(cassette, member)
         return member
 
     stack = build_combo_transport(spec, providers=providers, calibrate=False, wrap=wrap)

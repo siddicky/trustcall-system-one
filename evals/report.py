@@ -54,6 +54,17 @@ def suite_markdown(suite: SuiteResult) -> str:
             else []
         ),
         *(
+            [
+                "**REMOVAL SHIFT:** this combination raises the probability that "
+                "decides a removal, a set-null or a delete "
+                f"({', '.join(suite.combo.removal_shifts())}): it makes the engine "
+                "remove more data. Read bleed and wrong deletes before the rest.",
+                "",
+            ]
+            if suite.combo is not None and suite.combo.removal_shifts()
+            else []
+        ),
+        *(
             [f"Suite: {suite.suite}" + (f"; tag: {suite.tag}" if suite.tag else ""), ""]
             if suite.suite != "default" or suite.tag
             else []

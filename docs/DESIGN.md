@@ -1766,7 +1766,12 @@ is the opt-in; no key in the environment ever routes text anywhere, and nothing 
   recorded (a recording by another provider, or by none, is a miss: `cassette miss ... made by another
   provider`). A miss fails its case, and goes to the provider only with `--live` (`results.json` has
   `replay`, the `mode` is `replay+live` and `forwarded` counts them). The calibration stays outermost, over
-  the raw answers. Cassettes recorded before this (one recorder over the whole stack) hold the merged
+  the raw answers. `RecordingTransport` and `CassetteTransport` forward `serves`, `classify_failure` and
+  `sensitive_values` to the transport they wrap (a router that asks what a provider can serve, for images,
+  must get the provider's answer through the recorder); a replay with nothing behind it is wrapped by the
+  runner in an adapter that answers those for the member it stands for. `Run`'s `gather` reads every
+  task's error, not only the first, so no "Task exception was never retrieved" is logged when several
+  chunks fail together. Cassettes recorded before this (one recorder over the whole stack) hold the merged
   Clairic responses and replay nothing for a combination: record again. The limits a replay uses
   (`max_questions`, `state_token_budget`) are the smallest recorded.
 - **`python -m evals search`** (`evals/search.py`): a greedy coordinate search from `--base spec.json` over

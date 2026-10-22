@@ -14,7 +14,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from datetime import time as dtime
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel
 
@@ -49,6 +49,8 @@ from trustcall_system_one.transport import (
     CallMeta,
     Transport,
     TransportResponse,
+    _can_serve,
+    classify_failure,
     max_questions,
     state_token_budget,
 )
@@ -2342,6 +2344,22 @@ class RecordingTransport:
         """The state budget of the wrapped transport (``None``: it says none)."""
         return state_token_budget(self._inner, model)
 
+    def serves(self, model: str, payload: Mapping[str, Any] | None = None) -> bool:
+        """Whether the wrapped transport can serve the request (a router asks)."""
+        return _can_serve(self._inner, model, payload)
+
+    def classify_failure(self, exc: Exception) -> str | None:
+        """The wrapped transport's category of a failure."""
+        classify = getattr(self._inner, "classify_failure", None)
+        if callable(classify):
+            return cast("str | None", classify(exc))
+        return classify_failure(exc)
+
+    def sensitive_values(self) -> tuple[str, ...]:
+        """The credentials passed explicitly to the wrapped transport."""
+        sensitive = getattr(self._inner, "sensitive_values", None)
+        return tuple(sensitive()) if callable(sensitive) else ()
+
     def _write(self, line: Mapping[str, Any]) -> None:
         sensitive = getattr(self._inner, "sensitive_values", None)
         extra = tuple(sensitive()) if callable(sensitive) else ()
@@ -2599,6 +2617,27 @@ class CassetteTransport:
     def provider(self) -> str | None:
         """The provider this cassette stands for (``None``: it replays any)."""
         return self._provider
+
+    def serves(self, model: str, payload: Mapping[str, Any] | None = None) -> bool:
+        """Whether a request can be served: what the ``inner`` transport says.
+
+        A cassette with no ``inner`` answers whatever it recorded and says nothing
+        (so, true); a router above it that must know what the provider behind a
+        recording can serve wraps it in an adapter that does (the evals do).
+        """
+        return _can_serve(self._inner, model, payload) if self._inner else True
+
+    def classify_failure(self, exc: Exception) -> str | None:
+        """The ``inner`` transport's category of a failure (else by type)."""
+        classify = getattr(self._inner, "classify_failure", None)
+        if callable(classify):
+            return cast("str | None", classify(exc))
+        return classify_failure(exc)
+
+    def sensitive_values(self) -> tuple[str, ...]:
+        """The credentials passed explicitly to the ``inner`` transport."""
+        sensitive = getattr(self._inner, "sensitive_values", None)
+        return tuple(sensitive()) if callable(sensitive) else ()
 
     def providers(self) -> dict[str, tuple[str, ...]]:
         """Who answered the recorded calls: ``{"clairic": (...), "clef": (...)}``.

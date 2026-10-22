@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import json
+import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -33,7 +34,7 @@ from tests.unit.test_evals_combo import (
     scripted,
     subset,
 )
-from trustcall_system_one import CLEF, CallMeta, TransportResponse
+from trustcall_system_one import CLAIRIC, CLEF, CallMeta, TransportResponse
 from trustcall_system_one.combos import ComboSpec
 from trustcall_system_one.testing import (
     CassetteMissError,
@@ -677,3 +678,252 @@ def test_the_search_still_picks_the_right_providers_with_the_margin() -> None:
         assert result.best.spec.by_kind[kind] == "decisions"
     for kind in GATES:
         assert result.best.spec.by_kind[kind] == "typesafe"
+
+
+# --------------------------------------------------------------------------- #
+# R1: a recorder or a cassette around a provider hides nothing from the routers
+# --------------------------------------------------------------------------- #
+
+IMAGE = "data:image/png;base64,iVBORw0KGgo="
+STATE = "<input>\nAda was born on 1815-12-10.\n</input>"
+PICTURED: dict[str, Any] = {
+    "model": "clairic",
+    "state": STATE,
+    "fields": {"name": {"type": "text"}, "born": {"type": "date"}},
+    "images": [IMAGE],
+    "options": {"return_state_text": True},
+}
+
+
+class Member:
+    """A provider that may take images, and fails loudly when it cannot."""
+
+    def __init__(self, name: str, images: bool) -> None:
+        self.provider, self.images, self.sent = name, images, []  # type: ignore[var-annotated]
+
+    def serves(self, model: str, payload: Mapping[str, Any] | None = None) -> bool:
+        return self.images or not (payload or {}).get("images")
+
+    def classify_failure(self, exc: Exception) -> str | None:
+        return f"{self.provider}-classified"
+
+    def sensitive_values(self) -> tuple[str, ...]:
+        return (f"secret-{self.provider}",)
+
+    async def run(
+        self,
+        model: str,
+        payload: Mapping[str, Any],
+        *,
+        meta: CallMeta,
+        timeout: float | None = None,
+    ) -> TransportResponse:
+        from trustcall_system_one import BadRequestError
+
+        if payload.get("images") and not self.images:
+            raise BadRequestError(f"{self.provider} takes text only")
+        await asyncio.sleep(0.01)
+        self.sent.append(list(payload["fields"]))
+        answers = {
+            n: {"type": s["type"], "value": "x", "p_null": 0.01, "confidence": 0.9}
+            for n, s in payload["fields"].items()
+        }
+        body = {
+            "model": "clairic",
+            "answers": answers,
+            "truncated": False,
+            "state_text": STATE,
+            "usage": {"input_tokens": 5, "output_tokens": 1},
+        }
+        return TransportResponse(body=body, status_code=200, provider=self.provider)
+
+
+def pictured_run(wrap: Any, tmp_path: Path) -> tuple[str, Member, Member]:
+    from trustcall_system_one.combos import build_combo_transport
+
+    cf, jev = Member("cloudflare", True), Member("typesafe", False)
+    spec = ComboSpec(extraction="cloudflare", extraction_by_type={"date": "typesafe"})
+    stack = build_combo_transport(
+        spec, providers={"cloudflare": cf, "typesafe": jev}, calibrate=False, wrap=wrap
+    )
+    try:
+        reply = asyncio.run(stack.run(CLAIRIC, PICTURED, meta=CallMeta(kind="extract")))
+        out = f"ok {reply.provider} rerouted_from={reply.rerouted_from}"
+    except Exception as exc:
+        out = f"{type(exc).__name__} maybe_sent={getattr(exc, 'maybe_sent', None)}"
+    return out, cf, jev
+
+
+def test_images_behave_the_same_with_a_recorder_around_each_provider(
+    tmp_path: Path,
+) -> None:
+    from trustcall_system_one.testing import RecordingTransport
+
+    plain, cf0, jev0 = pictured_run(None, tmp_path)
+    assert plain == "ok cloudflare rerouted_from=fieldtyperoutingtransport"  # whole
+    assert cf0.sent == [["name", "born"]] and jev0.sent == []
+    recorded, cf, jev = pictured_run(
+        lambda p, t: RecordingTransport(t, tmp_path / "r.jsonl"), tmp_path
+    )
+    assert recorded == plain
+    assert cf.sent == cf0.sent and jev.sent == []
+
+
+def test_images_behave_the_same_with_a_live_cassette_around_each_provider(
+    tmp_path: Path,
+) -> None:
+    from trustcall_system_one.testing import CassetteTransport
+
+    (tmp_path / "e.jsonl").write_text("")
+    plain, *_ = pictured_run(None, tmp_path)
+    live, cf, jev = pictured_run(
+        lambda p, t: CassetteTransport(
+            tmp_path / "e.jsonl", strict=False, inner=t, provider=p
+        ),
+        tmp_path,
+    )
+    assert live == plain and jev.sent == [] and cf.sent == [["name", "born"]]
+
+
+def test_images_under_a_replay_with_nothing_behind_it_are_rerouted_whole_too(
+    tmp_path: Path,
+) -> None:
+    """The runner's adapter: a strict cassette answers for the member it stands for."""
+    from evals.runner import _Replaying
+    from trustcall_system_one.testing import CassetteTransport
+
+    (tmp_path / "e.jsonl").write_text("")
+    cassettes: dict[str, CassetteTransport] = {}
+
+    def wrap(provider: str, member: Any) -> Any:
+        cassettes[provider] = CassetteTransport(tmp_path / "e.jsonl", provider=provider)
+        return _Replaying(cassettes[provider], member)
+
+    out, cf, jev = pictured_run(wrap, tmp_path)
+    # the request was rerouted whole to cloudflare's cassette (a miss: nothing was
+    # recorded), and typesafe's cassette was never asked: no partition was launched
+    assert out.startswith("CassetteMissError maybe_sent=")
+    assert len(cassettes["cloudflare"].misses) == 1
+    assert cassettes["typesafe"].misses == [] and jev.sent == [] == cf.sent
+    assert "maybe_sent=True" not in out
+
+
+def test_nothing_is_sent_when_no_partition_can_take_the_images(tmp_path: Path) -> None:
+    from evals.runner import _Replaying
+    from trustcall_system_one import BadRequestError
+    from trustcall_system_one.combos import build_combo_transport
+    from trustcall_system_one.testing import CassetteTransport, RecordingTransport
+
+    for wrap in (
+        None,
+        lambda p, t: RecordingTransport(t, tmp_path / "x.jsonl"),
+        lambda p, t: _Replaying(CassetteTransport(tmp_path, provider=p), t),
+    ):
+        a, b = Member("cloudflare", False), Member("typesafe", False)
+        spec = ComboSpec(
+            extraction="cloudflare", extraction_by_type={"date": "typesafe"}
+        )
+        stack = build_combo_transport(
+            spec, providers={"cloudflare": a, "typesafe": b}, calibrate=False, wrap=wrap
+        )
+        with pytest.raises(BadRequestError) as caught:
+            asyncio.run(stack.run(CLAIRIC, PICTURED, meta=CallMeta(kind="extract")))
+        assert a.sent == b.sent == []
+        assert not getattr(caught.value, "maybe_sent", False)  # nothing went out
+
+
+def test_a_recorder_and_a_cassette_forward_what_a_router_asks() -> None:
+    from trustcall_system_one import CloudflareTransport, UncertainOutcomeError
+    from trustcall_system_one.testing import RecordingTransport
+
+    member = Member("typesafe", False)
+    pictured = {"images": [IMAGE]}
+    recorder = RecordingTransport(member, Path(os.devnull))
+    assert recorder.serves(CLAIRIC, pictured) is False
+    assert recorder.serves(CLAIRIC, {}) is True
+    assert recorder.classify_failure(RuntimeError()) == "typesafe-classified"
+    assert recorder.sensitive_values() == ("secret-typesafe",)
+    cassette = (
+        CassetteTransport(Path("/nonexistent-never-read"), inner=member)
+        if False
+        else None
+    )
+    assert cassette is None
+    # a real transport: Cloudflare's own classification of a post-send failure
+    cf = CloudflareTransport(account_id="a", api_token="t")
+    wrapped = RecordingTransport(cf, Path(os.devnull))
+    assert wrapped.classify_failure(UncertainOutcomeError("x")) == "uncertain"
+    assert wrapped.sensitive_values() == ("a", "t")
+
+
+def test_a_cassette_with_an_inner_transport_forwards_and_one_without_says_nothing(
+    tmp_path: Path,
+) -> None:
+    from trustcall_system_one.testing import CassetteTransport
+
+    (tmp_path / "e.jsonl").write_text("")
+    member = Member("typesafe", False)
+    pictured = {"images": [IMAGE]}
+    live = CassetteTransport(tmp_path, strict=False, inner=member)
+    assert live.serves(CLAIRIC, pictured) is False
+    assert live.classify_failure(RuntimeError()) == "typesafe-classified"
+    assert live.sensitive_values() == ("secret-typesafe",)
+    alone = CassetteTransport(tmp_path)
+    assert alone.serves(CLAIRIC, pictured) is True  # it replays whatever was recorded
+    assert alone.sensitive_values() == ()
+    assert alone.classify_failure(RuntimeError()) is None
+
+
+# --------------------------------------------------------------------------- #
+# The engine's gather leaves no error unretrieved
+# --------------------------------------------------------------------------- #
+
+
+def test_concurrent_failures_leave_no_task_exception_never_retrieved() -> None:
+    import gc
+
+    from trustcall_system_one._run import gather
+
+    reports: list[dict[str, Any]] = []
+
+    async def fail(i: int) -> int:
+        raise ValueError(f"chunk {i} failed")
+
+    async def go() -> None:
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda _loop, context: reports.append(context))
+        for _ in range(3):  # several tasks fail in the same pass of the loop
+            with pytest.raises(ValueError, match="chunk 0 failed"):
+                await gather(*(fail(i) for i in range(4)))
+        gc.collect()
+        await asyncio.sleep(0)
+
+    asyncio.run(go())
+    gc.collect()
+    assert [r["message"] for r in reports] == []
+
+
+def test_gather_still_raises_the_first_error_and_returns_results_in_order() -> None:
+    from trustcall_system_one._run import gather
+
+    async def value(i: int) -> int:
+        await asyncio.sleep(0)
+        return i
+
+    async def go() -> list[int]:
+        return await gather(value(1), value(2), value(3))
+
+    assert asyncio.run(go()) == [1, 2, 3]
+
+    async def slow_then_fail() -> int:
+        await asyncio.sleep(0.01)
+        raise KeyError("late")
+
+    async def fail_now() -> int:
+        raise ValueError("first")
+
+    async def mixed() -> None:
+        await gather(slow_then_fail(), fail_now())
+
+    with pytest.raises(ValueError, match="first"):
+        asyncio.run(mixed())

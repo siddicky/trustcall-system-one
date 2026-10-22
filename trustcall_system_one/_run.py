@@ -215,7 +215,10 @@ async def gather(*awaitables: Awaitable[T]) -> list[T]:
         if failure is not None:
             raise failure from None
         raise asyncio.CancelledError
-    failure = next((e for t in tasks if (e := _error(t))), None)
+    # every task has finished: read EVERY error, not only the first, so that none is
+    # left "never retrieved" (asyncio logs that when the task is collected)
+    errors = [_error(t) for t in tasks]
+    failure = next((e for e in errors if e is not None), None)
     if failure is not None:
         raise failure from None
     if any(t.cancelled() for t in tasks):
