@@ -342,4 +342,4 @@ def test_08_testing_your_extractor(capsys: pytest.CaptureFixture[str]) -> None:
     out = capsys.readouterr().out
     assert BANNER in out
     assert outcome == {test.__name__: True for test in module.TESTS}
-    assert len(outcome) == 5
+    assert len(outcome) == 6

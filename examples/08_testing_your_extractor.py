@@ -213,6 +213,24 @@ def test_the_fake_rejects_answers_that_do_not_fit_the_request() -> None:
             raise AssertionError("the fake should have refused the wrong answer")
 
 
+def test_the_fake_rejects_an_incomplete_extraction_answer() -> None:
+    def forgetful(model: str, payload: Body, meta: CallMeta) -> Body:
+        if meta.kind == "presence":
+            return clef_response({"presence": noul(0.97)})
+        if meta.kind == "extract":  # answers only one of the requested fields
+            return clairic_response({"requester": clairic_answer("text", None)})
+        # every other kind answers correctly, so exactly one call is wrong
+        return clef_response({q: noul(0.9) for q in payload["questions"]})
+
+    with world(FakeTransport(forgetful)) as w:
+        try:
+            parse_meeting_request(EMAIL, w.extractor)
+        except AssertionError as error:  # raised inside a concurrent step, as itself
+            assert "differ from the requested" in str(error)
+        else:
+            raise AssertionError("the fake should have refused the incomplete answer")
+
+
 def test_the_request_carries_the_text_and_the_field_descriptions() -> None:
     with world() as w:
         parse_meeting_request(EMAIL, w.extractor)
@@ -230,6 +248,7 @@ TESTS: list[Callable[[], None]] = [
     test_text_without_a_request_makes_no_extraction_calls,
     test_a_value_the_text_does_not_support_is_dropped,
     test_the_fake_rejects_answers_that_do_not_fit_the_request,
+    test_the_fake_rejects_an_incomplete_extraction_answer,
     test_the_request_carries_the_text_and_the_field_descriptions,
 ]
 
