@@ -39,7 +39,17 @@ def suite_markdown(suite: SuiteResult) -> str:
     lines = [
         f"# Evals: config `{suite.config}` ({suite.mode})",
         "",
-        *([f"Clef provider: {suite.clef_provider}", ""] if suite.clef_provider else []),
+        *(
+            [
+                f"Clef provider: {suite.clef_provider}"
+                + (
+                    " (replay only: nothing was sent)" if suite.mode == "replay" else ""
+                ),
+                "",
+            ]
+            if suite.clef_provider
+            else []
+        ),
         f"Overrides: `{dict(suite.overrides)}`"
         if suite.overrides
         else "Overrides: none",
@@ -68,6 +78,14 @@ def suite_markdown(suite: SuiteResult) -> str:
         lines += ["", f"Skipped (no offline world): {', '.join(suite.skipped)}"]
     if agg["forwarded"]:
         lines += ["", f"Requests sent live during the replay: {agg['forwarded']}"]
+    if agg["unknown_outcomes"]:
+        lines += [
+            "",
+            f"Calls with an unknown outcome (sent, no answer; possibly charged): "
+            f"{agg['unknown_outcomes']}",
+        ]
+    if agg["reported_cost_usd"]:
+        lines += ["", f"Cost reported by the provider: ${agg['reported_cost_usd']:.6f}"]
     if suite.mode == "offline":
         lines += [
             "",

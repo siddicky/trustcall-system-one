@@ -64,9 +64,10 @@ def _common(parser: argparse.ArgumentParser) -> None:
         choices=("cloudflare", "experiential"),
         default=None,
         help="who serves Clef on live requests (Clairic stays on Cloudflare); "
-        "default: TRUSTCALL_S1_CLEF_PROVIDER, else experiential when "
-        "EXPERIENTIAL_API_KEY is set, else cloudflare. experiential needs "
-        "EXPERIENTIAL_API_KEY and never retries an uncertain request",
+        "default: TRUSTCALL_S1_CLEF_PROVIDER, else cloudflare (an "
+        "EXPERIENTIAL_API_KEY alone never moves Clef). experiential needs "
+        "EXPERIENTIAL_API_KEY and never retries an uncertain request; it only "
+        "matters with --live",
     )
     parser.add_argument("--record", type=Path, help="write cassettes to this directory")
     parser.add_argument(
@@ -126,6 +127,12 @@ def _out_dir(args: argparse.Namespace, name: str) -> Path:
 
 
 def _settings(args: argparse.Namespace, overrides: dict[str, Any]) -> Settings:
+    if args.clef_provider and not args.live:
+        print(
+            "note: --clef-provider has no effect without --live: nothing is sent, "
+            "requests are answered offline or from the cassettes",
+            file=sys.stderr,
+        )
     return Settings(
         overrides=overrides,
         live=args.live,

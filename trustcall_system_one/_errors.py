@@ -43,10 +43,13 @@ class TransportError(TrustcallSystemOneError):
         body: The decoded response body, if any.
         retries: Retries performed before giving up (set by the transport).
         retry_after: Seconds the server asked the client to wait, if it did.
+        request_id: The id the server gave the request (a correlation or request
+            id header), when the transport saw one.
     """
 
     retries: int = 0
     retry_after: float | None = None
+    request_id: str | None = None
 
     def __init__(
         self,
@@ -113,12 +116,26 @@ class UncertainOutcomeError(TransportError):
 
 
 class ModelResponseError(TrustcallSystemOneError):
-    """Model response did not match the published schema."""
+    """Model response did not match the published schema.
 
-    def __init__(self, message: str, *, raw: object | None = None) -> None:
+    Attributes:
+        raw: The body that did not match.
+        request_id: The id the server gave the request, when the transport saw one.
+    """
+
+    request_id: str | None = None
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        raw: object | None = None,
+        request_id: str | None = None,
+    ) -> None:
         """Create a model response error."""
         super().__init__(message)
         self.raw = raw
+        self.request_id = request_id
 
 
 class ExtractionValidationError(TrustcallSystemOneError):

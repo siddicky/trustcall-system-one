@@ -196,7 +196,7 @@ the provider switched.
 # in addition to the Cloudflare variables of section 0 (from the environment only):
 export EXPERIENTIAL_API_KEY=...                  # never write it to a file; do not echo it
 test -n "$EXPERIENTIAL_API_KEY" && echo set      # enough to check it
-export TRUSTCALL_S1_CLEF_PROVIDER=experiential   # optional: the key alone selects it too
+export TRUSTCALL_S1_CLEF_PROVIDER=experiential   # required: the key alone never moves Clef
 
 make smoke 2>&1 | tee /tmp/smoke-experiential.txt
 uv run python -m evals run --live --clef-provider experiential --config default \
@@ -204,8 +204,10 @@ uv run python -m evals run --live --clef-provider experiential --config default 
 ```
 
 Which provider serves Clef: `--clef-provider` (evals only), else `TRUSTCALL_S1_CLEF_PROVIDER`
-(`cloudflare` or `experiential`), else Experiential when `EXPERIENTIAL_API_KEY` is set, else
-Cloudflare. `results.json` records it as `clef_provider` and `summary.md` prints it. Cassettes
+(`cloudflare` or `experiential`), else Cloudflare: an `EXPERIENTIAL_API_KEY` alone never moves
+Clef, because that would send the text to another company. `--clef-provider` without `--live`
+only prints a note. `results.json` records the provider as `clef_provider` and `summary.md`
+prints it, for a live run and for a replay (which sends only what the cassettes lack). Cassettes
 are keyed by the model id and the request body, so a cassette recorded on Cloudflare replays
 under Experiential and the other way round; to compare the providers fairly, record into
 separate directories (`--record evals/cassettes-experiential`), or leave `--replay` out.
@@ -214,9 +216,21 @@ No request to Experiential is ever retried once it may have reached the server. 
 dropped connection or a 5xx fails the case with `UncertainOutcomeError` after exactly one
 request, and that call may have been charged. In the report:
 
-- count the cases that ended in `UncertainOutcomeError` (their `error` starts with that name) and
-  give each message, with the `correlation id` it carries when the server sent one: that is what
-  to quote when asking Experiential Labs whether the call was charged;
+- count the calls that may have been charged without an answer: `unknown_outcomes` in
+  `results.json` (per case and in `aggregate`) and the "Calls with an unknown outcome" line of
+  `summary.md`. It counts every call that ended in `UncertainOutcomeError` and every call that was
+  *cancelled after it may have been sent* (when one request of a case fails, its siblings that
+  are on the wire are cancelled; they are logged with `error` "cancelled after send; outcome
+  unknown" and have no response). The `requests` of a failed case now counts those calls too.
+  For the uncertain ones give each message, with the `correlation id` it carries when the server
+  sent one: that is what to quote when asking Experiential Labs whether a call was charged;
+- the cost is the `reported_cost_usd` of `aggregate` (what Experiential reports per call, only for
+  the calls that answered); calls without an answer are not in it, which is one more reason to
+  report the unknown outcomes;
+- a 429 storm can use up the 300 s budget: a re-send is not made when less time is left than an
+  attempt needs (`min_attempt_budget`, default the 60 s read timeout), and the call fails with a
+  deadline error saying the request was not sent, instead of sending a request that is likely to
+  be cut off and charged;
 - do not re-run just those cases to "fix" the table without saying so: each re-run is a new
   charge. A 429 with `Retry-After` and a failed connection are retried inside the transport and
   appear as `retries` in the call log only;
@@ -225,8 +239,9 @@ request, and that call may have been charged. In the report:
 The response shape was confirmed by a live probe and is saved in
 `docs/schemas/experiential-clef-response.example.json` (see `docs/DESIGN.md`, Transport): a bare
 Clef response plus `id`, `provider` and `usage.cost`. `usage.cost` is the price of the call as
-Experiential Labs reports it; `Prices` in the library does not read it. Before committing
-anything, run `grep -rn "xpl_" . --exclude-dir=.git`: it must find nothing.
+Experiential Labs reports it, and the library sums it as `usage.reported_cost_usd`
+(`result.cost.reported_usd`), apart from the token-price estimate. Before committing anything,
+run `grep -rnE "xpl_[A-Za-z0-9_-]{16,}" . --exclude-dir=.git`: it must find nothing.
 
 ## 5. What to hand back
 

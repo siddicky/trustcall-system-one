@@ -24,7 +24,7 @@ from trustcall_system_one._render import (
     fit_clef_state,
     reanchor,
 )
-from trustcall_system_one._types import CallRecord, Usage
+from trustcall_system_one._types import CallRecord, Usage, _reported_cost
 from trustcall_system_one._wire import (
     CLAIRIC,
     CLEF,
@@ -45,7 +45,10 @@ from trustcall_system_one._wire import (
 )
 from trustcall_system_one.transport import CallMeta, Transport
 
-__all__ = ["CLEF_BATCH", "Answer", "Question", "Run", "gather"]
+__all__ = ["CANCELLED_AFTER_SEND", "CLEF_BATCH", "Answer", "Question", "Run", "gather"]
+
+CANCELLED_AFTER_SEND = "cancelled after send; outcome unknown"
+"""``CallRecord.error`` of a call cancelled while it may have been on the wire."""
 
 CLEF_BATCH = 64
 """Most questions a single Clef request may carry."""
@@ -143,6 +146,7 @@ class _Sent:
     retries: int
     duration_ms: float
     status_code: int | None
+    request_id: str | None = None
 
 
 @dataclass
@@ -228,9 +232,11 @@ class Run:
         retries: int = 0,
         status_code: int | None = None,
         error: str | None = None,
+        request_id: str | None = None,
     ) -> None:
         """Append one ``CallRecord`` (and the usage, for a successful call)."""
         counted: dict[str, int] = {}
+        cost_usd: float | None = None
         if usage is not None:
             self.usage.add_call(model, meta.kind, usage)
             counted = {
@@ -238,6 +244,7 @@ class Run:
                 for key, value in usage.model_dump().items()
                 if isinstance(value, int) and not isinstance(value, bool)
             }
+            cost_usd = _reported_cost(usage)
         self.calls.append(
             CallRecord(
                 model=model,
@@ -252,6 +259,8 @@ class Run:
                 retries=retries,
                 error=error,
                 status_code=status_code,
+                request_id=request_id,
+                cost_usd=cost_usd,
             )
         )
 
@@ -262,10 +271,24 @@ class Run:
         meta: CallMeta,
         n_items: int,
     ) -> _Sent:
-        """Send one request; a failure is logged first and then re-raised."""
+        """Send one request; a failure is logged first and then re-raised.
+
+        A request that is cancelled (a sibling failed, or the caller gave up) may
+        already have been sent, and charged, so it is logged too, as
+        ``CANCELLED_AFTER_SEND``, before the cancellation goes on.
+        """
         started = time.perf_counter()
         try:
             response = await self.transport.run(model, payload, meta=meta)
+        except asyncio.CancelledError:
+            self._record(
+                model,
+                meta,
+                n_items,
+                duration_ms=(time.perf_counter() - started) * 1000,
+                error=CANCELLED_AFTER_SEND,
+            )
+            raise
         except Exception as exc:
             self._record(
                 model,
@@ -275,6 +298,7 @@ class Run:
                 retries=getattr(exc, "retries", 0),
                 status_code=getattr(exc, "status_code", None),
                 error=f"{type(exc).__name__}: {exc}",
+                request_id=getattr(exc, "request_id", None),
             )
             raise
         return _Sent(
@@ -282,6 +306,7 @@ class Run:
             retries=response.retries,
             duration_ms=response.duration_ms or (time.perf_counter() - started) * 1000,
             status_code=response.status_code,
+            request_id=response.request_id,
         )
 
     def _unparsable(
@@ -295,6 +320,7 @@ class Run:
             retries=sent.retries,
             status_code=sent.status_code,
             error=f"{type(exc).__name__}: {exc}",
+            request_id=sent.request_id,
         )
 
     async def call_clairic(
@@ -348,6 +374,7 @@ class Run:
             duration_ms=sent.duration_ms,
             retries=sent.retries,
             status_code=sent.status_code,
+            request_id=sent.request_id,
         )
         return response
 
@@ -466,6 +493,7 @@ class Run:
             duration_ms=sent.duration_ms,
             retries=sent.retries,
             status_code=sent.status_code,
+            request_id=sent.request_id,
         )
         if response.usage.input_tokens >= _TRUNCATION_RATIO * _CLEF_CONTEXT_TOKENS:
             self.warn(

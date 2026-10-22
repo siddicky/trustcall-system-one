@@ -1954,7 +1954,7 @@ _API_ACCOUNT = re.compile(
 _GATEWAY_PATH = re.compile(
     r"(?<=gateway\.ai\.cloudflare\.com/v1/)[^/\s\"'?#]+", re.IGNORECASE
 )
-_EXPERIENTIAL_KEY = re.compile(r"\bxpl_[A-Za-z0-9]{16,}")
+_EXPERIENTIAL_KEY = re.compile(r"\bxpl_[A-Za-z0-9_-]{16,}")
 _ACCOUNT_ID = re.compile(r"(?<=accounts/)[0-9a-fA-F]{32}(?![0-9A-Za-z])")
 _BEARER_HEADER = re.compile(
     r"(?i)(authorization[\"']?\s*[:=]\s*[\"']?)bearer\s+[^\s\"',}]+"

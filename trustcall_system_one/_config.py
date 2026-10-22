@@ -106,14 +106,23 @@ class CostReport:
     """The priced part of a usage total.
 
     Attributes:
-        usd: Cost of the models that have a configured price.
-        unpriced_models: Models that used input tokens but have no price.
-        complete: True when every model with input tokens was priced.
+        usd: Cost, estimated from input tokens, of the models that have a
+            configured price.
+        unpriced_models: Models that used input tokens but have neither a
+            configured price nor a reported cost on every call.
+        complete: True when every model with input tokens was priced, by a
+            configured price or because all of its calls reported a cost.
+        reported_usd: The costs that responses reported (Experiential Labs does),
+            summed over the models all of whose calls reported one. It is a
+            second, separate figure: where a model has both a configured price
+            and reported costs they are two measures of the same spend, not two
+            amounts to add.
     """
 
     usd: float
     unpriced_models: tuple[str, ...]
     complete: bool
+    reported_usd: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -144,25 +153,35 @@ class Prices:
             usage: Accumulated usage with a per-model breakdown.
 
         Returns:
-            A report whose ``usd`` sums the priced models only. Models that
-            consumed input tokens without a price are listed in
+            A report whose ``usd`` sums the models with a configured price,
+            estimated from input tokens. A model counts as priced too when every
+            one of its calls reported a cost; those costs are summed in
+            ``reported_usd``, apart from ``usd``. Models that consumed input
+            tokens and are priced in neither way are listed in
             ``unpriced_models`` and make ``complete`` false. Input tokens with
             no per-model breakdown are reported under ``"(unattributed)"``.
         """
         total = 0.0
+        reported = 0.0
         unpriced: set[str] = set()
         for model, used in usage.by_model.items():
             if used.input_tokens == 0:
                 continue
+            all_reported = used.requests > 0 and used.reported_requests == used.requests
+            if all_reported:
+                reported += used.reported_cost_usd
             price = self.per_million_input.get(model)
-            if price is None:
-                unpriced.add(normalize_model_id(model))
-            else:
+            if price is not None:
                 total += used.input_tokens * price / 1_000_000
+            elif not all_reported:
+                unpriced.add(normalize_model_id(model))
         if not usage.by_model and usage.input_tokens:
             unpriced.add("(unattributed)")
         return CostReport(
-            usd=total, unpriced_models=tuple(sorted(unpriced)), complete=not unpriced
+            usd=total,
+            unpriced_models=tuple(sorted(unpriced)),
+            complete=not unpriced,
+            reported_usd=reported,
         )
 
 

@@ -681,8 +681,15 @@ def test_provider_defaults_to_cloudflare() -> None:
     assert clef_provider_from_env({"EXPERIENTIAL_API_KEY": "  "}) == "cloudflare"
 
 
-def test_a_key_alone_selects_experiential() -> None:
-    assert clef_provider_from_env({"EXPERIENTIAL_API_KEY": KEY}) == "experiential"
+def test_a_key_alone_never_selects_experiential() -> None:
+    # sending the text to another company is an explicit choice
+    assert clef_provider_from_env({"EXPERIENTIAL_API_KEY": KEY}) == "cloudflare"
+    assert (
+        clef_provider_from_env(
+            {"EXPERIENTIAL_API_KEY": KEY, "TRUSTCALL_S1_CLEF_PROVIDER": ""}
+        )
+        == "cloudflare"
+    )
 
 
 def test_the_variable_beats_the_key_in_both_directions() -> None:
@@ -704,9 +711,9 @@ def test_provider_reads_the_process_environment(
 ) -> None:
     assert clef_provider_from_env() == "cloudflare"
     monkeypatch.setenv("EXPERIENTIAL_API_KEY", KEY)
-    assert clef_provider_from_env() == "experiential"
-    monkeypatch.setenv("TRUSTCALL_S1_CLEF_PROVIDER", "cloudflare")
     assert clef_provider_from_env() == "cloudflare"
+    monkeypatch.setenv("TRUSTCALL_S1_CLEF_PROVIDER", "experiential")
+    assert clef_provider_from_env() == "experiential"
 
 
 def test_the_factory_builds_a_plain_cloudflare_transport_or_a_router() -> None:
@@ -739,7 +746,7 @@ def test_the_factory_uses_the_environment_and_the_transports_it_is_given(
     [
         ({}, CloudflareTransport),
         ({"TRUSTCALL_S1_CLEF_PROVIDER": "cloudflare"}, CloudflareTransport),
-        ({"EXPERIENTIAL_API_KEY": KEY}, RoutingTransport),
+        ({"EXPERIENTIAL_API_KEY": KEY}, CloudflareTransport),  # a key alone: no
         (
             {"EXPERIENTIAL_API_KEY": KEY, "TRUSTCALL_S1_CLEF_PROVIDER": "cloudflare"},
             CloudflareTransport,
@@ -902,10 +909,14 @@ def test_the_live_tests_need_the_experiential_key_only_when_clef_goes_there(
     monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "acct")
     monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "tok")
     assert credentials_present()
-    monkeypatch.setenv("TRUSTCALL_S1_CLEF_PROVIDER", "experiential")
-    assert not credentials_present()
     monkeypatch.setenv("EXPERIENTIAL_API_KEY", KEY)
+    assert credentials_present()  # a key alone does not move Clef
+    monkeypatch.setenv("TRUSTCALL_S1_CLEF_PROVIDER", "experiential")
     assert credentials_present()
+    monkeypatch.setenv("EXPERIENTIAL_API_KEY", "  ")
+    assert not credentials_present()
+    monkeypatch.delenv("EXPERIENTIAL_API_KEY")
+    assert not credentials_present()
     monkeypatch.delenv("TRUSTCALL_S1_CLEF_PROVIDER")
     assert credentials_present()
     monkeypatch.delenv("CLOUDFLARE_ACCOUNT_ID")

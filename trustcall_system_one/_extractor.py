@@ -117,6 +117,8 @@ class _Core:
     def __init__(
         self, transport: Transport | None, concurrency: ConcurrencyConfig | None
     ) -> None:
+        if transport is None:
+            clef_provider_from_env()  # a bad TRUSTCALL_S1_CLEF_PROVIDER fails here
         self._given = transport
         self._concurrency = concurrency
         self._owned: CloudflareTransport | RoutingTransport | None = None

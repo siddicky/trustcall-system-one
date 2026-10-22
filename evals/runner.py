@@ -41,8 +41,8 @@ class Settings:
         concurrency: Cases run at the same time.
         clef_provider: Who serves Clef when requests go live: ``cloudflare`` or
             ``experiential``. ``None`` decides from ``TRUSTCALL_S1_CLEF_PROVIDER``
-            and ``EXPERIENTIAL_API_KEY`` (Cloudflare when neither is set).
-            Clairic always goes to Cloudflare.
+            (Cloudflare when it is unset; an ``EXPERIENTIAL_API_KEY`` alone never
+            selects Experiential). Clairic always goes to Cloudflare.
     """
 
     overrides: Mapping[str, Any] = field(default_factory=dict)
@@ -80,7 +80,10 @@ def _have_credentials(clef_provider: str = "cloudflare") -> bool:
     token = os.environ.get("CLOUDFLARE_API_TOKEN") or os.environ.get(
         "CLOUDFLARE_AUTH_TOKEN"
     )
-    if clef_provider == "experiential" and not os.environ.get("EXPERIENTIAL_API_KEY"):
+    if (
+        clef_provider == "experiential"
+        and not (os.environ.get("EXPERIENTIAL_API_KEY") or "").strip()
+    ):
         return False
     return bool(account and token)
 
@@ -88,6 +91,24 @@ def _have_credentials(clef_provider: str = "cloudflare") -> bool:
 def _provider(settings: Settings) -> Literal["cloudflare", "experiential"]:
     """The provider that serves Clef: the setting, else the environment."""
     return settings.clef_provider or clef_provider_from_env()
+
+
+def count_unknown_outcomes(calls: Sequence[Any]) -> int:
+    """Calls that failed after they may have been run (and charged).
+
+    These are the ``UncertainOutcomeError`` calls and the calls that were
+    cancelled after they may have been sent (``CallRecord.error`` starts with
+    ``cancelled after send``).
+    """
+    return sum(
+        1
+        for call in calls
+        if call.error
+        and (
+            call.error.startswith("UncertainOutcomeError")
+            or call.error.startswith("cancelled after send")
+        )
+    )
 
 
 def mode_of(settings: Settings) -> str:
@@ -134,6 +155,11 @@ async def _run_case(
         result = await extractor.ainvoke(case.text, existing=case.existing)
     except Exception as exc:
         failed = CaseResult(case=case.id)
+        # the failed invoke's log: requests that were sent, answered or not
+        failed.requests = len(getattr(exc, "calls", ()))
+        failed.unknown_outcomes = count_unknown_outcomes(getattr(exc, "calls", ()))
+        spent = getattr(exc, "usage", None)
+        failed.reported_cost_usd = getattr(spent, "reported_cost_usd", 0.0)
         # an error message can carry the request URL, and with it the account id
         failed.error = scrub(f"{type(exc).__name__}: {str(exc)[:300]}", secrets)
         failed.wall_s = time.perf_counter() - started
@@ -143,6 +169,8 @@ async def _run_case(
             failed.forwarded = cassette.forwarded
         return failed
     scored = score(case, result)
+    scored.unknown_outcomes = count_unknown_outcomes(result.calls)
+    scored.reported_cost_usd = result.usage.reported_cost_usd
     scored.warnings = [scrub(w, secrets) for w in scored.warnings]
     scored.wall_s = time.perf_counter() - started
     if cassette is not None:
@@ -168,8 +196,10 @@ async def run_suite(
     """
     runnable = [c for c in cases if settings.live or c.world is not None]
     skipped = [c.id for c in cases if c not in runnable]
-    provider = _provider(settings) if settings.live else ""
-    if settings.live and not _have_credentials(provider):
+    # Shown in the report whenever a live request is possible: live, or a replay
+    # that sends the requests it has no recording for.
+    provider = _provider(settings) if settings.live or settings.replay else ""
+    if settings.live and not _have_credentials(provider or "cloudflare"):
         raise RuntimeError(
             "--live needs CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN in the "
             "environment"
@@ -182,7 +212,7 @@ async def run_suite(
     if settings.record is not None:
         settings.record.mkdir(parents=True, exist_ok=True)
     gate = asyncio.Semaphore(max(1, settings.concurrency))
-    live = system_one_transport(provider or None) if settings.live else None
+    live = system_one_transport(provider) if settings.live and provider else None
     snapshot = CassetteTransport(settings.replay) if settings.replay else None
 
     async def one(case: Case) -> CaseResult:
@@ -245,4 +275,6 @@ def aggregate(results: Sequence[CaseResult]) -> dict[str, Any]:
         "input_tokens": sum(r.input_tokens for r in results),
         "wall_s": round(sum(r.wall_s for r in results), 2),
         "forwarded": sum(r.forwarded for r in results),
+        "unknown_outcomes": sum(r.unknown_outcomes for r in results),
+        "reported_cost_usd": round(sum(r.reported_cost_usd for r in results), 6),
     }

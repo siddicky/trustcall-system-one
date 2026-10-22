@@ -651,9 +651,9 @@ target). See [`CONTRIBUTING.md`](https://github.com/siddicky/trustcall-system-on
 
 ### Using Clef from Experiential Labs
 
-Clef can be served by Experiential Labs while Clairic stays on Cloudflare. Set `EXPERIENTIAL_API_KEY` (and keep the Cloudflare variables for Clairic): Clef then
-goes there by default, and `TRUSTCALL_S1_CLEF_PROVIDER=cloudflare|experiential` overrides that.
-Or choose it in code:
+Clef can be served by Experiential Labs while Clairic stays on Cloudflare. This sends your text to
+another company, so it is always an explicit choice: set `EXPERIENTIAL_API_KEY` **and**
+`TRUSTCALL_S1_CLEF_PROVIDER=experiential` (the key alone changes nothing), or pass a transport:
 
 ```python
 from trustcall_system_one import (
@@ -674,7 +674,8 @@ extractor = create_extractor([One(Contact)], transport=transport)
 
 `ExperientialTransport` sends each request once. After a timeout, a dropped connection or a 5xx it
 may already have run, and been charged, so it raises `UncertainOutcomeError` instead of retrying;
-only a failed connection and a 429 with `Retry-After` are retried.
+only a failed connection and a 429 with `Retry-After` are retried. Experiential reports the price
+of each call: see `result.usage.reported_cost_usd` and `result.cost.reported_usd`.
 
 ## Extract one record
 

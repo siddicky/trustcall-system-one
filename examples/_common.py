@@ -159,8 +159,8 @@ def build_extractor(
         return create_extractor(schemas, transport=script.transport, **options)
     # No transport given: the extractor creates one from the environment on first
     # use and closes it with the extractor: Cloudflare for both models, or Clef on
-    # Experiential Labs when TRUSTCALL_S1_CLEF_PROVIDER=experiential (or
-    # EXPERIENTIAL_API_KEY is set and the variable is not).
+    # Experiential Labs only when TRUSTCALL_S1_CLEF_PROVIDER=experiential (an
+    # EXPERIENTIAL_API_KEY alone never moves Clef).
     return create_extractor(schemas, **options)
 
 

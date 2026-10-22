@@ -327,6 +327,11 @@ class CaseResult:
             precision).
         n_rejections: Expected rejections.
         rejections_found: How many were reported.
+        unknown_outcomes: Calls that may have been run and charged although no
+            answer came back: ``UncertainOutcomeError`` (a timeout, a dropped
+            connection, a 5xx) and calls cancelled after they may have been sent.
+        reported_cost_usd: The cost in USD that responses reported (Experiential
+            Labs reports one per call); it covers the calls that answered.
         probabilities: The attribution and change-gate probabilities behind the
             result, keyed ``"<record> <field> attribution"`` / ``"... gate"``
             (a list field has one attribution per element). These are the margins
@@ -358,6 +363,8 @@ class CaseResult:
     allowed: int = 0
     n_rejections: int = 0
     rejections_found: int = 0
+    unknown_outcomes: int = 0
+    reported_cost_usd: float = 0.0
 
     @property
     def precision(self) -> float:

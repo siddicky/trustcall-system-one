@@ -1,6 +1,7 @@
 """Result and accounting types shared across the package."""
 
 import dataclasses
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
@@ -90,12 +91,26 @@ _TOKEN_FIELDS = (
     "output_tokens",
     "passes",
     "requests",
+    "reported_requests",
 )
+
+
+def _reported_cost(usage: Any) -> float | None:
+    """The cost a response reported in USD, or ``None`` (absent or not a price)."""
+    cost = getattr(usage, "cost", None)
+    if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+        return None
+    return float(cost) if math.isfinite(cost) and cost >= 0 else None
 
 
 @dataclass
 class Usage:
     """Token and request totals, with breakdowns by model and by call kind.
+
+    ``reported_cost_usd`` sums the costs that responses reported (Experiential
+    Labs reports one per call); ``reported_requests`` counts the calls that did.
+    Both are kept apart from any estimate made from token prices
+    (``Prices.cost``).
 
     The nested ``Usage`` values in ``by_model`` and ``by_kind`` are leaf totals
     and have empty breakdowns of their own.
@@ -108,12 +123,15 @@ class Usage:
     output_tokens: int = 0
     passes: int = 0
     requests: int = 0
+    reported_requests: int = 0
+    reported_cost_usd: float = 0.0
     by_model: dict[str, "Usage"] = dataclasses.field(default_factory=dict)
     by_kind: dict[str, "Usage"] = dataclasses.field(default_factory=dict)
 
     def _add_totals(self, other: "Usage") -> None:
         for name in _TOKEN_FIELDS:
             setattr(self, name, getattr(self, name) + getattr(other, name))
+        self.reported_cost_usd += other.reported_cost_usd
 
     def add_call(self, model: str, kind: str, usage: ClairicUsage | ClefUsage) -> None:
         """Record one successful call.
@@ -122,8 +140,12 @@ class Usage:
             model: Model id the call went to; bare names are stored as the full
                 ``@cf/...`` id.
             kind: The ``CallMeta.kind`` of the call.
-            usage: The ``usage`` object parsed from the response.
+            usage: The ``usage`` object parsed from the response. A ``cost`` the
+                provider reported is added to ``reported_cost_usd`` (and the call
+                to ``reported_requests``), apart from any estimate made from
+                token prices.
         """
+        reported = _reported_cost(usage)
         call = Usage(
             state_tokens=getattr(usage, "state_tokens", None) or 0,
             image_tokens=getattr(usage, "image_tokens", None) or 0,
@@ -132,6 +154,8 @@ class Usage:
             output_tokens=usage.output_tokens,
             passes=getattr(usage, "passes", None) or 0,
             requests=1,
+            reported_requests=0 if reported is None else 1,
+            reported_cost_usd=reported or 0.0,
         )
         self._add_totals(call)
         self.by_model.setdefault(normalize_model_id(model), Usage())._add_totals(call)
@@ -163,6 +187,10 @@ class CallRecord:
 
     ``error`` is the failure message for a call that raised (``None`` on
     success) and ``status_code`` the HTTP status when one was received.
+    ``request_id`` is the id the server gave the request (a correlation or
+    request id header) and ``cost_usd`` the price the response reported, when
+    the provider gives them. A call cancelled after it may have been sent has
+    ``error="cancelled after send; outcome unknown"``: it may have been charged.
     """
 
     model: str
@@ -177,6 +205,8 @@ class CallRecord:
     retries: int = 0
     error: str | None = None
     status_code: int | None = None
+    request_id: str | None = None
+    cost_usd: float | None = None
 
 
 # --------------------------------------------------------------------------- #

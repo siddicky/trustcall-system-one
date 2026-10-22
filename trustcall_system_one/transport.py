@@ -68,12 +68,15 @@ class TransportResponse:
         retries: Retries needed before the call succeeded.
         duration_ms: Wall-clock time of the call, including retries and waits.
         status_code: HTTP status of the successful response, if there was one.
+        request_id: The id the server gave the request (a correlation or request
+            id header), if it sent one.
     """
 
     body: dict[str, Any]
     retries: int = 0
     duration_ms: float = 0.0
     status_code: int | None = None
+    request_id: str | None = None
 
 
 @runtime_checkable
@@ -526,12 +529,18 @@ class _HttpTransport:
         }
 
     def _deadline_error(
-        self, retries: int, failure: TransportError | None
+        self,
+        retries: int,
+        failure: TransportError | None,
+        *,
+        reason: str | None = None,
     ) -> TransportError:
         """Build the error raised when ``call_deadline`` is used up."""
         message = f"call deadline of {self._call_deadline}s exceeded"
         if retries:
             message += f" after {retries} retr{'y' if retries == 1 else 'ies'}"
+        if reason:
+            message += f" ({reason})"
         if failure is not None:
             message += f"; last error: {failure}"
         error = TransportError(
@@ -898,6 +907,26 @@ def _correlation_id(response: httpx.Response) -> str | None:
     return None
 
 
+def _starved(left: float, need: float, *, waiting: bool = False) -> str:
+    """Why a re-send is not made: too little of the deadline would be left."""
+    when = "after the wait" if waiting else "now"
+    return (
+        f"{max(left, 0.0):.1f}s left {when}, less than the {need:.1f}s an attempt "
+        "needs to be answered, so the request was not sent"
+    )
+
+
+def _tag_request_id(
+    exc: TransportError | ModelResponseError, request_id: str | None
+) -> None:
+    """Put the request id on an error and in its message."""
+    if not request_id:
+        return
+    exc.request_id = request_id
+    if exc.args:
+        exc.args = (f"{exc.args[0]} (correlation id {request_id})", *exc.args[1:])
+
+
 class ExperientialTransport(_HttpTransport):
     """Calls Clef through Experiential Labs (``POST /v1/systemone``).
 
@@ -927,6 +956,14 @@ class ExperientialTransport(_HttpTransport):
     The ``CallMeta`` of a call is not sent anywhere (the entity label can be a
     person's name). Event loops, the adaptive limiter and ``aclose`` behave as
     for ``CloudflareTransport``.
+
+    **The key is inside the exceptions httpx raises.** The ``UncertainOutcomeError``
+    of a transport failure chains (``__cause__``) the httpx error, and that error's
+    ``request`` holds the ``Authorization`` header. The library's own messages
+    never contain the key, but an error tracker that captures chained exceptions
+    or local variables can send it. Scrub ``Authorization`` headers and ``xpl_``
+    keys in its ``before_send`` hook (``trustcall_system_one.testing.scrub`` does
+    this for text).
     """
 
     def __init__(
@@ -942,6 +979,7 @@ class ExperientialTransport(_HttpTransport):
         max_retry_after: float = 60.0,
         call_deadline: float | None = 300.0,
         queue_timeout: float | None = None,
+        min_attempt_budget: float | None = None,
         concurrency: ConcurrencyConfig | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         clock: Callable[[], float] = time.monotonic,
@@ -969,14 +1007,29 @@ class ExperientialTransport(_HttpTransport):
                 waits, or ``None`` for no budget (see ``CloudflareTransport``).
             queue_timeout: Longest wait for a limiter slot, in seconds, or
                 ``None`` to wait indefinitely.
+            min_attempt_budget: The least time that must be left of
+                ``call_deadline`` for a *re*-send (after a connect error or a 429
+                wait) to go out; otherwise the call fails with a deadline
+                ``TransportError`` before sending. ``None`` (the default) means the
+                read timeout the attempt would have (the call's ``timeout``, else
+                the client's), so a request is never sent with less time to answer
+                than it normally gets: one that is cut off early is likely to have
+                been run, and charged, with its result lost. ``0`` turns the check
+                off. The first attempt always goes out.
             concurrency: Concurrency limits for the adaptive limiter.
             sleep: Awaitable sleep, injectable for tests.
             clock: Monotonic clock in seconds, injectable for tests.
             extra_headers: Headers added to (and able to override) the defaults.
 
         Raises:
-            ValueError: If a retry or backoff setting is out of range.
+            ValueError: If a retry, backoff or budget setting is out of range.
         """
+        if min_attempt_budget is not None and not (
+            math.isfinite(min_attempt_budget) and min_attempt_budget >= 0
+        ):
+            raise ValueError(
+                "min_attempt_budget must be finite and at least 0, or None"
+            )
         super().__init__(
             client=client,
             timeout=timeout,
@@ -992,7 +1045,19 @@ class ExperientialTransport(_HttpTransport):
         )
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
+        self._min_attempt_budget = min_attempt_budget
         self._extra_headers = dict(extra_headers or {})
+
+    def _attempt_budget(
+        self, client: httpx.AsyncClient, timeout: float | None
+    ) -> float:
+        """The time a re-send needs: ``min_attempt_budget``, else its read timeout."""
+        if self._min_attempt_budget is not None:
+            return self._min_attempt_budget
+        if timeout is not None:
+            return timeout
+        read = client.timeout.read
+        return 0.0 if read is None else float(read)
 
     def sensitive_values(self) -> tuple[str, ...]:
         """The API key that was passed in explicitly.
@@ -1087,10 +1152,20 @@ class ExperientialTransport(_HttpTransport):
                     post_kwargs = self._post_kwargs(client, timeout, deadline)
                     if post_kwargs is None:
                         raise self._deadline_error(retries, last_failure)
+                    if retries and deadline is not None:
+                        left = deadline - self._clock()
+                        need = self._attempt_budget(client, timeout)
+                        if left < need:
+                            raise self._deadline_error(
+                                retries, last_failure, reason=_starved(left, need)
+                            )
+                    # Built outside the try: a payload that cannot be encoded
+                    # fails here, before anything is sent, and is not uncertain.
+                    request = client.build_request(
+                        "POST", url, json=payload, headers=headers, **post_kwargs
+                    )
                     try:
-                        response = await client.post(
-                            url, json=payload, headers=headers, **post_kwargs
-                        )
+                        response = await client.send(request)
                     except _PRE_SEND_RETRYABLE as exc:
                         failure = TransportError(
                             f"Could not connect to {url}; the request was not "
@@ -1103,7 +1178,7 @@ class ExperientialTransport(_HttpTransport):
                         )
                         fatal.retries = retries
                         raise fatal from exc
-                    except (httpx.HTTPError, asyncio.TimeoutError) as exc:
+                    except Exception as exc:  # anything else: it may have been sent
                         uncertain = UncertainOutcomeError(
                             f"Request to {url} failed after it may have been "
                             f"sent: {exc!r}. {_UNCERTAIN_NOTE}"
@@ -1113,10 +1188,13 @@ class ExperientialTransport(_HttpTransport):
                     else:
                         status = response.status_code
                         if response.is_success:
+                            request_id = _correlation_id(response)
                             try:
                                 body = self._unwrap(response)
-                            except TransportError as exc:
-                                exc.retries = retries
+                            except (TransportError, ModelResponseError) as exc:
+                                if isinstance(exc, TransportError):
+                                    exc.retries = retries
+                                _tag_request_id(exc, request_id)
                                 raise
                             self.limiter.on_success(model)
                             return TransportResponse(
@@ -1124,6 +1202,7 @@ class ExperientialTransport(_HttpTransport):
                                 retries=retries,
                                 duration_ms=(time.perf_counter() - started) * 1000,
                                 status_code=status,
+                                request_id=request_id,
                             )
                         retry_after = _parse_retry_after(
                             response.headers.get("Retry-After")
@@ -1159,6 +1238,14 @@ class ExperientialTransport(_HttpTransport):
                 )
             if deadline is not None and self._clock() + delay >= deadline:
                 raise self._deadline_error(retries, failure)
+            if deadline is not None:
+                # Do not wait for a send that would be starved of time anyway.
+                left = deadline - self._clock() - delay
+                need = self._attempt_budget(client, timeout)
+                if left < need:
+                    raise self._deadline_error(
+                        retries, failure, reason=_starved(left, need, waiting=True)
+                    )
             retries += 1
             if retry_after is None:
                 previous_delay = delay
@@ -1194,6 +1281,7 @@ class ExperientialTransport(_HttpTransport):
         else:
             error = TransportError(message, status_code=status, body=body)
         error.retry_after = retry_after
+        error.request_id = correlation
         return error
 
     @staticmethod
@@ -1334,11 +1422,21 @@ class RoutingTransport:
         await self.aclose()
 
     async def aclose(self) -> None:
-        """Close the routed transports' clients for the running loop."""
+        """Close the routed transports' clients for the running loop.
+
+        Every member is closed even if one fails; the first error is raised
+        afterwards.
+        """
+        first: Exception | None = None
         for transport in self._members():
             closer = getattr(transport, "aclose", None)
             if callable(closer):
-                await closer()
+                try:
+                    await closer()
+                except Exception as exc:
+                    first = first or exc
+        if first is not None:
+            raise first
 
     def close(self) -> None:
         """Close the routed transports from synchronous code, best effort."""
@@ -1356,8 +1454,10 @@ def clef_provider_from_env(environ: Mapping[str, str] | None = None) -> ClefProv
     """Which provider serves Clef, from the environment.
 
     ``TRUSTCALL_S1_CLEF_PROVIDER`` (``cloudflare`` or ``experiential``, any case)
-    decides. With it unset or empty, Clef goes to Experiential when
-    ``EXPERIENTIAL_API_KEY`` is set and to Cloudflare otherwise.
+    decides. With it unset or empty, Clef stays on Cloudflare: having an
+    ``EXPERIENTIAL_API_KEY`` in the environment does not move it. Sending your
+    text to another company is an explicit choice, made with this variable or by
+    passing a transport.
 
     Args:
         environ: The environment to read; defaults to ``os.environ``.
@@ -1370,10 +1470,7 @@ def clef_provider_from_env(environ: Mapping[str, str] | None = None) -> ClefProv
     """
     env = os.environ if environ is None else environ
     value = (env.get("TRUSTCALL_S1_CLEF_PROVIDER") or "").strip().lower()
-    if not value:
-        has_key = bool((env.get("EXPERIENTIAL_API_KEY") or "").strip())
-        return "experiential" if has_key else "cloudflare"
-    if value == "cloudflare":
+    if not value or value == "cloudflare":
         return "cloudflare"
     if value == "experiential":
         return "experiential"

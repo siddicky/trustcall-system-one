@@ -23,8 +23,8 @@ def credentials_present() -> bool:
     """Whether the credentials of the providers in use are in the environment.
 
     Clairic always needs the Cloudflare account id and an API token. With Clef on
-    Experiential Labs (``TRUSTCALL_S1_CLEF_PROVIDER=experiential``, or
-    ``EXPERIENTIAL_API_KEY`` set and the variable unset) its key is needed too.
+    Experiential Labs (``TRUSTCALL_S1_CLEF_PROVIDER=experiential``) its key is
+    needed too.
     """
     token = os.environ.get("CLOUDFLARE_API_TOKEN") or os.environ.get(
         "CLOUDFLARE_AUTH_TOKEN"
@@ -32,7 +32,7 @@ def credentials_present() -> bool:
     if not (os.environ.get("CLOUDFLARE_ACCOUNT_ID") and token):
         return False
     if clef_provider_from_env() == "experiential":
-        return bool(os.environ.get("EXPERIENTIAL_API_KEY"))
+        return bool((os.environ.get("EXPERIENTIAL_API_KEY") or "").strip())
     return True
 
 
@@ -52,8 +52,8 @@ SKIP_REASON = (
 def live_transport() -> Iterator[Callable[[str], Transport]]:
     """Make the transport of one scenario: live, recording when asked to.
 
-    Clef goes to Experiential Labs when ``TRUSTCALL_S1_CLEF_PROVIDER=experiential``
-    (or ``EXPERIENTIAL_API_KEY`` is set and the variable is not), else to Cloudflare.
+    Clef goes to Experiential Labs only when
+    ``TRUSTCALL_S1_CLEF_PROVIDER=experiential``, else to Cloudflare.
 
     ``TRUSTCALL_S1_RECORD=<dir>`` writes each scenario's requests and responses to
     ``<dir>/smoke_<name>.jsonl`` (never headers or credentials).

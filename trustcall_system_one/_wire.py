@@ -534,11 +534,27 @@ class ScoreAnswer(_Response):
     confidence: Probability
 
 
+def _cost_or_none(value: Any) -> Any:
+    """A reported cost that is a number; anything else is treated as not reported.
+
+    The published schema allows extra keys, so a provider's ``cost`` could be of
+    any type; a response is not invalid because of it.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value
+
+
 class ClefUsage(_Response):
-    """Token accounting for one Clef call."""
+    """Token accounting for one Clef call.
+
+    ``cost`` is the price of the call in USD when the provider reports one
+    (Experiential Labs does; Cloudflare does not). Other extra keys are kept.
+    """
 
     input_tokens: int
     output_tokens: int
+    cost: Annotated[float | None, BeforeValidator(_cost_or_none)] = None
 
 
 ClefAnswer = Annotated[

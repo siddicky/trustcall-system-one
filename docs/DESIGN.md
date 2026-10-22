@@ -1138,6 +1138,12 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
   `ConnectError`/`ConnectTimeout` (nothing was sent; jittered backoff) and 429 *with*
   `Retry-After` (refused unprocessed; waits that long, at most `max_retry_after`), both bounded by
   `max_retries` (6) and `call_deadline` (300 s) and releasing the limiter slot while waiting. A
+  re-send is also never made with less time left than an attempt normally gets
+  (`min_attempt_budget`, default the attempt's read timeout, `0` turns it off): after 429 waits the
+  budget can be nearly gone, and a request cut off after about 5 s instead of 60 is likely to have
+  been run, and charged, with its result lost. The check runs before the wait (no point sleeping
+  for a send that will not happen) and again before the send, and fails with a deadline
+  `TransportError` that says the request was not sent. The first attempt always goes out. A
   429 without `Retry-After`, 401/403 (`AuthError`), other 4xx and 3xx (`BadRequestError`, with the
   error object in `cf_errors`), a pool timeout and a proxy error are not retried. The engine does
   not retry a failed call either, so an `UncertainOutcomeError` ends the invoke with the usage so
@@ -1150,11 +1156,39 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
   experiential=, concurrency=)` builds the usual setup: `"cloudflare"` is a plain
   `CloudflareTransport`, `"experiential"` is `RoutingTransport({"clef": ExperientialTransport()},
   default=CloudflareTransport())`. `None` reads the environment through `clef_provider_from_env()`:
-  `TRUSTCALL_S1_CLEF_PROVIDER=cloudflare|experiential`, else `experiential` when
-  `EXPERIENTIAL_API_KEY` is set, else `cloudflare` (an unknown value is a `ValueError`). That is also
-  the extractor's default transport, `examples/_common.py`, `tests/live/conftest.py` and the evals
-  (`--clef-provider cloudflare|experiential`, recorded in `results.json` as `clef_provider`).
+  `TRUSTCALL_S1_CLEF_PROVIDER=cloudflare|experiential`, else `cloudflare` (an unknown value is a
+  `ValueError`, raised when the extractor is created). **Opt-in only:** an `EXPERIENTIAL_API_KEY`
+  in the environment does not move Clef, because that would send a user's text to another company
+  because of a variable they set for something else; choose it with the provider variable, with
+  `--clef-provider`, or by passing a transport. The same selection is the extractor's default
+  transport, `examples/_common.py`, `tests/live/conftest.py` and the evals (`--clef-provider
+  cloudflare|experiential`, recorded in `results.json` as `clef_provider`; shown in the report of a
+  live run and of a replay, and a note is printed when the flag is given without `--live`).
   Cassettes are keyed by model id and payload, so they replay under either provider.
+- Two transports mean two limiters: `RoutingTransport` does not share one, so the in-flight caps
+  (64 per transport, 32 per model) apply to Cloudflare and to Experiential separately, and a 429
+  from one lowers only that provider's limit. Pass `concurrency=` to lower both.
+- **Every call that may have been charged is on record.** A call that is cancelled (a sibling
+  failed, or the caller gave up) after it may have been sent is logged by `Run._send` as a
+  `CallRecord` with `error="cancelled after send; outcome unknown"`, for every transport, and then
+  the cancellation goes on; a call cancelled while it still waited for a limiter slot is logged
+  the same way (the engine cannot tell the difference, so it errs towards "may have been
+  charged"). `CallRecord.request_id` and `TransportResponse.request_id` carry the server's
+  correlation (else request) id, which is also put in the message of an error raised from a 2xx
+  (`ModelResponseError`, `BadRequestError`) and of an HTTP error. The evals count
+  `unknown_outcomes` (uncertain and cancelled calls) per case, also for a case that failed.
+- **Reported cost.** `ClefUsage.cost` (optional) is the price Experiential reports per call.
+  `Usage.reported_cost_usd` sums it (with `reported_requests`, the calls that reported one, per
+  model and kind), `CallRecord.cost_usd` has it per call and `CostReport.reported_usd` sums it over
+  the models all of whose calls reported a cost, which are then counted as priced (`complete`).
+  It stays apart from `CostReport.usd`, which is estimated from `Prices`; where a model has both
+  they are two measures of the same spend, not amounts to add. A cost that is negative, not
+  finite or not a number counts as not reported.
+- **Where the key can leak.** The key sits in the headers of the httpx request, which the httpx
+  exception chained to an `UncertainOutcomeError` (`__cause__`) holds. The library's messages never
+  contain it, but an error tracker that records chained exceptions or locals can send it: scrub
+  `Authorization` headers and `xpl_` keys in its `before_send` hook (or use
+  `trustcall_system_one.testing.scrub` on text).
 - Concurrency: 64 in flight per transport per event loop (shared across invokes and batch),
   32 per model, adaptive (halve on 429, at most once per generation so a burst of 429s halves
   once, +1 per 20 successes). The slot is released while a retry backs off. Limiter state and
@@ -1192,7 +1226,7 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
   `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_AUTH_TOKEN` and
   `EXPERIENTIAL_API_KEY`, the account id, token and key given explicitly to the wrapped
   `CloudflareTransport` / `ExperientialTransport` / `RoutingTransport` (`sensitive_values()`), any
-  `Bearer` token, any `xpl_...` key, and the id in an `accounts/<id>` URL path or a gateway `/v1/<id>/` path (an error message
+  `Bearer` token, any `xpl_[A-Za-z0-9_-]{16,}` key, and the id in an `accounts/<id>` URL path or a gateway `/v1/<id>/` path (an error message
   quotes the request URL). The evals scrub the case errors and warnings and the reports they write
   with the same function (tests: `test_recording.py` and `test_evals_harness.py` set the ids and
   tokens in the environment and explicitly, with and without a gateway, and grep the files). `CassetteTransport(path, *, strict=True, inner=None)` loads a file, a
