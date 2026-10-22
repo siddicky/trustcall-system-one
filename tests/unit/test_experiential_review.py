@@ -181,13 +181,13 @@ def test_the_budget_must_be_valid() -> None:
 
 
 def two_chunks() -> Mapping[str, Any]:
-    """70 questions: more than the 64 one request takes, so two requests."""
+    """40 questions: more than the 32 one Experiential request takes, so two."""
     questions = {
-        f"q{i}": {"type": "noul", "instructions": f"Is {i} even?"} for i in range(70)
+        f"q{i}": {"type": "noul", "instructions": f"Is {i} even?"} for i in range(40)
     }
     items = list(questions.items())
     merged: dict[str, Any] = {}
-    for part in (items[:64], items[64:]):
+    for part in (items[:32], items[32:]):
         merged.update(
             ClefRequest.model_validate(
                 {"model": "clef", "state": "s", "questions": dict(part)}

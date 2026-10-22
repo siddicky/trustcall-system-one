@@ -1107,7 +1107,20 @@ _NOT_NAMES = frozenset(
 )
 """Words that start a sentence without naming anyone: pronouns, roles and kin."""
 _FALLBACK_REASONS = frozenset(
-    {None, "low_confidence", "low_choice_prob", "missing_answer", "identity_bleed"}
+    {
+        None,
+        "low_confidence",
+        "low_choice_prob",
+        "missing_answer",
+        "identity_bleed",
+        # the checks that ask whether the input STATES the extracted name: a Clef that
+        # doubts "Emma's full name" (null check 0.02, attribution 0.45 live 8) says
+        # nothing against the entity, which exists because the input names it
+        "p_null",
+        "null_check",
+        "attribution",
+        "attribution_missing",
+    }
 )
 _SENTENCE_END = ".!?\n:;"
 
@@ -1261,9 +1274,11 @@ def _from_mention(ctx: Ctx, spec: FieldSpec, answer: FieldAnswer) -> FieldAnswer
     ``identity_bleed``), the field takes the mention text instead of leaving the
     record invalid. Only for a field that holds what the entity is called
     (``_name_like``), only for a text identity field of an entity of a collection
-    (never an update), only when the answer is null or was refused for low
-    confidence, and only when a mention is a proper noun ("Dana Ruiz"; not "my
-    cousin", "Client" or "He"). The items of a nested list are named by what they
+    (never an update), only when the answer is null or was refused (for low
+    confidence, or by the null or attribution check: they ask whether the input
+    states a "full name", which says nothing against an entity the input names), and
+    only when a mention is a proper noun ("Dana Ruiz"; not "my cousin", "Client" or
+    "He"). The items of a nested list are named by what they
     are, so there a noun phrase ("the blue mugs" gives "blue mugs") is a name too.
     An email, an id or a code is never made up from a mention. The fallback is a
     run warning too (``identity_from_mention``).

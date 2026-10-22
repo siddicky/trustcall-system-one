@@ -57,9 +57,11 @@ DECISIONS_MODEL = "gpt-6-luna-decisions"
 
 DEFAULT_HARD_CAP = 0.8
 """Most probability (and confidence) a hard pick is given: an answer without
-probabilities, or with only 0 and 1. 0.8 passes the add (0.55) and replace (0.6)
-gates and the attribution keep (0.75), but never the remove / set-null gate
-(0.85): a bare yes from the fallback cannot authorise a removal by itself."""
+probabilities, or with only (nearly: within 0.001) 0 and 1. 0.8 passes the add (0.55)
+and replace (0.6) gates and the attribution keep (0.75), but never the remove /
+set-null gate (0.85): a bare yes from the fallback cannot authorise a removal by
+itself. That holds only while ``gates.remove_threshold`` stays above the cap: a
+user who lowers it below 0.8 loses the protection."""
 
 YES = "yes"
 NO = "no"
@@ -335,7 +337,9 @@ def _bad(message: str, body: Any) -> ModelResponseError:
 
 _SUM_TOLERANCE = 0.02
 _ARGMAX_TOLERANCE = 1e-9
-_SATURATED = 1e-9
+_SATURATED = 1e-3
+"""How near 0 or 1 a probability must be to count as saturated: {yes: 0.9999,
+no: 0.0001} is a hard pick too, and is capped below the removal gate."""
 
 
 def _answer(
@@ -381,8 +385,8 @@ def _answer(
             )
         # the reported confidence cannot be higher than the probabilities say
         confidence = top if given.confidence is None else min(given.confidence, top)
-        # Probabilities that are all 0 and 1 (what the live API sends) are a pick
-        # that says nothing about how sure it is: a hard answer, like one without.
+        # Probabilities that are all (nearly) 0 and 1 (what the live API sends) are a
+        # pick that says nothing about how sure it is: a hard answer, like one without.
         hard = all(
             p <= _SATURATED or p >= 1.0 - _SATURATED for p in probabilities.values()
         )

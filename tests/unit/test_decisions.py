@@ -1215,3 +1215,63 @@ def test_the_live_tests_need_the_key_for_the_fallback(
     assert not credentials_present()
     monkeypatch.setenv("EXPERIENTIAL_API_KEY", KEY)
     assert credentials_present()
+
+
+@pytest.mark.parametrize(
+    ("yes", "hard"),
+    [
+        (1.0, True),
+        (0.9999, True),  # not 1.0, still a hard pick: capped below remove (0.85)
+        (0.9991, True),
+        (0.001, True),  # a near-certain no is just as bare
+        (0.995, False),  # 0.005 from 1: graded, 0.001 is the line
+        (0.9, False),
+    ],
+)
+def test_near_saturated_probabilities_are_hard_picks_too(
+    yes: float, hard: bool
+) -> None:
+    payload = {**REVIEW, "questions": {"q": {"type": "noul", "instructions": "Is it?"}}}
+    _, plans = to_decisions_request(payload)
+    body = response_for(
+        payload,
+        [
+            {
+                "type": "choice",
+                "name": "q",
+                "choice": "yes" if yes >= 0.5 else "no",
+                "probabilities": probs(yes=yes, no=1 - yes),
+            }
+        ],
+    )
+    answer = from_decisions_response(body, plans, clef_model="clef")["answers"]["q"]
+    assert answer.get("hard", False) is hard
+    if hard:
+        assert answer["noul"] in (pytest.approx(0.8), pytest.approx(0.2))
+        assert answer["noul"] < 0.85 or answer["noul"] == pytest.approx(0.2)
+    else:
+        assert answer["noul"] == pytest.approx(yes)
+
+
+def test_a_near_saturated_yes_cannot_authorise_a_removal() -> None:
+    from trustcall_system_one import GateConfig
+
+    payload = {**REVIEW, "questions": {"q": {"type": "noul", "instructions": "Is it?"}}}
+    _, plans = to_decisions_request(payload)
+    body = response_for(
+        payload,
+        [
+            {
+                "type": "choice",
+                "name": "q",
+                "choice": "yes",
+                "probabilities": probs(yes=0.9999, no=0.0001),
+            }
+        ],
+    )
+    noul_p = from_decisions_response(body, plans, clef_model="clef")["answers"]["q"][
+        "noul"
+    ]
+    gates = GateConfig()
+    assert noul_p < gates.remove_threshold  # no removal or set-null
+    assert noul_p >= gates.add_threshold and noul_p >= gates.replace_threshold

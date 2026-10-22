@@ -44,11 +44,15 @@ from trustcall_system_one._wire import (
     parse_clairic,
     parse_clef,
 )
-from trustcall_system_one.transport import CallMeta, Transport, TransportResponse
+from trustcall_system_one.transport import (
+    CallMeta,
+    Transport,
+    TransportResponse,
+    max_questions,
+)
 
 __all__ = [
     "CANCELLED_AFTER_SEND",
-    "CLEF_BATCH",
     "FALLBACK_WARNING",
     "Answer",
     "Question",
@@ -63,8 +67,6 @@ FALLBACK_WARNING = "clef_fallback_used"
 CANCELLED_AFTER_SEND = "cancelled after send; outcome unknown"
 """``CallRecord.error`` of a call cancelled while it may have been on the wire."""
 
-CLEF_BATCH = 64
-"""Most questions a single Clef request may carry."""
 _CLEF_CONTEXT_TOKENS = 65_536
 _TRUNCATION_RATIO = 0.97
 
@@ -481,8 +483,8 @@ class Run:
         )
         if self.fallback_hard:
             message += (
-                f"; {self.fallback_hard} answer(s) came without probabilities "
-                "(hard picks, confidence capped)"
+                f"; {self.fallback_hard} hard pick(s) (no or saturated probabilities, "
+                "confidence capped)"
             )
         fields = list(self.fallback_fields)
         if fields:
@@ -589,6 +591,16 @@ class Run:
             )
         return anchored
 
+    def clef_batch(self, model: str | None = None) -> int:
+        """Most questions one Clef request to ``model`` may carry on this transport.
+
+        64 on Cloudflare, 32 on Experiential Labs and the Decisions API, and the
+        limit of the transport that would serve the model behind a routing or a
+        fallback (``transport.max_questions``). Everything that groups Clef
+        questions asks this instead of assuming 64.
+        """
+        return max_questions(self.transport, model or self.clef_model)
+
     async def call_clef(
         self,
         questions: Mapping[str, Question],
@@ -598,9 +610,10 @@ class Run:
         model: str | None = None,
         decisive: bool = False,
     ) -> dict[str, Answer]:
-        """Send Clef questions, in requests of at most 64, and merge the answers.
+        """Send Clef questions in requests the transport accepts; merge the answers.
 
-        More than 64 questions are split into several requests that are issued
+        More questions than one request may carry (``clef_batch``: 64 on Cloudflare,
+        32 on Experiential Labs) are split into several requests that are issued
         concurrently; each is logged as its own ``CallRecord``.
 
         Args:
@@ -625,7 +638,9 @@ class Run:
         items = list(questions.items())
         if not items:
             return {}
-        width = 1 if decisive and self.verify.isolate_decisions else CLEF_BATCH
+        width = (
+            1 if decisive and self.verify.isolate_decisions else self.clef_batch(model)
+        )
         chunks = [items[i : i + width] for i in range(0, len(items), width)]
         parts = await gather(
             *(self._clef_once(model, chunk, state, meta) for chunk in chunks)

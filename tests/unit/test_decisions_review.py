@@ -430,7 +430,7 @@ async def test_hard_answers_are_counted_in_the_warning() -> None:
     assert answers["review"].confidence == 0.8  # type: ignore[union-attr]
     assert run.fallback_hard == 1
     (warning,) = run.warnings
-    assert "1 answer(s) came without probabilities" in warning
+    assert "1 hard pick(s) (no or saturated probabilities" in warning
     assert "used for: gate:Person" in warning
 
 
@@ -676,8 +676,9 @@ async def test_the_report_shows_the_fallback_and_its_triggers(
 
 
 async def test_three_chunks_each_get_one_request_per_provider() -> None:
-    # probe exp_decisions_fallback: 150 questions are three requests; with the
-    # opt-in each one falls back on its own, and each is logged
+    # probe exp_decisions_fallback: 150 questions are five requests of at most 32
+    # (the limit of Experiential Labs and the Decisions API); with the opt-in each
+    # one falls back on its own, and each is logged
     primary, primary_server = experiential(httpx.ReadTimeout("slow"))
     backup, backup_server = decisions()
     run = Run(transport=FallbackTransport(primary, backup, on=ALL))
@@ -694,7 +695,7 @@ async def test_three_chunks_each_get_one_request_per_provider() -> None:
         )
     answers = await run.call_clef(questions, "s", meta=META)
     assert len(answers) == 150
-    assert (len(primary_server.requests), len(backup_server.requests)) == (3, 3)
-    assert run.fallback_used == 3
-    assert len(run.calls) == 6 and count_unknown_outcomes(run.calls) == 3
-    assert run.usage.by_model[DECISIONS_MODEL].requests == 3
+    assert (len(primary_server.requests), len(backup_server.requests)) == (5, 5)
+    assert run.fallback_used == 5
+    assert len(run.calls) == 10 and count_unknown_outcomes(run.calls) == 5
+    assert run.usage.by_model[DECISIONS_MODEL].requests == 5

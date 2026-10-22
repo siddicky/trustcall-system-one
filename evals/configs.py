@@ -106,6 +106,7 @@ REQUEST_LIGHT = (
     "match.accept_compatible",
     "match.compatible_margin",
     "match.confirm_accept",
+    "match.new_final",
     "match.delete_threshold",
     "coref.merge_threshold",
     "discovery.record_presence",

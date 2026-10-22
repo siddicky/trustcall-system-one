@@ -925,17 +925,20 @@ async def _confirmations(
     answers: Mapping[str, MatchAnswer],
     kind: str,
 ) -> dict[str, str]:
-    """Confirm, pairwise, the entities the choice question left new or undecided.
+    """Confirm, pairwise, the entities the choice question did not settle.
 
     Clef's record choice answers ``__new__`` at 0.83 for "Emma" against the record
     "Emma Thompson" while the record-presence check agrees with the record at 0.87,
-    and gives the README's Emma only 0.506. When the choice is ``__new__`` or not
-    sure, and EXACTLY ONE record is a strong name fit for the entity
-    (``_Matcher.sole_fit``), one Clef ``noul`` in its own request asks whether the
-    entity is the same kind of thing as that record. At ``match.confirm_accept`` the
-    entity is matched to the record; otherwise the outcome stays as it was. A record
-    already assigned to another entity, or wanted by a more likely one, is not
-    taken.
+    and gives the README's Emma only 0.506. An entity is settled when the choice
+    picks a record and is sure (``accept``, ``min_confidence``), or picks ``__new__``
+    at ``match.new_final`` (0.9) or more: by that probability alone, since the
+    choice's confidence is calibrated differently by every provider. Otherwise, when
+    EXACTLY ONE record is a strong name fit for the entity (``_Matcher.sole_fit``),
+    one Clef ``noul`` in its own request asks whether the entity is the same kind of
+    thing as that record. At ``match.confirm_accept``, and above the choice's own
+    probability of ``__new__``, the entity is matched to the record; otherwise the
+    outcome stays as it was. A record already assigned to another entity, or wanted
+    by a more likely one, is not taken.
 
     Returns:
         The record id by entity key, for the entities that were confirmed.
@@ -949,9 +952,14 @@ async def _confirmations(
         if sure and pick != NEW
     }
     wanted: list[tuple[EntityInfo, int]] = []
-    for info, sure in zip(infos, sure_ones, strict=True):
-        if sure:
-            continue  # a sure __new__ is as final as a sure record
+    for info, pick, sure in zip(infos, chosen, sure_ones, strict=True):
+        if pick == NEW:
+            # a __new__ is final from `new_final`, by its probability alone: the
+            # choice's confidence means something else on every provider
+            if answers[info.key].p(NEW) >= run.match.new_final:
+                continue
+        elif sure:
+            continue  # a sure record is final
         index = matcher.sole_fit(info)
         if index is not None and ids[index] not in taken:
             wanted.append((info, index))
@@ -989,10 +997,6 @@ async def _confirmations(
 # --------------------------------------------------------------------------- #
 
 
-DELETE_BATCH = 64
-"""Records one delete request asks about (Clef takes 64 questions per request)."""
-
-
 async def flag_deletes(
     run: Run,
     plan: SchemaPlan,
@@ -1003,7 +1007,8 @@ async def flag_deletes(
 ) -> dict[str, float | None]:
     """Ask, per existing record, whether the input says it should be deleted.
 
-    The records go into requests of up to 64, in order, one Clef ``noul`` each (call
+    The records go into requests of up to ``run.clef_batch()`` (64, or 32 on
+    Experiential Labs), in order, one Clef ``noul`` each (call
     kind ``delete``): the state is ``{input, records: {r0: <record>, r1: ...}}`` and
     the question ``delete.r<k>`` names ``records.r<k>`` (``k`` is the record's place
     in ``candidates``). A request that would be over the Clef state budget takes
@@ -1026,6 +1031,7 @@ async def flag_deletes(
         The probability by record id (``None`` for a missing answer).
     """
     budget = run.limits.clef_state_token_budget
+    delete_batch = run.clef_batch()
     placed = placement or Placement()
     parent_ctx = Ctx(
         run=run, plan=plan, text=text, label="", parent=placed.parent, nest=placed.nest
@@ -1047,7 +1053,7 @@ async def flag_deletes(
             compacted += 1
         if (
             not batches
-            or len(batches[-1]) >= DELETE_BATCH
+            or len(batches[-1]) >= delete_batch
             or (used + size > budget and batches[-1])
         ):
             batches.append({})

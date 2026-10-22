@@ -42,6 +42,7 @@ from trustcall_system_one._wire import body_model, normalize_model_id, parse_cle
 
 __all__ = [
     "DEFAULT_FALLBACK_ON",
+    "DEFAULT_MAX_QUESTIONS",
     "AdaptiveLimiter",
     "CallKind",
     "CallMeta",
@@ -55,8 +56,38 @@ __all__ = [
     "clef_fallback_from_env",
     "clef_fallback_on_from_env",
     "clef_provider_from_env",
+    "max_questions",
     "system_one_transport",
 ]
+
+DEFAULT_MAX_QUESTIONS = 64
+"""Questions one Clef request may carry when a transport does not say otherwise
+(Cloudflare takes 64; Experiential Labs 32)."""
+
+
+def max_questions(transport: object, model: str) -> int:
+    """How many questions one Clef request to ``model`` may carry on ``transport``.
+
+    A transport says it with a ``max_questions`` attribute (an int) or method
+    (``max_questions(model)``): Cloudflare 64, Experiential Labs 32, the Decisions
+    API 32 (not documented, so the safe number), a ``RoutingTransport`` that of the
+    transport serving the model and a ``FallbackTransport`` the smaller of the two
+    (the fallback answers the same request). A transport that says nothing (a fake,
+    a custom one) gets ``DEFAULT_MAX_QUESTIONS``.
+
+    Args:
+        transport: The transport the requests go to.
+        model: The Clef model (full id or bare name).
+
+    Returns:
+        A limit of at least 1.
+    """
+    said = getattr(transport, "max_questions", None)
+    if callable(said):
+        said = said(model)
+    if isinstance(said, int) and not isinstance(said, bool) and said >= 1:
+        return said
+    return DEFAULT_MAX_QUESTIONS
 
 
 @dataclass(frozen=True)
@@ -634,6 +665,8 @@ class CloudflareTransport(_HttpTransport):
     """
 
     provider = "cloudflare"
+    max_questions = 64
+    """Questions one Clef request may carry."""
 
     def classify_failure(self, exc: Exception) -> str | None:
         """Say whether a failure of ``run`` means that nothing was run.
@@ -1101,6 +1134,10 @@ class ExperientialTransport(_HttpTransport):
     this for text).
     """
 
+    max_questions = 32
+    """Questions one Clef request may carry: the API answers a 400 ("questions must
+    map 1 through 32 ids to typed questions") above 32."""
+
     def __init__(
         self,
         *,
@@ -1521,6 +1558,10 @@ class DecisionsTransport(ExperientialTransport):
     provider = "decisions"
     _api_name = "Experiential Labs Decisions API"
 
+    max_questions = 32
+    """Questions one request may carry. The Decisions API documents no limit, so the
+    Experiential one is used, the safe number."""
+
     def __init__(
         self,
         *,
@@ -1536,11 +1577,13 @@ class DecisionsTransport(ExperientialTransport):
             base_url: The endpoint that receives the POST.
             decisions_hard_cap: The most probability (and confidence) a hard pick is
                 given, in ``(0.5, 1]``. A hard pick is an answer without
-                probabilities or with only 0 and 1 (the shape the API sends), tagged
-                ``"hard"``. The default 0.8 passes the add (0.55) and replace (0.6)
-                gates and the 0.75 attribution keep, but sits below the 0.85
-                remove / set-null gate, so a bare yes cannot authorise a removal by
-                itself; 1.0 gives it full weight.
+                probabilities or with only (nearly: within 0.001) 0 and 1 (the shape
+                the API sends), tagged ``"hard"``. The default 0.8 passes the add
+                (0.55) and replace (0.6) gates and the 0.75 attribution keep, but
+                sits below the 0.85 remove / set-null gate, so a bare yes cannot
+                authorise a removal by itself (only while
+                ``gates.remove_threshold`` stays above the cap: a lower threshold
+                loses that protection); 1.0 gives it full weight.
             **kwargs: The other settings of ``ExperientialTransport`` (``api_key``,
                 ``client``, ``timeout``, ``max_retries``, ``call_deadline``,
                 ``min_attempt_budget``, ...).
@@ -1740,6 +1783,18 @@ class FallbackTransport:
         self._primary = primary
         self._fallback = fallback
 
+    def max_questions(self, model: str) -> int:
+        """Questions one request may carry: the smaller limit of the two transports.
+
+        The fallback receives the same request, so it has to take it too; a
+        fallback that does not serve the model is not counted.
+        """
+        limit = max_questions(self._primary, model)
+        serves = getattr(self._fallback, "serves", None)
+        if callable(serves) and not serves(model):
+            return limit
+        return min(limit, max_questions(self._fallback, model))
+
     def _falls_back_on(self, exc: Exception) -> bool:
         if isinstance(exc, _NEVER_FALL_BACK):
             return False
@@ -1892,6 +1947,10 @@ class RoutingTransport:
             return self._default
         route = self._routes.get(name) or self._routes.get(_family(name))
         return self._default if route is None else route
+
+    def max_questions(self, model: str) -> int:
+        """Questions one request may carry: the limit of the transport serving it."""
+        return max_questions(self.transport_for(model), model)
 
     async def run(
         self,

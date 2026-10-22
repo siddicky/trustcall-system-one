@@ -12,7 +12,8 @@ Two strategies, picked by ``CorefConfig.strategy``:
   single name stands near a longer one, or one side is a descriptive reference
   such as "my cousin"). A pair that is not asked is "not asked", never a "no": it
   stays out of the pair cache, and a count-driven merge can still check it. The
-  questions go out in requests of at most 64, each with a structured state
+  questions go out in requests of at most ``Run.clef_batch()`` (64; 32 on
+  Experiential Labs), each with a structured state
   ``{"input", "mentions": {"m0": {"text", "span", "context"}}}``
   that holds only the mentions its questions name; the requests run
   concurrently. The answers are clustered with average linkage, which settles
@@ -34,7 +35,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
-from trustcall_system_one._run import CLEF_BATCH, Run, gather
+from trustcall_system_one._run import Run, gather
 from trustcall_system_one._types import Mention
 from trustcall_system_one._wire import (
     ChoiceAnswer,
@@ -594,7 +595,8 @@ async def _pairwise(
             for qid, (i, j) in missing.items()
         }
         ids = list(missing)
-        chunks = [ids[k : k + CLEF_BATCH] for k in range(0, len(ids), CLEF_BATCH)]
+        batch = run.clef_batch()
+        chunks = [ids[k : k + batch] for k in range(0, len(ids), batch)]
 
         async def ask(chunk: list[str]) -> dict[str, object]:
             shown = {index: mentions[index] for qid in chunk for index in missing[qid]}

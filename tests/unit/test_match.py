@@ -831,18 +831,70 @@ async def test_a_short_form_the_choice_calls_new_is_confirmed_pairwise() -> None
     assert outcome.targets == {} and outcome.skipped[0].reason == "ambiguous_match"
 
 
-async def test_a_sure_new_is_never_overridden_by_the_pairwise_answer() -> None:
-    """bleed_update (live 7): Maria __new__ 0.836, confidence 0.5827 (sure). A gullible
-    pairwise 0.99 does not turn a new person into Maria Costa."""
-    fixed = Fixed(
-        {"Maria": {"Maria Costa": 0.15, NEW: 0.836}},
-        confidence=0.5827,
-        confirm={"Maria": 0.99},
+async def test_a_final_new_is_never_overridden_by_the_pairwise_answer() -> None:
+    """A `__new__` at 0.9 or more is final (different_emma 0.984, new_hire 0.929, a
+    sure 0.92): a gullible pairwise 0.99 does not turn a new person into the record."""
+    for p_new in (0.984, 0.929, 0.92, 0.9):
+        fixed = Fixed(
+            {"Maria": {"Maria Costa": round(1 - p_new, 3), NEW: p_new}},
+            confidence=p_new,  # Experiential reports the top probability itself
+            confirm={"Maria": 0.99},
+        )
+        outcome, _ = await run_fixed(
+            fixed, [named("e0", "Maria")], candidates("Maria Costa")
+        )
+        assert outcome.targets == {"e0": None} and fixed.confirmed == [], p_new
+
+
+async def test_a_new_below_the_final_probability_may_be_confirmed_on_any_provider() -> (
+    None
+):
+    """The sureness of `__new__` is its probability, not the choice's confidence:
+    Cloudflare gave short_form a confidence of 0.44, Experiential reports 0.8176 (the
+    top probability) for the same answer, and both are confirmed."""
+    cases = [
+        ("cloudflare", 0.831, 0.4377, 0.8472),  # live 7
+        ("experiential", 0.8176, 0.8176, 0.85),  # live 8
+        ("maria on experiential", 0.696, 0.696, 0.75),  # must beat 0.7 and 0.696
+    ]
+    for name, p_new, confidence, p_confirm in cases:
+        fixed = Fixed(
+            {"Emma": {"Emma Thompson": round(1 - p_new, 4), NEW: p_new}},
+            confidence=confidence,
+            confirm={"Emma": p_confirm},
+        )
+        outcome, _ = await run_fixed(
+            fixed, [named("e0", "Emma")], candidates("Emma Thompson")
+        )
+        assert outcome.targets == {"e0": "0"}, name
+    # it must beat max(confirm_accept, p(__new__)): 0.69 is under the floor
+    weak = Fixed(
+        {"Emma": {"Emma Thompson": 0.3, NEW: 0.696}},
+        confidence=0.696,
+        confirm={"Emma": 0.69},
     )
     outcome, _ = await run_fixed(
-        fixed, [named("e0", "Maria")], candidates("Maria Costa")
+        weak, [named("e0", "Emma")], candidates("Emma Thompson")
     )
-    assert outcome.targets == {"e0": None} and fixed.confirmed == []
+    assert outcome.targets == {"e0": None}  # the choice's own outcome stands
+
+
+async def test_the_final_probability_is_a_knob() -> None:
+    table = {"Emma": {"Emma Thompson": 0.08, NEW: 0.92}}
+    fixed = Fixed(table, confidence=0.92, confirm={"Emma": 0.95})
+    outcome, _ = await run_fixed(
+        fixed,
+        [named("e0", "Emma")],
+        candidates("Emma Thompson"),
+        MatchConfig(new_final=0.95),
+    )
+    assert outcome.targets == {"e0": "0"}  # 0.92 is no longer final
+    outcome, _ = await run_fixed(
+        Fixed(table, confidence=0.92, confirm={"Emma": 0.95}),
+        [named("e0", "Emma")],
+        candidates("Emma Thompson"),
+    )
+    assert outcome.targets == {"e0": None}  # at the default 0.9 it is
 
 
 async def test_two_first_names_are_confirmed_one_by_one_when_unsure() -> None:
@@ -1389,6 +1441,7 @@ def test_the_defaults() -> None:
     assert config.accept_compatible == 0.5
     assert config.compatible_margin == 0.1
     assert config.confirm_accept == 0.7
+    assert config.new_final == 0.9
     assert (config.collision, config.on_ambiguous, config.delete_threshold) == (
         "warn",
         "skip",
@@ -1408,6 +1461,8 @@ def test_the_defaults() -> None:
         {"compatible_margin": -0.1},
         {"compatible_margin": 1.5},
         {"confirm_accept": 1.5},
+        {"new_final": 0.0},
+        {"new_final": 1.5},
         {"delete_threshold": float("nan")},
         {"render_fields": -1},
         {"render_fields": True},

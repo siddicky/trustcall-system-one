@@ -1491,3 +1491,60 @@ async def test_the_title_fallback_is_used_cleaned_in_the_questions() -> None:
     assert payload["questions"]["qualify.e0"]["instructions"] == (
         "Is `entities.e0.label` a gadget?"
     )
+
+
+# --------------------------------------------------------------------------- #
+# M10f: the new hire is inserted, named by the mention (live 8)
+# --------------------------------------------------------------------------- #
+
+
+def _doubts_the_name(name_p: float) -> Any:
+    """A Clef that doubts the extracted name ("does the input state Emma's full
+    name?") the way Experiential did: null check 0.02, attribution 0.45."""
+    from trustcall_system_one.testing import clef_response, noul
+
+    def handler(model: str, payload: dict[str, Any], meta: Any) -> Any:
+        answers = {
+            qid: noul(name_p if qid in ("attr.name", "nullcheck.name") else 0.95)
+            for qid in payload["questions"]
+        }
+        return clef_response(answers, model=payload["model"])
+
+    return handler
+
+
+async def test_a_name_the_clef_doubts_is_still_the_mention_of_a_new_person() -> None:
+    from trustcall_system_one import Many, create_extractor
+    from trustcall_system_one.testing import route
+
+    text = "A new hire, Emma, joined the Oslo office today."
+    world = FakeWorld(text)
+    world.entity(
+        "Emma",
+        schema=Member,
+        mentions=["Emma"],
+        fields={"name": "Emma", "city": "Oslo"},
+    )
+    transport = FakeTransport(
+        route(default=world.handler, attribution=_doubts_the_name(0.45))
+    )
+    result = await create_extractor(
+        [Many(Member, identity="name")], transport=transport, enable_inserts=True
+    ).ainvoke(
+        text, existing=[("0", "Member", {"name": "Emma Thompson", "city": "Austin"})]
+    )
+    assert [m.kind for _, _, m in transport.calls].count("reask") >= 1  # the band
+    (record,) = result.records
+    assert record.kind == "insert" and record.valid
+    assert record.after is not None and record.after["name"] == "Emma"
+    assert record.after["city"] == "Oslo"
+    assert result.skipped == () and result.untouched == ("0",)
+
+
+def test_the_fallback_covers_the_checks_that_doubt_a_stated_name() -> None:
+    from trustcall_system_one._entity import _FALLBACK_REASONS
+
+    assert {"null_check", "attribution", "attribution_missing", "p_null"} <= (
+        _FALLBACK_REASONS
+    )
+    assert "validation" not in _FALLBACK_REASONS  # a real error is not papered over

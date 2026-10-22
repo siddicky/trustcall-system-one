@@ -70,7 +70,7 @@ from trustcall_system_one._render import (
     entity_focus,
     mention_windows,
 )
-from trustcall_system_one._run import CLEF_BATCH, Run, gather
+from trustcall_system_one._run import Run, gather
 from trustcall_system_one._types import (
     CallKind,
     EntityInfo,
@@ -1137,7 +1137,10 @@ def _provisional(index: int) -> str:
 async def _qualify(
     run: Run, scope: Scope, items: Sequence[tuple[int, _Group]]
 ) -> list[float | None]:
-    """Ask, in requests of at most 64 entities, whether each is really a ``<Schema>``.
+    """Ask whether each entity is really a ``<Schema>``, in capped requests.
+
+    A request holds at most ``run.clef_batch()`` entities (64, or 32 on Experiential
+    Labs).
 
     A request has the state ``{"input", "entities": {"e0": {"label", "mentions"},
     ...}}`` with the entities it asks about, and each is a question
@@ -1215,7 +1218,8 @@ async def _qualify(
             )
         return found
 
-    chunks = [items[k : k + CLEF_BATCH] for k in range(0, len(items), CLEF_BATCH)]
+    batch = run.clef_batch()
+    chunks = [items[k : k + batch] for k in range(0, len(items), batch)]
     parts = await gather(*(ask(chunk) for chunk in chunks))
     merged = {key: p for part in parts for key, p in part.items()}
     return [merged[_provisional(n)] for n, _ in items]

@@ -719,15 +719,24 @@ class MatchConfig:
             name that fits is the strongest evidence of a match. A fit that is
             only a prefix, a typo or an initial of a one-word mention ("Dan" for
             "Daniela Cruz") does not count.
+        new_final: Probability of ``__new__`` from which a choice of "none of the
+            records" is final. Below it, an entity the choice calls new may still be
+            confirmed pairwise (``confirm_accept``) as one record. Clef's choice
+            ``confidence`` is calibrated differently by each provider (Cloudflare gave
+            0.44 for a ``__new__`` at 0.83, Experiential reports the top probability
+            itself), so whether a ``__new__`` is "sure" is decided by its probability
+            alone, not by that confidence.
         confirm_accept: Probability the pairwise confirmation (call kind
-            ``match_confirm``) needs to settle an AMBIGUOUS match: one where the
-            choice question was not sure (``accept`` and ``min_confidence``) and
+            ``match_confirm``) needs to settle a match the choice question did not
+            settle: one that picks a record without being sure (``accept`` and
+            ``min_confidence``), or picks ``__new__`` below ``new_final``, while
             exactly one existing record is a strong name fit for the entity. The
             question is "is this entity the same kind of thing as that record?"; its
             answer must also exceed the choice's own probability of ``__new__``.
-            It never overrides a sure choice, is never asked when two records fit
-            ("Emma" with Emma Thompson and Emma Watson) or when a full name of the
-            entity contradicts the record ("Emma Davis"). 0 switches it off.
+            It never overrides a sure record or a final ``__new__``, is never asked
+            when two records fit ("Emma" with Emma Thompson and Emma Watson) or when
+            a full name of the entity contradicts the record ("Emma Davis"). 0
+            switches it off.
         compatible_margin: By how much that record must beat the runner-up
             option (``__new__`` included) for ``accept_compatible`` to apply; 0.51
             against 0.49 is a coin flip, not a decision.
@@ -750,6 +759,7 @@ class MatchConfig:
     accept_compatible: float = 0.5
     compatible_margin: float = 0.1
     confirm_accept: float = 0.7
+    new_final: float = 0.9
     render_fields: int = 4
     collision: Literal["warn", "merge"] = "warn"
     on_ambiguous: Literal["skip", "insert", "raise"] = "skip"
@@ -762,6 +772,7 @@ class MatchConfig:
         _check_unit("accept_compatible", self.accept_compatible)
         _check_unit("compatible_margin", self.compatible_margin, allow_zero=True)
         _check_unit("confirm_accept", self.confirm_accept, allow_zero=True)
+        _check_unit("new_final", self.new_final)
         _check_unit("delete_threshold", self.delete_threshold)
         _check_int("render_fields", self.render_fields, 0)
         if self.collision not in ("warn", "merge"):

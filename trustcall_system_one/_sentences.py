@@ -427,9 +427,10 @@ async def read_sentences(ctx: "Ctx", spec: "FieldSpec") -> "Resolved":
     """Read a ``list[str]`` field one sentence at a time.
 
     Splits the input, keeps the sentences that concern the entity, asks Clef one
-    ``noul`` question per candidate (call kind ``sentences``; more than 64 are
-    split over several requests by the run) and keeps the sentences at or above
-    ``verify.sentence_keep`` (and the field's ``min_confidence``, per element).
+    ``noul`` question per candidate (call kind ``sentences``; more than a request
+    takes (64, or 32 on Experiential Labs) are split over several requests by the run)
+    and keeps the sentences at or above ``verify.sentence_keep`` (and the field's
+    ``min_confidence``, per element).
     The tokens of the questions count against the Clef state budget: the input is
     narrowed to windows around the candidates by as much as they need.
 
@@ -490,7 +491,7 @@ async def read_sentences(ctx: "Ctx", spec: "FieldSpec") -> "Resolved":
         return ctx.fitted(spans=[span_of[q] for q in chunk], budget=room)
 
     per_question = max(cost([q]) for q in ids)
-    size = max(1, min(64, int(budget / 2 / per_question)))
+    size = max(1, min(ctx.run.clef_batch(), int(budget / 2 / per_question)))
     while True:
         chunks = [ids[i : i + size] for i in range(0, len(ids), size)]
         states = [state_for(c) for c in chunks]

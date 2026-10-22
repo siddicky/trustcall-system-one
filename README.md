@@ -677,6 +677,15 @@ may already have run, and been charged, so it raises `UncertainOutcomeError` ins
 only a failed connection and a 429 with `Retry-After` are retried. Experiential reports the price
 of each call: see `result.usage.reported_cost_usd` and `result.cost.reported_usd`.
 
+An Experiential request takes at most 32 questions (Cloudflare takes 64): the library splits larger
+sets by the limit of the transport that serves the model. **Cloudflare stays the default, and the
+thresholds were tuned on Cloudflare's Clef.** Clef on Experiential calibrates differently, so the
+same input can score differently and results differ between providers. In live run 8 the presence
+of a line item for "two more of the blue mugs" scored 0.21 and its qualify questions 0.07 and
+0.016, and the attribution of "5 of the tea towels" 0.53 (0.83 on Cloudflare). A choice's
+`confidence` is the top probability itself there, so a `__new__` is judged by its probability
+(`match.new_final`) and not by that confidence. The thresholds have not been retuned for it.
+
 As a fallback for Clef you can also opt in to Experiential's Decisions API
 (`TRUSTCALL_S1_CLEF_FALLBACK=decisions`, or `system_one_transport(clef_fallback="decisions")`).
 **The Decisions API is served by OpenAI through Experiential Labs, so opting in sends your text

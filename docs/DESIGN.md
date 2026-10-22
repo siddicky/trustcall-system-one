@@ -538,11 +538,15 @@ schema title: "Person").
      (`match.confirm_accept`, default 0.7, 0 off; call kind `match_confirm`).** Clef's record choice
      answered `__new__` at 0.83 for "Emma" against the record "Emma Thompson" and 0.84 for "Maria" against
      "Maria Costa" while the record-presence check agreed with the records at 0.87, and gave the README's Emma
-     0.506 (a coin flip for the margin). The confirmation settles only an AMBIGUOUS outcome: the choice
-     was not sure (below `accept` or `min_confidence`; "Emma" 0.83 with confidence 0.44 was, "Maria" 0.84
-     with confidence 0.58 was sure and stays new), and its answer must also exceed the choice's p(`__new__`).
-     A sure `__new__` is as final as a sure record ("A new hire, Emma, joined the Oslo office" is never
-     written onto Emma Thompson by a gullible pairwise 0.75). And EXACTLY ONE existing
+     0.506 (a coin flip for the margin). The confirmation settles only an UNSETTLED outcome. A record picked with `p >= accept` and
+     `confidence >= min_confidence` is final; a `__new__` is final at `p >= match.new_final` (default 0.9) BY
+     ITS PROBABILITY ALONE, since the choice's `confidence` is calibrated differently by every provider
+     (Cloudflare: 0.44 for "Emma" `__new__` 0.831; Experiential: the top probability itself, 0.8176). Below
+     0.9 the pairwise answer may settle it, and it must beat `max(confirm_accept, p(__new__))`. Live numbers:
+     `different_emma` (0.984) and `new_hire_same_first_name` (0.929, a sure 0.92) stay new whatever a
+     gullible pairwise says; `short_form` (0.8176 or 0.831), the README Emma (0.468) and "Maria" (0.84 or
+     0.696) may be confirmed ("A new hire, Emma, joined the Oslo office" is never written onto Emma
+     Thompson by a gullible pairwise 0.75). And EXACTLY ONE existing
      record fits the entity's mentions at all (`identity_compatible`) and strongly (`strong_compatible`),
      one Clef `noul` in a request of its own asks "In `input`, is `entity.label` the same {kind} as the
      existing record `record` ({identity})?" over the input windows around the mentions, the entity and the
@@ -905,7 +909,10 @@ cannot tell a right derived number from a wrong one).
 
 **A new entity's name falls back to its mention.** When extraction gives the NAME field of a new entity
 of a collection nothing usable (null, or a low confidence on the very words discovery quoted: "blue mugs"
-at 0.33 on the first pass and the repair), the field takes a proper-noun mention (label and span), with
+at 0.33 on the first pass and the repair, or refused by the null check or the attribution check: live 8,
+"A new hire, Emma, joined the Oslo office" had "Emma" extracted at 0.997 and then dropped because Clef
+doubted that the input states Emma's "full name" (null check 0.02, attribution 0.45), which left the
+new person invalid and dropped), the field takes a proper-noun mention (label and span), with
 the warning `identity_from_mention: <the reason>` on the field and in `result.warnings`; never for an
 update. Only a name-like identity field qualifies (named `name`, `full_name`, `title`, `label` or
 `display_name`, or marked `s1_field(identity=True)` with a description about a name, title or label), so a
@@ -1231,6 +1238,25 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
   `docs/schemas/experiential-clef-response.example.json`, which the tests use. An error is
   `{"error": {"message", "type", "param", "code"}}` (OpenAI style; a 401 is `invalid_key`), shown
   in the exception message. The envelope unwrapping stays as a defensive fallback.
+- **Question limit per transport (`transport.max_questions`).** Experiential rejects more than 32
+  questions per request (`HTTP 400: questions must map 1 through 32 ids to typed questions`, live 8: the
+  36 pairs of a 9-mention pairwise coref failed the README scenario); Cloudflare takes 64. A transport
+  says its limit with an attribute or a method `max_questions(model)` (Cloudflare 64, Experiential 32,
+  the Decisions API 32 because it documents none, a `RoutingTransport` that of the transport serving the
+  model, a `FallbackTransport` the smaller of primary and fallback when the fallback serves the model, a
+  transport that says nothing 64: `transport.max_questions(transport, model)`). `Run.clef_batch(model)`
+  is that number, and `Run.call_clef`, coreference (36 pairs go as 32 + 4), qualification, the sentence
+  requests and the delete questions group their questions by it instead of 64. The published
+  `clef-input.json` schema says 1 to 64 and stays the validator of what is sent.
+- **Provider calibration.** Every threshold (attribution 0.75/0.4, gates, presence 0.2/0.5, qualify
+  0.4, match accept 0.6, confirm 0.7) was tuned on Cloudflare's Clef, which stays the default. Clef on
+  Experiential Labs calibrates differently (live 8): the presence of a line item for "two more of the
+  blue mugs" scored 0.21 and its qualify questions 0.07 and 0.016 (so the line was never found), the
+  attribution of "5 of the tea towels" 0.53 where Cloudflare gave 0.83, and a choice's `confidence`
+  equals its top probability (Cloudflare gave 0.44 for a `__new__` at 0.83). Results therefore differ
+  between providers, and a threshold that is right for one can be wrong for the other. Nothing is
+  retuned for Experiential yet; where a rule depended on a provider-specific number (the sureness of
+  `__new__`) it now depends on a probability (`match.new_final`).
 - **Retry policy of `ExperientialTransport` (deliberately unlike Cloudflare's).** A request that
   may have reached the server is never retried: a timeout can leave a call that was run and
   charged with the result lost. Timeouts (read, write), read/write/protocol errors, a connection
@@ -1299,13 +1325,16 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
     `ModelResponseError`), and `choice` must be the most probable option (a tie is fine), else
     `ModelResponseError`; the confidence reported cannot exceed the most probable option's
     probability (after normalising). **An answer without probabilities, or whose probabilities
-    are all 0 and 1 (the shape the live API sends), is a hard pick**: it carries `"hard": true`
+    are all within 0.001 of 0 and 1 (the shape the live API sends; {yes: 0.9999, no: 0.0001} counts), is a
+    hard pick**: it carries `"hard": true`
     and its probability and confidence are capped at `decisions_hard_cap` (default **0.8**,
     range (0.5, 1]; 1.0 gives it full weight), the rest sharing what is left. 0.8 sits below
     `gates.remove_threshold` (0.85) and above the add (0.55) and replace (0.6) gates and the
     attribution keep (0.75): **a bare GPT yes can never authorise a removal or a set-null by
     itself, but it still passes an add or a replace**, and a bare no is 0.2 (below the 0.4
-    attribution drop). The warning counts hard answers. Graded probabilities (0.1/0.9, say) are
+    attribution drop). The cap protects removals only while `gates.remove_threshold` stays above it: a user
+    who lowers `remove_threshold` below `decisions_hard_cap` (0.8) loses that protection. The warning counts
+    hard picks. Graded probabilities (0.1/0.9, say) are
     the API's own numbers and are left alone; thresholds written for graded Clef answers (a
     re-ask band between 0.4 and 0.75) behave like yes/no on a fallback that mostly sends picks.
   - `images` are refused (`BadRequestError`) before sending, and `serves(model, payload)` is
@@ -1374,7 +1403,7 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
   `attribution_by:decisions` in its `warnings`. The change gates and the isolated re-asks are not
   marked per decision; the call log (`CallRecord.provider`, `fallback_from`) and the warning cover
   them. The warning `clef_fallback_used: N Clef request(s) were answered by the fallback (...)
-  because <primary> could not answer them; H answer(s) came without probabilities; used for:
+  because <primary> could not answer them; H hard pick(s) (no or saturated probabilities); used for:
   <kind>:<Schema>.<field>, ...` lists up to 8 uses (also uses of a memoised answer), counts hard
   answers and never names an entity.
 - Setup: `system_one_transport(clef=..., clef_fallback="decisions"|"none"|None,
