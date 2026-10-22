@@ -248,3 +248,71 @@ async def test_a_fallback_pair_chunks_by_the_smaller_limit() -> None:
     backup = DecisionsTransport(api_key=KEY)
     run = Run(transport=FallbackTransport(primary, backup))
     assert run.clef_batch() == 32
+
+
+# --------------------------------------------------------------------------- #
+# The recording and cassette wrappers forward the limit
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_recording_transport_around_experiential_chunks_by_32(
+    tmp_path: Any,
+) -> None:
+    from trustcall_system_one.testing import (
+        CassetteTransport,
+        RecordingTransport,
+    )
+
+    inner, server = experiential()
+    path = tmp_path / "cassette.jsonl"
+    recorder = RecordingTransport(inner, path)
+    assert max_questions(recorder, CLEF) == 32
+    run = Run(transport=recorder)
+    source, mentions = nine_mentions()
+    await cluster_mentions(
+        run, source=source, mentions=mentions, noun="Person", schema="Person"
+    )
+    assert sorted(server.sizes) == [4, 32]  # not one request of 36: a 400 live
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert {row["max_questions"] for row in rows} == {32}  # recorded with the lines
+
+    # the cassette replays with the limit it was recorded with, no inner needed
+    cassette = CassetteTransport(path)
+    assert max_questions(cassette, CLEF) == 32
+    replay = Run(transport=cassette)
+    await cluster_mentions(
+        replay, source=source, mentions=mentions, noun="Person", schema="Person"
+    )
+    assert cassette.misses == [] and cassette.hits == 2
+    assert max_questions(cassette.fork(), CLEF) == 32
+
+
+def test_a_cassette_without_a_recorded_limit_asks_its_inner_transport_else_64(
+    tmp_path: Any,
+) -> None:
+    from trustcall_system_one.testing import CassetteTransport
+
+    path = tmp_path / "old.jsonl"
+    path.write_text(
+        json.dumps({"key": "k", "model": CLEF, "request": {}, "response": {}}) + "\n"
+    )
+    assert max_questions(CassetteTransport(path), CLEF) == DEFAULT_MAX_QUESTIONS
+    inner = ExperientialTransport(api_key=KEY)
+    live = CassetteTransport(path, strict=False, inner=inner)
+    assert max_questions(live, CLEF) == 32
+    # a recorded 64 does not widen an inner that takes 32
+    wide = tmp_path / "wide.jsonl"
+    wide.write_text(
+        json.dumps(
+            {
+                "key": "k",
+                "model": CLEF,
+                "request": {},
+                "response": {},
+                "max_questions": 64,
+            }
+        )
+        + "\n"
+    )
+    assert max_questions(CassetteTransport(wide), CLEF) == 64
+    assert max_questions(CassetteTransport(wide, strict=False, inner=inner), CLEF) == 32

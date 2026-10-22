@@ -1548,3 +1548,56 @@ def test_the_fallback_covers_the_checks_that_doubt_a_stated_name() -> None:
         _FALLBACK_REASONS
     )
     assert "validation" not in _FALLBACK_REASONS  # a real error is not papered over
+
+
+# --------------------------------------------------------------------------- #
+# M10f follow-up: the new_final band is a known risk, pinned here
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_gullible_pairwise_in_the_new_final_band_matches_the_wrong_record() -> (
+    None
+):
+    """KNOWN RISK, pinned on purpose: `__new__` at 0.85 (below `new_final` 0.9) and a
+    gullible pairwise 0.9 write a NEW "Emma" onto Emma Thompson. The correct live
+    matches (short_form 0.83 then 0.87, Maria 0.84 then 0.87) have the same shape, so
+    no margin tells them apart. See docs/DESIGN.md (known limits)."""
+    odds = {"Emma Thompson": 0.15, "__new__": 0.85}
+    text = "A new hire, Emma, joined the Oslo office today."
+    fields = {"name": "Emma", "city": "Oslo"}
+    result, asked = await _confirm_case(
+        text, ["Emma"], fields, odds=odds, confidence=0.9, confirm=0.9
+    )
+    (record,) = result.records
+    assert asked == 1 and record.kind == "update" and record.json_doc_id == "0"
+
+
+async def test_the_new_final_band_can_be_opted_out_of() -> None:
+    from trustcall_system_one import Many, MatchConfig, create_extractor
+
+    odds = {"Emma Thompson": 0.15, "__new__": 0.85}
+    text = "A new hire, Emma, joined the Oslo office today."
+    for match in (MatchConfig(new_final=0.7), MatchConfig(confirm_accept=0)):
+        world = FakeWorld(text)
+        world.entity(
+            "Emma",
+            schema=Member,
+            mentions=["Emma"],
+            fields={"name": "Emma", "city": "Oslo"},
+            match_odds=odds,
+            match_confidence=0.9,
+            confirm=0.9,
+        )
+        transport = world.transport()
+        result = await create_extractor(
+            [Many(Member, identity="name")],
+            transport=transport,
+            enable_inserts=True,
+            match=match,
+        ).ainvoke(
+            text,
+            existing=[("0", "Member", {"name": "Emma Thompson", "city": "Austin"})],
+        )
+        (record,) = result.records
+        assert record.kind == "insert", match  # a new person, Emma Thompson untouched
+        assert "match_confirm" not in [m.kind for _, _, m in transport.calls]

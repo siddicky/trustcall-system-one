@@ -2386,12 +2386,7 @@ async def apply_collection(
             done = await _update_entity(
                 run, scope, info, record, enable_updates=enable_updates
             )
-            if (
-                info.key in matched.confirmed
-                and done.skipped is not None
-                and done.skipped.reason == "ambiguous_match"
-                and done.skipped.detail.startswith("identity conflict")
-            ):
+            if info.key in matched.confirmed and done.identity_conflict:
                 # the pairwise check said yes and the extraction found another name:
                 # the entity is somebody new, not a dropped one
                 run.warn(

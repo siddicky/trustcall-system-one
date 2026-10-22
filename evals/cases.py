@@ -541,8 +541,10 @@ def new_hire_same_first_name() -> Case:
         "new_hire_same_first_name",
         "A new hire, Emma, joined the Oslo office today.",
         ["Emma"],
-        "A bare first name that the choice question calls new is not Emma "
-        "Thompson: the pairwise confirmation never overrides a sure __new__.",
+        "A bare first name that the choice question calls new at 0.9 or more "
+        "(match.new_final) is not Emma Thompson: a gullible pairwise answer does "
+        "not override it. Below 0.9 the pairwise check can still decide (a known "
+        "risk, see docs/DESIGN.md).",
     )
 
 

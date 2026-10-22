@@ -44,7 +44,13 @@ from trustcall_system_one._wire import (
     parse_clairic,
     parse_clef,
 )
-from trustcall_system_one.transport import CallMeta, Transport, TransportResponse
+from trustcall_system_one.transport import (
+    DEFAULT_MAX_QUESTIONS,
+    CallMeta,
+    Transport,
+    TransportResponse,
+    max_questions,
+)
 
 __all__ = [
     "CassetteMissError",
@@ -2262,10 +2268,13 @@ class RecordingTransport:
         }
 
     ``key`` is ``request_key(model, request)``. ``request`` is the payload that was
-    sent and ``response`` the bare response body. A call that fails is re-raised and,
-    with ``record_errors``, also written with ``response: null`` and an ``error``
-    object. Failures are not recorded by default: a transient 429 or a network
-    error replayed later would poison every run that uses the cassette.
+    sent and ``response`` the bare response body. A Clef line also carries
+    ``max_questions``, the question limit of the wrapped transport, so that a replay
+    chunks its questions the same way (``CassetteTransport.max_questions``). A call
+    that fails is re-raised and, with ``record_errors``, also written with
+    ``response: null`` and an ``error`` object. Failures are not recorded by default:
+    a transient 429 or a network error replayed later would poison every run that
+    uses the cassette.
 
     Only payloads and bodies are written: never headers, tokens or account ids
     (the wrapped transport owns those). As a second line of defence a call whose
@@ -2309,6 +2318,14 @@ class RecordingTransport:
         if not append:
             with open(self.path, "w", encoding="utf-8"):
                 pass
+
+    def max_questions(self, model: str) -> int:
+        """Questions one Clef request may carry: the wrapped transport's limit.
+
+        Recording against Experiential (32) must chunk by 32, not by the default
+        64 that a transport without a limit gets.
+        """
+        return max_questions(self._inner, model)
 
     def _write(self, line: Mapping[str, Any]) -> None:
         sensitive = getattr(self._inner, "sensitive_values", None)
@@ -2369,6 +2386,8 @@ class RecordingTransport:
             "field": meta.field,
             "request": request,
         }
+        if "questions" in request:  # a Clef request: the limit it was chunked by
+            head["max_questions"] = self.max_questions(model)
         started = time.perf_counter()
         try:
             result = await self._inner.run(model, payload, meta=meta, timeout=timeout)
@@ -2456,6 +2475,7 @@ class CassetteTransport:
         self._entries: dict[str, list[dict[str, Any]]] = {}
         self._cursor: dict[str, int] = {}
         self._lock = threading.Lock()
+        self._recorded_limit: int | None = None
         self.hits = 0
         self.forwarded = 0
         self.misses: list[tuple[str, dict[str, Any], CallMeta]] = []
@@ -2480,6 +2500,27 @@ class CassetteTransport:
                 except (ValueError, KeyError, TypeError) as exc:
                     raise ValueError(f"{path}:{number}: not a recorded call") from exc
                 self._entries.setdefault(key, []).append(entry)
+                limit = entry.get("max_questions")
+                if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
+                    smaller = (
+                        self._recorded_limit is None or limit < self._recorded_limit
+                    )
+                    self._recorded_limit = limit if smaller else self._recorded_limit
+
+    def max_questions(self, model: str) -> int:
+        """Questions one Clef request may carry when it is replayed.
+
+        The limit the cassette was recorded with (the smallest, if several), so the
+        questions are chunked as they were and the request keys match; and, when a
+        miss can go to an ``inner`` transport, no more than that one takes. Without
+        either, the default (64).
+        """
+        limits = []
+        if self._recorded_limit is not None:
+            limits.append(self._recorded_limit)
+        if self._inner is not None:
+            limits.append(max_questions(self._inner, model))
+        return min(limits) if limits else DEFAULT_MAX_QUESTIONS
 
     def fork(
         self, *, strict: bool | None = None, inner: Transport | None = None
@@ -2497,6 +2538,7 @@ class CassetteTransport:
         other.strict = self.strict if strict is None else strict
         other._inner = self._inner if inner is None else inner
         other._entries = self._entries
+        other._recorded_limit = self._recorded_limit
         other._cursor = {}
         other._lock = threading.Lock()
         other.hits = other.forwarded = 0

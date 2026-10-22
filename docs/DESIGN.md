@@ -755,6 +755,12 @@ re-extracted by the parent's repair loop (each item has its own).
     quotes the clause, but it can still be dropped. `computed_total` (0.7308) and a city (0.7124) sit
     just under keep 0.75; the threshold is not lowered for them (a bleed was kept at 0.7139). A single
     capitalised name that only starts a sentence ("Alice called.") is not made up from the mention.
+    **The `new_final` band is a known risk.** With p(`__new__`) between 0.7 and 0.9 and a pairwise
+    answer above it, a gullible pairwise answer (0.9 for a new "Emma" next to "Emma Thompson") still
+    writes the new person's facts onto the wrong record: that is the shape of the correct live matches
+    too (short_form 0.83 then 0.87, Maria 0.84 then 0.87), so no margin separates them; a test pins it
+    (`__new__` 0.85, pairwise 0.9: matched). Opt out with `match.new_final=0.7` (from 0.7 a `__new__` is
+    final) or `match.confirm_accept=0` (confirmation off; 1.0 never confirms).
 
 ## Verification ladder (`_verify.py`) and update path (`_diff.py`, `_gates.py`)
 

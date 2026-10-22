@@ -725,7 +725,14 @@ class MatchConfig:
             ``confidence`` is calibrated differently by each provider (Cloudflare gave
             0.44 for a ``__new__`` at 0.83, Experiential reports the top probability
             itself), so whether a ``__new__`` is "sure" is decided by its probability
-            alone, not by that confidence.
+            alone, not by that confidence. **Known risk:** with ``__new__`` between
+            0.7 and 0.9 and a pairwise answer above it, a pairwise answer that is
+            wrong (a Clef that says yes to a new "Emma" next to the record "Emma
+            Thompson") writes the new person's facts onto the record. The live
+            matches that need the band (short_form 0.83 then 0.87, Maria 0.84 then
+            0.87) have the same shape, so no margin separates them. To opt out, set
+            ``new_final=0.7`` (a ``__new__`` from 0.7 is final) or switch the
+            confirmation off with ``confirm_accept=0`` (``1.0`` also never confirms).
         confirm_accept: Probability the pairwise confirmation (call kind
             ``match_confirm``) needs to settle a match the choice question did not
             settle: one that picks a record without being sure (``accept`` and

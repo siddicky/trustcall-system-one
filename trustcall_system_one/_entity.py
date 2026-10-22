@@ -2152,6 +2152,9 @@ class UpdateOutcome:
             cross-check, null check). A short form of the record's name, a repeat
             of what it holds and a field the input is silent about are not
             changes. Empty means the input proposes nothing for the record.
+        identity_conflict: Whether the match was refused because what the input
+            calls the entity contradicts the record (the reason code of ``skipped``;
+            the engine's fallback to a new record reads it, not the detail text).
     """
 
     record: ResultRecord | None
@@ -2161,6 +2164,7 @@ class UpdateOutcome:
     attempts: int = 0
     nested_skipped: tuple[SkippedEntity, ...] = ()
     proposed: tuple[str, ...] = ()
+    identity_conflict: bool = False
 
 
 def _json_default(model: type[BaseModel], spec: FieldSpec) -> Any:
@@ -3505,4 +3509,5 @@ async def update_one(
         max(1 + rounds, nested.attempts),
         tuple(nested.skipped),
         tuple(proposed),
+        bool(conflict),
     )
