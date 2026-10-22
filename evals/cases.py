@@ -646,6 +646,58 @@ def relative_edit() -> Case:
     )
 
 
+def relative_mixed() -> Case:
+    text = (
+        "Hi Sam, Ines about order SO-10442: two more of the steel kettle, and the "
+        "tea towels at 5."
+    )
+
+    def world() -> FakeWorld:
+        w = FakeWorld(text)
+        w.entity(
+            "the Order",
+            schema=Order,
+            mentions=["SO-10442"],
+            fields={"order_id": "SO-10442"},
+        )
+        for name, record, quantity in (
+            ("steel kettle", "Steel kettle", 2),  # the model reads "two"
+            ("tea towels", "Tea towels", 5),
+        ):
+            w.entity(
+                name,
+                schema=LineItem,
+                parent="Order",
+                mentions=[name],
+                fields={"name": name, "quantity": quantity},
+                matches={"name": record},
+            )
+        return w
+
+    return Case(
+        id="relative_mixed",
+        text=text,
+        schemas=lambda: [One(Order)],
+        existing=[("SO-10442", "Order", ORDER_EXISTING)],
+        options={"enable_inserts": True},
+        # the absolute value is written, the relative one is refused: one phrase of
+        # the input about one line never decides another line
+        expect_ops=[Op("replace", "/items/1/quantity", 5, who="SO-10442")],
+        expect_rejected=[
+            Rejected("relative_edit_unsupported", "/items/0/quantity", "SO-10442")
+        ],
+        must_not=[
+            MustNot.op("replace", "/items/0/quantity", who="SO-10442"),
+            MustNot.value_at("SO-10442", "/items/0/quantity", 2),
+            MustNot.op("add", "/items/-"),
+        ],
+        tags=("order", "update", "nested", "relative"),
+        world=world,
+        note="'Two more of the steel kettle' is relative (refused) while 'the tea "
+        "towels at 5' is a new value (applied): the question is about the change.",
+    )
+
+
 def delete_request() -> Case:
     text = "Please remove Bob Roe from my contacts."
     existing = [
@@ -745,6 +797,37 @@ def pet_not_person() -> Case:
         tags=("people", "negative"),
         world=world,
         note="A dog is found as a name and refused by qualification (not a Person).",
+    )
+
+
+def brand_not_person() -> Case:
+    text = (
+        "Ford announced a recall on Monday. Jaguar unveiled a new model, and I "
+        "bought an Apple laptop."
+    )
+
+    def world() -> FakeWorld:
+        w = FakeWorld(text)
+        for brand in ("Ford", "Jaguar", "Apple"):
+            w.non_entity(brand, schema=Member, mentions=[brand])
+        return w
+
+    return Case(
+        id="brand_not_person",
+        text=text,
+        schemas=lambda: [Many(Member, identity="name")],
+        options={"enable_inserts": True},
+        expect_ops=[],
+        must_not=[
+            MustNot.insert("Ford"),
+            MustNot.insert("Jaguar"),
+            MustNot.insert("Apple"),
+        ],
+        tags=("people", "negative", "qualify"),
+        world=world,
+        note="Names that are also people's names (Ford, Jaguar, Apple) used as "
+        "companies or products must not become people: measures how far the "
+        "qualify question (kind named, refuse at 0.4) was loosened.",
     )
 
 
@@ -1010,7 +1093,13 @@ def notes_near_duplicate() -> Case:
         existing=[("crm-1", "Contact", CONTACT_EXISTING)],
         expect_ops=[],
         expect_rejected=[Rejected("duplicate", "/notes/-", "crm-1")],
-        must_not=[MustNot.op("add", "/notes/-"), MustNot.op("remove")],
+        # live 6: "Dana Whitfield called today." is grounded (attribution 0.92) and
+        # new; the duplicate must still be rejected and nothing removed
+        allow_ops=[Op("add", "/notes/-", contains="called today", who="crm-1")],
+        must_not=[
+            MustNot.op("add", "/notes/-", contains="prefers email"),
+            MustNot.op("remove"),
+        ],
         tags=("contact", "update", "notes"),
         world=world,
         note="The record already says she prefers email over phone: a paraphrase is "
@@ -1042,6 +1131,10 @@ def note_beside_applied_change() -> Case:
             Op("replace", "/city", "Berlin", who="crm-1"),
             Op("add", "/notes/-", contains="lead the Ops team", who="crm-1"),
         ],
+        # live 6: "Dana Whitfield called." is a grounded extra note (0.97)
+        allow_ops=[
+            Op("add", "/notes/-", contains="Dana Whitfield called", who="crm-1")
+        ],
         must_not=[MustNot.op("replace", "/name"), MustNot.op("remove")],
         tags=("contact", "update", "notes"),
         world=world,
@@ -1065,10 +1158,12 @@ CASES: list[Case] = [
     order_line_items(),
     order_remove_item(),
     relative_edit(),
+    relative_mixed(),
     delete_request(),
     change_not_delete(),
     no_entity(),
     pet_not_person(),
+    brand_not_person(),
     only_phone(),
     silence_is_not_deletion(),
     bleed_update(),

@@ -50,6 +50,7 @@ __all__ = [
     "Clustering",
     "PairCache",
     "agglomerate",
+    "article",
     "canonical_label",
     "cluster_mentions",
     "has_context",
@@ -121,6 +122,30 @@ def plural(noun: str) -> str:
     if lower.endswith(("s", "x", "z", "ch", "sh")):
         return noun + "es"
     return noun + "s"
+
+
+_AN_LETTERS = frozenset("AEFHILMNORSX")
+_A_BEFORE_VOWEL = ("uni", "use", "usu", "uti", "eu", "one", "once", "ubiq")
+_AN_BEFORE_CONSONANT = ("hour", "honest", "honor", "honour", "heir")
+
+
+def article(noun: str) -> str:
+    """``a`` or ``an`` for a noun phrase, by how it is said: "a user", "an hour".
+
+    An acronym is said letter by letter ("an LLM", "a CEO").
+    """
+    found = re.match(r"[A-Za-z]+", noun.strip())
+    word = found.group(0) if found else ""
+    if not word:
+        return "a"
+    lower = word.lower()
+    if len(word) > 1 and word.isupper():
+        return "an" if word[0] in _AN_LETTERS else "a"
+    if lower.startswith(_AN_BEFORE_CONSONANT):
+        return "an"
+    if lower.startswith(_A_BEFORE_VOWEL):
+        return "a"
+    return "an" if lower[0] in "aeiou" else "a"
 
 
 def _capitalised(token: str) -> bool:

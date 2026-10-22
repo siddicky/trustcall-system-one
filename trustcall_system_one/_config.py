@@ -699,6 +699,12 @@ class MatchConfig:
             name that fits is the strongest evidence of a match. A fit that is
             only a prefix, a typo or an initial of a one-word mention ("Dan" for
             "Daniela Cruz") does not count.
+        confirm_accept: Probability the pairwise confirmation ("is the entity the same
+            kind of thing as this record?", call kind ``match_confirm``) needs to match
+            an entity to a record the choice question did not pick. Asked only when
+            the choice is ``__new__`` or ambiguous and EXACTLY ONE existing record is
+            a strong name fit for the entity (never for "Emma" with both Emma
+            Thompson and Emma Watson). 0 switches it off.
         compatible_margin: By how much that record must beat the runner-up
             option (``__new__`` included) for ``accept_compatible`` to apply; 0.51
             against 0.49 is a coin flip, not a decision.
@@ -720,6 +726,7 @@ class MatchConfig:
     min_confidence: float = 0.5
     accept_compatible: float = 0.5
     compatible_margin: float = 0.1
+    confirm_accept: float = 0.7
     render_fields: int = 4
     collision: Literal["warn", "merge"] = "warn"
     on_ambiguous: Literal["skip", "insert", "raise"] = "skip"
@@ -731,6 +738,7 @@ class MatchConfig:
         _check_unit("min_confidence", self.min_confidence)
         _check_unit("accept_compatible", self.accept_compatible)
         _check_unit("compatible_margin", self.compatible_margin, allow_zero=True)
+        _check_unit("confirm_accept", self.confirm_accept, allow_zero=True)
         _check_unit("delete_threshold", self.delete_threshold)
         _check_int("render_fields", self.render_fields, 0)
         if self.collision not in ("warn", "merge"):

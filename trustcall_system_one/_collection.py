@@ -38,6 +38,7 @@ from trustcall_system_one._compile import SchemaPlan
 from trustcall_system_one._coref import (
     Clustering,
     PairCache,
+    article,
     canonical_label,
     cluster_mentions,
     has_context,
@@ -212,8 +213,12 @@ class Scope:
         ``Many(kind=...)``, else its ``label``, else the leading noun phrase of the
         schema's description, else the schema title.
         """
-        many = self.cardinality
-        return many.kind or many.label or _derive_kind(self.plan)
+        return self.cardinality.kind or _derive_kind(self.plan) or self.plan.title
+
+    @property
+    def kind_fell_back(self) -> bool:
+        """Whether the kind is the schema title because nothing else gave one."""
+        return not self.cardinality.kind and _derive_kind(self.plan) is None
 
     @property
     def name(self) -> str:
@@ -756,43 +761,162 @@ _CONTEXT_WORDS = frozenset(
 
 
 _KIND_STOP = _CONTEXT_WORDS | frozenset(
-    ["named", "called", "mentioned", "known", "listed", "described", "found", "kept"]
+    [
+        "named",
+        "called",
+        "mentioned",
+        "known",
+        "listed",
+        "described",
+        "found",
+        "kept",
+        "about",
+        "describing",
+        "the",
+        "a",
+        "an",
+        "my",
+        "our",
+        "your",
+        "his",
+        "her",
+        "their",
+    ]
 )
-_KIND_HEADS = {"someone": "person", "somebody": "person", "anyone": "person"}
+_KIND_HEADS = {
+    "someone": "person",
+    "somebody": "person",
+    "anyone": "person",
+    "anybody": "person",
+}
+_META_NOUNS = frozenset(
+    [
+        "information",
+        "info",
+        "details",
+        "detail",
+        "data",
+        "record",
+        "records",
+        "schema",
+        "model",
+        "entry",
+        "entries",
+        "profile",
+        "instance",
+        "object",
+        "class",
+        "type",
+        "structure",
+        "representation",
+        "description",
+    ]
+)
+"""Nouns that say a schema is a description, not what it describes."""
+_OF_WORDS = frozenset(["of", "about", "for", "on", "describing"])
+_BOILERPLATE = re.compile(
+    r"^(?:this\s+(?:class|model|schema)\s+)?"
+    r"(?:represents?|describes?|models?|stores?|holds?|contains?|defines?|is|are)\s+",
+    re.IGNORECASE,
+)
+_ABBREVIATIONS = re.compile(
+    r"\b(?:[A-Za-z]\.){2,}|\b(?:etc|vs|inc|ltd|st|mr|mrs|dr)\.", re.I
+)
+_LEAD_EG = re.compile(r"^(?:e\.?g\.?|i\.?e\.?)\s+", re.IGNORECASE)
+_IRREGULAR = {"people": "person", "men": "man", "women": "woman", "children": "child"}
 
 
-def _article(noun: str) -> str:
-    """``a`` or ``an`` in front of a noun phrase."""
-    return "an" if noun[:1].lower() in "aeiou" else "a"
+def _singular(word: str) -> str:
+    lower = word.lower()
+    if lower in _IRREGULAR:
+        return _IRREGULAR[lower]
+    if lower.endswith("ies") and len(lower) > 4:
+        return word[:-3] + "y"
+    if lower.endswith("s") and not lower.endswith(("ss", "us", "is")) and len(word) > 3:
+        return word[:-1]
+    return word
 
 
-def _derive_kind(plan: SchemaPlan) -> str:
+def _derive_kind(plan: SchemaPlan) -> str | None:
     """The kind of thing a schema is, from the start of its description.
 
     "A person in an address book" is a "person", "A customer order" a "customer
     order", "One product line on an order" a "product line", "A colleague named in
     an announcement" a "colleague": the leading noun phrase, up to the first
-    preposition, relative word, participle or punctuation mark, at most four
-    words. A description with no such phrase ("Someone the speaker knows") falls
-    back to what its first word says ("someone" is a "person"), else the schema
-    title.
+    preposition, relative word, participle, parenthesis or punctuation mark, at most
+    four words. The description is cut at its first blank line (Google style
+    ``Attributes:`` follow it), a boilerplate lead ("This class represents ...",
+    "Schema for ...", "e.g.") is skipped, and a META noun (information, details,
+    data, record, schema, model, entry, profile) is not what the schema is: "Details
+    of a person" is a "person", "Customer record" a "customer", and "An entry in
+    the address book" says nothing, so it is ``None``. A possessive owner is dropped
+    ("The user's pet" is a "pet"), a plural made singular ("People the user knows"
+    is a "person"), and "someone" is a "person".
+
+    Returns:
+        The kind, or ``None`` when the description gives none (the caller falls back
+        to the schema title and warns).
     """
-    title = plan.title
-    text = _described(plan)
+    text = re.split(r"\n\s*\n|\(", plan.description.strip(), maxsplit=1)[0]
+    text = _ABBREVIATIONS.sub(lambda m: m.group(0).replace(".", ""), text)
+    text = " ".join(text.split()).rstrip(" .!?:;")
+    text = _LEAD_EG.sub("", text)
+    text = _BOILERPLATE.sub("", text)
+    sentence = re.split(r"\.\s", text, maxsplit=1)[0]
     words: list[str] = []
-    for raw in text.split(".")[0].split():
+    for raw in sentence.split():
         word = raw.strip(",;:()")
         if not word or (word.casefold() in _KIND_STOP and words):
             break
         words.append(word)
         if raw[-1] in ",;:":  # the phrase ends with its punctuation mark
             break
+    following = sentence.split()[len(words) :] if words else []
     while words and words[0].casefold() in ("a", "an", "the", "one"):
         words.pop(0)
+    if words and re.fullmatch(r"\w+['\u2019]s", words[0]) and len(words) > 1:
+        words.pop(0)  # "The user's pet": the owner is not part of the kind
     if words and words[0].casefold() in _KIND_HEADS:
         return _KIND_HEADS[words[0].casefold()]
+    meta = [w.casefold() in _META_NOUNS for w in words]
+    if words and all(meta):
+        # "Details of a person", "Schema for a customer": what it is OF
+        rest = [w.strip(",;:()") for w in following]
+        if rest and rest[0].casefold() in _OF_WORDS:
+            return _kind_of_phrase(rest[1:])
+        return None
+    while words and words[-1].casefold() in _META_NOUNS:
+        words.pop()  # "Customer record" is a customer
+        if not words:
+            return None
     if not words or len(words) > 4 or words[0].casefold() in ("something", "anything"):
-        return title
+        return None
+    if len(words) == 1 and words[0].lower().endswith("ed"):
+        return None  # "Extracted named entity": a participle is no kind of thing
+    words[-1] = _singular(words[-1])
+    first = words[0]
+    return " ".join([first.lower() if first.istitle() else first, *words[1:]])
+
+
+def _kind_of_phrase(rest: Sequence[str]) -> str | None:
+    """The noun phrase after "of": ``["a", "person"]`` is "person"."""
+    words: list[str] = []
+    for raw in rest:
+        word = raw.strip(",;:()")
+        if not word or (word.casefold() in _KIND_STOP and words):
+            break
+        words.append(word)
+        if raw[-1] in ",;:":
+            break
+    while words and words[0].casefold() in ("a", "an", "the", "one"):
+        words.pop(0)
+    if not words or len(words) > 4:
+        return None
+    if words[0].casefold() in _KIND_HEADS:
+        return _KIND_HEADS[words[0].casefold()]
+    if words[-1].casefold() in _META_NOUNS:
+        return None
+    words[-1] = _singular(words[-1])
     first = words[0]
     return " ".join([first.lower() if first.istitle() else first, *words[1:]])
 
@@ -821,7 +945,7 @@ async def _presence(run: Run, scope: Scope) -> tuple[float | None, bool]:
         type="noul",
         instructions=(
             f"Does `input` mention any {kind}"
-            + (" belonging to `parent.label`" if nested else "")
+            + (" of `parent.label`" if nested else "")
             + "?"
         ),
         criteria=NoulCriteria(
@@ -1012,14 +1136,14 @@ async def _qualify(
             f"qualify.{_provisional(n)}": NoulQuestion(
                 type="noul",
                 instructions=(
-                    f"Is `entities.{_provisional(n)}.label` {_article(kind)} {kind}"
+                    f"Is `entities.{_provisional(n)}.label` {article(kind)} {kind}"
                     + belonging
                     + "?"
                 ),
                 criteria=NoulCriteria(
-                    true=f"The entity is {_article(kind)} {kind}"
+                    true=f"The entity is {article(kind)} {kind}"
                     + (" belonging to the parent." if nested else "."),
-                    false=f"The entity is clearly something else, not {_article(kind)} "
+                    false=f"The entity is clearly something else, not {article(kind)} "
                     + f"{kind}"
                     + (" of the parent." if nested else "."),
                 ),
@@ -1067,6 +1191,34 @@ async def _group(
     for g in groups:
         g.qualify_p = known[g.signature]
     return groups, clustering
+
+
+def _distinct_names(groups: Sequence[_Group]) -> int:
+    """How many different names the mentions of some groups use.
+
+    Case and spacing do not make a name different, and neither does a short form:
+    "Sarah" is "Sarah Johnson" (``identity_compatible``), while "Sarah Johnson" and
+    "Sarah Miller" are two names.
+    """
+    names: list[str] = []
+    for group in groups:
+        for mention in group.mentions:
+            text = " ".join(mention.text.casefold().split())
+            if text and text not in names:
+                names.append(text)
+    parent = list(range(len(names)))
+
+    def root(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i, first in enumerate(names):
+        for j in range(i + 1, len(names)):
+            if identity_compatible(first, names[j]):
+                parent[root(j)] = root(i)
+    return len({root(i) for i in range(len(names))})
 
 
 def _qualified(groups: Sequence[_Group], minimum: float) -> list[_Group]:
@@ -1320,21 +1472,46 @@ def _name_words(text: str) -> list[str]:
     ]
 
 
-def _word_pattern(word: str) -> str:
+def _case_flat(source: str) -> bool:
+    """Whether the input carries no case information: all lower case or all upper."""
+    letters = [ch for ch in source if ch.isalpha()]
+    return bool(letters) and (
+        not any(ch.isupper() for ch in letters)
+        or not any(ch.islower() for ch in letters)
+    )
+
+
+def _word_pattern(word: str, *, flat: bool = False) -> str:
     """The pattern that finds ``word`` as a whole word: exactly if it is a name.
 
     "Bill" does not match "pay the bill": a capitalised word of an identity is a
     proper name and is looked for in its case. A lower-case word ("blue", in a
-    product line) is looked for in any.
+    product line) is looked for in any, and so is a word written in capitals
+    ("IBM") or any word when the input has no case to go by (``flat``: "talked to
+    emma today", "EMMA THOMPSON CALLED").
     """
-    flag = "" if word[:1].isupper() else "(?i:"
     pattern = rf"(?<!\w){re.escape(word)}(?!\w)"
-    return pattern if not flag else f"{flag}{pattern})"
+    if flat or not word[:1].isupper() or (len(word) > 1 and word.isupper()):
+        return f"(?i:{pattern})"
+    return pattern
 
 
 def _present(words: Sequence[str], source: str) -> bool:
     """Whether any of the words occurs in the input (a name in its own case)."""
-    return any(re.search(_word_pattern(w), source) for w in words)
+    flat = _case_flat(source)
+    return any(re.search(_word_pattern(w, flat=flat), source) for w in words)
+
+
+def _mentioned(value: str, source: str) -> bool:
+    """Whether the input names a record by this identity value.
+
+    A whole name of two words or more ("Emma Thompson") is distinctive in any case;
+    a single word is looked for by ``_present``'s rule.
+    """
+    words = _name_words(value)
+    if len(words) >= 2 and re.search(_word_pattern(value.strip(), flat=True), source):
+        return True
+    return _present(words, source)
 
 
 def _locate(source: str, values: Sequence[str]) -> Mention | None:
@@ -1343,19 +1520,22 @@ def _locate(source: str, values: Sequence[str]) -> Mention | None:
     The longest identity value that occurs in the input wins; failing that the
     first word (of three letters or more, not a stopword) of an identity value that
     occurs as a word of its own. A proper name is found in its own case: the record
-    "Bill Gates" is not named by "pay the bill". The mention is the words as the
-    input writes them, with their span.
+    "Bill Gates" is not named by "pay the bill" (but is by "talked to bill", an
+    input with no capitals at all). The mention is the words as the input writes
+    them, with their span.
     """
+    flat = _case_flat(source)
     for value in sorted(values, key=len, reverse=True):
         value = value.strip()
         if not value or not _name_words(value):
             continue
-        found = re.search(_word_pattern(value), source)
+        whole = flat or len(_name_words(value)) >= 2  # a full name is distinctive
+        found = re.search(_word_pattern(value, flat=whole), source)
         if found is not None:
             return Mention(found.group(0), found.span())
     for value in values:
         for word in _name_words(value):
-            found = re.search(_word_pattern(word), source)
+            found = re.search(_word_pattern(word, flat=flat), source)
             if found is not None:
                 return Mention(found.group(0), found.span())
     return None
@@ -1452,7 +1632,7 @@ async def _adopt_records(
             for v in values
         ):
             continue
-        if not any(_present(_name_words(v), scope.source) for v in values):
+        if not any(_mentioned(v, scope.source) for v in values):
             continue
         wanted[record.record_id] = values
         asked.append(
@@ -1545,6 +1725,12 @@ async def collect(
             "with Many(..., identity=...) or s1_field(identity=True)"
         )
     phrase = _identity_phrase(plan, names)
+    if scope.kind_fell_back:
+        warn(
+            f"kind_fallback: the description of {plan.name} names no kind of thing "
+            f"({_described(plan)!r}), so the presence and qualify questions say "
+            f"{scope.kind!r}; give it with Many(kind=...)"
+        )
 
     jobs: list[Any] = [_discover(run, scope, phrase), _count(run, scope)]
     if not skip_presence:
@@ -1560,40 +1746,69 @@ async def collect(
     def empty() -> CollectionOutcome:
         return CollectionOutcome((), (), tuple(warnings), presence, count)
 
+    async def rescue() -> list[_Group] | None:
+        """The items of a nested list that the existing items say are there.
+
+        A nested list's presence question is the weakest one (live: 0.1991 for "two
+        more of the blue mugs" next to an order), so before an update concludes there
+        are no items, the parent's existing items are asked about (record presence).
+        """
+        if scope.parent is None or not scope.existing:
+            return None
+        return await _adopt_records(run, scope, names, [], [], warn) or None
+
+    rescued: list[_Group] | None = None
     if presence is not None and presence < config.presence_absent:
         if not (cut and mentions):
-            return empty()
-        warn(
-            f"presence_unreliable: the input of {plan.name} did not fit one Clef "
-            f"request, so its presence answer ({presence:.2f}) came from the start "
-            f"of the input only; the {len(mentions)} mention(s) discovery found "
-            "were kept"
-        )
-    if presence is not None and presence < config.presence_present and not mentions:
-        return empty()
-    if not mentions and not count:
-        if presence is not None:
+            rescued = await rescue()
+            if rescued is None:
+                return empty()
+        else:
             warn(
-                "no_mentions_found: the input seems to mention "
-                f"{plural(scope.noun)} but discovery found no mention of one"
+                f"presence_unreliable: the input of {plan.name} did not fit one Clef "
+                f"request, so its presence answer ({presence:.2f}) came from the "
+                f"start of the input only; the {len(mentions)} mention(s) discovery "
+                "found were kept"
             )
-        return empty()
+    if (
+        rescued is None
+        and presence is not None
+        and presence < config.presence_present
+        and not mentions
+    ):
+        rescued = await rescue()
+        if rescued is None:
+            return empty()
+    if rescued is None and not mentions and not count:
+        rescued = await rescue()
+        if rescued is None:
+            if presence is not None:
+                warn(
+                    "no_mentions_found: the input seems to mention "
+                    f"{plural(scope.noun)} but discovery found no mention of one"
+                )
+            return empty()
 
     pair_cache: PairCache = {}
     known: dict[frozenset[Mention], float | None] = {}
-    groups, _ = await _group(run, scope, mentions, pair_cache, known)
-    live = _qualified(groups, config.qualify_min)
-    groups = await _adopt_records(run, scope, names, groups, live, warn)
-    live = _qualified(groups, config.qualify_min)
+    if rescued is not None:
+        groups = rescued
+        live = _qualified(groups, config.qualify_min)
+    else:
+        groups, _ = await _group(run, scope, mentions, pair_cache, known)
+        live = _qualified(groups, config.qualify_min)
+        groups = await _adopt_records(run, scope, names, groups, live, warn)
+        live = _qualified(groups, config.qualify_min)
 
-    if count is not None and count != len(live):
-        # a count above the entities that qualify is no miss when the DISTINCT
-        # mentions found cover it: the model counted two NAMES of one person
-        # (coreference joined them), or the entity was found and then refused as a
-        # non-<noun>. The same name twice is one name: "Sarah called. Sarah and my
-        # cousin went hiking" has two mentions of one text and a count of 2, so the
-        # cousin is still missing.
-        distinct = len({" ".join(m.text.casefold().split()) for m in mentions})
+    if rescued is None and count is not None and count != len(live):
+        # a count above the entities that qualify is no miss when the mentions of
+        # the QUALIFIED entities cover it with DISTINCT names: the model counted two
+        # NAMES of one person (coreference joined them: "Sarah Johnson", then
+        # "Sarah Miller"). The same name twice is one name, a short form is its full
+        # name ("Sarah" ~ "Sarah Johnson"), and a refused non-person (a dog) is no
+        # one: "Sarah Johnson called. Sarah and my cousin went hiking" has one name
+        # and a count of 2, so the cousin is still missing. When in doubt, broaden.
+        distinct = _distinct_names(live)
         explained = count > len(live) and distinct >= count
         act = (
             config.broaden_on_count_mismatch
@@ -1923,6 +2138,7 @@ async def apply_collection(
             keys,
             merge_check,
             scope.placement(),
+            scope.kind,
         )
 
     async def deleting() -> dict[str, float | None]:

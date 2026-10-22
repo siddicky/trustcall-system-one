@@ -169,9 +169,7 @@ async def test_discovery_for_a_parent_asks_about_the_items_of_that_parent() -> N
     )
     # presence, count and qualification name the parent too
     presence = [c for c in pet_calls if c[2].kind == "presence"]
-    assert all(
-        "belonging to `parent.label`" in str(c[1]["questions"]) for c in presence
-    )
+    assert all(" of `parent.label`" in str(c[1]["questions"]) for c in presence)
     assert {c[1]["state"]["parent"]["label"] for c in presence} == {
         "Emma Thompson",
         "Michael Chen",
@@ -1917,3 +1915,206 @@ def test_a_parent_can_be_given_as_the_world_entity() -> None:
     world.bleed_item(emma, rex)
     world.delete("0", parent=emma)
     assert rex.parent == "Emma Thompson"
+
+
+# --------------------------------------------------------------------------- #
+# M10d: a nested item's name is never its sibling's
+# --------------------------------------------------------------------------- #
+
+
+def bled_world() -> FakeWorld:
+    world = order_world(mugs=False)
+    world.entity(  # the model names the mugs "tea towels", the item next to them
+        "blue mugs",
+        schema=LineItem,
+        parent="Order",
+        mentions=["blue mugs"],
+        fields={"name": "tea towels", "quantity": 2},
+    )
+    return world
+
+
+async def test_a_sibling_name_is_refused_and_the_mention_names_the_item() -> None:
+    world = bled_world()
+    result = await update_order(world)
+    (record,) = result.records
+    assert record.valid and record.after is not None
+    added = [i for i in record.after["items"] if i["name"] == "blue mugs"]
+    assert added == [{"name": "blue mugs", "quantity": 2}]
+    assert [i["name"] for i in record.after["items"]].count("Tea towels") == 1
+    refused = [r for r in record.rejected if r.reason == "identity_bleed"]
+    assert len(refused) == 1 and "'tea towels'" in refused[0].detail
+    assert any("identity_bleed" in w for w in result.warnings)
+    assert any("identity_from_mention" in w for w in result.warnings)
+    assert result.skipped == ()
+
+
+async def test_a_name_of_the_items_own_is_never_refused_as_a_bleed() -> None:
+    world = order_world()  # "blue mugs" is named "blue mugs"
+    result = await update_order(world)
+    (record,) = result.records
+    assert not [r for r in record.rejected if r.reason == "identity_bleed"]
+    assert not any("identity_" in w for w in result.warnings)
+
+
+# --------------------------------------------------------------------------- #
+# M10d review: the relative-edit question is about THIS change
+# --------------------------------------------------------------------------- #
+
+MIXED = "Order SO-10442: Ines wants two more of the blue mugs and the tea towels at 5."
+ORDER_WITH_MUGS: Doc = {
+    **ORDER,
+    "items": [*ORDER["items"], {"name": "Blue mugs", "quantity": 3, "sku": "MUG-BLU"}],
+}
+
+
+def mixed_world(text: str = MIXED) -> FakeWorld:
+    world = FakeWorld(text)
+    world.entity(
+        "the Order",
+        schema=Order,
+        mentions=["SO-10442"],
+        fields={"order_id": "SO-10442"},
+    )
+    add_line(world, "blue mugs", "Blue mugs", quantity=2)  # the model reads "two"
+    add_line(world, "tea towels", "Tea towels", quantity=5)
+    return world
+
+
+async def test_a_relative_phrase_elsewhere_does_not_refuse_an_absolute_change() -> None:
+    world = mixed_world()
+    result = await update_order(world, ORDER_WITH_MUGS)
+    (record,) = result.records
+    assert ops(record) == [("replace", "/items/1/quantity", 5)]  # the towels, 4 to 5
+    refused = [r for r in record.rejected if r.reason == "relative_edit_unsupported"]
+    assert [r.path for r in refused] == ["/items/3/quantity"]  # the mugs, "two more"
+    # one question per ordered-quantity change, about that change
+    asked = [
+        c[1]["state"]["proposed_change"]
+        for c in world.transport().calls
+        if c[2].kind == "relative_edit"
+    ]
+    assert sorted((a["field"], a["from"], a["to"]) for a in asked) == [
+        ("quantity", 3, 2),
+        ("quantity", 4, 5),
+    ]
+    first = next(c for c in world.transport().calls if c[2].kind == "relative_edit")[1][
+        "questions"
+    ]["relative"]["instructions"]
+    assert "`proposed_change.to`" in first and "`proposed_change.field`" in first
+
+
+async def test_a_total_a_price_or_a_year_is_never_asked_about_relatively() -> None:
+    from pydantic import BaseModel, Field
+
+    class Invoice(BaseModel):
+        """An invoice."""
+
+        invoice_number: str
+        total: float = Field(description="invoice total")
+        unit_price: float | None = Field(None, description="price per unit")
+        year: int | None = None
+
+    text = "INV-7: the corrected total is 120, unit price 12, issued 2026."
+    world = FakeWorld(text)
+    world.entity(
+        "the Invoice",
+        schema=Invoice,
+        mentions=["INV-7"],
+        fields={
+            "invoice_number": "INV-7",
+            "total": 120.0,
+            "unit_price": 12.0,
+            "year": 2026,
+        },
+    )
+    extractor = create_extractor([One(Invoice)], transport=world.transport())
+    result = await extractor.ainvoke(
+        text,
+        existing=[
+            (
+                "inv-7",
+                "Invoice",
+                {
+                    "invoice_number": "INV-7",
+                    "total": 100.0,
+                    "unit_price": 10.0,
+                    "year": 2025,
+                },
+            )
+        ],
+    )
+    (record,) = result.records
+    assert len(record.patches) == 3
+    assert "relative_edit" not in [c[2].kind for c in world.transport().calls]
+
+
+@pytest.mark.parametrize(
+    ("text", "old", "new", "relative"),
+    [
+        ("two more of the blue mugs", 3, 2, True),
+        ("add 2 more", 3, 2, True),
+        ("two more of the blue mugs", 3, 5, True),  # computed: the difference
+        ("one fewer", 3, 1, True),
+        ("double the tea towels", 4, 8, True),
+        ("the tea towels at 5", 4, 5, False),
+        ("two more of the blue mugs and the tea towels at 5", 4, 5, False),
+        ("two more of the blue mugs and the tea towels at 5", 3, 2, True),
+        ("set the quantity to 2", 3, 2, False),
+        ("tea towels from 4 to 5, please", 4, 5, False),
+        ("nothing numeric here", 3, 2, False),
+        ("two more", 3, "x", False),
+    ],
+)
+def test_states_relative_change_depends_on_the_change(
+    text: str, old: Any, new: Any, relative: bool
+) -> None:
+    from trustcall_system_one.testing import states_relative_change
+
+    assert states_relative_change(text, old, new) is relative
+
+
+async def test_a_nested_presence_below_the_floor_asks_the_existing_items() -> None:
+    """relative_edit (live 6): "mention any product line of the order" scored 0.1991
+    and discovery found nothing, so the line was never looked at and the relative-edit
+    refusal never ran. The existing items are asked about (record presence) first."""
+    from trustcall_system_one.testing import clef_response, noul
+
+    text = "Please add two more blue mugs to SO-10442."
+    world = FakeWorld(text)
+    world.entity(
+        "the Order",
+        schema=Order,
+        mentions=["SO-10442"],
+        fields={"order_id": "SO-10442"},
+    )
+    add_line(world, "blue mugs", "Blue mugs", quantity=2)
+
+    def shy(model: str, payload: dict[str, Any], meta: Any) -> Any:
+        if meta.schema == "LineItem" and meta.kind == "presence":
+            return clef_response(
+                {q: noul(0.1991) for q in payload["questions"]}, model=payload["model"]
+            )
+        return world.handler(model, payload, meta)
+
+    def blind(model: str, payload: dict[str, Any], meta: Any) -> Any:
+        if meta.schema == "LineItem" and meta.kind == "discover":
+            from trustcall_system_one.testing import clairic_answer, clairic_response
+
+            empty = clairic_answer("list", [], spans=[], p_null=0.99, confidence=0.5)
+            return clairic_response(
+                {name: empty for name in payload["fields"]}, state_text=payload["state"]
+            )
+        return shy(model, payload, meta)
+
+    transport = FakeTransport(route(default=blind))
+    extractor = create_extractor([One(Order)], transport=transport, enable_inserts=True)
+    result = await extractor.ainvoke(
+        text, existing=[("SO-10442", "Order", ORDER_WITH_MUGS)]
+    )
+    (record,) = result.records
+    assert ops(record) == []
+    refused = [r for r in record.rejected if r.reason == "relative_edit_unsupported"]
+    assert [r.path for r in refused] == ["/items/3/quantity"]
+    asked = [c[2].field for c in transport.calls if c[2].kind == "record_presence"]
+    assert asked == ["3"]  # only the line the input names

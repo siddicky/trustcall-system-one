@@ -216,9 +216,8 @@ async def test_the_pipeline_runs_in_this_order() -> None:
     assert seen[0] == "presence"
     assert sorted(seen[1:3]) == ["crosscheck", "extract"]
     assert seen[3] == "attribution"
-    # the one number that changes is asked about first (a relative edit is refused
-    # before it is gated), then every operation gets a gate request
-    assert seen[4:] == ["relative_edit"] + ["gate"] * 4
+    # a changed age is not an ordered quantity: no relative-edit request for it
+    assert seen[4:] == ["gate"] * 4
 
 
 # --------------------------------------------------------------------------- #

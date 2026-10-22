@@ -77,10 +77,14 @@ _DAYS_MONTHS = _words(
     "january february march april may june july august september october november",
     "december",
 )
-# A modal or a pronoun after a day or month word starts a sentence ("5 p.m. May I
-# suggest ...", "9 a.m. April will be ...") instead of continuing the time.
+# A modal or a pronoun after a MONTH word starts a sentence ("5 p.m. May I suggest
+# ...", "9 a.m. April will be ...") instead of continuing the time; a weekday goes on.
 _MODALS = _words("will would can could shall should may might must")
-_SUBJECTS = _words("i we you he she it they there this that these those")
+_SUBJECTS = _words("i we you he she it they there")
+_MONTHS = _words(
+    "january february march april may june july august september october november",
+    "december",
+)
 _CLOSERS = "\"')]}\N{RIGHT DOUBLE QUOTATION MARK}\N{RIGHT SINGLE QUOTATION MARK}"
 _CLOSERS += "\N{RIGHT-POINTING DOUBLE ANGLE QUOTATION MARK}"
 _OPENERS = "\"'([{\N{LEFT DOUBLE QUOTATION MARK}\N{LEFT SINGLE QUOTATION MARK}"
@@ -161,6 +165,8 @@ def _is_abbreviation(line: str, dot: int, rest: str) -> bool:
             return False
         word = following.group(1).lower()
         after = (following.group(2) or "").lower()
+        if word not in _MONTHS:
+            return True  # a weekday goes on: "5 p.m. Friday this week"
         if word in _MODALS and after and not after[:1].isdigit():
             return False  # "May I suggest ...": the modal, not the month
         return after not in _MODALS and after not in _SUBJECTS

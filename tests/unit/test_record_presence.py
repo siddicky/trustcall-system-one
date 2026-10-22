@@ -10,6 +10,7 @@ person to a record that only shares a first name.
 
 from typing import Any, Optional
 
+import pytest
 from pydantic import BaseModel
 
 from trustcall_system_one import (
@@ -18,7 +19,7 @@ from trustcall_system_one import (
     Many,
     create_extractor,
 )
-from trustcall_system_one._collection import _derive_kind, _locate
+from trustcall_system_one._collection import _derive_kind, _locate, _present
 from trustcall_system_one._compile import compile_schema
 from trustcall_system_one._types import Mention
 from trustcall_system_one.testing import (
@@ -221,27 +222,130 @@ def test_a_proper_name_is_located_in_its_own_case() -> None:
     assert _locate("Add two Blue Mugs.", ["blue mugs"]) == Mention("Blue Mugs", (8, 17))
 
 
+def test_an_input_without_case_names_a_record_in_any_case() -> None:
+    # the original lower-case input of the test above, and an all-caps one
+    text = "Please tell emma thompson that emma is late."
+    assert _locate(text, ["Emma Thompson"]) == Mention("emma thompson", (12, 25))
+    assert _locate("talked to emma today", ["Emma Thompson"]) == Mention(
+        "emma", (10, 14)
+    )
+    assert _locate("EMMA THOMPSON CALLED", ["Emma Thompson"]) == Mention(
+        "EMMA THOMPSON", (0, 13)
+    )
+    assert _present(["Emma"], "talked to emma today")
+    assert _present(["Emma"], "EMMA CALLED")
+    # a mix of cases is information again: the bill is not Bill
+    assert not _present(["Bill"], "Tom, please pay the bill by Friday.")
+    # and a word written in capitals in the record is found in any case
+    assert _locate("Call ibm about it.", ["IBM"]) == Mention("ibm", (5, 8))
+
+
 def test_short_words_and_stopwords_locate_nothing() -> None:
     assert _locate("Ed and Jo came to the office.", ["Ed Jo"]) is None
     assert _locate("The Company met.", ["The Company"]) is None
     assert _locate("Dr Ng came.", ["Dr Ng"]) is None
 
 
-def test_the_kind_of_a_schema_is_the_leading_noun_phrase_of_its_description() -> None:
-    def kind(doc: str, name: str = "Thing") -> str:
-        model = type(name, (BaseModel,), {"__doc__": doc, "__annotations__": {}})
-        return _derive_kind(compile_schema(model))
+KINDS: list[tuple[str, str | None]] = [
+    ("A customer order.", "customer order"),
+    ("A person in an address book.", "person"),
+    ("Someone the speaker knows or is being introduced to.", "person"),
+    ("One product line on an order.", "product line"),
+    ("An invoice with its number and total.", "invoice"),
+    ("Invoice, paid or open.", "invoice"),
+    ("A colleague named in an announcement.", "colleague"),
+    ("CRM contact for sales.", "CRM contact"),
+    # meta nouns say a schema is a description, not what it describes
+    ("Details of a person", "person"),
+    ("Information about a person.", "person"),
+    ("Schema for a customer", "customer"),
+    ("Data model for an invoice", "invoice"),
+    ("A record of a customer", "customer"),
+    ("Contact information for a person", "contact"),
+    ("User profile", "user"),
+    ("Customer record", "customer"),
+    ("An entry in the address book", None),
+    # a possessive owner, a plural, a lead-in
+    ("Person's contact details", "contact"),
+    ("The user's pet", "pet"),
+    ("People the user knows", "person"),
+    ("Customers", "customer"),
+    ("This class represents a contact.", "contact"),
+    ("Represents a person", "person"),
+    ("Stores info on employees", "employee"),
+    ("e.g. a book", "book"),
+    # punctuation: blank line, parenthesis, abbreviation dots, a colon
+    ("A person\n\nAttributes:\n    name: the name", "person"),
+    ("A family member (parent, child, sibling)", "family member"),
+    ("An item (SKU) in the cart", "item"),
+    ("A U.S. state", "US state"),
+    ("A pet: dog, cat or other animal", "pet"),
+    # nothing usable: the title, with a warning
+    ("", None),
+    ("Something the user owns", None),
+    ("Extracted named entity", None),
+    ("Anyone mentioned", "person"),
+]
 
-    assert kind("A customer order.") == "customer order"
-    assert kind("A person in an address book.") == "person"
-    assert kind("Someone the speaker knows or is being introduced to.") == "person"
-    assert kind("One product line on an order.") == "product line"
-    assert kind("An invoice with its number and total.") == "invoice"
-    assert kind("Invoice, paid or open.") == "invoice"
-    assert kind("A colleague named in an announcement.") == "colleague"
-    assert kind("CRM contact for sales.") == "CRM contact"
-    assert kind("", "Member") == "Member"  # no description: the title
-    assert kind("Something we keep.") == "Thing"
+
+@pytest.mark.parametrize(("doc", "kind"), KINDS)
+def test_the_kind_of_a_schema_is_the_leading_noun_phrase_of_its_description(
+    doc: str, kind: str | None
+) -> None:
+    model = type("Thing", (BaseModel,), {"__doc__": doc, "__annotations__": {}})
+    assert _derive_kind(compile_schema(model)) == kind, doc
+
+
+@pytest.mark.parametrize(
+    ("noun", "expected"),
+    [
+        ("person", "a"),
+        ("invoice", "an"),
+        ("user", "a"),
+        ("hour", "an"),
+        ("LLM-generated summary", "an"),
+        ("CEO", "a"),
+        ("FAQ entry", "an"),
+        ("unit", "a"),
+        ("item", "an"),
+    ],
+)
+def test_the_article_agrees_with_how_the_noun_is_said(noun: str, expected: str) -> None:
+    from trustcall_system_one._coref import article
+
+    assert article(noun) == expected
+
+
+async def test_a_label_does_not_change_the_kind_and_a_fallback_warns() -> None:
+    from trustcall_system_one import Many, create_extractor
+
+    text = "Emma moved to Denver."
+    world = FakeWorld(text)
+    world.entity("Emma", schema=Member, mentions=["Emma"], fields={"name": "Emma"})
+    transport = FakeTransport(world.handler)
+    await create_extractor(
+        [Many(Member, identity="name", label="address book entry")],
+        transport=transport,
+        enable_inserts=True,
+    ).ainvoke(text)
+    ((_, payload, _),) = [c for c in transport.calls if c[2].kind == "qualify"]
+    assert payload["questions"]["qualify.e0"]["instructions"] == (
+        "Is `entities.e0.label` a person?"  # not "an address book entry"
+    )
+
+    class Gadget(BaseModel):
+        """Something we keep."""
+
+        name: str
+
+    world = FakeWorld("The Zorb is here.")
+    world.entity("Zorb", schema=Gadget, mentions=["Zorb"], fields={"name": "Zorb"})
+    result = await create_extractor(
+        [Many(Gadget, identity="name")],
+        transport=world.transport(),
+        enable_inserts=True,
+    ).ainvoke("The Zorb is here.")
+    assert any(w.startswith("kind_fallback") for w in result.warnings)
 
 
 async def test_the_qualify_question_has_no_context_sentence() -> None:
@@ -414,3 +518,23 @@ def test_fakeworld_calls_a_record_with_blank_values_absent() -> None:
 
     assert ask({"name": "Emma Thompson"}) > 0.9
     assert ask({"name": "", "city": "   "}) < 0.1  # nothing to compare is no fit
+
+
+async def test_a_lower_case_or_all_caps_input_still_asks_about_its_record() -> None:
+    for text, mention, city in (
+        ("talked to emma today, she moved to denver", "emma", "denver"),
+        ("EMMA THOMPSON CALLED AND MOVED TO DENVER", "EMMA THOMPSON", "DENVER"),
+    ):
+        world = FakeWorld(text)
+        world.entity(
+            mention,
+            schema=Member,
+            mentions=[mention],
+            fields={"name": mention, "city": city},
+            matches="Emma Thompson",
+        )
+        transport = FakeTransport(route(default=world.handler, discover=nothing_found))
+        result = await run(transport, text)
+        asked = [c[2].field for c in transport.calls if c[2].kind == "record_presence"]
+        assert asked == ["0"], text
+        assert [r.json_doc_id for r in result.records] == ["0"], text

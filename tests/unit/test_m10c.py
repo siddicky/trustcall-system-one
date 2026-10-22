@@ -485,9 +485,13 @@ def test_a_time_followed_by_a_day_or_month_does_not_split() -> None:
         "Breakfast is at 9 a.m.",
         "April will be warm.",
     ]
+    # a weekday goes on whatever follows: only the month words (May, April) are
+    # also verbs and names that start a sentence
     assert texts("We start at 9 a.m. Monday we rest.") == [
-        "We start at 9 a.m.",
-        "Monday we rest.",
+        "We start at 9 a.m. Monday we rest."
+    ]
+    assert texts("Call me at 5 p.m. Friday this week.") == [
+        "Call me at 5 p.m. Friday this week."
     ]
     assert texts("Call at 5 p.m. May 3 is the date.") == [
         "Call at 5 p.m. May 3 is the date."
@@ -868,6 +872,10 @@ async def test_fakeworld_novelty_depends_on_what_the_record_holds() -> None:
         ("quantity", "total units shipped so far", False),
         ("total", "the amount due", False),
         ("size", "the number of seats", False),
+        ("tickets", "how many tickets", True),
+        ("seats", "number of seats to book", True),
+        ("guests", "number of guests", True),
+        ("capacity", "number of seats in the hall", False),
     ],
 )
 def test_only_an_ordered_quantity_is_asked_for(
@@ -876,12 +884,12 @@ def test_only_an_ordered_quantity_is_asked_for(
     from pydantic import create_model
 
     from trustcall_system_one._compile import compile_schema
-    from trustcall_system_one._verify import _requestable
+    from trustcall_system_one._verify import requestable
 
     field = (int, Field(description=description) if description else Field())
     plan = compile_schema(create_model("Line", **{name: field}))  # type: ignore[call-overload]
     (spec,) = plan.specs
-    assert _requestable(spec) is asked, (name, description)
+    assert requestable(spec) is asked, (name, description)
 
 
 @pytest.mark.parametrize(
@@ -1124,3 +1132,172 @@ async def test_many_kind_names_the_kind_and_the_knob_moves_the_floor() -> None:
         assert payload["questions"]["qualify.e0"]["instructions"] == (
             "Is `entities.e0.label` a human being?"
         )
+
+
+# --------------------------------------------------------------------------- #
+# M10d: the pairwise confirmation, through the extractor
+# --------------------------------------------------------------------------- #
+
+
+def _yes(p: float) -> Any:
+    from trustcall_system_one.testing import clef_response, noul
+
+    def handler(model: str, payload: dict[str, Any], meta: Any) -> Any:
+        return clef_response(
+            {q: noul(p) for q in payload["questions"]}, model=payload["model"]
+        )
+
+    return handler
+
+
+async def test_a_short_form_the_world_calls_new_is_matched_by_the_confirmation() -> (
+    None
+):
+    from trustcall_system_one import Many, create_extractor
+    from trustcall_system_one.testing import route
+
+    text = "Emma just moved to Denver."
+    world = FakeWorld(text)
+    world.entity(  # no matches=: the choice answers __new__ (0.92)
+        "Emma",
+        schema=Member,
+        mentions=["Emma"],
+        fields={"name": "Emma", "city": "Denver"},
+    )
+    transport = FakeTransport(route(default=world.handler, match_confirm=_yes(0.9)))
+    result = await create_extractor(
+        [Many(Member, identity="name")], transport=transport
+    ).ainvoke(
+        text, existing=[("0", "Member", {"name": "Emma Thompson", "city": "Austin"})]
+    )
+    (record,) = result.records
+    assert record.kind == "update" and record.json_doc_id == "0"
+    assert [(p.op, p.path, p.value) for p in record.patches] == [
+        ("replace", "/city", "Denver")
+    ]
+    assert any(w.startswith("match_confirmed") for w in result.warnings)
+
+
+async def test_the_identity_conflict_guard_still_refuses_a_confirmed_match() -> None:
+    from trustcall_system_one import Many, create_extractor
+    from trustcall_system_one.testing import route
+
+    text = "Emma Watson just moved to Denver."
+    world = FakeWorld(text)
+    world.entity(
+        "Emma",
+        schema=Member,
+        mentions=["Emma"],
+        fields={"name": "Emma Watson", "city": "Denver"},
+    )
+    transport = FakeTransport(route(default=world.handler, match_confirm=_yes(0.99)))
+    result = await create_extractor(
+        [Many(Member, identity="name")], transport=transport
+    ).ainvoke(
+        text, existing=[("0", "Member", {"name": "Emma Thompson", "city": "Austin"})]
+    )
+    assert not [p for r in result.records for p in r.patches]
+    assert [s.reason for s in result.skipped] == ["ambiguous_match"]
+    assert result.skipped[0].detail.startswith("identity conflict:")
+
+
+# --------------------------------------------------------------------------- #
+# M10d review: the count is covered by distinct names of QUALIFIED entities
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_full_name_then_its_first_name_is_one_name_for_the_count() -> None:
+    result, discovers = await _count_case(
+        "Sarah Johnson called. Sarah and my cousin went hiking in Oslo.",
+        [
+            (
+                "Sarah Johnson",
+                ["Sarah Johnson", "Sarah"],
+                [],
+                {"name": "Sarah Johnson"},
+            ),
+            ("my cousin", [], ["my cousin"], {"name": "my cousin"}),
+        ],
+        2,
+    )
+    assert discovers == 2  # the broadened discovery ran
+    assert len(result.records) + len(result.skipped) == 2
+
+
+async def test_a_possessive_and_a_case_variant_are_the_same_name_too() -> None:
+    _, discovers = await _count_case(
+        "Sarah's bike broke. SARAH and my cousin went hiking in Oslo.",
+        [
+            ("Sarah", ["Sarah's", "SARAH"], [], {"name": "Sarah"}),
+            ("my cousin", [], ["my cousin"], {"name": "my cousin"}),
+        ],
+        2,
+    )
+    assert discovers == 2
+
+
+async def test_a_refused_non_person_does_not_cover_the_count() -> None:
+    from trustcall_system_one import Many, create_extractor
+
+    text = "Sarah walked Sunny with my cousin in Oslo."
+    world = FakeWorld(text)
+    world.entity("Sarah", schema=Member, mentions=["Sarah"], fields={"name": "Sarah"})
+    world.entity(
+        "my cousin",
+        schema=Member,
+        mentions=[],
+        descriptive=["my cousin"],
+        fields={"name": "my cousin"},
+    )
+    world.non_entity("Sunny", schema=Member, mentions=["Sunny"])
+    world.count(Member, 2)
+    transport = world.transport()
+    result = await create_extractor(
+        [Many(Member, identity="name")], transport=transport, enable_inserts=True
+    ).ainvoke(text)
+    assert [m.kind for _, _, m in transport.calls].count("discover") == 2
+    assert {s.entity.label for s in result.skipped} >= {"Sunny"}
+
+
+@pytest.mark.parametrize(
+    ("mention", "text", "name"),
+    [
+        ("Dana Ruiz", "Dana Ruiz called.", True),
+        ("my cousin", "I met my cousin.", False),
+        ("Client", "Client called from Oslo about the invoice.", False),
+        ("Manager", "Manager flew to Oslo.", False),
+        ("Mom", "Mom called.", False),
+        ("Cousin", "Cousin came by.", False),
+        ("CEO", "CEO spoke.", False),
+        ("He", "He left.", False),
+        ("I", "I left.", False),
+        ("Someone", "Someone in Oslo rang.", False),
+        ("Everyone", "Everyone left.", False),
+        # a single capital that only starts the sentence is no evidence ...
+        ("Sunrise", "Sunrise came late.", False),
+        # ... unless the word is written with a capital inside a sentence too
+        ("Sunrise", "Sunrise came late. We met Sunrise at noon.", True),
+        ("Anna", "We met Anna. Anna called.", True),
+        ("my cousin Anna", "I met my cousin Anna.", True),
+        ("The Printer Ticket", "The Printer Ticket is open.", True),
+    ],
+)
+def test_a_proper_noun_is_not_a_pronoun_a_role_or_a_sentence_initial_capital(
+    mention: str, text: str, name: bool
+) -> None:
+    from trustcall_system_one._entity import _proper_noun
+
+    at = text.index(mention.split()[0])
+    span = (at, at + len(mention))
+    assert _proper_noun(mention, text, span) is name
+
+
+@pytest.mark.parametrize("mention", ["Client", "Manager", "Someone"])
+async def test_the_fallback_never_invents_a_name_from_a_role_or_pronoun(
+    mention: str,
+) -> None:
+    result = await _fallback(
+        Member, f"{mention} called from Oslo.", mention, mention, {"city": "Oslo"}
+    )
+    assert not any(r.valid for r in result.records)
+    assert not [w for w in result.warnings if "identity_from_mention" in w]

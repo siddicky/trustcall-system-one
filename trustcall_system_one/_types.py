@@ -63,6 +63,7 @@ CallKind = Literal[
     "coref",
     "qualify",
     "match",
+    "match_confirm",
     "delete",
     "extract",
     "crosscheck",

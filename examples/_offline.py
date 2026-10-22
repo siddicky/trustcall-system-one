@@ -58,6 +58,7 @@ from trustcall_system_one.testing import (
     clef_response,
     noul,
     score,
+    states_relative_change,
 )
 
 __all__ = [
@@ -585,8 +586,17 @@ class OfflineScript:
         return {qid: 0.96 for qid in call.ids}
 
     def _relative_edit(self, call: Call) -> Mapping[str, Any]:
-        """A change relative to the old value? The examples state new values: no."""
-        return {qid: 0.04 for qid in call.ids}
+        """Does the input only say how the old value changes ("two more")?
+
+        Answered from the change itself (its field, old and new value) and the input:
+        a new value that the input states outright is not relative.
+        """
+        state = call.state if isinstance(call.state, dict) else {}
+        change = state.get("proposed_change") or {}
+        relative = states_relative_change(
+            str(state.get("input", "")), change.get("from"), change.get("to")
+        )
+        return {qid: 0.95 if relative else 0.04 for qid in call.ids}
 
     def _adjudicate(self, call: Call) -> Mapping[str, Any]:
         assert call.meta.field is not None

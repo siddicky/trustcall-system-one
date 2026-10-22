@@ -1205,3 +1205,25 @@ async def test_a_new_line_whose_quantity_is_asked_for_gets_a_second_look() -> No
         + first
     )
     assert "relative_edit" not in kinds(script.transport)  # an add, never a replace
+
+
+def test_a_passage_never_exceeds_the_cap_and_keeps_the_subject() -> None:
+    from trustcall_system_one._verify import _PASSAGE_MAX, _passage
+
+    text = (
+        "The assistant manager of the northern distribution centre "
+        + "very " * 80
+        + "carefully reviewed the shipment of blue mugs yesterday evening."
+    )
+    near = text.index("blue")
+    short = _passage(text, (near, near + 9))
+    assert short is not None and len(short) <= _PASSAGE_MAX
+    assert short.startswith("The assistant manager")  # the subject of the clause
+    assert "blue mugs" in short and "…" in short
+    # a span as long as the clause itself is cut too, at a word boundary
+    long_span = _passage(text, (text.index("very"), len(text) - 1))
+    assert long_span is not None and len(long_span) <= _PASSAGE_MAX
+    assert long_span.startswith("The assistant manager")
+    assert not long_span.endswith("ver")  # not cut inside a word
+    # a clause that fits is quoted whole
+    assert _passage("Dana lives in Berlin.", (14, 20)) == "Dana lives in Berlin."

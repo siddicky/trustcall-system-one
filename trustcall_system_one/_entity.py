@@ -108,6 +108,7 @@ from trustcall_system_one._sentences import list_kind, read_sentences
 from trustcall_system_one._types import (
     EntityInfo,
     FieldAnswer,
+    Mention,
     PatchOp,
     RejectedOp,
     ResultRecord,
@@ -127,6 +128,7 @@ from trustcall_system_one._verify import (
     contest_cross,
     crosscheck,
     reask,
+    requestable,
     resolve,
     resolve_clef,
     run_ladder,
@@ -985,7 +987,7 @@ def _absent(doc: dict[str, Any], owner: FieldGroup | UnionGroup) -> None:
 _NAME_FIELDS = frozenset({"name", "full_name", "title", "label", "display_name"})
 _NAME_WORDS = re.compile(r"\b(?:names?|titles?|labels?|called|nicknames?)\b", re.I)
 _REFERENCE_WORDS = frozenset(
-    {
+    [
         "a",
         "an",
         "the",
@@ -1003,11 +1005,104 @@ _REFERENCE_WORDS = frozenset(
         "some",
         "another",
         "one",
-    }
+        "two",
+        "three",
+        "four",
+        "five",
+        "six",
+        "seven",
+        "eight",
+        "nine",
+        "ten",
+    ]
 )
+_NOT_NAMES = frozenset(
+    [
+        "i",
+        "me",
+        "myself",
+        "we",
+        "us",
+        "you",
+        "he",
+        "him",
+        "she",
+        "they",
+        "them",
+        "it",
+        "who",
+        "someone",
+        "somebody",
+        "anyone",
+        "anybody",
+        "everyone",
+        "everybody",
+        "nobody",
+        "client",
+        "customer",
+        "user",
+        "manager",
+        "boss",
+        "ceo",
+        "cto",
+        "cfo",
+        "director",
+        "president",
+        "owner",
+        "teacher",
+        "doctor",
+        "nurse",
+        "officer",
+        "agent",
+        "assistant",
+        "engineer",
+        "developer",
+        "colleague",
+        "coworker",
+        "friend",
+        "neighbor",
+        "neighbour",
+        "partner",
+        "buyer",
+        "seller",
+        "supplier",
+        "vendor",
+        "guest",
+        "visitor",
+        "mom",
+        "mum",
+        "mother",
+        "dad",
+        "father",
+        "parent",
+        "cousin",
+        "brother",
+        "sister",
+        "sibling",
+        "uncle",
+        "aunt",
+        "grandma",
+        "grandpa",
+        "wife",
+        "husband",
+        "spouse",
+        "son",
+        "daughter",
+        "child",
+        "kid",
+        "baby",
+        "sir",
+        "madam",
+        "team",
+        "staff",
+        "everyone",
+    ]
+)
+"""Words that start a sentence without naming anyone: pronouns, roles and kin."""
 _FALLBACK_REASONS = frozenset(
-    {None, "low_confidence", "low_choice_prob", "missing_answer"}
+    {None, "low_confidence", "low_choice_prob", "missing_answer", "identity_bleed"}
 )
+_SENTENCE_END = ".!?\n:;"
 
 
 def _name_like(spec: FieldSpec) -> bool:
@@ -1023,17 +1118,123 @@ def _name_like(spec: FieldSpec) -> bool:
     return spec.identity and bool(_NAME_WORDS.search(spec.description))
 
 
-def _proper_noun(text: str) -> bool:
+def _sentence_initial(source: str, at: int) -> bool:
+    """Whether the text at ``at`` starts the input or a sentence."""
+    before = source[:at].rstrip(" \t\"'(\N{LEFT DOUBLE QUOTATION MARK}")
+    return not before or before[-1] in _SENTENCE_END
+
+
+def _capitalised_inside(source: str, word: str) -> bool:
+    """Whether ``word`` is written with its capital in the middle of a sentence."""
+    return any(
+        not _sentence_initial(source, found.start())
+        for found in re.finditer(rf"(?<!\w){re.escape(word)}(?!\w)", source)
+    )
+
+
+def _proper_noun(text: str, source: str = "", span: Span | None = None) -> bool:
     """Whether a mention is a proper noun, not a descriptive reference.
 
     "Dana Ruiz" is; "my cousin", "the client" and "The printer ticket" are not (a
     leading article or possessive does not make a word a name), while "my cousin
-    Anna" is, by "Anna".
+    Anna" is, by "Anna". A pronoun, a role or a kin word ("Client", "Manager", "Mom",
+    "CEO", "He", "I", "Someone") is never a name. A single capitalised word that
+    only starts a sentence ("Client called ...") is a name only if it is written
+    with its capital in the middle of a sentence too.
     """
-    words = (word.strip(".,;:!?()\"'") for word in text.split())
-    return any(
-        word[:1].isupper() and word.casefold() not in _REFERENCE_WORDS for word in words
+    words = [word.strip(".,;:!?()\"'") for word in text.split()]
+    names = [
+        w
+        for w in words
+        if w[:1].isupper()
+        and w.casefold() not in _REFERENCE_WORDS
+        and w.casefold() not in _NOT_NAMES
+    ]
+    if not names:
+        return False
+    only_initial = (
+        len(names) == 1
+        and len(words) == 1
+        and bool(source)
+        and span is not None
+        and _sentence_initial(source, span[0])
+        and not _capitalised_inside(source, names[0])
     )
+    return not only_initial
+
+
+_PRONOUNS = frozenset(
+    ["it", "them", "they", "he", "she", "him", "her", "one", "ones", "who"]
+)
+
+
+def _noun_phrase(mention: Mention) -> tuple[str, Span | None] | None:
+    """A mention as the name of a nested item: "the blue mugs" is "blue mugs"."""
+    words = mention.text.split()
+    drop = 0
+    while drop < len(words) and words[drop].casefold() in _REFERENCE_WORDS:
+        drop += 1
+    kept = words[drop:]
+    if not kept or kept[0].casefold() in _PRONOUNS:
+        return None
+    text = " ".join(kept)
+    if mention.span is None:
+        return text, None
+    lead = re.match(r"\s*(?:\S+\s+){" + str(drop) + "}", mention.text)
+    offset = lead.end() if lead is not None else 0
+    return text, (mention.span[0] + offset, mention.span[1])
+
+
+def _identity_target(ctx: Ctx, spec: FieldSpec) -> bool:
+    """Whether a field is the name of a NEW entity of a collection (an insert)."""
+    return (
+        ctx.info is not None
+        and ctx.existing is None
+        and bool(ctx.info.mentions)
+        and spec.path in {(name,) for name in ctx.plan.identity}
+        and spec.clairic is not None
+        and spec.clairic.type == "text"
+        and _name_like(spec)
+    )
+
+
+def _identity_bleed(
+    ctx: Ctx, spec: FieldSpec, answer: FieldAnswer
+) -> tuple[FieldAnswer, list[RejectedOp]]:
+    """Refuse a name that is a sibling's: ``identity_bleed``.
+
+    The entity "blue mugs" can come back from extraction named "tea towels", the
+    item next to it in the same sentence (live 6). A name that fits none of the
+    entity's own mentions but fits the mention of another entity of the same
+    collection and scope is that sibling's, not this entity's: it is thrown away and
+    the mention fallback (``_from_mention``) supplies the name.
+    """
+    info = ctx.info
+    value = answer.value
+    if not _identity_target(ctx, spec) or not isinstance(value, str) or info is None:
+        return answer, []
+    own = [info.label, *(m.text for m in info.mentions)]
+    if any(identity_compatible(value, text) for text in own):
+        return answer, []
+    mine = {m.span for m in info.mentions if m.span is not None}
+    siblings = [
+        ctx.text[a:b]
+        for a, b in ctx.others
+        if (a, b) not in mine and b <= len(ctx.text)
+    ]
+    other = next((t for t in siblings if identity_compatible(value, t)), None)
+    if other is None:
+        return answer, []
+    detail = f"{value!r} is the name of {other!r}, another one of the same list"
+    ctx.warn(f"{ctx.plan.name}.{spec.pretty}: identity_bleed: {detail}")
+    refused = dataclasses.replace(
+        answer,
+        value=None,
+        rejected_reason="identity_bleed",
+        warnings=(*answer.warnings, "identity_bleed"),
+    )
+    reject = RejectedOp(None, json_pointer(spec.path), "identity_bleed", detail, None)
+    return refused, [reject]
 
 
 def _from_mention(ctx: Ctx, spec: FieldSpec, answer: FieldAnswer) -> FieldAnswer:
@@ -1041,37 +1242,47 @@ def _from_mention(ctx: Ctx, spec: FieldSpec, answer: FieldAnswer) -> FieldAnswer
 
     The entity exists because the input names it, and the name is the discovered
     mention: when extraction gives its name field nothing usable (a low confidence
-    on the very words discovery quoted: "blue mugs" at 0.33), the field takes the
-    mention text instead of leaving the record invalid. Only for a field that holds
-    what the entity is called (``_name_like``), only for a text identity field of
-    an entity of a collection (never an update), only when the answer is null or
-    was refused for low confidence, and only when a mention is a proper noun: "my
-    cousin" is no name, and an email, an id or a code is never made up from a
-    mention. The fallback is a run warning too (``identity_from_mention``).
+    on the very words discovery quoted: "blue mugs" at 0.33, or a sibling's name,
+    ``identity_bleed``), the field takes the mention text instead of leaving the
+    record invalid. Only for a field that holds what the entity is called
+    (``_name_like``), only for a text identity field of an entity of a collection
+    (never an update), only when the answer is null or was refused for low
+    confidence, and only when a mention is a proper noun ("Dana Ruiz"; not "my
+    cousin", "Client" or "He"). The items of a nested list are named by what they
+    are, so there a noun phrase ("the blue mugs" gives "blue mugs") is a name too.
+    An email, an id or a code is never made up from a mention. The fallback is a
+    run warning too (``identity_from_mention``).
     """
     info = ctx.info
     if (
         answer.value is not None
+        or not _identity_target(ctx, spec)
         or info is None
-        or ctx.existing is not None
-        or not info.mentions
-        or spec.path not in {(name,) for name in ctx.plan.identity}
-        or spec.clairic is None
-        or spec.clairic.type != "text"
-        or not _name_like(spec)
         or answer.rejected_reason not in _FALLBACK_REASONS
     ):
         return answer
-    proper = next((m for m in info.mentions if _proper_noun(m.text)), None)
-    if proper is None:
+    chosen: tuple[str, Span | None] | None = None
+    proper = next(
+        (m for m in info.mentions if _proper_noun(m.text, ctx.text, m.span)), None
+    )
+    if proper is not None:
+        label = info.label if _proper_noun(info.label) else proper.text
+        chosen = (label, proper.span)
+    elif ctx.parent is not None:
+        for m in info.mentions:
+            phrase = _noun_phrase(m)
+            if phrase is not None:
+                chosen = phrase
+                break
+    if chosen is None:
         return answer
-    value = info.label if _proper_noun(info.label) else proper.text
+    value, span = chosen
     was = answer.rejected_reason or "no value"
     ctx.warn(f"{ctx.plan.name}.{spec.pretty}: identity_from_mention: {was}")
     return dataclasses.replace(
         answer,
         value=value,
-        span=proper.span,
+        span=span,
         rejected_reason=None,
         warnings=(*answer.warnings, f"identity_from_mention: {was}"),
     )
@@ -1085,6 +1296,8 @@ def _emit_leaf(ctx: Ctx, leaf: _Leaf, doc: dict[str, Any], out: _Assembly) -> No
         answer, rejects = _clef_answer(spec, leaf.resolved)
     else:
         answer, rejects = _filled_answer(spec, leaf.value), []
+    answer, bled = _identity_bleed(ctx, spec, answer)
+    rejects.extend(bled)
     answer = _from_mention(ctx, spec, answer)
     out.answers[spec.pretty] = answer
     out.rejected.extend(rejects)
@@ -2122,7 +2335,16 @@ async def _judge_changes(
             )
 
     floor_relative = ctx.run.verify.relative_edit
-    numbers = [v for v in verdicts if v.reason is None and numeric_replace(v.change)]
+    quantities = {
+        spec.pretty for spec in ctx.plan.all_specs() if requestable(spec)
+    }  # only an ordered quantity can be requested relatively: "two more"
+    numbers = [
+        v
+        for v in verdicts
+        if v.reason is None
+        and numeric_replace(v.change)
+        and v.change.field_path in quantities
+    ]
     if floor_relative > 0 and numbers:
         asked_relative = await relative_edits(ctx, before, [v.change for v in numbers])
         for verdict, p in zip(numbers, asked_relative, strict=True):

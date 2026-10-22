@@ -1968,13 +1968,17 @@ _NOT_REQUESTED = re.compile(
 )
 _ORDERED_UNITS = re.compile(
     r"\b(?:units?|items?|pieces?|copies|pcs|quantity|qty|number|count|how many)\b"
-    r".*\b(?:ordered|wanted|requested|needed|to\s+(?:order|buy|add|purchase))\b"
-    r"|\b(?:ordered|requested|wanted)\s+(?:quantity|units?|items?)\b",
+    r".*\b(?:ordered|wanted|requested|needed|"
+    r"to\s+(?:order|buy|add|purchase|book|reserve))\b"
+    r"|\b(?:ordered|requested|wanted)\s+(?:quantity|units?|items?)\b"
+    # a head count is asked for by whoever books: "how many tickets", "number of guests"
+    r"|\bhow many\b"
+    r"|\bnumber of\s+(?:guests|attendees|passengers|people|diners|participants)\b",
     re.IGNORECASE,
 )
 
 
-def _requestable(spec: FieldSpec) -> bool:
+def requestable(spec: FieldSpec) -> bool:
     """Whether the input may ASK for the field's value instead of stating it.
 
     An ORDERED quantity can be requested ("add two more of the blue mugs": a
@@ -2047,33 +2051,90 @@ _CLAUSE_BREAK = re.compile(
 )
 
 
+def _head(text: str, limit: int) -> str:
+    """The start of ``text`` in at most ``limit`` characters, cut at a word end."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    if not text[limit].isspace():
+        space = cut.rfind(" ")
+        cut = cut[:space] if space > 0 else cut
+    return cut.rstrip(" ,;:-")
+
+
+def _tail(text: str, limit: int) -> str:
+    """The end of ``text`` in at most ``limit`` characters, cut at a word start."""
+    if limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+    cut = text[-limit:]
+    if not text[-limit - 1].isspace():
+        space = cut.find(" ")
+        cut = cut[space + 1 :] if space >= 0 else cut
+    return cut.lstrip(" ,;:-")
+
+
+def _fit_passage(before: str, mid: str, after: str) -> str:
+    """A passage of at most ``_PASSAGE_MAX`` characters around ``mid``.
+
+    The clause is kept whole when it fits. Otherwise the start of the clause (its
+    subject) is kept, then a gap, then the words next to the span, all cut at word
+    boundaries; a span longer than the cap is cut itself.
+    """
+    if len(before) + len(mid) + len(after) <= _PASSAGE_MAX:
+        return before + mid + after
+    gap = " … "
+    # a span longer than the cap is cut itself, keeping room for the clause's subject
+    reserve = min(len(before.strip()), 60) + len(gap) if before.strip() else 0
+    mid = _head(mid, _PASSAGE_MAX - reserve)
+    room = _PASSAGE_MAX - len(mid)
+    post = _head(after, room // 4)
+    room -= len(post)
+    if len(before) <= room:
+        return before + mid + post
+    subject = _head(before, min(60, max(0, room - len(gap)) // 2))
+    near = _tail(before, room - len(subject) - len(gap))
+    return f"{subject}{gap}{near}{mid}{post}" if near else f"{subject}{gap}{mid}{post}"
+
+
 def _passage(text: str, span: Span | None) -> str | None:
     """The clause of the input a span lies in, as the passage a re-check quotes.
 
     The sentence the span is in, cut to the clause around it when the sentence has
     several ("Please add two more of the blue mugs and drop the quantity of the tea
     towels to 1" gives the first: another clause's number would otherwise pull the
-    answer about the first one down, live 0.4793). A passage longer than
-    ``_PASSAGE_MAX`` is cut to the characters around the span.
+    answer about the first one down, live 0.4793). A clause over ``_PASSAGE_MAX``
+    characters keeps its subject and the words around the span, cut at word
+    boundaries; the passage never exceeds the cap, whatever the span's length.
     """
     if span is None:
         return None
     for sentence in split_sentences(text):
         if sentence.start <= span[0] < sentence.end:
             start, end = sentence.start, sentence.end
-            cuts = [m for m in _CLAUSE_BREAK.finditer(text, start, end)]
             low, high = start, end
-            for cut in cuts:
+            for cut in _CLAUSE_BREAK.finditer(text, start, end):
                 if cut.end() <= span[0]:
                     low = cut.end()
                 elif cut.start() >= span[1] and high == end:
                     high = cut.start()
             if len(text[low:high].split()) >= 3:  # a clause with something in it
                 start, end = low, high
-            if end - start > _PASSAGE_MAX:
-                start = max(start, span[0] - _PASSAGE_MAX // 2)
-                end = min(end, max(span[1], start) + _PASSAGE_MAX // 2)
-            return " ".join(text[start:end].split()).replace('"', "'")
+            at = min(max(span[0], start), end)
+            to = min(max(span[1], at), end)
+
+            def clean(piece: str) -> str:
+                # collapse runs of white space; keep one at an edge so words stay apart
+                squeezed = " ".join(piece.split())
+                lead = " " if piece[:1].isspace() and squeezed else ""
+                trail = " " if piece[-1:].isspace() and squeezed else ""
+                return f"{lead}{squeezed}{trail}"
+
+            passage = _fit_passage(
+                clean(text[start:at]), clean(text[at:to]), clean(text[to:end])
+            )
+            return _head(passage.strip().replace('"', "'"), _PASSAGE_MAX)
     return None
 
 
@@ -2124,7 +2185,7 @@ def _attribution_questions(
                 st.spec.scoped,
                 st.resolved.value,
                 element=False,
-                ask_for=_requestable(st.spec),
+                ask_for=requestable(st.spec),
             )
     return questions
 
@@ -2262,7 +2323,7 @@ async def _recheck_scalar(ctx: Ctx, st: FieldState) -> None:
                     st.spec.scoped,
                     checked.value,
                     element=False,
-                    ask_for=_requestable(st.spec),
+                    ask_for=requestable(st.spec),
                 ),
                 ctx.text,
                 checked.span,

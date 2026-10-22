@@ -79,14 +79,15 @@ NOVELTY_TRUE = "The sentence adds information that `record` does not hold."
 NOVELTY_FALSE = "Everything the sentence says is already held by `record`."
 
 RELATIVE_QUESTION = (
-    "Does `input` state a change relative to the current value (e.g. 'two more', "
-    "'one fewer', 'double it') rather than a new value?"
+    "Does `input` only describe how the current value `proposed_change.from` of "
+    "`proposed_change.field` of `entity.label` changes (e.g. 'two more', 'one "
+    "fewer', 'double it'), instead of giving `proposed_change.to` as its new value?"
 )
 RELATIVE_TRUE = (
     "The input says how the current value changes (more, fewer, double), not what "
     "the new value is."
 )
-RELATIVE_FALSE = "The input gives the new value itself."
+RELATIVE_FALSE = "The input gives `proposed_change.to` as the new value itself."
 
 
 @dataclass(frozen=True)
@@ -288,9 +289,11 @@ async def relative_edits(
 
     "Please add two more of the blue mugs" says how much to add to the line's
     quantity (3), not that the quantity is 2; the library does no arithmetic on a
-    record's values, so writing the 2 over the 3 loses data. One request per
-    operation (call kind ``relative_edit``, model ``gate_model``) with the gate's
-    state.
+    record's values, so writing the 2 over the 3 loses data. The question is about
+    THIS change (its field, its old and its new value: a relative phrase about
+    another line of the input does not refuse "the tea towels at 5"). One request
+    per operation (call kind ``relative_edit``, model ``gate_model``) with the
+    gate's state.
 
     Args:
         ctx: The entity context.

@@ -359,10 +359,16 @@ schema title: "Person").
    "mentions": [{"text", "span", "context"}]}, …}}` (a state whose input was narrowed carries
    `{"text", "context"}` without spans; `context` only for the first 8 and last 2 mentions); the call carries no entity key, since the numbering changes
    with a broadened discovery or a merge: "Is `entities.e{n}.label` a {kind}?" where the KIND is what the schema is, not its
-   title: `Many(kind=...)`, else its `label`, else the leading noun phrase of the schema description up to the
-   first preposition, relative word, participle or punctuation mark (at most four words: "A person in an
-   address book" is a "person", "One product line on an order" a "product line"; "Someone ..." is a
-   "person"), else the title. Live, "Is Emma a Member?" scored 0.24, Maria 0.189, Jon 0.226 and the
+   title: `Many(kind=...)`, else the leading noun phrase of the schema description (the `label` is how the
+   entity is displayed and never the kind): cut at the first blank line, parenthesis, abbreviation-safe
+   sentence end, preposition, relative word, participle or determiner, at most four words ("A person in an
+   address book" is a "person", "One product line on an order" a "product line", "Someone ..." a "person").
+   A META noun (information, details, data, record, schema, model, entry, profile) is not what the schema
+   is: "Details of a person" and "Schema for a customer" give "person" and "customer", "Customer record"
+   gives "customer"; a possessive owner is dropped ("The user's pet" is a "pet"), a plural made singular
+   ("Customers"); "An entry in the address book", "Something we keep" or no description give nothing, and
+   the kind is then the title, with the warning `kind_fallback` (name it with `Many(kind=...)`). "a" and
+   "an" follow how the noun is said ("a user", "an LLM"). Live, "Is Emma a Member?" scored 0.24, Maria 0.189, Jon 0.226 and the
    presence question 0.21 (live run 5), against 0.97 for "is Emma a person?", so a terse title made bare
    names unqualifiable; the presence question ("Does `input` mention any {kind}?") names the kind as well.
    The criteria refuse only a clear non-match ("The entity is clearly something else, not a {kind}.").
@@ -387,10 +393,11 @@ schema title: "Person").
 5. **Count reconciliation** (count `n` against `k` qualifying entities; acted on only when
    `broaden_on_count_mismatch` and `max(n, k) ≤ count_trust_max`, else the mismatch only warns;
    `count_trust_max` is validated to at most 30, so a merge asks at most 30·29/2 = 435 pair checks):
-   * `n > k`: unless the DISTINCT mentions found (case-folded texts: "Sarah called. Sarah and my cousin went
-     hiking" has two mentions of one text and a count of 2, so the cousin is still missing) already cover `n`
-     (the model counted two NAMES of one person that coreference joined, "Sarah Johnson" and "Sarah Miller", or an entity was found and refused as a non-{Person}: nothing was missed, no
-     warning), ONE broadened re-discovery (the same question plus "Also include descriptive
+   * `n > k`: unless the DISTINCT names of the QUALIFIED entities already cover `n` (case-folded, a short form
+     is its full name: "Sarah" ~ "Sarah Johnson", so "Sarah Johnson called. Sarah and my cousin went hiking"
+     has one name and a count of 2 and the cousin is still missing; a refused non-person such as a dog is
+     no name at all; "Sarah Johnson" and "Sarah Miller", the model counting two names of one person that
+     coreference joined, are two: nothing was missed, no warning; when in doubt, broaden), ONE broadened re-discovery (the same question plus "Also include descriptive
      references such as 'my cousin' when no name is given."), whose mentions are only ADDED to the
      first list where they overlap none of its mentions (a broadened "Emma's brother Tom" never
      takes the place of, or joins, "Emma" and "Tom"), re-clustered (cached pairs) and re-qualified
@@ -523,7 +530,19 @@ schema title: "Person").
      word that is a word or diminutive of the record's identity; "Dan" is only the start of "Daniela Cruz",
      "Emma Thomson" for "Emma Thompson" is fine). A blank identity value fits nothing. Clef's
      choice `confidence` is not the probability of the chosen option (live: p 0.84 with confidence 0.47).
-     The assignment and the identity-conflict guard are unchanged. Else the entity is ambiguous:
+     The assignment and the identity-conflict guard are unchanged. **Pairwise confirmation
+     (`match.confirm_accept`, default 0.7, 0 off; call kind `match_confirm`).** Clef's record choice
+     answered `__new__` at 0.83 for "Emma" against the record "Emma Thompson" and 0.84 for "Maria" against
+     "Maria Costa" while the record-presence check agreed with the records at 0.87, and gave the README's Emma
+     0.506 (a coin flip for the margin). When the choice is `__new__` or not sure, and EXACTLY ONE existing
+     record fits the entity's mentions at all (`identity_compatible`) and strongly (`strong_compatible`),
+     one Clef `noul` in a request of its own asks "In `input`, is `entity.label` the same {kind} as the
+     existing record `record` ({identity})?" over the input windows around the mentions, the entity and the
+     record. At the knob the entity is matched to the record (warning `match_confirmed`); otherwise the
+     choice's outcome stands. Never with two or more compatible records ("Emma" with Emma Thompson and Emma
+     Watson), never for "Emma Watson" against "Emma Thompson" (not a strong fit), never for a record another
+     entity holds, and the identity-conflict guard still refuses a confirmed match whose extracted name
+     contradicts the record. Else the entity is ambiguous:
      `SkippedEntity(reason="ambiguous_match", candidates=((option, p), …))` (the options with p ≥
      0.01, the most likely first; the records it might have been are NOT handled, so they stay
      untouched), or, with `on_ambiguous="insert"`, it is treated as new when its `__new__`
@@ -714,6 +733,14 @@ the parent entity (the canonical label of its mentions; "the Order" for a `One`)
 spans settle which of two parents with one label is meant. A collection is extracted after its
 parent's own fields (one more sequential hop), and the items of an inserted parent are not
 re-extracted by the parent's repair loop (each item has its own).
+10. Known limits, measured live. Olivia's "cousin" (a relationship in the speaker's voice) scores 0.6875
+    on attribution, under keep 0.75: the speaker-relative value is dropped, and a REQUIRED
+    `relationship` then makes her record invalid (a `Literal` or an optional field avoids it). The
+    quantity of a NEW line, "add two more of the blue mugs" when no such line exists, is genuinely
+    ambiguous ("2 of blue mugs" scored 0.48): it is asked as a requested quantity and the second look
+    quotes the clause, but it can still be dropped. `computed_total` (0.7308) and a city (0.7124) sit
+    just under keep 0.75; the threshold is not lowered for them (a bleed was kept at 0.7139). A single
+    capitalised name that only starts a sentence ("Alice called.") is not made up from the mention.
 
 ## Verification ladder (`_verify.py`) and update path (`_diff.py`, `_gates.py`)
 
@@ -874,14 +901,36 @@ update. Only a name-like identity field qualifies (named `name`, `full_name`, `t
 `display_name`, or marked `s1_field(identity=True)` with a description about a name, title or label), so a
 Subscriber's `email` or a Ticket's `id` is never made up from "Dana Ruiz" or "printer ticket"; and only a
 capitalised mention that is not a descriptive reference ("my cousin", "the client", "The printer ticket")
-counts as a proper noun.
+counts as a proper noun. A pronoun, a role or a kin word ("Client", "Manager", "Mom", "CEO", "He", "I",
+"Someone") is never a name, and a single capitalised word that only starts a sentence ("Client called
+...") is a name only if it is written with its capital inside a sentence too; so "Alice called." alone
+does not name Alice when extraction gave nothing (the record is skipped, never invented).
+
+**Nested presence on updates.** The presence question of a nested list is the weakest one ("Does `input`
+mention any product line of `parent.label`?" scored 0.1991 for "two more of the blue mugs" next to an
+order, under the 0.2 floor, and the line was never looked at). On an update, before the collection
+concludes that there are no items, the parent's existing items are asked about with the record-presence
+check (only those with a name word in the input), and the items they bring back go on to matching and
+the usual per-item update, where the relative-edit refusal can run.
+
+**A name that is a sibling's is refused (`identity_bleed`).** The entity "blue mugs" came back from
+extraction named "tea towels", the item next to it in the same sentence (live 6, example 07). A name
+that fits none of the entity's own mentions but fits the mention of another entity of the same list and
+scope is thrown away (`RejectedOp(reason="identity_bleed")`, a run warning) and the mention fallback names
+the entity. For the items of a NESTED list, which are named by what they are, a noun phrase counts as a
+name there ("the blue mugs" gives "blue mugs"); at the top level a descriptive reference still does not.
 
 **A relative edit is refused (`verify.relative_edit`, default 0.5, 0 off).** "Please add two more of the
 blue mugs" says how a quantity changes; the library does no arithmetic on a record's values, and writing
-the stated 2 over the line's 3 loses data. For every `replace` of one number by another, one Clef `noul`
-(kind `relative_edit`, the gate's model and state) asks "Does `input` state a change relative to the
-current value (e.g. 'two more', 'one fewer', 'double it') rather than a new value?"; at the knob or above
-the operation is refused as `relative_edit_unsupported` and nothing is written. It is never asked for an
+the stated 2 over the line's 3 loses data. For every `replace` of an ORDERED QUANTITY field (the fields `requestable` accepts: `quantity`, "number
+of units ordered", "how many tickets", "number of guests"; never a total, price, year or age) by another
+number, one Clef `noul` (kind `relative_edit`, the gate's model and state) asks it about THAT change:
+"Does `input` only describe how the current value `proposed_change.from` of `proposed_change.field` of
+`entity.label` changes (e.g. 'two more', 'one fewer', 'double it'), instead of giving `proposed_change.to`
+as its new value?" ("two more of the blue mugs and the tea towels at 5" refuses the mugs, 3 to 2, and
+writes the towels, 4 to 5); at the knob or above the operation is refused as
+`relative_edit_unsupported` and nothing is written. The offline stand-ins answer from the change, not from
+words anywhere in the input (`testing.states_relative_change`). It is never asked for an
 `add` (a new line's quantity is attributed as a requested quantity above). The README case expects no
 operation, and an operation that writes the 2 is a `must_not` violation.
 

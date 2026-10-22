@@ -43,7 +43,7 @@ from trustcall_system_one._coref import (
     strong_compatible,
 )
 from trustcall_system_one._errors import AmbiguousMatchError
-from trustcall_system_one._render import estimate_tokens
+from trustcall_system_one._render import estimate_tokens, mention_windows
 from trustcall_system_one._run import Run, gather
 from trustcall_system_one._types import EntityInfo, Mention, SkippedEntity
 from trustcall_system_one._verify import Ctx, Placement
@@ -536,6 +536,68 @@ class _Matcher:
         probs[NEW] = answer.probabilities.get(NEW, 0.0)
         return MatchAnswer(probs, answer.confidence)
 
+    def sole_fit(self, info: EntityInfo) -> int | None:
+        """The index of the ONE record the entity is a strong name fit for, if any.
+
+        ``None`` when no record fits, when two or more fit at all (``Emma`` with
+        Emma Thompson and Emma Watson: a name is no evidence there), or when the
+        one that fits only does so as a prefix, a typo or an initial of a one-word
+        mention (``strong_compatible``).
+        """
+        mentions = [info.label, *(m.text for m in info.mentions)]
+        fits = [
+            index
+            for index, values in enumerate(self._values)
+            if any(identity_compatible(m, v) for m in mentions for v in values)
+        ]
+        if len(fits) != 1:
+            return None
+        (only,) = fits
+        strong = any(
+            strong_compatible(m, v) for m in mentions for v in self._values[only]
+        )
+        return only if strong else None
+
+    async def confirm(self, info: EntityInfo, index: int, kind: str) -> float | None:
+        """Ask whether the entity is the same kind of thing as one record.
+
+        One Clef ``noul`` in a request of its own (call kind ``match_confirm``) over
+        the input (windows around the entity's mentions), the entity and the record.
+        """
+        record = self._full[index]
+        budget = self.run.limits.clef_state_token_budget
+        if _size(record) > budget // 2:
+            record = self._small[index]
+        ctx = self.ctx(info)
+        spans = [m.span for m in info.mentions if m.span is not None]
+        windows = (
+            mention_windows(len(self.text), spans, self.run.verify.window_chars)
+            if spans
+            else None
+        )
+        who = ", ".join(v for v in self._values[index] if v.strip()) or "no name"
+        question = NoulQuestion(
+            type="noul",
+            instructions=(
+                f"In `input`, is `entity.label` the same {kind} as the existing "
+                f"record `record` ({who})?"
+            ),
+            criteria=NoulCriteria(
+                true=f"Yes: `entity.label` and `record` are the same {kind}.",
+                false=f"No: `entity.label` is not the {kind} that `record` describes, "
+                f"but a different one.",
+            ),
+        )
+        state = ctx.fitted(windows=windows, record=record)
+        answers = await self.run.call_clef(
+            {"confirm": question},
+            state,
+            meta=ctx.meta("match_confirm", field=self.candidates[index].record_id),
+            decisive=True,
+        )
+        answer = answers.get("confirm")
+        return answer.noul if isinstance(answer, NoulAnswer) else None
+
     def warnings(self) -> list[str]:
         """One warning per thing the requests had to do to fit."""
         report, name, total = self.report, self.plan.name, len(self.candidates)
@@ -723,6 +785,7 @@ async def match_entities(
     identity: Sequence[str],
     merge_check: MergeCheck,
     placement: Placement | None = None,
+    kind: str | None = None,
 ) -> MatchOutcome:
     """Match every entity to an existing record or to ``__new__``.
 
@@ -740,6 +803,8 @@ async def match_entities(
         placement: For the items of a nested list, whom they belong to: the
             match state names the parent, so the candidates are the items of
             that parent only.
+        kind: What kind of thing an entity is ("person"), for the confirmation
+            question; defaults to ``noun``.
 
     Returns:
         The decisions.
@@ -788,17 +853,30 @@ async def match_entities(
     out: list[EntityInfo] = []
     targets: dict[str, str | None] = {}
     skipped: list[SkippedEntity] = []
+    sure_ones: list[bool] = []
     for info, pick in zip(infos, chosen, strict=True):
+        answer = answers[info.key]
+        p = answer.p(pick)
+        sure_ones.append(
+            (
+                bool(answer.probs)
+                and p >= config.accept
+                and answer.confidence is not None
+                and answer.confidence >= config.min_confidence
+            )
+            or _compatible_top(config, matcher, ids, info, answer, pick)
+        )
+    confirmed = await _confirmations(
+        run, matcher, infos, chosen, sure_ones, ids, answers, kind or noun
+    )
+    for info, pick, sure in zip(infos, chosen, sure_ones, strict=True):
         answer = answers[info.key]
         info = replace(info, match_probs=dict(answer.probs))
         out.append(info)
         p = answer.p(pick)
-        sure = (
-            bool(answer.probs)
-            and p >= config.accept
-            and answer.confidence is not None
-            and answer.confidence >= config.min_confidence
-        ) or _compatible_top(config, matcher, ids, info, answer, pick)
+        if info.key in confirmed:
+            targets[info.key] = confirmed[info.key]
+            continue
         if sure:
             targets[info.key] = None if pick == NEW else pick
             continue
@@ -824,6 +902,75 @@ async def match_entities(
             SkippedEntity(plan.name, info, "ambiguous_match", detail, candidates_)
         )
     return MatchOutcome(tuple(out), targets, tuple(skipped))
+
+
+async def _confirmations(
+    run: Run,
+    matcher: _Matcher,
+    infos: Sequence[EntityInfo],
+    chosen: Sequence[str],
+    sure_ones: Sequence[bool],
+    ids: Sequence[str],
+    answers: Mapping[str, MatchAnswer],
+    kind: str,
+) -> dict[str, str]:
+    """Confirm, pairwise, the entities the choice question left new or undecided.
+
+    Clef's record choice answers ``__new__`` at 0.83 for "Emma" against the record
+    "Emma Thompson" while the record-presence check agrees with the record at 0.87,
+    and gives the README's Emma only 0.506. When the choice is ``__new__`` or not
+    sure, and EXACTLY ONE record is a strong name fit for the entity
+    (``_Matcher.sole_fit``), one Clef ``noul`` in its own request asks whether the
+    entity is the same kind of thing as that record. At ``match.confirm_accept`` the
+    entity is matched to the record; otherwise the outcome stays as it was. A record
+    already assigned to another entity, or wanted by a more likely one, is not
+    taken.
+
+    Returns:
+        The record id by entity key, for the entities that were confirmed.
+    """
+    floor = run.match.confirm_accept
+    if floor <= 0:
+        return {}
+    taken = {
+        pick
+        for pick, sure in zip(chosen, sure_ones, strict=True)
+        if sure and pick != NEW
+    }
+    wanted: list[tuple[EntityInfo, int]] = []
+    for info, pick, sure in zip(infos, chosen, sure_ones, strict=True):
+        if sure and pick != NEW:
+            continue
+        index = matcher.sole_fit(info)
+        if index is not None and ids[index] not in taken:
+            wanted.append((info, index))
+    if not wanted:
+        return {}
+    asked = await gather(
+        *(matcher.confirm(info, index, kind) for info, index in wanted)
+    )
+    confirmed: dict[str, str] = {}
+    ranked = sorted(
+        (
+            (p, info, index)
+            for (info, index), p in zip(wanted, asked, strict=True)
+            if p is not None and p >= floor
+        ),
+        key=lambda item: -item[0],
+    )
+    picked = {info.key: pick for info, pick in zip(infos, chosen, strict=True)}
+    for p, info, index in ranked:
+        if ids[index] in taken:
+            continue
+        taken.add(ids[index])
+        confirmed[info.key] = ids[index]
+        was = picked[info.key]
+        run.warn(
+            f"match_confirmed: {info.label} ({info.key}) is the record "
+            f"{ids[index]!r} on a pairwise check (p={p:.2f}); the choice gave "
+            f"{was!r} (p={answers[info.key].p(was):.2f})"
+        )
+    return confirmed
 
 
 # --------------------------------------------------------------------------- #

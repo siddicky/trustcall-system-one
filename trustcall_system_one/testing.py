@@ -62,6 +62,7 @@ __all__ = [
     "route",
     "score",
     "scrub",
+    "states_relative_change",
     "trace_to_cassette",
 ]
 
@@ -514,6 +515,69 @@ def _content(text: str) -> set[str]:
     }
 
 
+_NUMBER_WORDS = {
+    word: number
+    for number, word in enumerate(
+        [
+            "zero",
+            "one",
+            "two",
+            "three",
+            "four",
+            "five",
+            "six",
+            "seven",
+            "eight",
+            "nine",
+            "ten",
+        ]
+    )
+}
+_NUMBER = re.compile(
+    r"(?<![\w.])(?P<n>\d+(?:\.\d+)?|" + "|".join(_NUMBER_WORDS) + r")(?![\w.])",
+    re.IGNORECASE,
+)
+_RELATIVE_AFTER = re.compile(
+    r"\s+(?:more|fewer|less|extra|additional)\b", re.IGNORECASE
+)
+_RELATIVE_WORD = re.compile(r"\b(?:double|triple|twice|halve|half|another)\b", re.I)
+
+
+def states_relative_change(text: str, old: Any, new: Any) -> bool:
+    """Whether a text describes a change from ``old`` to ``new``, not ``new`` itself.
+
+    For ``FakeWorld`` and scripted examples, which have no model: the answer depends
+    on the CHANGE, not on the words of the input anywhere. The new value is stated if
+    it occurs as a number that is not followed by "more", "fewer", "less", "extra"
+    or "additional" ("the tea towels at 5"); it is relative if it occurs only as
+    such an amount ("two more") or as the difference from the old value, or if
+    "double", "triple", "half" or "another" is said and ``new`` is what that gives
+    from ``old``.
+
+    Args:
+        text: The input.
+        old: What the record holds.
+        new: What the operation would write.
+    """
+    if isinstance(new, bool) or not isinstance(new, (int, float)):
+        return False
+    if isinstance(old, bool) or not isinstance(old, (int, float)):
+        return False
+    relative_amounts: list[float] = []
+    for found in _NUMBER.finditer(text):
+        raw = found.group("n").lower()
+        value = float(_NUMBER_WORDS[raw]) if raw in _NUMBER_WORDS else float(raw)
+        if _RELATIVE_AFTER.match(text, found.end()):
+            relative_amounts.append(value)
+        elif value == new:
+            return False  # stated outright
+    if any(v == new or v == abs(new - old) for v in relative_amounts):
+        return True
+    if _RELATIVE_WORD.search(text):
+        return new in (old * 2, old * 3, old / 2, old + 1) if old else False
+    return False
+
+
 def _fold(value: Any) -> str:
     """Compare-ready text: case and spacing folded; dates, bools and numbers plain."""
     if isinstance(value, bool):
@@ -776,9 +840,15 @@ class FakeWorld:
     * ``gate`` (Clef ``gate``): 0.9 if ``proposed_change.to`` is new compared to
       ``record`` (not equal to what the record holds at the path, nor an element
       of the list it is appended to), else 0.05.
-    * ``relative_edit`` (``relative``, one per numeric replacement of an update): 0.95
-      if the words around the entity's mentions state a change relative to the
-      current value ("two more", "one fewer", "double", "another"), else 0.04.
+    * ``relative_edit`` (``relative``, one per replacement of an ordered quantity in
+      an update): 0.95 if the input describes the change from ``proposed_change.from``
+      to ``proposed_change.to`` instead of giving the new value (``states_relative_
+      change``: "two more" for 3 to 2, not "the tea towels at 5" for 4 to 5), else
+      0.04.
+    * ``match_confirm`` (``confirm``, asked only when the choice left an entity new or
+      undecided and exactly one record is a strong name fit): 0.95 if the entity's
+      ``matches=`` describes the record in the state and no ``match_odds=`` was
+      declared, else 0.05.
     * ``match`` (Clef choice, question id ``match``): the state is ``{input, entity:
       {label, mentions}}`` (the focused entity is found as for every Clef request)
       and the options are ``rec_<i>``, whose criteria is the existing record as a
@@ -1353,6 +1423,7 @@ class FakeWorld:
             "gate": self._gate,
             "relative_edit": self._relative_edit,
             "match": self._match,
+            "match_confirm": self._match_confirm,
             "delete": self._delete,
         }.get(meta.kind)
         if method is None:
@@ -1891,27 +1962,14 @@ class FakeWorld:
             model=payload["model"],
         )
 
-    _RELATIVE = re.compile(
-        r"\b(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|a few|a couple of)"
-        r"\s+(?:more|fewer|less|extra|additional)\b"
-        r"|\b(?:double|triple|halve|half|another)\b",
-        re.IGNORECASE,
-    )
-
     def _relative_edit(
         self, model: str, payload: dict[str, Any], meta: CallMeta
     ) -> Any:
-        element = self._focus(payload, meta)
-        source = str(payload["state"].get("input", ""))
-        if element is not None and element.spans and self.text:
-            # only the words around the entity's own mentions: "two more of the blue
-            # mugs" is about the mugs, not about the tea towels in the next clause
-            windows = [
-                self.text[max(0, a - 40) : b + 25] for a, b in sorted(element.spans)
-            ]
-        else:
-            windows = [source]
-        relative = any(self._RELATIVE.search(w) for w in windows)
+        state = payload["state"]
+        change = state.get("proposed_change") or {}
+        relative = states_relative_change(
+            str(state.get("input", "")), change.get("from"), change.get("to")
+        )
         return clef_response(
             {qid: noul(0.95 if relative else 0.04) for qid in payload["questions"]},
             model=payload["model"],
@@ -1930,6 +1988,22 @@ class FakeWorld:
                 for key, value in spec.items()
             )
         return _fold(spec) in _fold(json.dumps(record, ensure_ascii=False))
+
+    def _match_confirm(
+        self, model: str, payload: dict[str, Any], meta: CallMeta
+    ) -> Any:
+        element = self._focus(payload, meta)
+        record = payload["state"].get("record")
+        same = (
+            element is not None
+            and element.matches is not None
+            and element.odds is None  # a declared doubt is a doubt here too
+            and self._is_record(element.matches, record)
+        )
+        return clef_response(
+            {qid: noul(0.95 if same else 0.05) for qid in payload["questions"]},
+            model=payload["model"],
+        )
 
     def _match(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
         element = self._focus(payload, meta)

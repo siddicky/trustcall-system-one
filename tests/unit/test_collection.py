@@ -345,8 +345,9 @@ async def test_many_label_is_what_prompts_call_an_entity() -> None:
         in (payload["fields"]["mentions"]["instructions"])
     )
     ((_, presence, _),) = of_kind(world, "presence")
-    assert presence["questions"]["presence"]["instructions"].startswith(
-        "Does `input` mention any friend"
+    # the label is how the entity is called (display); the kind is what it is
+    assert presence["questions"]["presence"]["instructions"] == (
+        "Does `input` mention any person?"
     )
 
 
