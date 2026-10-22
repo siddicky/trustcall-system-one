@@ -62,6 +62,7 @@ __all__ = [
     "route",
     "score",
     "scrub",
+    "states_relative_change",
     "trace_to_cassette",
 ]
 
@@ -439,6 +440,144 @@ _YES, _NO = 0.96, 0.03
 _ATTR_YES, _ATTR_NO = 0.95, 0.04
 
 
+_FILLER = frozenset(
+    [
+        "the",
+        "and",
+        "for",
+        "with",
+        "from",
+        "into",
+        "onto",
+        "that",
+        "this",
+        "these",
+        "those",
+        "she",
+        "her",
+        "hers",
+        "his",
+        "him",
+        "they",
+        "them",
+        "their",
+        "you",
+        "your",
+        "our",
+        "was",
+        "were",
+        "are",
+        "has",
+        "have",
+        "had",
+        "who",
+        "whom",
+        "what",
+        "when",
+        "where",
+        "which",
+        "will",
+        "would",
+        "can",
+        "could",
+        "not",
+        "but",
+        "now",
+        "new",
+        "also",
+        "just",
+        "today",
+        "then",
+        "than",
+        "there",
+        "here",
+        "its",
+        "said",
+        "says",
+        "called",
+        "calls",
+        "told",
+        "asked",
+        "wants",
+        "wanted",
+        "moved",
+    ]
+)
+"""Words that carry no news by themselves, for ``FakeWorld``'s novelty check."""
+
+
+def _content(text: str) -> set[str]:
+    """The words and numbers of a text that can tell something new."""
+    return {
+        word
+        for word in re.findall(r"\w+", _fold(text))
+        if len(word) >= 3 and word not in _FILLER
+    }
+
+
+_NUMBER_WORDS = {
+    word: number
+    for number, word in enumerate(
+        [
+            "zero",
+            "one",
+            "two",
+            "three",
+            "four",
+            "five",
+            "six",
+            "seven",
+            "eight",
+            "nine",
+            "ten",
+        ]
+    )
+}
+_NUMBER = re.compile(
+    r"(?<![\w.])(?P<n>\d+(?:\.\d+)?|" + "|".join(_NUMBER_WORDS) + r")(?![\w.])",
+    re.IGNORECASE,
+)
+_RELATIVE_AFTER = re.compile(
+    r"\s+(?:more|fewer|less|extra|additional)\b", re.IGNORECASE
+)
+_RELATIVE_WORD = re.compile(r"\b(?:double|triple|twice|halve|half|another)\b", re.I)
+
+
+def states_relative_change(text: str, old: Any, new: Any) -> bool:
+    """Whether a text describes a change from ``old`` to ``new``, not ``new`` itself.
+
+    For ``FakeWorld`` and scripted examples, which have no model: the answer depends
+    on the CHANGE, not on the words of the input anywhere. The new value is stated if
+    it occurs as a number that is not followed by "more", "fewer", "less", "extra"
+    or "additional" ("the tea towels at 5"); it is relative if it occurs only as
+    such an amount ("two more") or as the difference from the old value, or if
+    "double", "triple", "half" or "another" is said and ``new`` is what that gives
+    from ``old``.
+
+    Args:
+        text: The input.
+        old: What the record holds.
+        new: What the operation would write.
+    """
+    if isinstance(new, bool) or not isinstance(new, (int, float)):
+        return False
+    if isinstance(old, bool) or not isinstance(old, (int, float)):
+        return False
+    relative_amounts: list[float] = []
+    for found in _NUMBER.finditer(text):
+        raw = found.group("n").lower()
+        value = float(_NUMBER_WORDS[raw]) if raw in _NUMBER_WORDS else float(raw)
+        if _RELATIVE_AFTER.match(text, found.end()):
+            relative_amounts.append(value)
+        elif value == new:
+            return False  # stated outright
+    if any(v == new or v == abs(new - old) for v in relative_amounts):
+        return True
+    if _RELATIVE_WORD.search(text):
+        return new in (old * 2, old * 3, old / 2, old + 1) if old else False
+    return False
+
+
 def _fold(value: Any) -> str:
     """Compare-ready text: case and spacing folded; dates, bools and numbers plain."""
     if isinstance(value, bool):
@@ -485,6 +624,8 @@ class WorldEntity:
             for an entity that is new.
         odds: Declared match probabilities (see ``FakeWorld.entity``).
         odds_confidence: The confidence of the declared match answer.
+        confirm: What the pairwise ``match_confirm`` answers about this entity, when
+            declared (a Clef that says yes to a new person: 0.75).
         descriptive: Mentions that only a broadened discovery finds (see
             ``FakeWorld.entity``).
         flat: The field values by dotted path.
@@ -502,6 +643,7 @@ class WorldEntity:
     matches: Any = None
     odds: dict[str, float] | None = None
     odds_confidence: float | None = None
+    confirm: float | None = None
     descriptive: tuple[tuple[str, int | None], ...] = ()
     flat: dict[str, Any] = field(default_factory=dict)
     spans: list[Span] = field(default_factory=list)
@@ -701,6 +843,16 @@ class FakeWorld:
     * ``gate`` (Clef ``gate``): 0.9 if ``proposed_change.to`` is new compared to
       ``record`` (not equal to what the record holds at the path, nor an element
       of the list it is appended to), else 0.05.
+    * ``relative_edit`` (``relative``, one per replacement of an ordered quantity in
+      an update): 0.95 if the input describes the change from ``proposed_change.from``
+      to ``proposed_change.to`` instead of giving the new value (``states_relative_
+      change``: "two more" for 3 to 2, not "the tea towels at 5" for 4 to 5), else
+      0.04.
+    * ``match_confirm`` (``confirm``, asked only when the choice left an entity
+      undecided and exactly one record is a strong name fit): the entity's
+      ``confirm=`` if declared (a gullible Clef), else 0.95 if its ``matches=``
+      describes the record in the state and no ``match_odds=`` was declared, else
+      0.05.
     * ``match`` (Clef choice, question id ``match``): the state is ``{input, entity:
       {label, mentions}}`` (the focused entity is found as for every Clef request)
       and the options are ``rec_<i>``, whose criteria is the existing record as a
@@ -805,6 +957,7 @@ class FakeWorld:
         match_confidence: float | None = None,
         descriptive: Sequence[str | tuple[str, int]] = (),
         parent: "str | WorldEntity | None" = None,
+        confirm: float | None = None,
     ) -> "WorldEntity":
         """Declare an entity of a schema that the text really contains.
 
@@ -837,6 +990,11 @@ class FakeWorld:
                 does not matter). Requests about the items of one parent see only
                 the items declared with it. For a mapping, declare the entry's
                 ``key`` and ``value`` as its fields.
+            confirm: The probability the pairwise ``match_confirm`` question gives
+                for this entity and ANY record, true or not: a gullible Clef that
+                says 0.75 to a new "Emma" next to the record "Emma Thompson". Left
+                out, it answers from what the world declares: 0.95 for the record
+                ``matches`` describes, else 0.05.
 
         Returns:
             The declared entity (pass it, or its label, to ``bleed`` and
@@ -845,7 +1003,7 @@ class FakeWorld:
         Raises:
             ValueError: If a mention is not in the text.
         """
-        return self._add(
+        element = self._add(
             label,
             schema,
             mentions,
@@ -857,6 +1015,8 @@ class FakeWorld:
             descriptive=descriptive,
             parent=parent,
         )
+        element.confirm = confirm
+        return element
 
     def non_entity(
         self,
@@ -978,7 +1138,10 @@ class FakeWorld:
 
         The ``novelty`` check answers ``p`` (default 0.05) for a sentence that
         contains ``text`` (case and accents ignored): "Her mobile is now ..." when the
-        phone is being written to its own field. Every other sentence is news (0.95).
+        phone is being written to its own field. Without this the check judges the
+        sentence by its words: it is news (0.95) when it has a word or number (of
+        three letters or more, not a filler such as "the" or "she") that the record
+        it is shown does not hold, else it repeats the record (0.05).
         """
         self._redundant.append((_fold(text), p))
         return self
@@ -1270,7 +1433,9 @@ class FakeWorld:
             "novelty": self._novelty,
             "record_presence": self._record_presence,
             "gate": self._gate,
+            "relative_edit": self._relative_edit,
             "match": self._match,
+            "match_confirm": self._match_confirm,
             "delete": self._delete,
         }.get(meta.kind)
         if method is None:
@@ -1646,7 +1811,8 @@ class FakeWorld:
         answers = {}
         for qid, question in payload["questions"].items():
             found = re.search(
-                r'(?:\bis|\bbe|:) "(.*)"(?:\?\s*$|, or does it follow\b| one of the\b)',
+                r'(?:\bis|\bbe|:) "(.*)"'
+                r"(?:\?\s*$|, or does it follow\b| (?:one of the|an?)\b)",
                 question["instructions"],
                 re.S,
             )
@@ -1752,10 +1918,14 @@ class FakeWorld:
                 re.S,
             )
             text = _fold(found.group(1)) if found else ""
-            held = _fold(json.dumps(payload["state"].get("record"), ensure_ascii=False))
+            record = payload["state"].get("record")
+            held = _fold(json.dumps(record, ensure_ascii=False))
+            known = _content(held)
             p = 0.95
             if text and f'"{text}"' in held:
                 p = 0.05  # the record holds this very sentence already
+            elif text and not (_content(text) - known):
+                p = 0.05  # every word of it is in the record: nothing new
             for part, odds in self._redundant:
                 if part in text:
                     p = odds
@@ -1804,6 +1974,19 @@ class FakeWorld:
             model=payload["model"],
         )
 
+    def _relative_edit(
+        self, model: str, payload: dict[str, Any], meta: CallMeta
+    ) -> Any:
+        state = payload["state"]
+        change = state.get("proposed_change") or {}
+        relative = states_relative_change(
+            str(state.get("input", "")), change.get("from"), change.get("to")
+        )
+        return clef_response(
+            {qid: noul(0.95 if relative else 0.04) for qid in payload["questions"]},
+            model=payload["model"],
+        )
+
     # matching and deletes --------------------------------------------------- #
 
     @staticmethod
@@ -1817,6 +2000,25 @@ class FakeWorld:
                 for key, value in spec.items()
             )
         return _fold(spec) in _fold(json.dumps(record, ensure_ascii=False))
+
+    def _match_confirm(
+        self, model: str, payload: dict[str, Any], meta: CallMeta
+    ) -> Any:
+        element = self._focus(payload, meta)
+        record = payload["state"].get("record")
+        if element is not None and element.confirm is not None:
+            p = element.confirm
+        else:
+            same = (
+                element is not None
+                and element.matches is not None
+                and element.odds is None  # a declared doubt is a doubt here too
+                and self._is_record(element.matches, record)
+            )
+            p = 0.95 if same else 0.05
+        return clef_response(
+            {qid: noul(p) for qid in payload["questions"]}, model=payload["model"]
+        )
 
     def _match(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
         element = self._focus(payload, meta)
@@ -2419,7 +2621,10 @@ def trace_to_cassette(
     that was sent, the full REST response and the URL it went to (the model is the
     part after ``/ai/run/``). Such a line has everything a cassette key needs,
     except the call kind, which is left empty (it is informational; a lookup uses
-    the key only). The REST envelope is removed from the response.
+    the key only). The REST envelope is removed from the response. The lines are
+    written as they are: a line whose request or response holds an exact credential
+    (the Cloudflare environment variables) is left out with a ``RuntimeWarning``,
+    never edited, so a recorded answer replays as the model gave it.
 
     Args:
         trace: The JSONL trace file.
@@ -2449,6 +2654,17 @@ def trace_to_cassette(
                 and "result" in response
             ):
                 response = response["result"]
+            bodies = json.dumps([row["request"], response], ensure_ascii=False)
+            if any(secret in bodies for secret in _secrets()):
+                # a cassette is never edited (it replays what was said): a call that
+                # holds a credential is left out, as when recording
+                warnings.warn(
+                    f"trace_to_cassette: line {number} holds a credential in its "
+                    "request or response and was not converted",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                continue
             lines.append(
                 {
                     "key": request_key(model, row["request"]),
@@ -2465,5 +2681,5 @@ def trace_to_cassette(
             )
     with open(cassette, "w", encoding="utf-8") as out:
         for line in lines:
-            out.write(scrub(json.dumps(line, ensure_ascii=False)) + "\n")
+            out.write(json.dumps(line, ensure_ascii=False) + "\n")
     return len(lines)

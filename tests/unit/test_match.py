@@ -351,9 +351,11 @@ def test_identity_compatible(first: str, second: str, same: bool) -> None:
     assert identity_compatible(second, first) is same
 
 
-def test_an_identity_with_nothing_to_compare_is_compatible() -> None:
-    assert identity_compatible("", "Emma")
-    assert identity_compatible("...", "Emma")
+@pytest.mark.parametrize("blank", ["", "   ", "...", "\t\n"])
+def test_a_blank_identity_fits_nothing(blank: str) -> None:
+    assert not identity_compatible(blank, "Emma")
+    assert not identity_compatible("Emma", blank)
+    assert not identity_compatible(blank, blank)
 
 
 def test_compact_records_keep_identity_scalars_and_list_heads() -> None:
@@ -412,6 +414,14 @@ def entity(key: str, label: str, *texts: str, after: str = "") -> EntityInfo:
     )
 
 
+def named(key: str, label: str) -> EntityInfo:
+    """An entity whose single mention has no span (its text is not in ``TEXT``)."""
+    mention = Mention(label, None)
+    return EntityInfo(
+        key=key, label=label, mentions=(mention,), first_mention=mention, qualify_p=0.97
+    )
+
+
 class Recorder:
     """A transport handler that answers match questions from a name table."""
 
@@ -423,6 +433,10 @@ class Recorder:
         self.transport = FakeTransport(self.handle)
 
     def handle(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
+        if meta.kind == "match_confirm":  # not under test here: "a different one"
+            return clef_response(
+                {q: noul(0.05) for q in payload["questions"]}, model=payload["model"]
+            )
         assert meta.kind == "match"
         self.meta.append(meta)
         self.states.append(payload["state"])
@@ -634,13 +648,24 @@ class Fixed:
     """Match answers by entity label: probabilities by record name (or ``__new__``)."""
 
     def __init__(
-        self, table: dict[str, dict[str, float]], confidence: float | None = None
+        self,
+        table: dict[str, dict[str, float]],
+        confidence: float | dict[str, float] | None = None,
+        confirm: dict[str, float] | None = None,
     ) -> None:
         self.table, self.confidence = table, confidence
+        self.confirm = confirm or {}  # the pairwise answer by entity label
+        self.confirmed: list[tuple[str, dict[str, Any]]] = []
         self.transport = FakeTransport(self.handle)
 
     def handle(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
         label = payload["state"]["entity"]["label"]
+        if meta.kind == "match_confirm":
+            self.confirmed.append((label, payload))
+            p = self.confirm.get(label, 0.05)
+            return clef_response(
+                {q: noul(p) for q in payload["questions"]}, model=payload["model"]
+            )
         options = dict(payload["questions"]["match"]["criteria"])
         wanted = self.table[label]
         probs = {
@@ -648,8 +673,13 @@ class Fixed:
             for option in options
         }
         best = max(probs, key=lambda o: probs[o])
+        confidence = (
+            self.confidence.get(label)
+            if isinstance(self.confidence, dict)
+            else self.confidence
+        )
         return clef_response(
-            {"match": choice(best, probs, self.confidence)}, model=payload["model"]
+            {"match": choice(best, probs, confidence)}, model=payload["model"]
         )
 
 
@@ -732,28 +762,282 @@ async def test_a_name_compatible_top_record_is_accepted_without_the_confidence()
     assert outcome.targets == {} and outcome.skipped[0].reason == "ambiguous_match"
 
 
-async def test_a_first_name_fits_its_only_record_at_the_compatible_floor() -> None:
-    # live: Emma, 0.506 for the record against 0.4683 for __new__, confidence 0.30
-    fixed = Fixed(
-        {"Emma": {"Emma Thompson": 0.506, NEW: 0.4683, "Bob Roe": 0.02}},
-        confidence=0.30,
+async def test_the_readme_emma_at_0_506_is_confirmed_pairwise() -> None:
+    """Live 5/6: Emma, 0.506 for the record against 0.4683 for __new__, confidence
+    0.30. The margin makes it a coin flip for the choice; the pairwise question
+    decides it."""
+    table = {"Emma": {"Emma Thompson": 0.506, NEW: 0.4683, "Bob Roe": 0.02}}
+    pool = candidates("Emma Thompson", "Bob Roe")
+    fixed = Fixed(table, confidence=0.30, confirm={"Emma": 0.88})
+    outcome, run = await run_fixed(fixed, [entity("e0", "Emma", "Emma")], pool)
+    assert outcome.targets == {"e0": "0"} and outcome.skipped == ()
+    ((label, payload),) = fixed.confirmed
+    assert label == "Emma"
+    assert payload["questions"]["confirm"]["instructions"] == (
+        "In `input`, is `entity.label` the same Person as the existing record "
+        "`record` (Emma Thompson)?"
     )
-    outcome, _ = await run_fixed(
-        fixed, [entity("e0", "Emma", "Emma")], candidates("Emma Thompson", "Bob Roe")
-    )
-    assert outcome.targets == {"e0": "0"}
-    below = Fixed({"Emma": {"Emma Thompson": 0.45, NEW: 0.4, "Bob Roe": 0.15}})
-    outcome, _ = await run_fixed(
-        below, [entity("e0", "Emma", "Emma")], candidates("Emma Thompson", "Bob Roe")
-    )
+    assert payload["state"]["record"]["name"] == "Emma Thompson"
+    assert payload["state"]["entity"]["label"] == "Emma"
+    assert any(w.startswith("match_confirmed") for w in run.warnings)
+    # a low answer keeps the choice's outcome: ambiguous
+    low = Fixed(table, confidence=0.30, confirm={"Emma": 0.4})
+    outcome, _ = await run_fixed(low, [entity("e0", "Emma", "Emma")], pool)
     assert outcome.targets == {} and outcome.skipped[0].reason == "ambiguous_match"
-    loose, _ = await run_fixed(
+    # the knob moves the bar and 0 switches the step off
+    knob = MatchConfig(confirm_accept=0.95)
+    outcome, _ = await run_fixed(fixed, [entity("e0", "Emma", "Emma")], pool, knob)
+    assert outcome.targets == {}
+    off = Fixed(table, confidence=0.30, confirm={"Emma": 0.99})
+    outcome, _ = await run_fixed(
+        off, [entity("e0", "Emma", "Emma")], pool, MatchConfig(confirm_accept=0)
+    )
+    assert outcome.targets == {} and off.confirmed == []
+    # and the compatible shortcut still takes a clear margin without any question
+    clear = Fixed({"Emma": {"Emma Thompson": 0.58, NEW: 0.38, "Bob Roe": 0.04}}, 0.30)
+    outcome, _ = await run_fixed(clear, [entity("e0", "Emma", "Emma")], pool)
+    assert outcome.targets == {"e0": "0"} and clear.confirmed == []
+    below = Fixed({"Emma": {"Emma Thompson": 0.45, NEW: 0.3, "Bob Roe": 0.25}})
+    outcome, _ = await run_fixed(
         below,
         [entity("e0", "Emma", "Emma")],
-        candidates("Emma Thompson", "Bob Roe"),
-        MatchConfig(accept_compatible=0.4),
+        pool,
+        MatchConfig(accept_compatible=0.4, confirm_accept=0),
     )
-    assert loose.targets == {"e0": "0"}
+    assert outcome.targets == {"e0": "0"}
+
+
+async def test_a_short_form_the_choice_calls_new_is_confirmed_pairwise() -> None:
+    """short_form (live 7): __new__ 0.831 with confidence 0.4377 (not sure) for
+    "Emma" against the record Emma Thompson; the pairwise answer was 0.8472."""
+    fixed = Fixed(
+        {"Emma": {"Emma Thompson": 0.169, NEW: 0.831}},
+        confidence=0.4377,
+        confirm={"Emma": 0.8472},
+    )
+    outcome, _ = await run_fixed(
+        fixed, [entity("e0", "Emma", "Emma")], candidates("Emma Thompson")
+    )
+    assert outcome.targets == {"e0": "0"} and outcome.confirmed == {"e0"}
+    # the pairwise answer must beat the choice's own p(__new__)
+    weak = Fixed(
+        {"Emma": {"Emma Thompson": 0.169, NEW: 0.831}},
+        confidence=0.4377,
+        confirm={"Emma": 0.80},
+    )
+    outcome, _ = await run_fixed(
+        weak, [entity("e0", "Emma", "Emma")], candidates("Emma Thompson")
+    )
+    assert outcome.targets == {} and outcome.skipped[0].reason == "ambiguous_match"
+
+
+async def test_a_sure_new_is_never_overridden_by_the_pairwise_answer() -> None:
+    """bleed_update (live 7): Maria __new__ 0.836, confidence 0.5827 (sure). A gullible
+    pairwise 0.99 does not turn a new person into Maria Costa."""
+    fixed = Fixed(
+        {"Maria": {"Maria Costa": 0.15, NEW: 0.836}},
+        confidence=0.5827,
+        confirm={"Maria": 0.99},
+    )
+    outcome, _ = await run_fixed(
+        fixed, [named("e0", "Maria")], candidates("Maria Costa")
+    )
+    assert outcome.targets == {"e0": None} and fixed.confirmed == []
+
+
+async def test_two_first_names_are_confirmed_one_by_one_when_unsure() -> None:
+    fixed = Fixed(
+        {
+            "Maria": {"Maria Costa": 0.15, "Jon Petit": 0.01, NEW: 0.84},
+            "Jon": {"Maria Costa": 0.01, "Jon Petit": 0.852, NEW: 0.138},
+        },
+        confidence={"Maria": 0.4, "Jon": 0.616},
+        confirm={"Maria": 0.93},
+    )
+    outcome, _ = await run_fixed(
+        fixed,
+        [named("e0", "Maria"), named("e1", "Jon")],
+        candidates("Maria Costa", "Jon Petit"),
+    )
+    assert outcome.targets == {"e0": "0", "e1": "1"}
+    assert [label for label, _ in fixed.confirmed] == ["Maria"]  # Jon was sure
+
+
+async def test_a_full_name_that_contradicts_the_record_is_never_confirmed() -> None:
+    from trustcall_system_one._match import _Matcher
+
+    run = Run(transport=FakeTransport(lambda m, p, meta: None))
+    matcher = _Matcher(
+        run,
+        compile_schema(Person),
+        TEXT,
+        "Person",
+        candidates("Emma Thompson"),
+        ("name",),
+    )
+    emma = named("e0", "Emma")
+    davis = EntityInfo(
+        key="e1",
+        label="Emma Davis",
+        mentions=(Mention("Emma Davis", None), Mention("Emma", None)),
+        first_mention=Mention("Emma Davis", None),
+        qualify_p=0.97,
+    )
+    assert matcher.sole_fit(emma) == 0
+    assert matcher.sole_fit(davis) is None  # "Emma Davis" is not "Emma Thompson"
+
+
+async def test_a_new_person_who_is_not_a_strong_fit_is_never_asked_about() -> None:
+    fixed = Fixed(
+        {"Emma Watson": {"Emma Thompson": 0.1, NEW: 0.88}},
+        confirm={"Emma Watson": 0.99},
+    )
+    outcome, _ = await run_fixed(
+        fixed,
+        [named("e0", "Emma Watson")],
+        candidates("Emma Thompson", "Bob Roe"),
+    )
+    assert outcome.targets == {"e0": None} and fixed.confirmed == []
+
+
+async def test_two_compatible_records_are_never_confirmed() -> None:
+    fixed = Fixed(
+        {"Emma": {"Emma Thompson": 0.1, "Emma Watson": 0.1, NEW: 0.8}},
+        confirm={"Emma": 0.99},
+    )
+    outcome, _ = await run_fixed(
+        fixed,
+        [entity("e0", "Emma", "Emma")],
+        candidates("Emma Thompson", "Emma Watson"),
+    )
+    assert outcome.targets == {"e0": None} and fixed.confirmed == []
+
+
+async def test_a_different_person_is_not_forced_onto_the_record_by_a_low_answer() -> (
+    None
+):
+    fixed = Fixed(
+        {"Emma": {"Emma Thompson": 0.1, NEW: 0.85}},
+        confidence=0.3,
+        confirm={"Emma": 0.12},
+    )
+    outcome, _ = await run_fixed(
+        fixed, [entity("e0", "Emma", "Emma")], candidates("Emma Thompson")
+    )
+    # the choice was not sure, the pairwise answer is low: the old outcome stands
+    assert outcome.targets == {} and outcome.skipped[0].reason == "ambiguous_match"
+    assert len(fixed.confirmed) == 1
+    # with on_ambiguous="insert" the likely-new reading is a new person
+    inserting = MatchConfig(on_ambiguous="insert", accept=0.6)
+    outcome, _ = await run_fixed(
+        fixed, [entity("e0", "Emma", "Emma")], candidates("Emma Thompson"), inserting
+    )
+    assert outcome.targets == {"e0": None}
+
+
+async def test_a_record_another_entity_holds_is_not_confirmed_for_a_second() -> None:
+    fixed = Fixed(
+        {
+            "Emma Thompson": {"Emma Thompson": 0.95, NEW: 0.05},
+            "Emma": {"Emma Thompson": 0.1, NEW: 0.88},
+        },
+        confidence=0.9,
+        confirm={"Emma": 0.99},
+    )
+    outcome, _ = await run_fixed(
+        fixed,
+        [entity("e0", "Emma Thompson", "Emma Thompson"), named("e1", "Emma")],
+        candidates("Emma Thompson"),
+    )
+    assert outcome.targets == {"e0": "0", "e1": None} and fixed.confirmed == []
+
+
+async def test_the_compatible_shortcut_is_no_coin_flip() -> None:
+    # 0.51 against __new__ 0.49 with a low confidence: not a decision
+    flip = Fixed(
+        {"Emma": {"Emma Thompson": 0.51, NEW: 0.49}},
+        confidence=0.02,
+    )
+    pool = candidates("Emma Thompson", "Bob Roe")
+    outcome, _ = await run_fixed(flip, [entity("e0", "Emma", "Emma")], pool)
+    assert outcome.targets == {} and outcome.skipped[0].reason == "ambiguous_match"
+    # the margin is over the runner-up too, not only over __new__
+    runner = Fixed(
+        {"Emma": {"Emma Thompson": 0.52, "Emma Watson": 0.45, NEW: 0.03}},
+        confidence=0.02,
+    )
+    outcome, _ = await run_fixed(
+        runner,
+        [entity("e0", "Emma", "Emma")],
+        candidates("Emma Thompson", "Emma Watson"),
+    )
+    assert outcome.targets == {}
+    # a margin of 0.1 is enough, and the knob moves it
+    clear = Fixed({"Emma": {"Emma Thompson": 0.58, NEW: 0.42}}, confidence=0.02)
+    outcome, _ = await run_fixed(clear, [entity("e0", "Emma", "Emma")], pool)
+    assert outcome.targets == {"e0": "0"}
+    wide = MatchConfig(compatible_margin=0.3)
+    outcome, _ = await run_fixed(clear, [entity("e0", "Emma", "Emma")], pool, wide)
+    assert outcome.targets == {}
+    off = MatchConfig(compatible_margin=0.0)
+    outcome, _ = await run_fixed(flip, [entity("e0", "Emma", "Emma")], pool, off)
+    assert outcome.targets == {"e0": "0"}
+
+
+async def test_a_prefix_alone_does_not_accept_a_longer_name() -> None:
+    # "Dan" is the start of "Daniela", and a nickname of Daniel: not enough
+    fixed = Fixed({"Dan": {"Daniela Cruz": 0.7, NEW: 0.2}}, confidence=0.1)
+    pool = candidates("Daniela Cruz", "Bob Roe")
+    outcome, _ = await run_fixed(fixed, [named("e0", "Dan")], pool)
+    assert outcome.targets == {} and outcome.skipped[0].reason == "ambiguous_match"
+    # a typo of a two-word name is a fit; so is a single word the record has
+    typo = Fixed({"Emma Thomson": {"Emma Thompson": 0.7, NEW: 0.2}}, confidence=0.1)
+    outcome, _ = await run_fixed(
+        typo,
+        [named("e0", "Emma Thomson")],
+        candidates("Emma Thompson", "Bob Roe"),
+    )
+    assert outcome.targets == {"e0": "0"}
+    word = Fixed({"Daniela": {"Daniela Cruz": 0.7, NEW: 0.2}}, confidence=0.1)
+    outcome, _ = await run_fixed(word, [named("e0", "Daniela")], pool)
+    assert outcome.targets == {"e0": "0"}
+    liz = Fixed({"Liz": {"Elizabeth Parker": 0.7, NEW: 0.2}}, confidence=0.1)
+    outcome, _ = await run_fixed(
+        liz,
+        [named("e0", "Liz")],
+        candidates("Elizabeth Parker", "Bob Roe"),
+    )
+    assert outcome.targets == {"e0": "0"}
+
+
+@pytest.mark.parametrize(
+    ("mention", "value", "strong"),
+    [
+        ("Dan", "Daniela Cruz", False),
+        ("Jo", "John Doe", False),
+        ("JS", "John Smith", False),
+        ("Emma Thomson", "Emma Thompson", True),
+        ("Emma", "Emma Thompson", True),
+        ("Liz", "Elizabeth Parker", True),
+        ("J. Smith", "John Smith", True),
+        ("Emma Watson", "Emma Thompson", False),
+        ("", "Emma", False),
+    ],
+)
+def test_strong_compatible(mention: str, value: str, strong: bool) -> None:
+    from trustcall_system_one._coref import strong_compatible
+
+    assert strong_compatible(mention, value) is strong
+
+
+async def test_a_blank_identity_record_is_never_the_compatible_one() -> None:
+    recs = [
+        Candidate("0", {"name": "", "relationship": None, "notes": []}),
+        Candidate("1", {"name": "  ", "relationship": None, "notes": []}),
+    ]
+    fixed = Fixed({"Zara Khan": {"0": 0.7, NEW: 0.2}}, confidence=0.1)
+    outcome, _ = await run_fixed(fixed, [named("e0", "Zara Khan")], recs)
+    assert outcome.targets == {}
 
 
 async def test_the_compatible_shortcut_needs_the_top_and_only_fitting_record() -> None:
@@ -1103,6 +1387,8 @@ def test_the_defaults() -> None:
     config = MatchConfig()
     assert (config.accept, config.min_confidence, config.render_fields) == (0.6, 0.5, 4)
     assert config.accept_compatible == 0.5
+    assert config.compatible_margin == 0.1
+    assert config.confirm_accept == 0.7
     assert (config.collision, config.on_ambiguous, config.delete_threshold) == (
         "warn",
         "skip",
@@ -1119,6 +1405,9 @@ def test_the_defaults() -> None:
         {"accept": 1.5},
         {"min_confidence": -0.1},
         {"accept_compatible": 1.5},
+        {"compatible_margin": -0.1},
+        {"compatible_margin": 1.5},
+        {"confirm_accept": 1.5},
         {"delete_threshold": float("nan")},
         {"render_fields": -1},
         {"render_fields": True},

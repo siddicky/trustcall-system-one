@@ -402,6 +402,38 @@ async def test_a_wire_trace_becomes_a_cassette_that_replays_by_key(
     assert (await cassette.run(CLEF, second, meta=GATE)).body == decision
 
 
+async def test_a_trace_line_with_a_credential_is_skipped_not_scrubbed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = "0123456789abcdef0123456789abcdef"
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", secret)
+    fake = world()
+    first = clairic_payload()
+    answer = (await fake.run(CLAIRIC, first, meta=META)).body
+    second = clef_payload()
+    decision = (await fake.run(CLEF, second, meta=GATE)).body
+    # an ordinary line that merely looks like an account path is kept as it is
+    note = {**first, "state": f"{first['state']} accounts/{'a' * 32} Bearer abc"}
+    leaked = {**second, "state": f"{second['state']} id {secret}"}
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(
+        "\n".join(
+            json.dumps(row)
+            for row in (
+                trace_line(CLAIRIC, note, answer),
+                trace_line(CLEF, leaked, decision),
+            )
+        )
+        + "\n"
+    )
+    cassette_path = tmp_path / "out.jsonl"
+    with pytest.warns(RuntimeWarning, match="line 2 holds a credential"):
+        assert trace_to_cassette(trace, cassette_path) == 1
+    (row,) = lines(cassette_path)
+    assert row["request"] == note  # not one character of a kept line is rewritten
+    assert secret not in cassette_path.read_text()
+
+
 def test_a_line_that_is_not_a_wire_trace_is_refused(tmp_path: Path) -> None:
     trace = tmp_path / "t.jsonl"
     trace.write_text('{"request": {}}\n')

@@ -208,6 +208,52 @@ async def test_a_byte_identical_clef_request_is_answered_from_the_run() -> None:
     assert len(transport.calls) == 3
 
 
+def test_the_memo_key_is_a_hash_that_holds_neither_the_text_nor_the_images() -> None:
+    from trustcall_system_one._run import memo_key
+
+    payload = {
+        "model": "clef",
+        "state": {"input": "secret text " * 50},
+        "questions": {"a": {"type": "noul", "instructions": "A?"}},
+        "images": [PNG],
+    }
+    key = memo_key("m", payload)
+    assert len(key) == 64 and int(key, 16) >= 0
+    assert "secret" not in key and "iVBOR" not in key
+    assert key == memo_key("m", dict(payload))
+    assert key != memo_key("other", payload)
+
+
+def test_the_memo_key_ignores_key_order_but_not_question_order() -> None:
+    from trustcall_system_one._run import memo_key
+
+    a = {"type": "noul", "instructions": "A?", "criteria": {"true": "t", "false": "f"}}
+    b = {"type": "noul", "instructions": "B?"}
+    one = {"state": {"x": 1, "y": 2}, "questions": {"a": a, "b": b}}
+    same = {
+        "questions": {
+            "a": {
+                "criteria": {"false": "f", "true": "t"},
+                "instructions": "A?",
+                "type": "noul",
+            },
+            "b": b,
+        },
+        "state": {"y": 2, "x": 1},
+    }
+    swapped = {"state": {"x": 1, "y": 2}, "questions": {"b": b, "a": a}}
+    assert memo_key("m", one) == memo_key("m", same)
+    assert memo_key("m", one) != memo_key("m", swapped)
+
+
+async def test_the_memo_holds_hashes_not_requests() -> None:
+    run, _ = run_with(route(attribution=clef_ok), images=[PNG])
+    meta = CallMeta(kind="attribution")
+    await run.call_clef({"q": QUESTION}, {"input": "x" * 5000}, meta=meta)
+    (key,) = run.clef_memo
+    assert len(key) == 64 and "xxx" not in key
+
+
 async def test_a_failed_clef_request_is_not_remembered() -> None:
     attempts: list[int] = []
 

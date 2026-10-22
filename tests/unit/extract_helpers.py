@@ -115,6 +115,8 @@ class Script:
         sentences: ``sentences`` probability by a part of the sentence asked about
             (the first part found in it wins); ``sentences_default`` answers the
             rest.
+        relative: ``relative_edit`` probability by a part of the input (the first
+            part found in it wins); ``relative_default`` answers the rest.
         novelty: ``novelty`` probability by a part of the sentence asked about (the
             first part found in it wins); ``novelty_default`` answers the rest.
         list_kinds: What ``list_kind`` says about a list field, by wire name
@@ -150,6 +152,8 @@ class Script:
     sentences_default: float = 0.04
     novelty: dict[str, float] = field(default_factory=dict)
     novelty_default: float = 0.95
+    relative: dict[str, float] = field(default_factory=dict)
+    relative_default: float = 0.04
     list_kinds: dict[str, str] = field(default_factory=dict)
     truncated: int = 0
     state_text: Callable[[str], str] | None = None
@@ -175,6 +179,7 @@ class Script:
                 stated=self._stated,
                 sentences=self._sentences,
                 novelty=self._novelty,
+                relative_edit=self._relative_edit,
                 list_kind=self._list_kind,
             )
         )
@@ -355,6 +360,18 @@ class Script:
             )
             answers[qid] = noul(p)
         return clef_response(answers)
+
+    def _relative_edit(
+        self, model: str, payload: dict[str, Any], meta: CallMeta
+    ) -> Any:
+        source = str(payload["state"].get("input", ""))
+        p = next(
+            (p for part, p in self.relative.items() if part in source),
+            self.relative_default,
+        )
+        return clef_response(
+            {qid: noul(p) for qid in payload["questions"]}, model=payload["model"]
+        )
 
     # ---- inspection ----------------------------------------------------- #
 

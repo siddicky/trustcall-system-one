@@ -50,6 +50,7 @@ __all__ = [
     "Clustering",
     "PairCache",
     "agglomerate",
+    "article",
     "canonical_label",
     "cluster_mentions",
     "has_context",
@@ -63,6 +64,7 @@ __all__ = [
     "ordered_pair",
     "plausible",
     "plural",
+    "strong_compatible",
 ]
 
 logger = logging.getLogger(__name__)
@@ -120,6 +122,30 @@ def plural(noun: str) -> str:
     if lower.endswith(("s", "x", "z", "ch", "sh")):
         return noun + "es"
     return noun + "s"
+
+
+_AN_LETTERS = frozenset("AEFHILMNORSX")
+_A_BEFORE_VOWEL = ("uni", "use", "usu", "uti", "eu", "one", "once", "ubiq")
+_AN_BEFORE_CONSONANT = ("hour", "honest", "honor", "honour", "heir")
+
+
+def article(noun: str) -> str:
+    """``a`` or ``an`` for a noun phrase, by how it is said: "a user", "an hour".
+
+    An acronym is said letter by letter ("an LLM", "a CEO").
+    """
+    found = re.match(r"[A-Za-z]+", noun.strip())
+    word = found.group(0) if found else ""
+    if not word:
+        return "a"
+    lower = word.lower()
+    if len(word) > 1 and word.isupper():
+        return "an" if word[0] in _AN_LETTERS else "a"
+    if lower.startswith(_AN_BEFORE_CONSONANT):
+        return "an"
+    if lower.startswith(_A_BEFORE_VOWEL):
+        return "a"
+    return "an" if lower[0] in "aeiou" else "a"
 
 
 def _capitalised(token: str) -> bool:
@@ -297,7 +323,8 @@ def identity_compatible(first: str, second: str) -> bool:
     a prefix (Ann and Anne), a small typo (Thomson and Thompson), or the initials
     of the whole name ("JS" for John Smith). "Sarah" fits "Sarah Johnson"; "Emma
     Watson" does not fit "Emma Thompson" (a shared first name is not enough), and
-    two ids that differ in a number never fit.
+    two ids that differ in a number never fit. A blank value (empty, whitespace or
+    only punctuation) fits nothing: there is nothing to compare.
 
     Args:
         first: One identity value (a name, a title, an id).
@@ -305,7 +332,7 @@ def identity_compatible(first: str, second: str) -> bool:
     """
     a, b = name_tokens(first), name_tokens(second)
     if not a or not b:
-        return True  # nothing to compare
+        return False  # nothing to compare is no evidence: a blank fits no one
     short, long = (a, b) if len(a) <= len(b) else (b, a)
     if (
         len(short) == 1
@@ -322,6 +349,28 @@ def identity_compatible(first: str, second: str) -> bool:
         else:
             return False
     return True
+
+
+def strong_compatible(mention: str, value: str) -> bool:
+    """Whether a mention fits an identity value well enough to stand on its own.
+
+    ``identity_compatible`` also accepts a one-word mention that is only the start
+    of a word, a typo of it or an initial ("Dan" for "Daniela Cruz", "Jo" for
+    "John Doe"), which is a coin flip between two people. A fit stands on its own
+    when the mention has two words or more ("Emma Thomson" for "Emma Thompson"),
+    or its single word is a word of the value or a diminutive of one ("Liz" for
+    "Elizabeth Parker").
+
+    Args:
+        mention: How the input names the entity.
+        value: An identity value of the record.
+    """
+    if not identity_compatible(mention, value):
+        return False
+    words = name_tokens(mention)
+    if len(words) >= 2:
+        return True
+    return any(words[0] == t or nicknames(words[0], t) for t in name_tokens(value))
 
 
 def near(source: str, first: Mention, second: Mention) -> bool:

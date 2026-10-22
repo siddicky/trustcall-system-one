@@ -862,6 +862,7 @@ def _readme_result(extra0: tuple[str, ...] = (), extra1: tuple[str, ...] = ()) -
         patches=[],
         after={
             "name": "Olivia Davis",
+            "relationship": "my cousin",
             "notes": ["she's a 27-year-old graphic designer"],
         },
         before={},

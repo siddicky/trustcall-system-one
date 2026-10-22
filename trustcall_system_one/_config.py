@@ -406,6 +406,11 @@ class VerifyConfig:
             not already hold, once the record's other operations are applied
             (call kind ``novelty``). A sentence below it is dropped as
             ``not_novel``; 0 switches the check off.
+        relative_edit: Updates only: probability at or above which a replacement of
+            one number by another is refused as ``relative_edit_unsupported``
+            because the input states a change relative to the current value ("two
+            more", "one fewer", "double it") that the library does not compute
+            (call kind ``relative_edit``); 0 switches the check off.
         isolate_decisions: Ask the decisive Clef questions (attribution, the novelty
             check, the record-presence check) one per request. Clef's answer to a
             question depends on the other questions of its request (live: the same
@@ -431,6 +436,7 @@ class VerifyConfig:
     clef_stated_min: float = 0.7
     sentence_keep: float = 0.6
     note_novelty: float = 0.5
+    relative_edit: float = 0.5
     isolate_decisions: bool = True
     self_consistency_k: int = 1
 
@@ -445,6 +451,7 @@ class VerifyConfig:
         ):
             _check_flag(name, getattr(self, name))
         _check_unit("note_novelty", self.note_novelty, allow_zero=True)
+        _check_unit("relative_edit", self.relative_edit, allow_zero=True)
         for name in (
             "attribution_keep",
             "attribution_drop",
@@ -613,6 +620,11 @@ class DiscoveryConfig:
             entities found, discover again with a broader question (descriptive
             references such as "my cousin"); when it falls short, check whether
             two entities are one. Off, a mismatch only warns.
+        qualify_min: Probability at or above which an entity qualifies as the schema's
+            kind of thing ("Is `entities.e0.label` a person?"). Below it the entity is
+            refused (``not_qualified``). Only a clear non-match is refused: a bare
+            first name scored 0.2 to 0.3 when the question named the schema ("a
+            Member") instead of its kind, while an animal scored 0.02.
         record_presence: Updates only: probability at or above which Clef's "does the
             input refer to this existing record?" (call kind ``record_presence``,
             one question per record) makes the record's entity count when discovery
@@ -627,6 +639,7 @@ class DiscoveryConfig:
     presence_present: float = 0.5
     count_trust_max: int = 10
     broaden_on_count_mismatch: bool = True
+    qualify_min: float = 0.4
     record_presence: float = 0.5
     record_presence_max: int = 20
 
@@ -638,6 +651,7 @@ class DiscoveryConfig:
             raise ValueError("presence_absent must not exceed presence_present")
         _check_int("count_trust_max", self.count_trust_max, 1, 30)
         _check_flag("broaden_on_count_mismatch", self.broaden_on_count_mismatch)
+        _check_unit("qualify_min", self.qualify_min)
         _check_unit("record_presence", self.record_presence, allow_zero=True)
         _check_int("record_presence_max", self.record_presence_max, 0, 500)
 
@@ -702,7 +716,21 @@ class MatchConfig:
             mentions (``identity_compatible``, e.g. "Emma" for "Emma Thompson"). It
             replaces ``accept`` and ``min_confidence`` for that record: Clef's
             choice confidence is not the probability of the chosen option, and a
-            name that fits is the strongest evidence of a match.
+            name that fits is the strongest evidence of a match. A fit that is
+            only a prefix, a typo or an initial of a one-word mention ("Dan" for
+            "Daniela Cruz") does not count.
+        confirm_accept: Probability the pairwise confirmation (call kind
+            ``match_confirm``) needs to settle an AMBIGUOUS match: one where the
+            choice question was not sure (``accept`` and ``min_confidence``) and
+            exactly one existing record is a strong name fit for the entity. The
+            question is "is this entity the same kind of thing as that record?"; its
+            answer must also exceed the choice's own probability of ``__new__``.
+            It never overrides a sure choice, is never asked when two records fit
+            ("Emma" with Emma Thompson and Emma Watson) or when a full name of the
+            entity contradicts the record ("Emma Davis"). 0 switches it off.
+        compatible_margin: By how much that record must beat the runner-up
+            option (``__new__`` included) for ``accept_compatible`` to apply; 0.51
+            against 0.49 is a coin flip, not a decision.
         render_fields: Non-null scalar fields a record keeps (next to its identity
             fields and the first 3 elements of each list) when the records are
             rendered compactly to fit the Clef state budget.
@@ -720,6 +748,8 @@ class MatchConfig:
     accept: float = 0.6
     min_confidence: float = 0.5
     accept_compatible: float = 0.5
+    compatible_margin: float = 0.1
+    confirm_accept: float = 0.7
     render_fields: int = 4
     collision: Literal["warn", "merge"] = "warn"
     on_ambiguous: Literal["skip", "insert", "raise"] = "skip"
@@ -730,6 +760,8 @@ class MatchConfig:
         _check_unit("accept", self.accept)
         _check_unit("min_confidence", self.min_confidence)
         _check_unit("accept_compatible", self.accept_compatible)
+        _check_unit("compatible_margin", self.compatible_margin, allow_zero=True)
+        _check_unit("confirm_accept", self.confirm_accept, allow_zero=True)
         _check_unit("delete_threshold", self.delete_threshold)
         _check_int("render_fields", self.render_fields, 0)
         if self.collision not in ("warn", "merge"):

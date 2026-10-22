@@ -34,11 +34,17 @@ class Many:
         identity: Field name, or names for a compound identity, that tell two
             entities apart. ``None`` lets the engine pick one.
         label: How an entity is called in prompts; defaults to the schema title.
+        kind: What kind of thing an entity is, as a short noun phrase ("person",
+            "customer order"), for the questions that decide whether something
+            found in the text is one ("Is `entities.e0.label` a person?"). Defaults
+            to the leading noun phrase of the schema's description ("A person in an
+            address book" is a "person"), else the ``label``, else the schema title.
     """
 
     schema: SchemaLike | None = None
     identity: str | Sequence[str] | None = field(default=None, kw_only=True)
     label: str | None = field(default=None, kw_only=True)
+    kind: str | None = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
         """Normalise ``identity`` to a tuple of field names."""

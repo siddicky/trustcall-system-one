@@ -64,6 +64,7 @@ CallKind = Literal[
     "coref",
     "qualify",
     "match",
+    "match_confirm",
     "delete",
     "extract",
     "crosscheck",
@@ -79,6 +80,7 @@ CallKind = Literal[
     "novelty",
     "record_presence",
     "gate",
+    "relative_edit",
     "repair",
     "raw",
 ]

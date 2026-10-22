@@ -70,7 +70,9 @@ from trustcall_system_one._gates import (
     dedup_elements,
     gate_changes,
     note_novelty,
+    numeric_replace,
     record_after,
+    relative_edits,
 )
 from trustcall_system_one._match import (
     candidate_options,
@@ -106,6 +108,7 @@ from trustcall_system_one._sentences import list_kind, read_sentences
 from trustcall_system_one._types import (
     EntityInfo,
     FieldAnswer,
+    Mention,
     PatchOp,
     RejectedOp,
     ResultRecord,
@@ -125,6 +128,7 @@ from trustcall_system_one._verify import (
     contest_cross,
     crosscheck,
     reask,
+    relative_candidate,
     resolve,
     resolve_clef,
     run_ladder,
@@ -987,32 +991,313 @@ def _absent(doc: dict[str, Any], owner: FieldGroup | UnionGroup) -> None:
         doc[_key(owner)] = None
 
 
+_NAME_FIELDS = frozenset({"name", "full_name", "title", "label", "display_name"})
+_NAME_WORDS = re.compile(r"\b(?:names?|titles?|labels?|called|nicknames?)\b", re.I)
+_REFERENCE_WORDS = frozenset(
+    [
+        "a",
+        "an",
+        "the",
+        "my",
+        "our",
+        "your",
+        "his",
+        "her",
+        "its",
+        "their",
+        "this",
+        "that",
+        "these",
+        "those",
+        "some",
+        "another",
+        "one",
+        "two",
+        "three",
+        "four",
+        "five",
+        "six",
+        "seven",
+        "eight",
+        "nine",
+        "ten",
+    ]
+)
+_NOT_NAMES = frozenset(
+    [
+        "i",
+        "me",
+        "myself",
+        "we",
+        "us",
+        "you",
+        "he",
+        "him",
+        "she",
+        "they",
+        "them",
+        "it",
+        "who",
+        "someone",
+        "somebody",
+        "anyone",
+        "anybody",
+        "everyone",
+        "everybody",
+        "nobody",
+        "client",
+        "customer",
+        "user",
+        "manager",
+        "boss",
+        "ceo",
+        "cto",
+        "cfo",
+        "director",
+        "president",
+        "owner",
+        "teacher",
+        "doctor",
+        "nurse",
+        "officer",
+        "agent",
+        "assistant",
+        "engineer",
+        "developer",
+        "colleague",
+        "coworker",
+        "friend",
+        "neighbor",
+        "neighbour",
+        "partner",
+        "buyer",
+        "seller",
+        "supplier",
+        "vendor",
+        "guest",
+        "visitor",
+        "mom",
+        "mum",
+        "mother",
+        "dad",
+        "father",
+        "parent",
+        "cousin",
+        "brother",
+        "sister",
+        "sibling",
+        "uncle",
+        "aunt",
+        "grandma",
+        "grandpa",
+        "wife",
+        "husband",
+        "spouse",
+        "son",
+        "daughter",
+        "child",
+        "kid",
+        "baby",
+        "sir",
+        "madam",
+        "team",
+        "staff",
+        "everyone",
+    ]
+)
+"""Words that start a sentence without naming anyone: pronouns, roles and kin."""
+_FALLBACK_REASONS = frozenset(
+    {None, "low_confidence", "low_choice_prob", "missing_answer", "identity_bleed"}
+)
+_SENTENCE_END = ".!?\n:;"
+
+
+def _name_like(spec: FieldSpec) -> bool:
+    """Whether a field holds what the entity is CALLED.
+
+    The field is named ``name``, ``full_name``, ``title``, ``label`` or
+    ``display_name``, or it is a marked identity (``s1_field(identity=True)``) whose
+    description talks about a name, title or label. An email, an id or a code that
+    identifies a record is not a name: no mention is one.
+    """
+    if str(spec.path[-1]).lower() in _NAME_FIELDS:
+        return True
+    return spec.identity and bool(_NAME_WORDS.search(spec.description))
+
+
+def _sentence_initial(source: str, at: int) -> bool:
+    """Whether the text at ``at`` starts the input or a sentence."""
+    before = source[:at].rstrip(" \t\"'(\N{LEFT DOUBLE QUOTATION MARK}")
+    return not before or before[-1] in _SENTENCE_END
+
+
+def _capitalised_inside(source: str, word: str) -> bool:
+    """Whether ``word`` is written with its capital in the middle of a sentence."""
+    return any(
+        not _sentence_initial(source, found.start())
+        for found in re.finditer(rf"(?<!\w){re.escape(word)}(?!\w)", source)
+    )
+
+
+def _proper_noun(text: str, source: str = "", span: Span | None = None) -> bool:
+    """Whether a mention is a proper noun, not a descriptive reference.
+
+    "Dana Ruiz" is; "my cousin", "the client" and "The printer ticket" are not (a
+    leading article or possessive does not make a word a name), while "my cousin
+    Anna" is, by "Anna". A pronoun, a role or a kin word ("Client", "Manager", "Mom",
+    "CEO", "He", "I", "Someone") is never a name. A single capitalised word that
+    only starts a sentence ("Client called ...") is a name only if it is written
+    with its capital in the middle of a sentence too.
+    """
+    words = [word.strip(".,;:!?()\"'") for word in text.split()]
+    names = [
+        w
+        for w in words
+        if w[:1].isupper()
+        and w.casefold() not in _REFERENCE_WORDS
+        and w.casefold() not in _NOT_NAMES
+    ]
+    if not names:
+        return False
+    # "The Printer Ticket": a determiner and then title-case words is a description
+    # set in capitals, not a name ("The Hague", "The Beatles" are two words)
+    if (
+        len(words) >= 3
+        and words[0].casefold() in {"the", "a", "an"}
+        and all(w[:1].isupper() for w in words[1:])
+    ):
+        return False
+    only_initial = (
+        len(names) == 1
+        and len(words) == 1
+        and bool(source)
+        and span is not None
+        and _sentence_initial(source, span[0])
+        and not _capitalised_inside(source, names[0])
+    )
+    return not only_initial
+
+
+_PRONOUNS = frozenset(
+    ["it", "them", "they", "he", "she", "him", "her", "one", "ones", "who"]
+)
+
+
+def _noun_phrase(mention: Mention) -> tuple[str, Span | None] | None:
+    """A mention as the name of a nested item: "the blue mugs" is "blue mugs"."""
+    words = mention.text.split()
+    drop = 0
+    while drop < len(words) and words[drop].casefold() in _REFERENCE_WORDS:
+        drop += 1
+    kept = words[drop:]
+    if not kept or kept[0].casefold() in _PRONOUNS:
+        return None
+    text = " ".join(kept)
+    if mention.span is None:
+        return text, None
+    lead = re.match(r"\s*(?:\S+\s+){" + str(drop) + "}", mention.text)
+    offset = lead.end() if lead is not None else 0
+    return text, (mention.span[0] + offset, mention.span[1])
+
+
+def _identity_target(ctx: Ctx, spec: FieldSpec) -> bool:
+    """Whether a field is the name of a NEW entity of a collection (an insert)."""
+    return (
+        ctx.info is not None
+        and ctx.existing is None
+        and bool(ctx.info.mentions)
+        and spec.path in {(name,) for name in ctx.plan.identity}
+        and spec.clairic is not None
+        and spec.clairic.type == "text"
+        and _name_like(spec)
+    )
+
+
+def _identity_bleed(
+    ctx: Ctx, spec: FieldSpec, answer: FieldAnswer
+) -> tuple[FieldAnswer, list[RejectedOp]]:
+    """Refuse a name that is a sibling's: ``identity_bleed``.
+
+    The entity "blue mugs" can come back from extraction named "tea towels", the
+    item next to it in the same sentence (live 6). A name that fits none of the
+    entity's own mentions but fits the mention of another entity of the same
+    collection and scope is that sibling's, not this entity's: it is thrown away and
+    the mention fallback (``_from_mention``) supplies the name.
+    """
+    info = ctx.info
+    value = answer.value
+    if not _identity_target(ctx, spec) or not isinstance(value, str) or info is None:
+        return answer, []
+    own = [info.label, *(m.text for m in info.mentions)]
+    if any(identity_compatible(value, text) for text in own):
+        return answer, []
+    mine = {m.span for m in info.mentions if m.span is not None}
+    siblings = [
+        ctx.text[a:b]
+        for a, b in ctx.others
+        if (a, b) not in mine and b <= len(ctx.text)
+    ]
+    other = next((t for t in siblings if identity_compatible(value, t)), None)
+    if other is None:
+        return answer, []
+    detail = f"{value!r} is the name of {other!r}, another one of the same list"
+    ctx.warn(f"{ctx.plan.name}.{spec.pretty}: identity_bleed: {detail}")
+    refused = dataclasses.replace(
+        answer,
+        value=None,
+        rejected_reason="identity_bleed",
+        warnings=(*answer.warnings, "identity_bleed"),
+    )
+    reject = RejectedOp(None, json_pointer(spec.path), "identity_bleed", detail, None)
+    return refused, [reject]
+
+
 def _from_mention(ctx: Ctx, spec: FieldSpec, answer: FieldAnswer) -> FieldAnswer:
-    """The mention's own words for the identity field of a new entity, if it has none.
+    """The mention's own words for the name of a new entity, if extraction gave none.
 
     The entity exists because the input names it, and the name is the discovered
-    mention: when extraction gives its identity field nothing usable (a low
-    confidence on the very words discovery quoted: "blue mugs" at 0.33), the field
-    takes the mention text instead of leaving the record invalid. Only a text
-    field that identifies the entity, only for an entity of a collection, never for
-    an update.
+    mention: when extraction gives its name field nothing usable (a low confidence
+    on the very words discovery quoted: "blue mugs" at 0.33, or a sibling's name,
+    ``identity_bleed``), the field takes the mention text instead of leaving the
+    record invalid. Only for a field that holds what the entity is called
+    (``_name_like``), only for a text identity field of an entity of a collection
+    (never an update), only when the answer is null or was refused for low
+    confidence, and only when a mention is a proper noun ("Dana Ruiz"; not "my
+    cousin", "Client" or "He"). The items of a nested list are named by what they
+    are, so there a noun phrase ("the blue mugs" gives "blue mugs") is a name too.
+    An email, an id or a code is never made up from a mention. The fallback is a
+    run warning too (``identity_from_mention``).
     """
     info = ctx.info
     if (
         answer.value is not None
+        or not _identity_target(ctx, spec)
         or info is None
-        or ctx.existing is not None
-        or not info.mentions
-        or spec.path not in {(name,) for name in ctx.plan.identity}
-        or spec.clairic is None
-        or spec.clairic.type != "text"
+        or answer.rejected_reason not in _FALLBACK_REASONS
     ):
         return answer
+    chosen: tuple[str, Span | None] | None = None
+    proper = next(
+        (m for m in info.mentions if _proper_noun(m.text, ctx.text, m.span)), None
+    )
+    if proper is not None:
+        label = info.label if _proper_noun(info.label) else proper.text
+        chosen = (label, proper.span)
+    elif ctx.parent is not None:
+        for m in info.mentions:
+            phrase = _noun_phrase(m)
+            if phrase is not None:
+                chosen = phrase
+                break
+    if chosen is None:
+        return answer
+    value, span = chosen
     was = answer.rejected_reason or "no value"
+    ctx.warn(f"{ctx.plan.name}.{spec.pretty}: identity_from_mention: {was}")
     return dataclasses.replace(
         answer,
-        value=info.label,
-        span=info.mentions[0].span,
+        value=value,
+        span=span,
         rejected_reason=None,
         warnings=(*answer.warnings, f"identity_from_mention: {was}"),
     )
@@ -1026,6 +1311,8 @@ def _emit_leaf(ctx: Ctx, leaf: _Leaf, doc: dict[str, Any], out: _Assembly) -> No
         answer, rejects = _clef_answer(spec, leaf.resolved)
     else:
         answer, rejects = _filled_answer(spec, leaf.value), []
+    answer, bled = _identity_bleed(ctx, spec, answer)
+    rejects.extend(bled)
     answer = _from_mention(ctx, spec, answer)
     out.answers[spec.pretty] = answer
     out.rejected.extend(rejects)
@@ -1997,14 +2284,18 @@ async def _judge_changes(
     before: dict[str, Any],
     changes: list[Change],
     everything: Sequence[Change] | None = None,
+    settled: Mapping[tuple[str, str, str], _Verdict] | None = None,
 ) -> list[_Verdict]:
-    """Run the near-duplicate check, the novelty check and the change gate.
+    """Run the near-duplicate check, the change gate and the novelty check.
 
     A sentence appended to a note field is judged against the record AFTER the
-    update's other operations (``everything``: all of the update's operations, not
-    only the ones judged now): a sentence that only repeats a value being written to
-    another field ("Her mobile is now ...") is not a note. It must also add
-    something to that record (``verify.note_novelty``, call kind ``novelty``).
+    update's other operations that were ACCEPTED (``everything``: all of the
+    update's operations, not only the ones judged now; ``settled``: the verdicts of
+    the ones judged before): a sentence that only repeats a value being written to
+    another field ("Her mobile is now ...") is not a note, but one next to a change
+    the gate refuses is, since that value is not written. So the other fields' gates
+    run first, then the novelty check (``verify.note_novelty``, call kind
+    ``novelty``) and the notes' own gate, both against that record.
     """
     if ctx.vetoed:  # every operation is refused, nothing is asked
         return [
@@ -2033,53 +2324,100 @@ async def _judge_changes(
                 f"{change.value!r} is the same fact as {found.other!r}",
                 found.p,
             )
-    live = [v for v in verdicts if v.reason is None]
-    records: dict[int, dict[str, Any]] = {}
-    notes = [v for v in live if _is_note(ctx, v.change)]
-    if notes:
-        others = [c for c in (everything or changes) if not _is_note(ctx, c)]
-        after = record_after(before, others)
-        for verdict in notes:
-            records[id(verdict.change)] = after
-        floor = ctx.run.verify.note_novelty
-        if floor > 0:
-            asked = await note_novelty(ctx, after, [v.change for v in notes])
-            for verdict, p in zip(notes, asked, strict=True):
-                if p is not None and p >= floor:
-                    continue
-                change = verdict.change
-                verdict.reason = "not_novel" if p is not None else "novelty_missing"
-                verdict.p = p
-                verdict.rejection = RejectedOp(
-                    change.op,
-                    change.path,
-                    verdict.reason,
-                    f"the sentence adds nothing the record does not hold "
-                    f"(p={p:.2f} < {floor})"
-                    if p is not None
-                    else "the novelty check gave no answer",
-                    p,
-                )
-            live = [v for v in live if v.reason is None]
-    gated = await gate_changes(ctx, before, [v.change for v in live], records=records)
-    for verdict, answer in zip(live, gated, strict=True):
-        verdict.p = answer.p
-        if answer.passed:
-            continue
-        change = verdict.change
-        if answer.p is None:
-            verdict.reason = "gate_missing"
-            detail = "the change gate gave no answer"
-        else:
-            verdict.reason = "gate_noul"
-            detail = (
-                f"the input does not support the change (p={answer.p:.2f} < "
-                f"{answer.needed})"
-            )
-        verdict.stage = 1
-        verdict.rejection = RejectedOp(
-            change.op, change.path, verdict.reason, detail, answer.p
+
+    async def gate(
+        group: list[_Verdict], records: Mapping[int, dict[str, Any]] | None = None
+    ) -> None:
+        gated = await gate_changes(
+            ctx, before, [v.change for v in group], records=records
         )
+        for verdict, answer in zip(group, gated, strict=True):
+            verdict.p = answer.p
+            if answer.passed:
+                continue
+            change = verdict.change
+            if answer.p is None:
+                verdict.reason = "gate_missing"
+                detail = "the change gate gave no answer"
+            else:
+                verdict.reason = "gate_noul"
+                detail = (
+                    f"the input does not support the change (p={answer.p:.2f} < "
+                    f"{answer.needed})"
+                )
+            verdict.stage = 1
+            verdict.rejection = RejectedOp(
+                change.op, change.path, verdict.reason, detail, answer.p
+            )
+
+    floor_relative = ctx.run.verify.relative_edit
+    # any number that is not only ever stated (a price, a total, a year, an age) can
+    # be changed relatively, whatever the field is called: "two more" on `units`
+    quantities = {
+        spec.pretty for spec in ctx.plan.all_specs() if relative_candidate(spec)
+    }
+    numbers = [
+        v
+        for v in verdicts
+        if v.reason is None
+        and numeric_replace(v.change)
+        and v.change.field_path in quantities
+    ]
+    if floor_relative > 0 and numbers:
+        asked_relative = await relative_edits(ctx, before, [v.change for v in numbers])
+        for verdict, p in zip(numbers, asked_relative, strict=True):
+            if p is None or p < floor_relative:
+                continue
+            change = verdict.change
+            verdict.reason = "relative_edit_unsupported"
+            verdict.p = p
+            verdict.rejection = RejectedOp(
+                change.op,
+                change.path,
+                verdict.reason,
+                f"the input states a change relative to the current value "
+                f"{change.old!r} (p={p:.2f}), not a new value; relative edits are "
+                f"not computed, so {change.value!r} was not written",
+                p,
+            )
+    live = [v for v in verdicts if v.reason is None]
+    notes = [v for v in live if _is_note(ctx, v.change)]
+    await gate([v for v in live if v not in notes])
+    if not notes:
+        return verdicts
+    mine = {id(v.change): v for v in verdicts}
+
+    def accepted(change: Change) -> bool:
+        if id(change) in mine:
+            return mine[id(change)].reason is None
+        held = (settled or {}).get(_change_key(change))
+        return held is not None and held.reason is None
+
+    others = [
+        c for c in (everything or changes) if not _is_note(ctx, c) and accepted(c)
+    ]
+    after = record_after(before, others)
+    floor = ctx.run.verify.note_novelty
+    if floor > 0:
+        asked = await note_novelty(ctx, after, [v.change for v in notes])
+        for verdict, p in zip(notes, asked, strict=True):
+            if p is not None and p >= floor:
+                continue
+            change = verdict.change
+            verdict.reason = "not_novel" if p is not None else "novelty_missing"
+            verdict.p = p
+            verdict.rejection = RejectedOp(
+                change.op,
+                change.path,
+                verdict.reason,
+                f"the sentence adds nothing the record does not hold "
+                f"(p={p:.2f} < {floor})"
+                if p is not None
+                else "the novelty check gave no answer",
+                p,
+            )
+    kept = [v for v in notes if v.reason is None]
+    await gate(kept, {id(v.change): after for v in kept})
     return verdicts
 
 
@@ -2243,7 +2581,7 @@ async def _evaluate(
         cache.setdefault(_change_key(settled), _Verdict(settled))
     fresh = [c for c in changes if _change_key(c) not in cache]
     if fresh:
-        for verdict in await _judge_changes(ctx, before, fresh, changes):
+        for verdict in await _judge_changes(ctx, before, fresh, changes, cache):
             cache[_change_key(verdict.change)] = verdict
     verdicts = [cache[_change_key(c)] for c in changes]
     passed = [v.change for v in verdicts if v.reason is None]
@@ -2776,6 +3114,8 @@ def _identity_conflict(
         new, old = state.resolved.value, before.get(spec.alias or name)
         if not isinstance(new, str) or not isinstance(old, str):
             continue
+        if not new.strip() or not old.strip():
+            continue  # a blank identity says nothing, either way
         # a mention that fits the record and does not fit what the input calls the
         # entity is the other name of the same entity ("Sarah Johnson" next to
         # "Sarah Miller"); a short form of both ("Emma" for Emma Watson and Emma
@@ -2797,6 +3137,25 @@ def _identity_conflict(
 _ID_LIKE = re.compile(r"[A-Za-z]")
 
 
+_LABEL_MAX = 40
+
+
+def _clip_label(text: str, limit: int = _LABEL_MAX) -> str:
+    """Cut a label to ``limit`` characters at a word boundary, ending with "…".
+
+    A label that fits is returned as it is. The ellipsis counts in the limit, and a
+    single word longer than the limit is cut inside it.
+    """
+    if len(text) <= limit:
+        return text
+    head = text[: limit - 1]
+    if not text[limit - 1].isspace():  # the cut falls inside a word: back to a space
+        space = head.rfind(" ")
+        if space > 0:
+            head = head[:space]
+    return head.rstrip(" ,;:-") + "…"
+
+
 def _record_identity(plan: SchemaPlan, data: Mapping[str, Any], record_id: str) -> str:
     """What a single record is called, for the Clef states of its update.
 
@@ -2812,7 +3171,7 @@ def _record_identity(plan: SchemaPlan, data: Mapping[str, Any], record_id: str) 
         if isinstance(data.get(key), (str, int)) and str(data.get(key)).strip()
     ]
     if values:
-        return ", ".join(values)[:80]
+        return _clip_label(", ".join(values))
     if len(record_id) <= 24 and _ID_LIKE.search(record_id):
         return record_id
     return ""

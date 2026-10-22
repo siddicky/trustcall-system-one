@@ -1,6 +1,7 @@
 """Per-invoke context: transport calls, usage, call log and warnings."""
 
 import asyncio
+import hashlib
 import json
 import time
 from collections.abc import Awaitable, Mapping, Sequence
@@ -177,6 +178,34 @@ class _Sent:
     served_model: str | None = None
 
 
+def memo_key(model: str, payload: Mapping[str, Any]) -> str:
+    """The key of a Clef request in ``Run.clef_memo``: a hash of its canonical JSON.
+
+    The keys of every object are sorted, so two requests that differ only in the
+    order of their keys are one request; the QUESTIONS are kept in the order asked
+    (Clef's answer to a question depends on the ones around it, so a different order
+    is a different request). A hash, not the request, is what the run holds: a
+    request carries the whole state and the images, and the memo outlives them.
+
+    Args:
+        model: The model the request goes to.
+        payload: The request body (``ClefRequest.to_payload()``).
+
+    Returns:
+        A hex SHA-256 digest.
+    """
+    body = {k: v for k, v in payload.items() if k != "questions"}
+    questions = [[qid, q] for qid, q in (payload.get("questions") or {}).items()]
+    canonical = json.dumps(
+        {"model": model, "request": body, "questions": questions},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 @dataclass
 class Run:
     """Everything one ``invoke`` shares: configuration, transport and accounting.
@@ -210,8 +239,9 @@ class Run:
         warnings: Notes about anything that was degraded, without duplicates.
         list_kinds: What kind of items a ``list[str]`` field holds (``"items"`` or
             ``"statements"``), asked of Clef once per schema and field in this run.
-        clef_memo: The answers to the Clef requests sent so far, by request: a
-            byte-identical request is answered from here, not sent again.
+        clef_memo: The answers to the Clef requests sent so far, by the hash of the
+            request (``memo_key``): a byte-identical request is answered from here,
+            not sent again.
         fallback_used: How many requests a fallback transport answered after
             its primary failed (also reported as the ``clef_fallback_used`` warning).
         fallback_hard: How many of those answers had no probabilities.
@@ -242,7 +272,7 @@ class Run:
     usage: Usage = field(default_factory=Usage)
     calls: list[CallRecord] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
-    list_kinds: "dict[tuple[str, str], asyncio.Future[str]]" = field(
+    list_kinds: "dict[tuple[type, str], asyncio.Future[str]]" = field(
         default_factory=dict
     )
     clef_memo: "dict[str, dict[str, Answer]]" = field(default_factory=dict)
@@ -605,7 +635,7 @@ class Run:
         # same run (a re-check that asks what was just asked) is not sent again.
         # Only finished answers are kept: nothing is shared while a request runs,
         # so a cancelled call is cancelled.
-        key = json.dumps([model, payload], sort_keys=True, default=str)
+        key = memo_key(model, payload)
         known = self.clef_memo.get(key)
         if known is not None:
             # an answer keeps where it came from (its ``provider``), also here

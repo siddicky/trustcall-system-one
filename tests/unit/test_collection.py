@@ -345,8 +345,9 @@ async def test_many_label_is_what_prompts_call_an_entity() -> None:
         in (payload["fields"]["mentions"]["instructions"])
     )
     ((_, presence, _),) = of_kind(world, "presence")
-    assert presence["questions"]["presence"]["instructions"].startswith(
-        "Does `input` mention any friend"
+    # the label is how the entity is called (display); the kind is what it is
+    assert presence["questions"]["presence"]["instructions"] == (
+        "Does `input` mention any person?"
     )
 
 
@@ -574,7 +575,7 @@ async def test_qualification_skips_what_is_not_a_person() -> None:
     assert sunny["mentions"] == [{"text": "Sunny", "span": [at, at + 5]}]
     assert state["input"] == TEXT
     assert payload["questions"]["qualify.e1"]["instructions"].startswith(
-        "Is `entities.e1.label` a Person"
+        "Is `entities.e1.label` a person?"
     )
 
 
@@ -661,7 +662,7 @@ async def test_the_presence_gate_is_not_asked_again_per_entity() -> None:
     ((_, payload, _),) = of_kind(world, "presence")
     assert list(payload["questions"]) == ["presence"]
     assert payload["questions"]["presence"]["instructions"].startswith(
-        "Does `input` mention any Person (Someone the speaker knows"
+        "Does `input` mention any person?"
     )
 
 
