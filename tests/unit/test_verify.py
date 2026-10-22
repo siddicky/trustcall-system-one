@@ -45,9 +45,17 @@ def person(record: ResultRecord) -> Person:
     return record.value
 
 
-async def run_person(script: Script, **kwargs: Any) -> ResultRecord:
+PADDED = "x" * 40 + " " + TEXT + " " + "y" * 40
+RECHECK = VerifyConfig(window_chars=10, borderline_null=False, isolate_decisions=False)
+"""A narrow window: the re-check's state differs from the first check's (a state that
+does not differ is answered from the run, which is what the memo is for)."""
+
+
+async def run_person(
+    script: Script, *, text: str = TEXT, **kwargs: Any
+) -> ResultRecord:
     extractor = make_extractor([Person], script, **kwargs)
-    result = await extractor.ainvoke(TEXT)
+    result = await extractor.ainvoke(text)
     (record,) = result.records
     return record
 
@@ -179,7 +187,7 @@ async def test_a_bleed_at_0_62_is_no_longer_kept() -> None:
     script = person_script()
     script.attribution = {"attr.city": [0.62, 0.3]}
     script.reask = {"city": ca("text", "London", find="London")}
-    record = await run_person(script, verify=VerifyConfig(borderline_null=False))
+    record = await run_person(script, text=PADDED, verify=RECHECK)
     assert record.fields["city"].rejected_reason == "attribution"
     assert record.fields["city"].reask is True  # the middle band re-checks first
     assert kinds(script.transport).count("attribution") == 2
@@ -193,9 +201,7 @@ async def test_middle_band_reasks_in_isolation_then_checks_again() -> None:
     script.clairic["age"] = ca("number", None, p_null=0.99)
     script.attribution = {"attr.city": [0.45, 0.8]}
     script.reask = {"city": ca("text", "London", find="London")}
-    extractor = make_extractor(
-        [Person], script, verify=VerifyConfig(window_chars=10, borderline_null=False)
-    )
+    extractor = make_extractor([Person], script, verify=RECHECK)
     result = await extractor.ainvoke(text)
     record = result.records[0]
     assert person(record).city == "London"
@@ -223,7 +229,7 @@ async def test_middle_band_that_stays_low_drops_the_value() -> None:
     script = person_script()
     script.attribution = {"attr.city": [0.45, 0.4]}
     script.reask = {"city": ca("text", "London", find="London")}
-    record = await run_person(script, verify=VerifyConfig(borderline_null=False))
+    record = await run_person(script, text=PADDED, verify=RECHECK)
     assert record.fields["city"].rejected_reason == "attribution"
     assert record.fields["city"].attribution_p == 0.4
     assert record.fields["city"].reask is True
@@ -233,7 +239,7 @@ async def test_middle_band_whose_reask_finds_nothing_drops_the_value() -> None:
     script = person_script()
     script.attribution = {"attr.city": 0.45}
     script.reask = {"city": ca("text", None, p_null=0.99)}
-    record = await run_person(script, verify=VerifyConfig(borderline_null=False))
+    record = await run_person(script, text=PADDED, verify=RECHECK)
     assert record.fields["city"].rejected_reason == "attribution"
     assert kinds(script.transport).count("attribution") == 1
 
@@ -265,11 +271,11 @@ async def test_list_elements_are_attributed_one_by_one() -> None:
     ]
     assert answer.warnings == ("dropped 1 element(s): attribution",)
     (call,) = script.calls("attribution")
-    assert call[1]["questions"]["attr.notes.1"]["instructions"] == (
-        "Does `input` state this about `entity.label`, or does it follow by "
-        "simple arithmetic from figures the input states about "
-        '`entity.label`: "green"?'
+    question = call[1]["questions"]["attr.notes.1"]
+    assert question["instructions"].startswith(
+        'According to `input`, is "green" one of the notes of `entity.label`?'
     )
+    assert question["criteria"] == {"true": "Yes.", "false": "No."}
 
 
 async def test_list_with_every_element_dropped_is_rejected() -> None:
@@ -769,10 +775,10 @@ async def run_lossy(
     extractor = create_extractor(
         [Person],
         transport=Lossy(script, drop),
-        verify=VerifyConfig(borderline_null=False),
+        verify=RECHECK,
         **kwargs,
     )
-    return (await extractor.ainvoke(TEXT)).records[0], script
+    return (await extractor.ainvoke(PADDED)).records[0], script
 
 
 async def test_a_missing_scalar_attribution_is_rechecked_not_passed() -> None:
@@ -1061,9 +1067,9 @@ async def test_attribution_accepts_what_the_input_directly_implies() -> None:
     (call,) = script.calls("attribution")
     question = call[1]["questions"]["attr.total"]
     assert question["instructions"] == (
-        "Does `input` state that the amount due including shipping of "
-        '`entity.label` is "1080", or does it follow by simple arithmetic or date '
-        "math from figures the input states about `entity.label`?"
+        "Does `input` state or ask for the amount due including shipping of "
+        '`entity.label` to be "1080", or does it follow by simple arithmetic or '
+        "date math from figures the input states about `entity.label`?"
     )
     assert "simple arithmetic or date math" in question["criteria"]["true"]
     assert "concerns another entity" in question["criteria"]["false"]

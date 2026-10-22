@@ -381,6 +381,16 @@ class VerifyConfig:
         sentence_keep: Probability at or above which a candidate sentence is kept
             as a list element when a ``list[str]`` field is read by sentences
             (see ``Limits.list_strategy``).
+        note_novelty: Updates only: probability at or above which a sentence read
+            as a list element (a note) counts as adding something the record does
+            not already hold, once the record's other operations are applied
+            (call kind ``novelty``). A sentence below it is dropped as
+            ``not_novel``; 0 switches the check off.
+        isolate_decisions: Ask the decisive Clef questions (attribution, the novelty
+            check, the record-presence check) one per request. Clef's answer to a
+            question depends on the other questions of its request (live: the same
+            question gave 0.5597 alone and 0.2800 beside another one), so a decision
+            that is worth a request is not asked in a crowd.
         self_consistency_k: Number of state variants to ask; only 1 is
             supported.
     """
@@ -400,6 +410,8 @@ class VerifyConfig:
     input_only_crosscheck: bool = True
     clef_stated_min: float = 0.7
     sentence_keep: float = 0.6
+    note_novelty: float = 0.5
+    isolate_decisions: bool = True
     self_consistency_k: int = 1
 
     def __post_init__(self) -> None:
@@ -409,8 +421,10 @@ class VerifyConfig:
             "reask_low_confidence",
             "borderline_null",
             "input_only_crosscheck",
+            "isolate_decisions",
         ):
             _check_flag(name, getattr(self, name))
+        _check_unit("note_novelty", self.note_novelty, allow_zero=True)
         for name in (
             "attribution_keep",
             "attribution_drop",
@@ -579,12 +593,22 @@ class DiscoveryConfig:
             entities found, discover again with a broader question (descriptive
             references such as "my cousin"); when it falls short, check whether
             two entities are one. Off, a mismatch only warns.
+        record_presence: Updates only: probability at or above which Clef's "does the
+            input refer to this existing record?" (call kind ``record_presence``,
+            one question per record) makes the record's entity count when discovery
+            or qualification missed it. A record that no mention fits is asked about
+            only if one of its identity words occurs in the input. 0 switches the
+            check off.
+        record_presence_max: Records asked about at most; above it the check is
+            skipped for the collection (one request per record).
     """
 
     presence_absent: float = 0.2
     presence_present: float = 0.5
     count_trust_max: int = 10
     broaden_on_count_mismatch: bool = True
+    record_presence: float = 0.5
+    record_presence_max: int = 20
 
     def __post_init__(self) -> None:
         """Validate every setting."""
@@ -594,6 +618,8 @@ class DiscoveryConfig:
             raise ValueError("presence_absent must not exceed presence_present")
         _check_int("count_trust_max", self.count_trust_max, 1, 30)
         _check_flag("broaden_on_count_mismatch", self.broaden_on_count_mismatch)
+        _check_unit("record_presence", self.record_presence, allow_zero=True)
+        _check_int("record_presence_max", self.record_presence_max, 0, 500)
 
 
 @dataclass(frozen=True)
@@ -651,6 +677,12 @@ class MatchConfig:
             for its entity to be updated or inserted; below it the entity is
             ``ambiguous_match``.
         min_confidence: The match answer's confidence needed as well.
+        accept_compatible: Probability a record needs when it is Clef's own top
+            option AND the only record whose identity fits one of the entity's
+            mentions (``identity_compatible``, e.g. "Emma" for "Emma Thompson"). It
+            replaces ``accept`` and ``min_confidence`` for that record: Clef's
+            choice confidence is not the probability of the chosen option, and a
+            name that fits is the strongest evidence of a match.
         render_fields: Non-null scalar fields a record keeps (next to its identity
             fields and the first 3 elements of each list) when the records are
             rendered compactly to fit the Clef state budget.
@@ -667,6 +699,7 @@ class MatchConfig:
 
     accept: float = 0.6
     min_confidence: float = 0.5
+    accept_compatible: float = 0.5
     render_fields: int = 4
     collision: Literal["warn", "merge"] = "warn"
     on_ambiguous: Literal["skip", "insert", "raise"] = "skip"
@@ -676,6 +709,7 @@ class MatchConfig:
         """Validate every setting."""
         _check_unit("accept", self.accept)
         _check_unit("min_confidence", self.min_confidence)
+        _check_unit("accept_compatible", self.accept_compatible)
         _check_unit("delete_threshold", self.delete_threshold)
         _check_int("render_fields", self.render_fields, 0)
         if self.collision not in ("warn", "merge"):

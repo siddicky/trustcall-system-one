@@ -217,6 +217,13 @@ class Ctx:
             ``Placement.others``).
         scope: ``CallMeta.scope`` of this context's calls: the parent key and the
             pointer of the collection (``"e0/pets"``), empty at the top level.
+        identity_hint: For a single record being updated (a ``One``), what the
+            record is called (its identity values, else its id): the Clef states
+            name it next to the label ("the Bill INV-2291"), so a figure that
+            belongs to another invoice in the same input is not attributed to
+            this one.
+        sentence_fields: Names of the fields that were read by sentences in this
+            context (shared by its input-only copy), for the novelty check.
     """
 
     run: Run
@@ -242,6 +249,8 @@ class Ctx:
     nest: Nest = field(default_factory=Nest)
     scope: str = ""
     others: tuple[Span, ...] = ()
+    identity_hint: str = ""
+    sentence_fields: set[str] = field(default_factory=set)
 
     def input_only(self) -> "Ctx":
         """The same context without the record: every request is about the input.
@@ -431,7 +440,10 @@ class Ctx:
         mentions: list[Any] = list(self.mentions)
         if self.info is not None and self.info.mentions:
             mentions = self._mention_entries(self.info, spans=spans)
-        entity: dict[str, Any] = {"label": self.label, "mentions": mentions}
+        label = self.label
+        if self.identity_hint and self.identity_hint.casefold() not in label.casefold():
+            label = f"{label} {self.identity_hint}"
+        entity: dict[str, Any] = {"label": label, "mentions": mentions}
         parent = self.parent_dict(spans=spans)
         if parent is not None:
             entity["parent"] = parent
@@ -853,6 +865,7 @@ async def _settle_all(
                 or None
             ),
             meta=ctx.meta("attribution", field=",".join(pending)),
+            decisive=True,
         )
         for name, merged in pending.items():
             values = ", ".join(display(part.answer.value) for part in merged.candidates)
@@ -1899,21 +1912,59 @@ _ATTR_FALSE = (
 )
 
 
+_YES = "Yes."
+_NO = "No."
+
+
+def _plural(description: str) -> str:
+    """The field's description as the name of what a list holds (article dropped)."""
+    text = _ARTICLE.sub("", " ".join(description.split()).strip(" .!?:;"), count=1)
+    return text or "the things the field asks for"
+
+
+def _requestable(spec: FieldSpec) -> bool:
+    """Whether the input may ask for the field's value instead of stating it.
+
+    A number can be requested ("add two more of the blue mugs": a quantity of 2
+    that no sentence states); a name, a place or a date is stated.
+    """
+    return spec.clairic is not None and spec.clairic.type == "number"
+
+
 def _attribution_question(
-    description: str, value: Any, *, element: bool
+    description: str, value: Any, *, element: bool, ask_for: bool = False
 ) -> NoulQuestion:
+    """The question "is this value stated about the entity?" for a value or element.
+
+    A list element is asked as "is X one of the <field> of the entity?": the
+    field is named, since the element alone says nothing about what it is for
+    (live: a non-contact scored higher than a contact when it was not). The answers
+    are plain yes and no. A number the input may request rather than state (a
+    quantity in an order) is asked as "states or asks for".
+    """
     text = display(value)
     if element:
+        return NoulQuestion(
+            type="noul",
+            instructions=(
+                f'According to `input`, is "{text}" one of the {_plural(description)} '
+                "of `entity.label`? Something the input asks to include counts."
+            ),
+            criteria=NoulCriteria(true=_YES, false=_NO),
+        )
+    tail = (
+        "or does it follow by simple arithmetic or date math from figures the "
+        "input states about `entity.label`?"
+    )
+    if ask_for:
         instructions = (
-            "Does `input` state this about `entity.label`, or does it follow by "
-            "simple arithmetic from figures the input states about "
-            f'`entity.label`: "{text}"?'
+            f"Does `input` state or ask for {description} of `entity.label` to be "
+            f'"{text}", {tail}'
         )
     else:
         instructions = (
             f'Does `input` state that {description} of `entity.label` is "{text}", '
-            "or does it follow by simple arithmetic or date math from figures the "
-            "input states about `entity.label`?"
+            f"{tail}"
         )
     return NoulQuestion(
         type="noul",
@@ -1943,7 +1994,10 @@ def _attribution_questions(
                 )
         else:
             questions[_attr_id(st, None)] = _attribution_question(
-                st.spec.scoped, st.resolved.value, element=False
+                st.spec.scoped,
+                st.resolved.value,
+                element=False,
+                ask_for=_requestable(st.spec),
             )
     return questions
 
@@ -1995,6 +2049,7 @@ async def _attribution(ctx: Ctx, targets: list[FieldState]) -> None:
             questions,
             ctx.entity_state(anchors=anchors or None),
             meta=ctx.meta("attribution"),
+            decisive=True,
         )
     answers.update(known)
     await gather(*(_judge(ctx, st, answers) for st in targets))
@@ -2076,11 +2131,15 @@ async def _recheck_scalar(ctx: Ctx, st: FieldState) -> None:
     answers = await ctx.run.call_clef(
         {
             _attr_id(st, None): _attribution_question(
-                st.spec.scoped, checked.value, element=False
+                st.spec.scoped,
+                checked.value,
+                element=False,
+                ask_for=_requestable(st.spec),
             )
         },
         ctx.entity_state(spans or None),
         meta=ctx.meta("attribution", field=st.spec.wire_name),
+        decisive=True,
     )
     p = _p(answers, _attr_id(st, None))
     st.attribution_p = p
@@ -2140,6 +2199,7 @@ async def _recheck_elements(
         questions,
         ctx.entity_state(narrowed or None),
         meta=ctx.meta("attribution", field=st.spec.wire_name),
+        decisive=True,
     )
     for index, (value, _) in candidates.items():
         p = _p(answers, _attr_id(st, index))

@@ -266,7 +266,10 @@ class Case:
             (precision).
         allow_ops: Operations that may also happen: a legitimate extra note
             ("Emma took up rock climbing") neither fails the case nor lowers
-            precision. Anything else not in ``expect_ops`` still does.
+            precision. Each entry absorbs ONE produced operation (the same note
+            added twice is one allowed and one extra), and anything else not in
+            ``expect_ops`` still counts. An allowed note is judged by ``must_not``
+            too: another person's facts on a record are bleed.
         expect_values: Values the final records must hold.
         expect_rejected: Rejections the result must report (a near-duplicate that
             was recognised as such, not merely never proposed).

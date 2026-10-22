@@ -711,6 +711,71 @@ async def test_the_thresholds_are_configurable() -> None:
     assert outcome.targets == {"e0": "0"}
 
 
+async def test_a_name_compatible_top_record_is_accepted_without_the_confidence() -> (
+    None
+):
+    # live: p 0.84 with a choice confidence of 0.47 skipped a plain rename
+    fixed = Fixed(
+        {"Emma Thompson": {"Emma Thompson": 0.84, NEW: 0.16}}, confidence=0.47
+    )
+    outcome, _ = await run_fixed(
+        fixed,
+        [entity("e0", "Emma Thompson", "Emma Thompson", "Emma")],
+        candidates("Emma Thompson", "Bob Roe"),
+    )
+    assert outcome.targets == {"e0": "0"} and outcome.skipped == ()
+    # a record that no mention fits stays ambiguous with the same answer
+    other = Fixed({"Bob": {"Emma Thompson": 0.84, NEW: 0.16}}, confidence=0.47)
+    outcome, _ = await run_fixed(
+        other, [entity("e0", "Bob", "Bob")], candidates("Emma Thompson", "Zed Qux")
+    )
+    assert outcome.targets == {} and outcome.skipped[0].reason == "ambiguous_match"
+
+
+async def test_a_first_name_fits_its_only_record_at_the_compatible_floor() -> None:
+    # live: Emma, 0.506 for the record against 0.4683 for __new__, confidence 0.30
+    fixed = Fixed(
+        {"Emma": {"Emma Thompson": 0.506, NEW: 0.4683, "Bob Roe": 0.02}},
+        confidence=0.30,
+    )
+    outcome, _ = await run_fixed(
+        fixed, [entity("e0", "Emma", "Emma")], candidates("Emma Thompson", "Bob Roe")
+    )
+    assert outcome.targets == {"e0": "0"}
+    below = Fixed({"Emma": {"Emma Thompson": 0.45, NEW: 0.4, "Bob Roe": 0.15}})
+    outcome, _ = await run_fixed(
+        below, [entity("e0", "Emma", "Emma")], candidates("Emma Thompson", "Bob Roe")
+    )
+    assert outcome.targets == {} and outcome.skipped[0].reason == "ambiguous_match"
+    loose, _ = await run_fixed(
+        below,
+        [entity("e0", "Emma", "Emma")],
+        candidates("Emma Thompson", "Bob Roe"),
+        MatchConfig(accept_compatible=0.4),
+    )
+    assert loose.targets == {"e0": "0"}
+
+
+async def test_the_compatible_shortcut_needs_the_top_and_only_fitting_record() -> None:
+    # Clef's top option is __new__ ("Bob" as a new person): not rescued
+    new_top = Fixed({"Bob": {"Bob Roe": 0.15, NEW: 0.84}}, confidence=0.3)
+    outcome, _ = await run_fixed(
+        new_top, [entity("e0", "Bob", "Bob")], candidates("Bob Roe", "Zed Qux")
+    )
+    assert outcome.targets == {} and outcome.skipped[0].reason == "ambiguous_match"
+    # two records fit a first name: Clef has to decide it the normal way
+    two = Fixed(
+        {"Emma": {"Emma Thompson": 0.55, "Emma Watson": 0.35, NEW: 0.1}},
+        confidence=0.2,
+    )
+    outcome, _ = await run_fixed(
+        two,
+        [entity("e0", "Emma", "Emma")],
+        candidates("Emma Thompson", "Emma Watson"),
+    )
+    assert outcome.targets == {} and outcome.skipped[0].reason == "ambiguous_match"
+
+
 async def test_a_new_entity_needs_the_accept_threshold_too() -> None:
     fixed = Fixed({"Bob": {"Ann": 0.3, NEW: 0.55}})
     outcome, _ = await run_fixed(fixed, [entity("e0", "Bob", "Bob")], candidates("Ann"))
@@ -1037,6 +1102,7 @@ async def test_a_huge_record_is_compacted_for_the_delete_question() -> None:
 def test_the_defaults() -> None:
     config = MatchConfig()
     assert (config.accept, config.min_confidence, config.render_fields) == (0.6, 0.5, 4)
+    assert config.accept_compatible == 0.5
     assert (config.collision, config.on_ambiguous, config.delete_threshold) == (
         "warn",
         "skip",
@@ -1052,6 +1118,7 @@ def test_the_defaults() -> None:
         {"accept": 0.0},
         {"accept": 1.5},
         {"min_confidence": -0.1},
+        {"accept_compatible": 1.5},
         {"delete_threshold": float("nan")},
         {"render_fields": -1},
         {"render_fields": True},

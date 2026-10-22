@@ -44,7 +44,7 @@ ls -l tests/recorded/smoke_*.jsonl
 # credentials must not be in the files (prints a count, not the value):
 grep -rlF -e "$CLOUDFLARE_ACCOUNT_ID" -e "$CLOUDFLARE_API_TOKEN" tests/recorded evals/cassettes evals/results 2>/dev/null | wc -l   # must be 0
 # the recordings replay offline through the same invariants:
-uv run pytest --disable-socket tests/unit/test_recorded.py -v
+uv run pytest --disable-socket --allow-unix-socket tests/unit/test_recorded.py -v
 ```
 
 `make record` is `make smoke` plus `TRUSTCALL_S1_RECORD=tests/recorded`; it rewrites
@@ -122,13 +122,16 @@ Which knobs change requests (`evals/configs.py`, `REQUEST_LIGHT` / `REQUEST_CHAN
   decision, such as a re-ask in the middle attribution band, are new): `verify.attribution_keep`,
   `verify.attribution_drop`, `verify.low_confidence`, `verify.null_confirm_yes/no`,
   `verify.adjudicate_min`, `verify.clef_stated_min`, `verify.sentence_keep`,
+  `verify.note_novelty` (only the novelty requests are new), `match.accept_compatible`,
+  `discovery.record_presence` (only the record questions are new),
   `gates.add_threshold`, `gates.replace_threshold`, `gates.remove_threshold`,
   `gates.min_confidence`, `gates.min_choice_prob`, `limits.list_auto_below`, `match.accept`,
   `match.delete_threshold`, `coref.merge_threshold`.
 - Change the requests (every point sends live): `limits.list_strategy`, `limits.sentence_follow`,
   `limits.max_sentences`, `gates.required_null_threshold` and `gates.optional_null_threshold`
   (sent to Clairic as `null_threshold`), `verify.instruction_template`, `verify.window_chars`,
-  `verify.input_only_crosscheck`, `verify.attribution`, `passes.split`, `presence.*`,
+  `verify.input_only_crosscheck`, `verify.attribution`, `verify.isolate_decisions` (one question
+  per request or batched), `passes.split`, `presence.*`,
   `discovery.*`, `repair.*`.
 
 The sweeps to run, all with `--live --replay evals/cassettes --record evals/cassettes`:

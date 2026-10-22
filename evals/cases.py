@@ -133,6 +133,33 @@ def near_duplicates(p: float) -> Any:
 # --------------------------------------------------------------------------- #
 
 
+# What is distinctive about each person of the README conversation: a note about one
+# of them never sits on another's record (not as its own note, not merged into one).
+PEOPLE_FACTS: dict[str, tuple[str, ...]] = {
+    "0": ("promoted", "rock climbing", "puppy", "Sunny", "climbing gym"),
+    "1": ("Data Scientist", "vegan", "video call", "switched jobs"),
+    "2": ("special education", "middle school", "teaching", "kids"),
+    "Olivia": ("graphic designer", "sketching", "animal shelter", "27-year-old"),
+}
+
+
+def bleed_rules(facts: dict[str, tuple[str, ...]]) -> list[MustNot]:
+    """``must_not`` rules: each person's facts are never on anyone else's record.
+
+    One rule on the operations (a note added to the wrong record) and one on the
+    final document (a note that merges two people's sentences), per fact and per
+    other person; they count as bleed.
+    """
+    rules: list[MustNot] = []
+    for owner, words in facts.items():
+        for other in facts:
+            if other == owner:
+                continue
+            for word in words:
+                rules.append(MustNot.value_at(other, "/notes", contains=word))
+    return rules
+
+
 def readme_people() -> Case:
     return Case(
         id="readme_people",
@@ -160,6 +187,10 @@ def readme_people() -> Case:
             Op("add", "/notes/-", contains="going vegan", who="1"),
             Op("add", "/notes/-", contains="puppy", who="0"),
             Op("add", "/notes/-", contains="Sunny", who="0"),
+            # Sarah's sentences, each true of her and each allowed once
+            Op("add", "/notes/-", contains="doing well", who="2"),
+            Op("add", "/notes/-", contains="middle school", who="2"),
+            Op("add", "/notes/-", contains="passionate", who="2"),
         ],
         expect_values=[
             Val("Olivia", "/name", "Olivia Davis"),
@@ -167,10 +198,10 @@ def readme_people() -> Case:
         ],
         must_not=[
             MustNot.insert("Sunny"),
-            MustNot.op("add", "/notes/-", who="1", contains="rock climbing"),
             MustNot.op("replace", "/name", who="2"),
             MustNot.op("remove"),
             MustNot.delete(),
+            *bleed_rules(PEOPLE_FACTS),
         ],
         tags=("people", "update", "insert", "notes", "readme"),
         world=people_world,
@@ -587,7 +618,11 @@ def relative_edit() -> Case:
         schemas=lambda: [One(Order)],
         existing=existing,
         options={"enable_inserts": True},
-        expect_ops=[Op("replace", "/items/0/quantity", 2, who="SO-10442")],
+        # nothing is applied: "two more" is a request to add 2 to what is there, which
+        # the library does not compute. Writing the stated 2 over the 3 is what the
+        # design allows if a model reads it that way, never a computed 5.
+        expect_ops=[],
+        allow_ops=[Op("replace", "/items/0/quantity", 2, who="SO-10442")],
         must_not=[
             MustNot.op(value=5),
             MustNot.value_at("SO-10442", "/items/0/quantity", 5),
@@ -859,9 +894,11 @@ def notes_update_contact() -> Case:
 def notes_insert_contact() -> Case:
     text = (
         "Dana Ruiz called from Lyon. She wants to meet in May. Her mobile died. "
-        "Dr. Wu will follow up."
+        "Dr. Wu referred her to us."
     )
-    meet, follow = "She wants to meet in May.", "Dr. Wu will follow up."
+    # about Dana (a first live run's "Dr. Wu will follow up." was about Dr. Wu:
+    # Clef rightly refused it as a note of hers); "Dr." must not split a sentence
+    meet, follow = "She wants to meet in May.", "Dr. Wu referred her to us."
 
     def world() -> FakeWorld:
         w = FakeWorld(text)
@@ -883,7 +920,7 @@ def notes_insert_contact() -> Case:
             Val("Contact", "/name", "Dana Ruiz"),
             Val("Contact", "/city", "Lyon"),
             Val("Contact", "/notes", contains="meet in May"),
-            Val("Contact", "/notes", contains="follow up"),
+            Val("Contact", "/notes", contains="referred her"),
         ],
         tags=("contact", "insert", "notes"),
         world=world,

@@ -398,7 +398,8 @@ async def test_the_gate_uses_the_gate_model_and_one_request_per_operation() -> N
     state = gates[0][1]["state"]
     assert set(state) == {"input", "entity", "record", "proposed_change"}
     assert state["record"] == RECORD
-    assert state["entity"] == {"label": "the Contact", "mentions": []}
+    # a single record is named by what it is called (its identity), not only by type
+    assert state["entity"] == {"label": "the Contact Dana Whitfield", "mentions": []}
 
 
 # --------------------------------------------------------------------------- #

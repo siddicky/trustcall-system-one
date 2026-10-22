@@ -175,6 +175,7 @@ async def test_no_credentials_reach_the_file_even_when_they_are_set(
     for name, value in SECRETS.items():
         monkeypatch.setenv(name, value)
     seen_headers: list[httpx.Headers] = []
+    echo = False
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen_headers.append(request.headers)
@@ -183,11 +184,11 @@ async def test_no_credentials_reach_the_file_even_when_they_are_set(
             {name: clairic_answer("text", "Ada") for name in body["fields"]},
             state_text=body["state"],
         )
-        # a hostile server that echoes the account id and the token in the body
-        answer["echo"] = {
-            "header": request.headers["Authorization"],
-            "url": str(request.url),
-        }
+        if echo:  # a hostile server that echoes the account id and the token
+            answer["echo"] = {
+                "header": request.headers["Authorization"],
+                "url": str(request.url),
+            }
         return httpx.Response(
             200, json={"result": answer, "success": True}, headers={"x-acct": "x"}
         )
@@ -195,19 +196,26 @@ async def test_no_credentials_reach_the_file_even_when_they_are_set(
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     cloudflare = CloudflareTransport(client=client)  # credentials from the environment
     path = tmp_path / "c.jsonl"
-    # the payload itself mentions a secret value: it is removed from the line too
-    payload = clairic_payload(state=f"my token is {SECRETS['CLOUDFLARE_API_TOKEN']}")
-    result = await RecordingTransport(cloudflare, path).run(CLAIRIC, payload, meta=META)
-    assert result.status_code == 200
-    # the real call did carry the credentials ...
+    recorder = RecordingTransport(cloudflare, path)
+    # a clean call is recorded, and the real call did carry the credentials
+    result = await recorder.run(CLAIRIC, clairic_payload(), meta=META)
+    assert result.status_code == 200 and recorder.written == 1
     assert SECRETS["CLOUDFLARE_API_TOKEN"] in seen_headers[0]["Authorization"]
-    # ... and none of them is in the file, in any form
+    # a request that mentions a secret value is NOT recorded (never edited), and says so
+    leaky = clairic_payload(state=f"my token is {SECRETS['CLOUDFLARE_API_TOKEN']}")
+    with pytest.warns(RuntimeWarning, match="holds a credential"):
+        result = await recorder.run(CLAIRIC, leaky, meta=META)
+    assert result.status_code == 200 and recorder.written == 1
+    # a response that echoes the token or the account id URL is not recorded either
+    echo = True
+    with pytest.warns(RuntimeWarning, match="not recorded"):
+        await recorder.run(CLAIRIC, clairic_payload(name="other"), meta=META)
+    assert recorder.written == 1
+    # none of them is in the file, in any form
     text = path.read_text()
     for value in SECRETS.values():
         assert value not in text
-    assert "authorization" not in text.lower()
-    assert "Bearer tok" not in text and "Bearer auth" not in text
-    assert "<redacted>" in text
+    assert "authorization" not in text.lower() and len(lines(path)) == 1
     await client.aclose()
 
 
@@ -520,7 +528,89 @@ def test_scrub_removes_urls_ids_and_tokens() -> None:
         "https://gateway.ai.cloudflare.com/v1/abc123/gw/workers-ai/@cf/x "
         "Authorization: Bearer abcdefghijklmnop and extra-secret"
     )
-    out = scrub(text, extra=["extra-secret"])
+    out = scrub(text, extra=["extra-secret-0123456789"])
     assert "abc123" not in out and "abcdefghijklmnop" not in out
-    assert "extra-secret" not in out
     assert "/ai/run/@cf/x" in out and "/gw/workers-ai/" in out  # the rest is kept
+    assert scrub("see extra-secret-0123456789", ["extra-secret-0123456789"]) == (
+        "see <redacted>"
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Move it to accounts/receivable by Friday.",
+        "Her role: head of accounts/payable/EMEA.",
+        "Bearer bonds and bearer instruments are paper.",
+        "Call 5551234 today.",
+        "Account 1234 and accounts/12 are not ids.",
+        "The accounts/0123456789abcdef is 16 hex characters, not an id.",
+    ],
+)
+def test_scrub_leaves_legitimate_content_alone(text: str) -> None:
+    assert scrub(text) == text
+    assert scrub(text, ["1234", "5551234", "acct"]) == text  # short values are words
+
+
+def test_scrub_covers_the_shapes_a_credential_takes() -> None:
+    account = "0123456789abcdef0123456789abcdef"
+    out = scrub(f"GET https://api.cloudflare.com/client/v4/accounts/{account}/ai/run/x")
+    assert account not in out and "/ai/run/x" in out
+    # an id-shaped path on another host or in prose
+    assert account not in scrub(f"see accounts/{account}/ai")
+    # an Authorization header, in any quoting
+    for shown in (
+        "Authorization: Bearer abc.def-ghi",
+        "'authorization': 'Bearer abc.def-ghi'",
+        '{"cf-aig-authorization": "Bearer abc.def-ghi"}',
+    ):
+        assert "abc.def-ghi" not in scrub(shown), shown
+    # a token-shaped bearer value in an error message
+    assert "tok" not in scrub("401 for Bearer tok1234567890123456789012")
+
+
+async def test_a_cassette_replays_content_that_looks_like_a_secret_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "0123456789abcdef0123456789abcdef")
+    text = "Dept: accounts/receivable. Bearer bonds. Call 5551234."
+
+    def echo(model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
+        return clairic_response(
+            {name: clairic_answer("text", text) for name in payload["fields"]},
+            state_text=payload["state"],
+        )
+
+    path = tmp_path / "c.jsonl"
+    payload = clairic_payload(state=text)
+    live = await RecordingTransport(FakeTransport(echo), path).run(
+        CLAIRIC, payload, meta=META
+    )
+    replayed = await CassetteTransport(path).run(CLAIRIC, payload, meta=META)
+    assert replayed.body == live.body
+    assert replayed.body["answers"]["name"]["value"] == text
+    assert request_key(CLAIRIC, payload) == lines(path)[0]["key"]
+
+
+async def test_a_recorded_error_message_is_scrubbed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    account = "0123456789abcdef0123456789abcdef"
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", account)
+
+    class Failing:
+        async def run(
+            self, model: str, payload: Any, *, meta: Any, timeout: Any = None
+        ) -> Any:
+            raise TransportError(
+                "Request to https://api.cloudflare.com/client/v4/accounts/"
+                f"{account}/x failed"
+            )
+
+    path = tmp_path / "c.jsonl"
+    with pytest.raises(TransportError):
+        await RecordingTransport(Failing(), path, record_errors=True).run(
+            CLAIRIC, clairic_payload(), meta=META
+        )
+    text = path.read_text()
+    assert account not in text and "<redacted>" in text

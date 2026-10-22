@@ -33,6 +33,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from trustcall_system_one._compile import SchemaPlan
+from trustcall_system_one._config import MatchConfig
 from trustcall_system_one._coref import (
     NEW,
     canonical_label,
@@ -68,6 +69,7 @@ __all__ = [
     "hungarian",
     "identity_compatible",
     "identity_keys",
+    "identity_values",
     "match_entities",
     "similarity",
     "token_set_ratio",
@@ -345,7 +347,7 @@ def identity_keys(plan: SchemaPlan, names: Sequence[str]) -> tuple[str, ...]:
     return tuple(keys)
 
 
-def _identity_values(data: Mapping[str, Any], keys: Sequence[str]) -> list[str]:
+def identity_values(data: Mapping[str, Any], keys: Sequence[str]) -> list[str]:
     """The record's identity values as text (else its first text values)."""
     values: list[str] = []
     for key in keys:
@@ -441,7 +443,7 @@ class _Matcher:
         self.candidates = list(candidates)
         self.identity = tuple(identity)
         self.report = _Report()
-        self._values = [_identity_values(c.data, self.identity) for c in candidates]
+        self._values = [identity_values(c.data, self.identity) for c in candidates]
         self._full = [dict(c.data) for c in candidates]
         self._small = [
             compact_record(c.data, self.identity, run.match.render_fields)
@@ -662,6 +664,44 @@ async def _merge_collisions(
     return [_merged([infos[i] for i in members]) for members in sets.values()]
 
 
+def _compatible_top(
+    config: MatchConfig,
+    matcher: "_Matcher",
+    ids: Sequence[str],
+    info: EntityInfo,
+    answer: MatchAnswer,
+    pick: str,
+) -> bool:
+    """Whether a name-compatible record that is Clef's top choice is enough.
+
+    Clef's choice ``confidence`` is not the probability of the chosen option (live:
+    p 0.84 with confidence 0.47), and a record whose identity is a form of the
+    entity's own name (``identity_compatible``) is the strongest evidence there is
+    that it is the one. So when the pick is a record, it is Clef's own top option,
+    it is the ONLY record any of the entity's mentions fits, and its probability is
+    at least ``match.accept_compatible``, the entity is matched without the
+    ``match.min_confidence`` floor. Everything else (the assignment, the identity
+    conflict guard) is unchanged.
+    """
+    if pick == NEW or not answer.probs or pick not in ids:
+        return False
+    here = answer.p(pick)
+    rivals = [p for option, p in answer.probs.items() if option != pick]
+    if here < config.accept_compatible or any(p >= here for p in rivals):
+        return False  # not above every other option: not Clef's top choice
+    mentions = [info.label, *(m.text for m in info.mentions)]
+    fits = [
+        index
+        for index, values in enumerate(matcher._values)
+        if any(
+            identity_compatible(mention, value)
+            for mention in mentions
+            for value in values
+        )
+    ]
+    return len(fits) == 1 and ids[fits[0]] == pick
+
+
 async def match_entities(
     run: Run,
     plan: SchemaPlan,
@@ -747,7 +787,7 @@ async def match_entities(
             and p >= config.accept
             and answer.confidence is not None
             and answer.confidence >= config.min_confidence
-        )
+        ) or _compatible_top(config, matcher, ids, info, answer, pick)
         if sure:
             targets[info.key] = None if pick == NEW else pick
             continue

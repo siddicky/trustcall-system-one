@@ -1134,8 +1134,9 @@ async def test_call_records_keep_the_retries_the_transport_reports() -> None:
 
     extractor = create_extractor([Person], transport=Retrying())
     result = await extractor.ainvoke(PERSON_TEXT)
-    assert [c.retries for c in result.calls] == [2, 2, 2]
-    assert [c.duration_ms for c in result.calls] == [12.5, 12.5, 12.5]
+    assert {c.retries for c in result.calls} == {2}
+    assert {c.duration_ms for c in result.calls} == {12.5}
+    assert len(result.calls) >= 3
 
 
 async def test_transport_errors_propagate() -> None:

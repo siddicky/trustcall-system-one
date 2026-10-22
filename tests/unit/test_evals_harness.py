@@ -428,6 +428,7 @@ def test_a_replay_with_a_live_fallback_sends_only_the_new_requests(
     assert {meta.kind for _, _, meta in live.calls} <= {
         "sentences",
         "list_kind",
+        "novelty",
         "attribution",
         "gate",
         "list_dedup",
@@ -830,3 +831,116 @@ def test_the_summary_has_a_notes_recall_column() -> None:
     assert aggregate(suite.results)["notes_recall"] == 1.0
     readme = next(r for r in suite.results if r.case == "readme_people")
     assert readme.allowed >= 1  # the legitimate extra notes were not held against it
+
+
+# --------------------------------------------------------------------------- #
+# allow_ops: one produced operation each, and never another person's facts
+# --------------------------------------------------------------------------- #
+
+
+def _readme_result(extra0: tuple[str, ...] = (), extra1: tuple[str, ...] = ()) -> Any:
+    from types import SimpleNamespace as NS
+
+    def update(record_id: str, notes: list[str]) -> Any:
+        return NS(
+            kind="update",
+            json_doc_id=record_id,
+            entity=None,
+            patches=[NS(op="add", path="/notes/-", value=v) for v in notes],
+            after={"name": record_id, "notes": notes},
+            before={},
+            rejected=(),
+            fields={},
+            valid=True,
+            schema_name="Person",
+        )
+
+    olivia = NS(
+        kind="insert",
+        json_doc_id=None,
+        entity=NS(label="Olivia Davis"),
+        patches=[],
+        after={
+            "name": "Olivia Davis",
+            "notes": ["she's a 27-year-old graphic designer"],
+        },
+        before={},
+        rejected=(),
+        fields={},
+        valid=True,
+        schema_name="Person",
+    )
+    records = [
+        update(
+            "0",
+            [
+                "She mentioned she got promoted to Senior Marketing Manager "
+                "last month.",
+                *extra0,
+            ],
+        ),
+        update(
+            "1",
+            [
+                "He's switched jobs and is now working as a Data Scientist at a "
+                "startup.",
+                *extra1,
+            ],
+        ),
+        update(
+            "2", ["She's still teaching, but now she's focusing on special education."]
+        ),
+        olivia,
+    ]
+    return NS(records=records, usage=NS(requests=1, input_tokens=1), warnings=())
+
+
+def _readme() -> Any:
+    from evals.cases import readme_people
+
+    return readme_people()
+
+
+def test_a_clean_run_of_the_readme_case_passes() -> None:
+    out = score(_readme(), _readme_result())
+    assert out.passed and out.extra == [] and out.violations == []
+
+
+def test_an_allowed_note_added_twice_is_one_allowed_and_one_extra() -> None:
+    twice = ("she's taken up rock climbing", "she's taken up rock climbing")
+    out = score(_readme(), _readme_result(extra0=twice))
+    assert out.allowed == 1
+    assert out.extra == ['0: add /notes/- "she\'s taken up rock climbing"']
+    assert not out.passed
+
+
+def test_michaels_fact_on_emma_is_bleed_not_an_extra() -> None:
+    out = score(
+        _readme(),
+        _readme_result(extra0=("He's also mentioned he's thinking of going vegan.",)),
+    )
+    categories = {category for category, _ in out.violations}
+    assert "bleed" in categories
+    assert any("vegan" in label for _, label in out.violations)
+    assert not out.passed
+
+
+def test_two_peoples_sentences_merged_into_one_note_are_bleed() -> None:
+    merged = (
+        "Oh, and did you know she's taken up rock climbing? He's also mentioned "
+        "he's thinking of going vegan.",
+    )
+    out = score(_readme(), _readme_result(extra0=merged))
+    assert any(category == "bleed" for category, _ in out.violations)
+    # the climbing half is Emma's, so it is absorbed as an allowed note
+    assert out.allowed == 1 and not out.passed
+
+
+def test_emmas_puppy_on_michael_is_bleed() -> None:
+    out = score(
+        _readme(),
+        _readme_result(
+            extra1=("She was walking her new puppy, a golden retriever named Sunny.",)
+        ),
+    )
+    assert any(category == "bleed" for category, _ in out.violations)

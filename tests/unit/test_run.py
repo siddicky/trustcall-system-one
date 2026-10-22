@@ -177,6 +177,54 @@ async def test_exactly_64_questions_are_one_request() -> None:
     assert len(transport.calls) == 1
 
 
+async def test_a_decisive_question_gets_a_request_of_its_own() -> None:
+    run, transport = run_with(route(attribution=clef_ok))
+    questions = {f"q{i}": QUESTION for i in range(5)}
+    meta = CallMeta(kind="attribution")
+    answers = await run.call_clef(questions, {"input": "x"}, meta=meta, decisive=True)
+    assert sorted(answers) == sorted(questions)
+    assert [len(p["questions"]) for _, p, _ in transport.calls] == [1] * 5
+    # a plain call still batches, and the knob switches the isolation off
+    plain, seen = run_with(route(attribution=clef_ok))
+    await plain.call_clef(questions, {"input": "x"}, meta=meta)
+    assert len(seen.calls) == 1
+    off, seen_off = run_with(
+        route(attribution=clef_ok), verify=VerifyConfig(isolate_decisions=False)
+    )
+    await off.call_clef(questions, {"input": "x"}, meta=meta, decisive=True)
+    assert len(seen_off.calls) == 1
+
+
+async def test_a_byte_identical_clef_request_is_answered_from_the_run() -> None:
+    run, transport = run_with(route(attribution=clef_ok))
+    meta = CallMeta(kind="attribution")
+    first = await run.call_clef({"q": QUESTION}, {"input": "x"}, meta=meta)
+    again = await run.call_clef({"q": QUESTION}, {"input": "x"}, meta=meta)
+    assert first == again and len(transport.calls) == 1 and run.usage.requests == 1
+    # any difference in the state or the question is a new request
+    await run.call_clef({"q": QUESTION}, {"input": "y"}, meta=meta)
+    other = NoulQuestion(type="noul", instructions="Does `input` say no?")
+    await run.call_clef({"q": other}, {"input": "x"}, meta=meta)
+    assert len(transport.calls) == 3
+
+
+async def test_a_failed_clef_request_is_not_remembered() -> None:
+    attempts: list[int] = []
+
+    def flaky(model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RateLimitError("slow down")
+        return clef_response({qid: noul(0.9) for qid in payload["questions"]})
+
+    run, _ = run_with(route(attribution=flaky))
+    meta = CallMeta(kind="attribution")
+    with pytest.raises(RateLimitError):
+        await run.call_clef({"q": QUESTION}, {"input": "x"}, meta=meta)
+    answers = await run.call_clef({"q": QUESTION}, {"input": "x"}, meta=meta)
+    assert isinstance(answers["q"], NoulAnswer) and len(attempts) == 2
+
+
 async def test_no_questions_make_no_request() -> None:
     run, transport = run_with(route(clef_fields=clef_ok))
     assert (

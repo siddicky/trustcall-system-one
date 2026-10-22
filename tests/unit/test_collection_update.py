@@ -632,7 +632,7 @@ async def test_an_entity_below_the_accept_threshold_is_ambiguous_with_candidates
     transport = matcher(
         world,
         {
-            "Emma Thompson": {"Emma Thompson": 0.5, "Bob Roe": 0.3, "__new__": 0.2},
+            "Emma Thompson": {"Emma Thompson": 0.45, "Bob Roe": 0.3, "__new__": 0.25},
             "Bob Roe": {"Bob Roe": 0.95, "__new__": 0.05},
         },
     )
@@ -643,7 +643,7 @@ async def test_an_entity_below_the_accept_threshold_is_ambiguous_with_candidates
     ]
     (skip,) = result.skipped
     assert (skip.reason, skip.entity.label) == ("ambiguous_match", "Emma Thompson")
-    assert dict(skip.candidates) == {"0": 0.5, "1": 0.3, "__new__": 0.2}
+    assert dict(skip.candidates) == {"0": 0.45, "1": 0.3, "__new__": 0.25}
     assert [c[0] for c in skip.candidates] == ["0", "1", "__new__"]  # most likely first
     # the record she might have been is untouched
     assert result.untouched == ("0",)
@@ -660,7 +660,11 @@ async def test_a_confidence_below_the_minimum_is_ambiguous_too() -> None:
         },
         confidence=0.3,
     )
-    extractor = create_extractor([Many(Person, identity="name")], transport=transport)
+    extractor = create_extractor(
+        [Many(Person, identity="name")],
+        transport=transport,
+        match=MatchConfig(accept_compatible=1.0),  # off: the plain floor is tested
+    )
     result = await extractor.ainvoke(world.text, existing=RECORDS)
     assert result.records == ()
     assert [s.reason for s in result.skipped] == ["ambiguous_match"] * 2
@@ -676,7 +680,7 @@ async def test_a_confidence_below_the_minimum_is_ambiguous_too() -> None:
             },
             confidence=0.3,
         ),
-        match=MatchConfig(min_confidence=0.3),
+        match=MatchConfig(min_confidence=0.3, accept_compatible=1.0),
     )
     result = await extractor.ainvoke(world.text, existing=RECORDS)
     assert [r.json_doc_id for r in result.records] == ["0", "1"]
@@ -693,7 +697,7 @@ async def test_on_ambiguous_insert_inserts_an_entity_that_is_likely_new() -> Non
         [Many(Person, identity="name")],
         transport=matcher(world, table, confidence=0.3),
         enable_inserts=True,
-        match=MatchConfig(on_ambiguous="insert"),
+        match=MatchConfig(on_ambiguous="insert", accept_compatible=1.0),
     )
     result = await extractor.ainvoke(world.text, existing=RECORDS)
     assert [(r.json_doc_id, r.kind) for r in result.records] == [(None, "insert")]
@@ -704,7 +708,7 @@ async def test_on_ambiguous_insert_inserts_an_entity_that_is_likely_new() -> Non
     extractor = create_extractor(
         [Many(Person, identity="name")],
         transport=matcher(world, table, confidence=0.3),
-        match=MatchConfig(on_ambiguous="insert"),
+        match=MatchConfig(on_ambiguous="insert", accept_compatible=1.0),
     )
     result = await extractor.ainvoke(world.text, existing=RECORDS)
     assert [s.reason for s in result.skipped] == [
@@ -731,7 +735,13 @@ async def test_declared_match_odds_exercise_the_ambiguous_paths() -> None:
         match_odds={"Bob Roe": 0.9, "__new__": 0.1},
         match_confidence=0.3,  # sure of the option, not of the answer
     )
-    result = await invoke(world, RECORDS, Many(Person, identity="name"), text=text)
+    result = await invoke(
+        world,
+        RECORDS,
+        Many(Person, identity="name"),
+        text=text,
+        match=MatchConfig(accept_compatible=1.0),
+    )
     assert result.records == ()
     reasons = {s.entity.label: s for s in result.skipped}
     assert reasons["Emma Thompson"].candidates == (
@@ -1184,7 +1194,10 @@ async def test_a_flagged_record_an_ambiguous_entity_may_be_is_not_deleted() -> N
 
     transport = matcher(world, table, delete=answer)
     extractor = create_extractor(
-        [Many(Person, identity="name")], transport=transport, enable_deletes=True
+        [Many(Person, identity="name")],
+        transport=transport,
+        enable_deletes=True,
+        match=MatchConfig(accept_compatible=1.0),
     )
     result = await extractor.ainvoke(world.text, existing=RECORDS)
     # record "0" is flagged, and Emma (ambiguous) most likely is that record

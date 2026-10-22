@@ -55,8 +55,11 @@ from trustcall_system_one._existing import ExistingRecord, normalise_record
 from trustcall_system_one._match import (
     Candidate,
     MatchOutcome,
+    compact_record,
     flag_deletes,
+    identity_compatible,
     identity_keys,
+    identity_values,
     match_entities,
 )
 from trustcall_system_one._render import (
@@ -710,6 +713,59 @@ def _described(plan: SchemaPlan) -> str:
     return " ".join(plan.description.split()).rstrip(" .!?:;")
 
 
+_CONTEXT_WORDS = frozenset(
+    [
+        "in",
+        "on",
+        "at",
+        "for",
+        "from",
+        "of",
+        "with",
+        "to",
+        "by",
+        "who",
+        "whom",
+        "that",
+        "which",
+        "whose",
+        "where",
+        "when",
+        "while",
+        "or",
+        "and",
+        "as",
+        "is",
+        "are",
+        "was",
+        "were",
+        "has",
+        "have",
+        "knows",
+        "know",
+    ]
+)
+
+
+def _type_description(plan: SchemaPlan) -> str:
+    """The schema's description, if it names a kind of thing and nothing else.
+
+    "A customer order" is a type description; "A person in an address book" and
+    "Someone the speaker knows or is being introduced to" describe where the thing
+    is or who it is for. Put into the question "is Emma a Member (A person in an
+    address book)?" the second kind made Clef doubt that a bare first name is "in
+    an address book" (0.37; "is Emma a person?" gave 0.97). Only a short noun
+    phrase without prepositions, conjunctions or relative clauses is kept.
+    """
+    text = _described(plan)
+    words = [w.strip(",;:()").casefold() for w in text.split()]
+    if not text or len(words) > 4 or any(w in _CONTEXT_WORDS for w in words):
+        return ""
+    if any(ch in text for ch in ",;:"):
+        return ""
+    return text
+
+
 # --------------------------------------------------------------------------- #
 # Step 2: presence, discovery, count
 # --------------------------------------------------------------------------- #
@@ -881,7 +937,7 @@ async def _qualify(
     if not items:
         return []
     plan = scope.plan
-    described = _described(plan)
+    described = _type_description(plan)
     context = run.coref.context_chars
 
     def entity(group: _Group, *, spans: bool) -> dict[str, Any]:
@@ -1127,6 +1183,170 @@ def _union(
     )
 
 
+_WORD_MIN = 3
+"""Shortest identity word that makes a record worth asking about."""
+
+
+def _words_of(text: str) -> set[str]:
+    return {w for w in re.findall(r"\w+", text.casefold()) if len(w) >= _WORD_MIN}
+
+
+def _locate(source: str, values: Sequence[str]) -> Mention | None:
+    """Where the input names a record: its whole identity, else its first word.
+
+    The longest identity value that occurs in the input wins; failing that the
+    first word of an identity value that occurs as a word of its own. The mention
+    is the words as the input writes them, with their span.
+    """
+    for value in sorted(values, key=len, reverse=True):
+        found = re.search(rf"(?<!\w){re.escape(value.strip())}(?!\w)", source, re.I)
+        if found is not None and value.strip():
+            return Mention(found.group(0), found.span())
+    for value in values:
+        for word in re.findall(r"\w+", value):
+            if len(word) < _WORD_MIN:
+                continue
+            found = re.search(rf"(?<!\w){re.escape(word)}(?!\w)", source, re.I)
+            if found is not None:
+                return Mention(found.group(0), found.span())
+    return None
+
+
+async def _record_presence(
+    run: Run, scope: Scope, records: Sequence[tuple[str, dict[str, Any], str]]
+) -> dict[str, float | None]:
+    """Ask Clef, per existing record, whether the input refers to it.
+
+    Each record gets a request of its own (call kind ``record_presence``): the state
+    is the input, the record (cut down to its identity and a few fields) and, for an
+    item of a nested list, its parent; the question is "does the input refer to the
+    same <noun> as the record? A first name, a former name or a short form counts".
+    """
+    noun = scope.noun
+    context = run.coref.context_chars
+    questions: dict[str, NoulQuestion] = {}
+    shown: dict[str, dict[str, Any]] = {}
+    for k, (_, data, _) in enumerate(records):
+        questions[f"record.{k}"] = NoulQuestion(
+            type="noul",
+            instructions=(
+                f"Does `input` refer to the same {noun} as `record`? A first name, a "
+                "former name or a short form counts."
+            ),
+            criteria=NoulCriteria(
+                true="The input refers to this record.",
+                false="The input does not refer to this record.",
+            ),
+        )
+        shown[f"record.{k}"] = data
+    out: dict[str, float | None] = {}
+
+    async def ask(k: int) -> None:
+        qid = f"record.{k}"
+        extra: dict[str, Any] = {"record": shown[qid]}
+        if scope.parent is not None:
+            extra["parent"] = scope.parent_entry(context)
+        state = run.clef_state(scope.source, spans=scope.parent_spans(), extra=extra)
+        if scope.parent is not None and state["input"] != scope.source:
+            state["parent"] = scope.parent_entry(context, spans=False)
+        answers = await run.call_clef(
+            {qid: questions[qid]},
+            state,
+            meta=scope.meta("record_presence", field=records[k][0]),
+            decisive=True,
+        )
+        answer = answers.get(qid)
+        out[records[k][0]] = answer.noul if isinstance(answer, NoulAnswer) else None
+
+    await gather(*(ask(k) for k in range(len(records))))
+    return out
+
+
+async def _adopt_records(
+    run: Run,
+    scope: Scope,
+    names: Sequence[str],
+    groups: list[_Group],
+    live: list[_Group],
+) -> list[_Group]:
+    """Let the existing records say which entities the input is about.
+
+    Discovery and qualification are blind to the records: a first name alone can
+    fail the schema question, a multi-word product line can be cut short. For each
+    existing record that no qualified entity already fits (``identity_compatible``)
+    and whose identity has a word in the input, Clef is asked whether the input
+    refers to it. A yes (``discovery.record_presence``) brings the entity back: the
+    group discovery found and qualification refused, else a new group whose mention
+    is where the input names the record. A record an entity already fits is not
+    asked about, so no entity is made twice; matching still decides which record
+    each entity is (an adopted entity is no more than a candidate for it).
+
+    Returns:
+        The groups, with the adopted ones qualified.
+    """
+    config = run.discovery
+    if config.record_presence <= 0 or not scope.existing:
+        return groups
+    keys = identity_keys(scope.plan, names)
+    words = _words_of(scope.source)
+    asked: list[tuple[str, dict[str, Any], str]] = []
+    wanted: dict[str, list[str]] = {}
+    for record in scope.existing:
+        data = normalise_record(scope.plan, record.data)
+        values = identity_values(data, keys)
+        if not values or any(
+            identity_compatible(m.text, v)
+            for group in live
+            for m in group.mentions
+            for v in values
+        ):
+            continue
+        if not any(_words_of(v) & words for v in values):
+            continue
+        wanted[record.record_id] = values
+        asked.append(
+            (
+                record.record_id,
+                compact_record(data, keys, run.match.render_fields),
+                values[0],
+            )
+        )
+    if not asked or len(asked) > config.record_presence_max:
+        return groups
+    found = await _record_presence(run, scope, asked)
+    groups = list(groups)
+    for record_id, _, _ in asked:
+        p = found.get(record_id)
+        if p is None or p < config.record_presence:
+            continue
+        values = wanted[record_id]
+        refused = next(
+            (
+                g
+                for g in groups
+                if g not in live
+                and any(
+                    identity_compatible(m.text, v) for m in g.mentions for v in values
+                )
+            ),
+            None,
+        )
+        if refused is not None:
+            refused.qualify_p = p
+            live.append(refused)
+            continue
+        mention = _locate(scope.source, values)
+        if mention is None or any(
+            g.mentions and any(m.span == mention.span for m in g.mentions)
+            for g in groups
+        ):
+            continue
+        group = _Group((mention,), p)
+        groups.append(group)
+        live.append(group)
+    return groups
+
+
 async def collect(
     scope: Scope, run: Run, *, skip_presence: bool = False
 ) -> CollectionOutcome:
@@ -1199,19 +1419,27 @@ async def collect(
     known: dict[frozenset[Mention], float | None] = {}
     groups, _ = await _group(run, scope, mentions, pair_cache, known)
     live = _qualified(groups)
+    groups = await _adopt_records(run, scope, names, groups, live)
+    live = _qualified(groups)
 
     if count is not None and count != len(live):
+        # a count above the entities that qualify is no miss when the mentions
+        # found cover it: the model counted two NAMES of one person (coreference
+        # joined them), or the entity was found and then refused as a non-<noun>
+        explained = count > len(live) and len(mentions) >= count
         act = (
             config.broaden_on_count_mismatch
             and max(count, len(live)) <= config.count_trust_max
             and not (count == 0 and live)  # "none" is no answer when entities qualify
         )
-        if act and count > len(live):
+        if act and count > len(live) and not explained:
             wider = await _discover(run, scope, phrase, broaden=True)
             merged = _union(mentions, wider, scope.source)
             if merged != mentions:
                 mentions = merged
                 groups, _ = await _group(run, scope, mentions, pair_cache, known)
+                live = _qualified(groups)
+                groups = await _adopt_records(run, scope, names, groups, live)
                 live = _qualified(groups)
         checked = 0
         if act and count < len(live):
@@ -1230,7 +1458,7 @@ async def collect(
                 else "; broadening is switched off, so nothing was changed"
             )
         )
-        if count > len(live):
+        if count > len(live) and not explained:
             warn(
                 f"count_exceeds_discovered: the count is {count} but only "
                 f"{len(live)} {scope.noun}(s) were found"

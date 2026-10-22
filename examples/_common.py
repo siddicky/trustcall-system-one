@@ -32,6 +32,7 @@ from trustcall_system_one import (
     FieldAnswer,
     PatchOp,
     ResultRecord,
+    VerifyConfig,
     create_extractor,
 )
 
@@ -142,6 +143,10 @@ def build_extractor(
     if offline:
         if script is None:
             raise ValueError("offline mode needs a script")
+        # The scripted answers are given per question, so the demo's request log reads
+        # the same with the questions of a check batched; live, each decision gets
+        # a request of its own (verify.isolate_decisions, the default).
+        options.setdefault("verify", VerifyConfig(isolate_decisions=False))
         return create_extractor(schemas, transport=script.transport, **options)
     # No transport given: the extractor creates a CloudflareTransport() from the
     # environment on first use and closes it with the extractor.

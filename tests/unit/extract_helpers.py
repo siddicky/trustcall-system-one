@@ -8,6 +8,7 @@ from typing import Any
 from trustcall_system_one import (
     CallMeta,
     Extractor,
+    VerifyConfig,
     create_extractor,
 )
 from trustcall_system_one._wire import CLAIRIC
@@ -114,6 +115,8 @@ class Script:
         sentences: ``sentences`` probability by a part of the sentence asked about
             (the first part found in it wins); ``sentences_default`` answers the
             rest.
+        novelty: ``novelty`` probability by a part of the sentence asked about (the
+            first part found in it wins); ``novelty_default`` answers the rest.
         list_kinds: What ``list_kind`` says about a list field, by wire name
             (``"items"`` or ``"statements"``, the default).
         truncated: Number of ``extract`` calls to flag as truncated.
@@ -145,6 +148,8 @@ class Script:
     dedup_default: float = 0.05
     sentences: dict[str, float] = field(default_factory=dict)
     sentences_default: float = 0.04
+    novelty: dict[str, float] = field(default_factory=dict)
+    novelty_default: float = 0.95
     list_kinds: dict[str, str] = field(default_factory=dict)
     truncated: int = 0
     state_text: Callable[[str], str] | None = None
@@ -169,6 +174,7 @@ class Script:
                 list_dedup=self._dedup,
                 stated=self._stated,
                 sentences=self._sentences,
+                novelty=self._novelty,
                 list_kind=self._list_kind,
             )
         )
@@ -339,6 +345,17 @@ class Script:
             answers[qid] = noul(p)
         return clef_response(answers)
 
+    def _novelty(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
+        answers = {}
+        for qid, question in payload["questions"].items():
+            text = question["instructions"]
+            p = next(
+                (p for part, p in self.novelty.items() if part in text),
+                self.novelty_default,
+            )
+            answers[qid] = noul(p)
+        return clef_response(answers)
+
     # ---- inspection ----------------------------------------------------- #
 
     def calls(self, kind: str) -> list[tuple[str, dict[str, Any], CallMeta]]:
@@ -365,4 +382,8 @@ def make_extractor(schemas: list[Any], script: Script, **kwargs: Any) -> Extract
     tests that assert what an invalid record looks like WITHOUT a re-ask pass
     ``repair=RepairConfig(enabled=False)``.
     """
+    # The scripted tests assert the ladder's logic and read the attribution
+    # questions of a field together; the default (one question per request) has
+    # its own tests (test_run.py, test_isolation.py).
+    kwargs.setdefault("verify", VerifyConfig(isolate_decisions=False))
     return create_extractor(schemas, transport=script.transport, **kwargs)

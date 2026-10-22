@@ -91,6 +91,7 @@ REQUEST_LIGHT = (
     "verify.adjudicate_min",
     "verify.clef_stated_min",
     "verify.sentence_keep",
+    "verify.note_novelty",
     "gates.add_threshold",
     "gates.replace_threshold",
     "gates.remove_threshold",
@@ -102,8 +103,10 @@ REQUEST_LIGHT = (
     "limits.list_auto_below",
     "match.accept",
     "match.min_confidence",
+    "match.accept_compatible",
     "match.delete_threshold",
     "coref.merge_threshold",
+    "discovery.record_presence",
 )
 """Knobs that act on answers already received. A sweep over them replays the
 first-pass requests from the cassette; only the follow-up requests that depend on
@@ -122,6 +125,7 @@ REQUEST_CHANGING = (
     "verify.input_only_crosscheck",
     "verify.attribution",
     "verify.reask_low_confidence",
+    "verify.isolate_decisions",
     "verify.borderline_null",
     "passes.split",
     "presence.threshold_absent",

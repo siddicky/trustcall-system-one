@@ -13,6 +13,7 @@ This module holds the pure parts (splitting, scoping) and the Clef pass.
 """
 
 import asyncio
+import json
 import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -69,6 +70,12 @@ _ABBREVIATIONS = _words(
 _BEFORE_NUMBER = _words(
     "no nos fig figs vol vols pp ch sec art eq eqs",
     "jan feb mar apr jun jul aug sep sept oct nov dec",
+)
+# What can follow a time without starting a new sentence ("at 5 p.m. Monday").
+_DAYS_MONTHS = _words(
+    "monday tuesday wednesday thursday friday saturday sunday",
+    "january february march april may june july august september october november",
+    "december",
 )
 _CLOSERS = "\"')]}\N{RIGHT DOUBLE QUOTATION MARK}\N{RIGHT SINGLE QUOTATION MARK}"
 _CLOSERS += "\N{RIGHT-POINTING DOUBLE ANGLE QUOTATION MARK}"
@@ -143,7 +150,10 @@ def _is_abbreviation(line: str, dot: int, rest: str) -> bool:
         return False  # the M of "$1.5M": a unit, not an initial
     bare = word.replace(".", "").lower()
     if word.lower() in ("a.m", "p.m"):
-        return False  # "at 5 p.m. Then": the time ends the sentence
+        # "at 5 p.m. Then" ends the sentence; "at 5 p.m. Monday" does not: the
+        # time goes on with a day or a month
+        following = re.match(r"[A-Za-z]+", rest)
+        return following is not None and following.group(0).lower() in _DAYS_MONTHS
     if len(bare) == 1 and "." not in word:
         return word.isupper() and _is_initial(line, found.start(1), rest)
     if bare in _ABBREVIATIONS or (rest[:1].isdigit() and bare in _BEFORE_NUMBER):
@@ -383,6 +393,20 @@ def _question(sentence: Sentence, described: str) -> NoulQuestion:
     )
 
 
+def _tokens(value: Any) -> float:
+    """Tokens of a Clef state or question set, with a floor for non-ASCII text.
+
+    ``estimate_tokens`` counts the JSON with every non-ASCII character escaped
+    (several characters each), which is generous for accented Latin text; a language
+    written in CJK or emoji still costs about a token per character, so that is the
+    least the estimate may say.
+    """
+    from trustcall_system_one._render import estimate_tokens
+
+    wide = sum(1 for ch in json.dumps(value, ensure_ascii=False) if ord(ch) > 0x2E7F)
+    return max(estimate_tokens(value), float(wide))
+
+
 async def read_sentences(ctx: "Ctx", spec: "FieldSpec") -> "Resolved":
     """Read a ``list[str]`` field one sentence at a time.
 
@@ -402,7 +426,6 @@ async def read_sentences(ctx: "Ctx", spec: "FieldSpec") -> "Resolved":
         input, ``confidence`` the lowest probability among them. No kept sentence
         is a null answer. ``raw`` lists every candidate with its probability.
     """
-    from trustcall_system_one._render import estimate_tokens
     from trustcall_system_one._verify import Resolved
 
     limits, verify = ctx.run.limits, ctx.run.verify
@@ -434,31 +457,45 @@ async def read_sentences(ctx: "Ctx", spec: "FieldSpec") -> "Resolved":
     questions = {
         f"sentence.{i}": _question(s, described) for i, s in enumerate(candidates)
     }
-    # The questions of a request share the model's window with the state. A
-    # request carries as many questions as fit in half the budget (at most 64), the
-    # state gets the rest and is narrowed to windows around the candidates if it
-    # needs to be.
+    # The questions of a request share the model's window with the state, and the
+    # sum must fit the budget. Each request is given its own state: the input
+    # narrowed to windows around the sentences ITS questions quote (the question
+    # holds the sentence, so the state only has to place it) into whatever the
+    # questions leave. When even that does not fit, the chunk is halved.
     budget = limits.clef_state_token_budget
     ids = list(questions)
-    per_question = max(estimate_tokens({q: questions[q].model_dump()}) for q in ids)
+    span_of = {f"sentence.{i}": s.span for i, s in enumerate(candidates)}
+
+    def cost(chunk: Sequence[str]) -> float:
+        return _tokens({q: questions[q].model_dump() for q in chunk})
+
+    def state_for(chunk: Sequence[str]) -> dict[str, Any]:
+        room = max(500, int(budget - cost(chunk)))
+        return ctx.fitted(spans=[span_of[q] for q in chunk], budget=room)
+
+    per_question = max(cost([q]) for q in ids)
     size = max(1, min(64, int(budget / 2 / per_question)))
-    chunks = [ids[i : i + size] for i in range(0, len(ids), size)]
-    room = max(
-        1000,
-        int(
-            budget
-            - max(
-                estimate_tokens({q: questions[q].model_dump() for q in c})
-                for c in chunks
-            )
-        ),
-    )
-    state = ctx.fitted(spans=[s.span for s in candidates], budget=room)
+    while True:
+        chunks = [ids[i : i + size] for i in range(0, len(ids), size)]
+        states = [state_for(c) for c in chunks]
+        fits = all(
+            _tokens(st) + cost(c) <= budget
+            for st, c in zip(states, chunks, strict=True)
+        )
+        if fits or size == 1:
+            break
+        size = max(1, size // 2)
+    if not fits:
+        ctx.warn(
+            f"{spec.pretty}: a sentence question and the narrowest state do not fit "
+            f"the Clef budget of {budget} tokens together; the request may be "
+            "truncated (limits.clef_state_token_budget)"
+        )
     meta = ctx.meta("sentences", field=spec.wire_name)
     parts = await gather(
         *(
-            ctx.run.call_clef({q: questions[q] for q in chunk}, state, meta=meta)
-            for chunk in chunks
+            ctx.run.call_clef({q: questions[q] for q in chunk}, st, meta=meta)
+            for chunk, st in zip(chunks, states, strict=True)
         )
     )
     answers: dict[str, Any] = {}
@@ -533,7 +570,8 @@ async def list_kind(ctx: "Ctx", spec: "FieldSpec") -> str:
     Returns:
         ``"items"`` or ``"statements"``.
     """
-    key = (ctx.plan.name, spec.wire_name)
+    schema = ctx.plan.schema
+    key = (f"{schema.__module__}.{schema.__qualname__}", spec.wire_name)
     pending = ctx.run.list_kinds.get(key)
     if pending is None:
         pending = ctx.run.list_kinds[key] = asyncio.ensure_future(_ask_kind(ctx, spec))

@@ -155,8 +155,16 @@ def score(case: Case, result: ExtractionResult) -> CaseResult:
         else:
             free.remove(hit)
             out.matched_expected += 1
-    # a legitimate extra (an allowed operation) is neither right nor wrong
-    allowed = [i for i in free if any(a.matches(ops[i]) for a in case.allow_ops)]
+    # a legitimate extra (an allowed operation) is neither right nor wrong. Each
+    # allowed operation absorbs ONE produced operation: the same note added twice is
+    # one allowed and one extra.
+    pool = list(case.allow_ops)
+    allowed: list[int] = []
+    for i in free:
+        slot = next((k for k, a in enumerate(pool) if a.matches(ops[i])), None)
+        if slot is not None:
+            pool.pop(slot)
+            allowed.append(i)
     free = [i for i in free if i not in allowed]
     out.allowed = len(allowed)
     out.n_expected = len(case.expect_ops)

@@ -1,6 +1,7 @@
 """Per-invoke context: transport calls, usage, call log and warnings."""
 
 import asyncio
+import json
 import time
 from collections.abc import Awaitable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -177,6 +178,8 @@ class Run:
         warnings: Notes about anything that was degraded, without duplicates.
         list_kinds: What kind of items a ``list[str]`` field holds (``"items"`` or
             ``"statements"``), asked of Clef once per schema and field in this run.
+        clef_memo: The answers to the Clef requests sent so far, by request: a
+            byte-identical request is answered from here, not sent again.
     """
 
     transport: Transport
@@ -203,6 +206,7 @@ class Run:
     list_kinds: "dict[tuple[str, str], asyncio.Future[str]]" = field(
         default_factory=dict
     )
+    clef_memo: "dict[str, dict[str, Answer]]" = field(default_factory=dict)
 
     def warn(self, message: str) -> None:
         """Record a warning once."""
@@ -376,6 +380,7 @@ class Run:
         *,
         meta: CallMeta,
         model: str | None = None,
+        decisive: bool = False,
     ) -> dict[str, Answer]:
         """Send Clef questions, in requests of at most 64, and merge the answers.
 
@@ -387,6 +392,11 @@ class Run:
             state: The structured (or string) state, shared by every question.
             meta: Routing context; ``meta.kind`` is the call kind.
             model: Model id; defaults to ``clef_model``.
+            decisive: The answers decide whether a value is kept (attribution, the
+                novelty check, the record-presence check). With
+                ``verify.isolate_decisions`` each such question gets a request of
+                its own, because Clef's answer depends on the other questions in
+                its request.
 
         Returns:
             Answers keyed by question id.
@@ -399,7 +409,8 @@ class Run:
         items = list(questions.items())
         if not items:
             return {}
-        chunks = [items[i : i + CLEF_BATCH] for i in range(0, len(items), CLEF_BATCH)]
+        width = 1 if decisive and self.verify.isolate_decisions else CLEF_BATCH
+        chunks = [items[i : i + width] for i in range(0, len(items), width)]
         parts = await gather(
             *(self._clef_once(model, chunk, state, meta) for chunk in chunks)
         )
@@ -421,7 +432,27 @@ class Run:
             questions=dict(chunk),
             images=list(self.images) if self.images else None,
         )
-        sent = await self._send(model, request.to_payload(), meta, len(chunk))
+        payload = request.to_payload()
+        # Clef answers a byte-identical request identically, so a second one in the
+        # same run (a re-check that asks what was just asked) is not sent again.
+        # Only finished answers are kept: nothing is shared while a request runs,
+        # so a cancelled call is cancelled.
+        key = json.dumps([model, payload], sort_keys=True, default=str)
+        known = self.clef_memo.get(key)
+        if known is not None:
+            return dict(known)
+        answers = await self._clef_send(model, chunk, payload, meta)
+        self.clef_memo[key] = answers
+        return dict(answers)
+
+    async def _clef_send(
+        self,
+        model: str,
+        chunk: list[tuple[str, Question]],
+        payload: dict[str, Any],
+        meta: CallMeta,
+    ) -> dict[str, Answer]:
+        sent = await self._send(model, payload, meta, len(chunk))
         try:
             response = parse_clef(sent.body)
         except Exception as exc:

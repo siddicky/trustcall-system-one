@@ -358,14 +358,31 @@ schema title: "Person").
    holding only its own entities) over the state `{"input", "entities": {"e0": {"label",
    "mentions": [{"text", "span", "context"}]}, …}}` (a state whose input was narrowed carries
    `{"text", "context"}` without spans; `context` only for the first 8 and last 2 mentions); the call carries no entity key, since the numbering changes
-   with a broadened discovery or a merge: "Is `entities.e{n}.label` a {Person} ({description})?". `< 0.5` →
+   with a broadened discovery or a merge: "Is `entities.e{n}.label` a {Person}?" (a schema description is
+   added in parentheses ONLY when it is a type description, a noun phrase of at most four words without
+   prepositions or relative clauses: "A customer order", not "A person in an address book", which made
+   Clef doubt that a bare "Emma" is in an address book: 0.37 against 0.97 for "is Emma a person?"). `< 0.5` →
    `SkippedEntity(reason="not_qualified")` ("Sunny", a dog, for `Person`); a missing answer
    qualifies. Qualification runs BEFORE the count comparison, so "k" is the number of entities
    that qualify.
+   **Record-driven presence (updates, `discovery.record_presence`, default 0.5).** Discovery and
+   qualification do not see the existing records. For every existing record that no qualified entity
+   already fits (`identity_compatible` with one of its identity values) and whose identity has a word of
+   three letters or more in the input, one Clef `noul` of its own (kind `record_presence`, id `record.{k}`,
+   `CallMeta.field` the record id, at most `record_presence_max` = 20 records, else the check is skipped for
+   the collection) asks "Does `input` refer to the same {Person} as `record`? A first name, a former name or
+   a short form counts." over `{input, record (compacted), parent?}`. A yes (≥ the knob) brings the entity
+   back: the group discovery found and qualification refused (its `qualify_p` becomes the answer), else a
+   new group whose mention is where the input names the record (the whole identity, else its first word;
+   none found, none made). A record an entity already fits is never asked about, so no entity is made twice;
+   matching still decides which record each entity is, and a first name that Clef calls a NEW person is not
+   forced onto a record (the match's top option decides, see step 8). 0 switches it off.
 5. **Count reconciliation** (count `n` against `k` qualifying entities; acted on only when
    `broaden_on_count_mismatch` and `max(n, k) ≤ count_trust_max`, else the mismatch only warns;
    `count_trust_max` is validated to at most 30, so a merge asks at most 30·29/2 = 435 pair checks):
-   * `n > k`: ONE broadened re-discovery (the same question plus "Also include descriptive
+   * `n > k`: unless the mentions found already cover `n` (the model counted two NAMES of one person that
+     coreference joined, or an entity was found and refused as a non-{Person}: nothing was missed, no
+     warning), ONE broadened re-discovery (the same question plus "Also include descriptive
      references such as 'my cousin' when no name is given."), whose mentions are only ADDED to the
      first list where they overlap none of its mentions (a broadened "Emma's brother Tom" never
      takes the place of, or joins, "Emma" and "Tom"), re-clustered (cached pairs) and re-qualified
@@ -415,14 +432,22 @@ schema title: "Person").
    order (`match_probs` stays empty without existing records, see step 8), the skipped entities (`not_qualified` and
    `validation_failed`, in first-mention order) and the warnings; `responses` holds the valid
    models in the same order.
-7. **Attribution (default on):** Clef `noul` per non-null value and per list element: "Does
+7. **Attribution (default on):** Clef `noul` per non-null value and per list element. A scalar: "Does
    `input` state that {desc} of `entity.label` is '{value}', or does it follow by simple
-   arithmetic or date math from figures the input states about `entity.label`?" (true: the
+   arithmetic or date math from figures the input states about `entity.label`?" ("state or ask for
+   {desc} of `entity.label` to be '{value}'" for a number: "add two more of the blue mugs" asks for a
+   quantity of 2 that no sentence states; live 0.34 for "states", 0.80 to 0.89 for "asks for", and 0.06
+   to 0.12 for a 3). A list element names its field: "According to `input`, is '{value}' one of the {desc}
+   of `entity.label`? Something the input asks to include counts." with the plain criteria "Yes."/"No."
+   (without the field a non-contact scored higher than a contact). Scalars (true: the
    input states it about the entity, or it follows by simple arithmetic or date math from
    figures stated about the entity; false: the input does not state it about `entity.label`,
    or it concerns another entity. A computed value such as a total stated only as its parts is
    a legitimate answer, a figure of somebody else is not; an integral float is shown as `1080`,
    not `1080.0`)
+   `entity.label` of a single record being updated carries what it is called ("the Bill INV-2291": its
+   identity values, else its id when short and with a letter): a figure the input gives for another invoice
+   is then not attributed to this one (0.88 became 0.015). Clairic's instructions keep the plain label.
    ≥ 0.75 keep, < 0.4 drop (`attribution`), between → isolated re-ask then one more check. The
    0.75/0.4 defaults come from one live observation (a bleed kept at 0.62); they are guesses to be
    tuned by the evals harness (M10a). On updates an op must pass
@@ -471,7 +496,12 @@ schema title: "Person").
      mentions, relabelled) is matched again (`match_merged` warning) and a collision that
      survives warns as above.
    * **Thresholds.** An assignment stands only if its option (a record or `__new__`) has `p >=
-     accept` AND the answer's confidence is `>= min_confidence`. Else the entity is ambiguous:
+     accept` AND the answer's confidence is `>= min_confidence`, or if the pick is a record that is
+     Clef's own top option (above every other option, `__new__` included), the ONLY record any of the
+     entity's mentions fits (`identity_compatible`) and has `p >= accept_compatible` (0.5): Clef's
+     choice `confidence` is not the probability of the chosen option (live: p 0.84 with confidence 0.47,
+     p 0.506 with 0.30 for a record named exactly like the entity). The assignment and the identity-conflict
+     guard are unchanged. Else the entity is ambiguous:
      `SkippedEntity(reason="ambiguous_match", candidates=((option, p), …))` (the options with p ≥
      0.01, the most likely first; the records it might have been are NOT handled, so they stay
      untouched), or, with `on_ambiguous="insert"`, it is treated as new when its `__new__`
@@ -746,10 +776,11 @@ people called Emma are told apart); mention texts are matched as whole words onl
 without a span. The reach of a mention stops before a sentence that names another entity of the same
 collection (their mention spans travel with the entity: `Scope.siblings`, `Placement.others`,
 `Ctx.others`). More than `limits.max_sentences` (200) candidates are cut with a warning. The questions
-share the Clef window with the state: a request holds as many as fit in half of
-`limits.clef_state_token_budget` (at most 64, so up to four requests run concurrently for 200
-candidates), and the input is narrowed to windows around the candidates if the rest still does not
-fit. An element needs `verify.sentence_keep` and the field's `min_confidence`; one below either is
+share the Clef window with the state, and the SUM fits `limits.clef_state_token_budget`: a request
+starts with as many questions as fit in half of it (at most 64), is given its own state (the input
+narrowed to windows around the sentences its questions quote, into what the questions leave) and, if
+that still does not fit, the chunk is halved until it does (one question and the narrowest state that
+do not fit warn). Token counts have a floor of one token per CJK character or emoji. An element needs `verify.sentence_keep` and the field's `min_confidence`; one below either is
 dropped, the list is kept.
 
 The elements then take the usual path. The ladder runs on them (attribution per element; an element
@@ -757,7 +788,14 @@ in the middle band is dropped, since Clairic's list type cannot re-read it; no l
 re-ask; no input-only cross-check, the sentences come from the input alone and the field is marked
 `crosscheck_agree=True`); on an update `_diff` keeps only the elements the record lacks, a
 near-duplicate of an existing note goes to the `list_dedup` question and is rejected as `duplicate`
-when it is the same fact, and each remaining `add /notes/-` passes the change gate. Existing notes
+when it is the same fact, then (updates, `verify.note_novelty` = 0.5, 0 off) one Clef `noul` of its own per
+sentence (kind `novelty`): "Does the sentence 'S' say anything about `entity.label` that `record` does not
+already hold?" over the record AFTER the update's other operations (a sentence that only repeats a value
+written to another field, "Her mobile is now ...", is `not_novel`; live 0.04 to 0.22 against 0.90 to 0.97
+for the notes that matter), and each remaining `add /notes/-` passes the change gate, judged against the
+same record (the gate compared "Bob Roe's new phone number is 555-0199" with the record's OLD phone and
+passed it at 0.97). Only sentences read by the `sentences` strategy are checked: a list Clairic reads holds
+short named values, not sentences copied from the input that can repeat another field. Existing notes
 are never touched. Repair never sends such a field to Clairic's `list`: a list over its `max_length`
 keeps the sentences Clef was surest of, as many as the limit allows (minus the elements the record
 holds, on an update), in input order, and is validated again at no cost in requests; any other error
@@ -783,6 +821,27 @@ operation whose path lies inside an existing array element at any level (`add /i
 would land on the wrong element; (2) *removals*, the highest array index first, and what lies inside
 an element before the element; (3) *appends* (`/-`, a new key), in plan order. Test:
 `test_diff.py` (two levels) and `test_nested_collections.py`.
+
+**Decisive questions are asked one per request (`verify.isolate_decisions`, default on) and a
+byte-identical Clef request is sent once per run.** Live, Clef's answer to a question depends on the
+requests it sits in: the same attribution question gave 0.5597 alone and 0.2800 beside another one,
+Tom's bleed 0.6743 in a batch of three and 0.7139 alone, and the question id and the criteria text move
+it too (0.4762 with the long criteria, 0.8581 with "Yes."/"No."), so a threshold margin of 0.02 means
+nothing: the levers are the wording, the criteria and the state, not the threshold. Attribution, the
+note novelty check and the record-presence check (the questions that decide whether a value is kept)
+therefore get a request each (`Run.call_clef(..., decisive=True)`); the other kinds stay batched. Clef is
+deterministic for an identical request, so the run keeps the answers of the requests it has sent
+(`Run.clef_memo`, finished requests only: a cancelled call is cancelled) and a re-check that would send
+the same bytes again (a re-ask that returned the same value over the same state) is answered from there.
+Clef's answer to "state that X" cannot be checked against arithmetic (live: a wrong total 1100 scored
+0.89 and the right 1080 0.26 on a "follows by arithmetic" question), so there is no second arithmetic
+question; and no value-independent field-level question for derived values (one positive case, and it
+cannot tell a right derived number from a wrong one).
+
+**A new entity's identity falls back to its mention.** When extraction gives the identity field of a
+new entity of a collection nothing usable (a low confidence on the very words discovery quoted: "blue
+mugs" at 0.33 on the first pass and the repair), the field takes the mention text (label and span), with
+the warning `identity_from_mention: <the reason>`; never for an update.
 
 ## Update path (`One` schema with an existing record)
 

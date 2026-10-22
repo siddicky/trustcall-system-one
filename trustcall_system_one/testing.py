@@ -9,6 +9,7 @@ import re
 import threading
 import time
 import typing
+import warnings
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -17,6 +18,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel
 
+from trustcall_system_one._coref import identity_compatible
 from trustcall_system_one._errors import (
     AuthError,
     BadRequestError,
@@ -688,6 +690,14 @@ class FakeWorld:
     * ``list_kind`` (Clef choice ``kind``: ``items`` or ``statements``): the world's
       values of that field (any entity of the schema) are ``statements`` at 0.9 if
       one has four words or more, else ``items``.
+    * ``record_presence`` (``record.<i>``, one per existing record whose identity has
+      a word in the input and that no qualified entity fits): 0.97 if a real entity of
+      the schema has a name or mention that fits (``identity_compatible``) one of the
+      record's text values, else 0.03.
+    * ``novelty`` (``novelty.<i>``, one per sentence appended to a note field of an
+      update; the state holds the record after the update's other operations): 0.95
+      unless the record already holds the very sentence (0.05), or the sentence
+      contains a text declared with ``redundant(text, p)``, which answers ``p``.
     * ``gate`` (Clef ``gate``): 0.9 if ``proposed_change.to`` is new compared to
       ``record`` (not equal to what the record holds at the path, nor an element
       of the list it is appended to), else 0.05.
@@ -726,6 +736,9 @@ class FakeWorld:
         self._low: list[tuple[str, str, float, bool]] = []
         self._deletes: dict[tuple[str | None, str], float] = {}
         self._item_bleeds: list[tuple[str | None, str]] = []
+        self._redundant: list[tuple[str, float]] = []
+        self._qualifies: list[tuple[str, float]] = []
+        self._presence_of: dict[str, float] = {}
         self._ready = False
         self._transport: FakeTransport | None = None
 
@@ -958,6 +971,16 @@ class FakeWorld:
             "missing_span": missing_span,
             "shuffle": shuffle,
         }
+        return self
+
+    def redundant(self, text: str, p: float = 0.05) -> "FakeWorld":
+        """Inject a fault: a note containing ``text`` adds nothing to its record.
+
+        The ``novelty`` check answers ``p`` (default 0.05) for a sentence that
+        contains ``text`` (case and accents ignored): "Her mobile is now ..." when the
+        phone is being written to its own field. Every other sentence is news (0.95).
+        """
+        self._redundant.append((_fold(text), p))
         return self
 
     def count(self, schema: Any, n: int) -> "FakeWorld":
@@ -1244,6 +1267,8 @@ class FakeWorld:
             "list_dedup": self._dedup,
             "sentences": self._sentences,
             "list_kind": self._list_kind,
+            "novelty": self._novelty,
+            "record_presence": self._record_presence,
             "gate": self._gate,
             "match": self._match,
             "delete": self._delete,
@@ -1621,7 +1646,7 @@ class FakeWorld:
         answers = {}
         for qid, question in payload["questions"].items():
             found = re.search(
-                r'(?:is|:) "(.*)"(?:\?\s*$|, or does it follow\b)',
+                r'(?:\bis|\bbe|:) "(.*)"(?:\?\s*$|, or does it follow\b| one of the\b)',
                 question["instructions"],
                 re.S,
             )
@@ -1692,6 +1717,45 @@ class FakeWorld:
             text = _fold(found.group(1)) if found else ""
             hit = any(v and v in text for v in held)
             answers[qid] = noul(0.95 if hit else 0.04)
+        return clef_response(answers, model=payload["model"])
+
+    def _record_presence(
+        self, model: str, payload: dict[str, Any], meta: CallMeta
+    ) -> Any:
+        record = payload["state"].get("record") or {}
+        values = [v for v in record.values() if isinstance(v, str)]
+        hit = any(
+            e.real
+            and e.schema == meta.schema
+            and any(
+                identity_compatible(name, value)
+                for name in [e.label, *(text for text, _ in e.mentions)]
+                for value in values
+            )
+            for e in self._items
+        )
+        return clef_response(
+            {qid: noul(0.97 if hit else 0.03) for qid in payload["questions"]},
+            model=payload["model"],
+        )
+
+    def _novelty(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
+        answers = {}
+        for qid, question in payload["questions"].items():
+            found = re.search(
+                r'^Does the sentence "(.*)" say anything',
+                question["instructions"],
+                re.S,
+            )
+            text = _fold(found.group(1)) if found else ""
+            held = _fold(json.dumps(payload["state"].get("record"), ensure_ascii=False))
+            p = 0.95
+            if text and f'"{text}"' in held:
+                p = 0.05  # the record holds this very sentence already
+            for part, odds in self._redundant:
+                if part in text:
+                    p = odds
+            answers[qid] = noul(p)
         return clef_response(answers, model=payload["model"])
 
     def _dedup(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
@@ -1840,8 +1904,11 @@ _SECRET_ENV = (
     "CLOUDFLARE_API_TOKEN",
     "CLOUDFLARE_AUTH_TOKEN",
 )
-_BEARER = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}")
 _REDACTED = "<redacted>"
+_MIN_SECRET = 16
+"""Shortest exact value that counts as a credential (an account id has 32
+characters, a token 40 or more); a shorter "secret" is a word, and rewriting a word
+would alter content that has to replay as it was."""
 
 
 def request_key(model: str, payload: Mapping[str, Any]) -> str:
@@ -1870,37 +1937,59 @@ def request_key(model: str, payload: Mapping[str, Any]) -> str:
     return hashlib.sha256(f"{model}\n{canonical}".encode()).hexdigest()[:24]
 
 
-def _secrets() -> list[str]:
-    values = (os.environ.get(name, "") for name in _SECRET_ENV)
-    return [v for v in values if len(v) >= 4]
+def _secrets(extra: Iterable[str] = ()) -> list[str]:
+    """Exact credential values: the Cloudflare environment variables and ``extra``."""
+    values = [os.environ.get(name, "") for name in _SECRET_ENV]
+    return [v for v in (*values, *extra) if len(v) >= _MIN_SECRET]
 
 
-_ACCOUNT_PATH = re.compile(r"(?<=accounts/)[^/\s\"'?#]+")
-_GATEWAY_PATH = re.compile(r"(?<=gateway\.ai\.cloudflare\.com/v1/)[^/\s\"'?#]+")
+_API_ACCOUNT = re.compile(
+    r"(?<=api\.cloudflare\.com/client/v4/accounts/)[^/\s\"'?#]+", re.IGNORECASE
+)
+_GATEWAY_PATH = re.compile(
+    r"(?<=gateway\.ai\.cloudflare\.com/v1/)[^/\s\"'?#]+", re.IGNORECASE
+)
+_ACCOUNT_ID = re.compile(r"(?<=accounts/)[0-9a-fA-F]{32}(?![0-9A-Za-z])")
+_BEARER_HEADER = re.compile(
+    r"(?i)(authorization[\"']?\s*[:=]\s*[\"']?)bearer\s+[^\s\"',}]+"
+)
+_BEARER_TOKEN = re.compile(
+    r"(?i)\bBearer\s+(?=[A-Za-z0-9._~+/=-]*\d)[A-Za-z0-9._~+/=-]{20,}"
+)
 
 
 def scrub(text: str, extra: Iterable[str] = ()) -> str:
     """Remove credentials and account ids from text that is about to be written.
 
-    The transports never see headers, so this is a second line of defence for
-    payloads, bodies and error messages: the values of the Cloudflare environment
-    variables, ``extra`` (for example ``CloudflareTransport.sensitive_values()``),
-    any ``Bearer`` token, the account id in an ``accounts/<id>`` URL path and the
-    one in an AI Gateway ``/v1/<id>/`` URL path are replaced by ``<redacted>``,
-    whatever field they ended up in.
+    For error messages, reports and other text that is not replayed as data: the
+    exact values of the Cloudflare environment variables and of ``extra`` (for
+    example ``CloudflareTransport.sensitive_values()``), the account id in a
+    Cloudflare API URL (``api.cloudflare.com/client/v4/accounts/<id>``), an AI
+    Gateway URL (``gateway.ai.cloudflare.com/v1/<id>/``) or an ``accounts/<32 hex
+    characters>`` path, and the bearer token of an ``Authorization`` header (or a
+    token-shaped ``Bearer`` value of 20 characters with a digit in it) are replaced
+    by ``<redacted>``.
+
+    Everything else is left alone: ``accounts/receivable`` is a department, "bearer
+    instruments" are paper, and a short value is a word. A request or a response
+    that is about to be recorded is never passed through this (a cassette must
+    replay what the model said): ``RecordingTransport`` skips a call that holds an
+    exact credential instead.
 
     Args:
         text: The text.
-        extra: Further secret values to replace (those of four characters or more).
+        extra: Further secret values to replace (those of 16 characters or more).
 
     Returns:
         The text without them.
     """
-    for secret in [*_secrets(), *(v for v in extra if len(v) >= 4)]:
+    for secret in _secrets(extra):
         text = text.replace(secret, _REDACTED)
-    text = _ACCOUNT_PATH.sub(_REDACTED, text)
+    text = _API_ACCOUNT.sub(_REDACTED, text)
     text = _GATEWAY_PATH.sub(_REDACTED, text)
-    return _BEARER.sub(f"Bearer {_REDACTED}", text)
+    text = _ACCOUNT_ID.sub(_REDACTED, text)
+    text = _BEARER_HEADER.sub(rf"\1Bearer {_REDACTED}", text)
+    return _BEARER_TOKEN.sub(f"Bearer {_REDACTED}", text)
 
 
 class CassetteMissError(AssertionError):
@@ -1967,12 +2056,13 @@ class RecordingTransport:
     error replayed later would poison every run that uses the cassette.
 
     Only payloads and bodies are written: never headers, tokens or account ids
-    (the wrapped transport owns those). As a second line of defence the values of
-    ``CLOUDFLARE_ACCOUNT_ID``, ``CLOUDFLARE_API_TOKEN`` and
-    ``CLOUDFLARE_AUTH_TOKEN``, the account id and token of the wrapped
-    ``CloudflareTransport`` (``sensitive_values()``), any ``Bearer`` token and any
-    ``accounts/<id>`` or gateway ``/v1/<id>/`` URL path are replaced by
-    ``<redacted>`` in the line before it is written (see ``scrub``).
+    (the wrapped transport owns those). As a second line of defence a call whose
+    request or response holds the exact value of ``CLOUDFLARE_ACCOUNT_ID``,
+    ``CLOUDFLARE_API_TOKEN``, ``CLOUDFLARE_AUTH_TOKEN`` or of the account id and
+    token of the wrapped ``CloudflareTransport`` (``sensitive_values()``; 16
+    characters or more) is NOT written, with a ``RuntimeWarning``: a cassette
+    replays exactly what was asked and answered, so it is never edited. The message
+    of a recorded error is scrubbed (see ``scrub``).
 
     Attributes:
         path: The cassette file (its directory is created).
@@ -2010,7 +2100,29 @@ class RecordingTransport:
     def _write(self, line: Mapping[str, Any]) -> None:
         sensitive = getattr(self._inner, "sensitive_values", None)
         extra = tuple(sensitive()) if callable(sensitive) else ()
-        text = scrub(json.dumps(line, ensure_ascii=False, allow_nan=False), extra)
+        bodies = json.dumps(
+            [line.get("request"), line.get("response")],
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        if any(secret in bodies for secret in _secrets(extra)):
+            # A cassette replays what the model said and what was asked, so it is
+            # never edited: a call that holds a credential is not recorded at all.
+            warnings.warn(
+                f"RecordingTransport: a {line.get('kind')} call holds a credential "
+                "in its request or response and was not recorded",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            return
+        written = dict(line)
+        error = written.get("error")
+        if isinstance(error, Mapping):  # error text is not replayed as data
+            written["error"] = {
+                **error,
+                "message": scrub(str(error.get("message", "")), extra),
+            }
+        text = json.dumps(written, ensure_ascii=False, allow_nan=False)
         with self._lock, open(self.path, "a", encoding="utf-8") as handle:
             handle.write(text + "\n")
             self.written += 1

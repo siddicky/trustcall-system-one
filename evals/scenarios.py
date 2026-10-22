@@ -50,7 +50,9 @@ class Person(BaseModel):
     """Someone the speaker knows or is being introduced to."""
 
     name: str = Field(description="full name")
-    relationship: str = Field(description="how the person relates to the speaker")
+    relationship: Optional[str] = Field(
+        None, description="how the person relates to the speaker"
+    )
     notes: list[str] = Field(description="things worth remembering about the person")
 
 

@@ -20,17 +20,25 @@ ratio 0.6-0.9) is first checked with one Clef question of call kind
 ``list_dedup``: "Is the new element the same fact as the old one?".
 """
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from trustcall_system_one._config import GateConfig
-from trustcall_system_one._diff import Change
+from trustcall_system_one._diff import Change, apply_ops
 from trustcall_system_one._run import gather
 from trustcall_system_one._verify import Ctx
 from trustcall_system_one._wire import NoulAnswer, NoulCriteria, NoulQuestion
 
-__all__ = ["DedupVerdict", "GateVerdict", "dedup_elements", "gate_changes", "threshold"]
+__all__ = [
+    "DedupVerdict",
+    "GateVerdict",
+    "dedup_elements",
+    "gate_changes",
+    "note_novelty",
+    "record_after",
+    "threshold",
+]
 
 DUPLICATE_AT = 0.6
 """Probability from which Clef calls a new list element a repeat of an old one."""
@@ -58,6 +66,17 @@ REMOVE_TRUE = (
 REMOVE_FALSE = (
     "The input does not say that: it is silent about {field}, or it gives a new "
     "value for it."
+)
+
+
+NOVELTY_QUESTION = (
+    'Does the sentence "{text}" say anything about `entity.label` that `record` '
+    "does not already hold?"
+)
+NOVELTY_TRUE = "The sentence adds information that `record` does not hold."
+NOVELTY_FALSE = (
+    "Everything the sentence says is already held by `record`, or it says nothing "
+    "worth recording."
 )
 
 
@@ -142,7 +161,11 @@ def gate_state(ctx: Ctx, record: dict[str, Any], change: Change) -> dict[str, An
 
 
 async def gate_changes(
-    ctx: Ctx, record: dict[str, Any], changes: Sequence[Change]
+    ctx: Ctx,
+    record: dict[str, Any],
+    changes: Sequence[Change],
+    *,
+    records: Mapping[int, dict[str, Any]] | None = None,
 ) -> list[GateVerdict]:
     """Ask Clef, once per operation, whether the input supports it.
 
@@ -153,6 +176,9 @@ async def gate_changes(
         ctx: The entity context.
         record: The existing record.
         changes: The operations to judge.
+        records: The record to judge an operation against instead, by ``id`` of the
+            change (a note is judged against the record after the update's other
+            operations).
 
     Returns:
         One verdict per change, in order. An operation passes when Clef's
@@ -165,7 +191,7 @@ async def gate_changes(
         needed = threshold(gates, change)
         answers = await ctx.run.call_clef(
             {"gate": _gate_question(change)},
-            gate_state(ctx, record, change),
+            gate_state(ctx, (records or {}).get(id(change), record), change),
             meta=ctx.meta("gate", field=change.field_path),
             model=ctx.run.gate_model,
         )
@@ -228,3 +254,63 @@ async def dedup_elements(
         p = answer.noul if isinstance(answer, NoulAnswer) else None
         verdicts[index] = DedupVerdict(p is not None and p >= DUPLICATE_AT, p, other)
     return verdicts
+
+
+def record_after(record: dict[str, Any], changes: Sequence[Change]) -> dict[str, Any]:
+    """The record once the given operations are applied (those that apply).
+
+    The notes gate and the novelty check compare a sentence with this, not with
+    the record as it was: "Bob Roe's new phone number is 555-0199" is not news
+    about a record whose phone is changed to 555-0199 in the same update.
+
+    Args:
+        record: The existing record.
+        changes: The operations to apply, in order. One that cannot be applied is
+            left out.
+
+    Returns:
+        A patched copy.
+    """
+    doc: dict[str, Any] = apply_ops(record, [change.as_op() for change in changes]).doc
+    return doc
+
+
+async def note_novelty(
+    ctx: Ctx, record: dict[str, Any], notes: Sequence[Change]
+) -> list[float | None]:
+    """Ask Clef, per appended sentence, whether it adds anything to the record.
+
+    One question per sentence, each in its own request when
+    ``verify.isolate_decisions`` is on (call kind ``novelty``). The record is the
+    one after the update's other operations (``record_after``).
+
+    Args:
+        ctx: The entity context.
+        record: The record the sentences are compared with.
+        notes: The appended sentences (``add`` operations).
+
+    Returns:
+        One probability per note, in order; ``None`` for a missing answer.
+    """
+    questions: dict[str, NoulQuestion] = {
+        f"novelty.{i}": NoulQuestion(
+            type="noul",
+            instructions=NOVELTY_QUESTION.format(text=change.value),
+            criteria=NoulCriteria(true=NOVELTY_TRUE, false=NOVELTY_FALSE),
+        )
+        for i, change in enumerate(notes)
+    }
+    if not questions:
+        return []
+    spans = [span for change in notes for span in change.spans]
+    answers = await ctx.run.call_clef(
+        questions,
+        ctx.fitted(spans=spans or None, record=record),
+        meta=ctx.meta("novelty", field=",".join(sorted({c.field_path for c in notes}))),
+        decisive=True,
+    )
+    out: list[float | None] = []
+    for i in range(len(notes)):
+        answer = answers.get(f"novelty.{i}")
+        out.append(answer.noul if isinstance(answer, NoulAnswer) else None)
+    return out

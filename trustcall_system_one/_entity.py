@@ -26,6 +26,7 @@ import asyncio
 import contextlib
 import dataclasses
 import json
+import re
 from collections.abc import Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -65,8 +66,17 @@ from trustcall_system_one._diff import (
 )
 from trustcall_system_one._errors import ExtractionValidationError
 from trustcall_system_one._existing import ExistingRecord, normalise_record
-from trustcall_system_one._gates import dedup_elements, gate_changes
-from trustcall_system_one._match import candidate_options, identity_compatible
+from trustcall_system_one._gates import (
+    dedup_elements,
+    gate_changes,
+    note_novelty,
+    record_after,
+)
+from trustcall_system_one._match import (
+    candidate_options,
+    identity_compatible,
+    identity_keys,
+)
 from trustcall_system_one._names import Path
 from trustcall_system_one._nested import (
     COLLECTIONS,
@@ -380,6 +390,7 @@ async def _sentence_state(
 ) -> FieldState:
     """Read a list field by sentences (see ``_sentences``)."""
     ctx.crossed.pop(spec.wire_name, None)  # the input-only pass is moot
+    ctx.sentence_fields.add(spec.pretty)
     resolved = await read_sentences(ctx, spec)
     state = FieldState(spec, resolved, sentences=True)
     if instead_of is not None:
@@ -969,7 +980,38 @@ def _absent(doc: dict[str, Any], owner: FieldGroup | UnionGroup) -> None:
         doc[_key(owner)] = None
 
 
-def _emit_leaf(leaf: _Leaf, doc: dict[str, Any], out: _Assembly) -> None:
+def _from_mention(ctx: Ctx, spec: FieldSpec, answer: FieldAnswer) -> FieldAnswer:
+    """The mention's own words for the identity field of a new entity, if it has none.
+
+    The entity exists because the input names it, and the name is the discovered
+    mention: when extraction gives its identity field nothing usable (a low
+    confidence on the very words discovery quoted: "blue mugs" at 0.33), the field
+    takes the mention text instead of leaving the record invalid. Only a text
+    field that identifies the entity, only for an entity of a collection, never for
+    an update.
+    """
+    info = ctx.info
+    if (
+        answer.value is not None
+        or info is None
+        or ctx.existing is not None
+        or not info.mentions
+        or spec.path not in {(name,) for name in ctx.plan.identity}
+        or spec.clairic is None
+        or spec.clairic.type != "text"
+    ):
+        return answer
+    was = answer.rejected_reason or "no value"
+    return dataclasses.replace(
+        answer,
+        value=info.label,
+        span=info.mentions[0].span,
+        rejected_reason=None,
+        warnings=(*answer.warnings, f"identity_from_mention: {was}"),
+    )
+
+
+def _emit_leaf(ctx: Ctx, leaf: _Leaf, doc: dict[str, Any], out: _Assembly) -> None:
     spec = leaf.spec
     if leaf.state is not None:
         answer, rejects = _clairic_answer(leaf.state)
@@ -977,6 +1019,7 @@ def _emit_leaf(leaf: _Leaf, doc: dict[str, Any], out: _Assembly) -> None:
         answer, rejects = _clef_answer(spec, leaf.resolved)
     else:
         answer, rejects = _filled_answer(spec, leaf.value), []
+    answer = _from_mention(ctx, spec, answer)
     out.answers[spec.pretty] = answer
     out.rejected.extend(rejects)
     if answer.value is not None:
@@ -1064,7 +1107,7 @@ def _fragment(
         return None
     doc: dict[str, Any] = {}
     for leaf in result.leaves:
-        _emit_leaf(leaf, doc, out)
+        _emit_leaf(ctx, leaf, doc, out)
     for child in result.children:
         mark = out.mark()
         sub = _fragment(ctx, child, out, (*trail, _key(child.group)))
@@ -1932,10 +1975,29 @@ class _Verdict:
     stage: int = 0  # 0: the near-duplicate check, 1: the change gate
 
 
+def _is_note(ctx: Ctx, change: Change) -> bool:
+    """Whether an operation appends a sentence that was read from the input."""
+    return (
+        change.op == "add"
+        and change.path.endswith("/-")
+        and change.field_path in ctx.sentence_fields
+    )
+
+
 async def _judge_changes(
-    ctx: Ctx, before: dict[str, Any], changes: list[Change]
+    ctx: Ctx,
+    before: dict[str, Any],
+    changes: list[Change],
+    everything: Sequence[Change] | None = None,
 ) -> list[_Verdict]:
-    """Run the near-duplicate check and the change gate over the operations."""
+    """Run the near-duplicate check, the novelty check and the change gate.
+
+    A sentence appended to a note field is judged against the record AFTER the
+    update's other operations (``everything``: all of the update's operations, not
+    only the ones judged now): a sentence that only repeats a value being written to
+    another field ("Her mobile is now ...") is not a note. It must also add
+    something to that record (``verify.note_novelty``, call kind ``novelty``).
+    """
     if ctx.vetoed:  # every operation is refused, nothing is asked
         return [
             _Verdict(
@@ -1964,7 +2026,34 @@ async def _judge_changes(
                 found.p,
             )
     live = [v for v in verdicts if v.reason is None]
-    gated = await gate_changes(ctx, before, [v.change for v in live])
+    records: dict[int, dict[str, Any]] = {}
+    notes = [v for v in live if _is_note(ctx, v.change)]
+    if notes:
+        others = [c for c in (everything or changes) if not _is_note(ctx, c)]
+        after = record_after(before, others)
+        for verdict in notes:
+            records[id(verdict.change)] = after
+        floor = ctx.run.verify.note_novelty
+        if floor > 0:
+            asked = await note_novelty(ctx, after, [v.change for v in notes])
+            for verdict, p in zip(notes, asked, strict=True):
+                if p is not None and p >= floor:
+                    continue
+                change = verdict.change
+                verdict.reason = "not_novel" if p is not None else "novelty_missing"
+                verdict.p = p
+                verdict.rejection = RejectedOp(
+                    change.op,
+                    change.path,
+                    verdict.reason,
+                    f"the sentence adds nothing the record does not hold "
+                    f"(p={p:.2f} < {floor})"
+                    if p is not None
+                    else "the novelty check gave no answer",
+                    p,
+                )
+            live = [v for v in live if v.reason is None]
+    gated = await gate_changes(ctx, before, [v.change for v in live], records=records)
     for verdict, answer in zip(live, gated, strict=True):
         verdict.p = answer.p
         if answer.passed:
@@ -2146,7 +2235,7 @@ async def _evaluate(
         cache.setdefault(_change_key(settled), _Verdict(settled))
     fresh = [c for c in changes if _change_key(c) not in cache]
     if fresh:
-        for verdict in await _judge_changes(ctx, before, fresh):
+        for verdict in await _judge_changes(ctx, before, fresh, changes):
             cache[_change_key(verdict.change)] = verdict
     verdicts = [cache[_change_key(c)] for c in changes]
     passed = [v.change for v in verdicts if v.reason is None]
@@ -2697,6 +2786,30 @@ def _identity_conflict(
     )
 
 
+_ID_LIKE = re.compile(r"[A-Za-z]")
+
+
+def _record_identity(plan: SchemaPlan, data: Mapping[str, Any], record_id: str) -> str:
+    """What a single record is called, for the Clef states of its update.
+
+    The values of the schema's identity fields (a name, an invoice number), else the
+    record's id when it is short and has a letter in it (``INV-2291``, not an opaque
+    uuid). A figure the input gives for another record then cannot be attributed to
+    this one just because the label ("the Bill") fits both.
+    """
+    keys = identity_keys(plan, plan.identity)
+    values = [
+        str(data[key]).strip()
+        for key in keys
+        if isinstance(data.get(key), (str, int)) and str(data.get(key)).strip()
+    ]
+    if values:
+        return ", ".join(values)[:80]
+    if len(record_id) <= 24 and _ID_LIKE.search(record_id):
+        return record_id
+    return ""
+
+
 async def update_one(
     run: Run,
     plan: SchemaPlan,
@@ -2806,6 +2919,10 @@ async def update_one(
             focus_plain=focus_plain,
         )
         skip_presence = True
+    else:
+        ctx = dataclasses.replace(
+            ctx, identity_hint=_record_identity(plan, before, target.record_id)
+        )
     placed = placement or Placement()
     ctx = dataclasses.replace(
         ctx,

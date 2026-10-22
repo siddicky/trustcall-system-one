@@ -394,7 +394,7 @@ async def test_the_call_sequence_of_the_readme_people() -> None:
         "coref": 1,  # 7 mentions: every pair, 21 questions, in one request
         "qualify": 1,  # every entity, Sunny included, in one request
         "extract": 4,  # one per qualifying entity
-        "attribution": 4,
+        "attribution": 16,  # one request per checked value (verify.isolate_decisions)
     }
     first = kinds(result)[:3]
     assert sorted(first) == ["count", "discover", "presence"]  # the parallel step
@@ -402,7 +402,7 @@ async def test_the_call_sequence_of_the_readme_people() -> None:
     ((_, coref, _),) = of_kind(world, "coref")
     # 7 mentions: up to 24 EVERY pair is asked (21), in one request
     assert len(coref["questions"]) == 21
-    assert len(result.calls) == 13
+    assert len(result.calls) == 25
 
 
 async def test_the_three_discovery_requests_are_in_flight_together() -> None:
@@ -643,15 +643,15 @@ async def test_the_attribution_state_names_the_entity_and_its_mentions() -> None
     world = readme_world()
     await invoke(world)
     attribution = [c for c in of_kind(world, "attribution") if c[2].entity == "e0"]
-    assert len(attribution) == 1
-    _, payload, _ = attribution[0]
-    entity = payload["state"]["entity"]
-    assert entity["label"] == "Emma Thompson"
-    assert [m["text"] for m in entity["mentions"]] == ["Emma Thompson", "Emma"]
-    assert all(m["span"][1] > m["span"][0] for m in entity["mentions"])
-    assert payload["state"]["input"] == TEXT
-    instructions = [q["instructions"] for q in payload["questions"].values()]
-    assert any("`entity.label`" in text for text in instructions)
+    assert attribution and all(len(c[1]["questions"]) == 1 for c in attribution)
+    for _, payload, _ in attribution:
+        entity = payload["state"]["entity"]
+        assert entity["label"] == "Emma Thompson"
+        assert [m["text"] for m in entity["mentions"]] == ["Emma Thompson", "Emma"]
+        assert all(m["span"][1] > m["span"][0] for m in entity["mentions"])
+        assert payload["state"]["input"] == TEXT
+        instructions = [q["instructions"] for q in payload["questions"].values()]
+        assert all("`entity.label`" in text for text in instructions)
 
 
 async def test_the_presence_gate_is_not_asked_again_per_entity() -> None:
