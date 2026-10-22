@@ -246,7 +246,8 @@ class FieldAnswer:
         source: ``"clairic"``, ``"clef"``, ``"const"``, or ``"default"`` when
             the value is null and pydantic's default applies.
         attribution_p: Probability from the attribution check: a float for a
-            scalar, one float per original element for a list.
+            scalar, one entry per original element for a list (``None`` for an
+            element that got no answer, never NaN).
         gate_p: Probability from the change gate (updates).
         crosscheck_agree: Whether the input-only cross-check agreed (updates).
         reask: Whether a re-ask contributed to the value.
@@ -266,7 +267,7 @@ class FieldAnswer:
     span: Span | None = None
     spans: tuple[Span, ...] | None = None
     source: Literal["clairic", "clef", "const", "default"] = "clairic"
-    attribution_p: float | tuple[float, ...] | None = None
+    attribution_p: float | tuple[float | None, ...] | None = None
     gate_p: float | None = None
     crosscheck_agree: bool | None = None
     reask: bool = False

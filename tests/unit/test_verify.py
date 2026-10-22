@@ -3,6 +3,7 @@
 # ruff: noqa: UP045 - tests deliberately spell Optional and Union
 
 import datetime as dt
+import math
 from typing import Any, Literal, Optional
 
 import pytest
@@ -807,6 +808,34 @@ async def test_a_missing_element_attribution_drops_the_element_as_missing() -> N
         ("/notes/1", "attribution_missing")
     ]
     assert record.fields["notes"].attribution_p is not None
+
+
+async def test_a_missing_element_attribution_is_none_never_nan() -> None:
+    class Notes(BaseModel):
+        notes: list[str]
+
+    from trustcall_system_one import create_extractor
+
+    script = Script()
+    script.clairic = {"notes": ca("list", ["red", "green"], find_all=["red", "green"])}
+    script.reask = {"notes": ca("list", ["red", "green"], find_all=["red", "green"])}
+    extractor = create_extractor(
+        [Notes],
+        transport=Lossy(script, {"attr.notes.1": 2}),
+        verify=VerifyConfig(borderline_null=False),
+    )
+    record = (await extractor.ainvoke("red green")).records[0]
+    assert record.fields["notes"].attribution_p == (0.95, None)
+    # no NaN anywhere on the public result
+    assert not any(
+        isinstance(p, float) and math.isnan(p)
+        for answer in record.fields.values()
+        for p in (
+            answer.attribution_p
+            if isinstance(answer.attribution_p, tuple)
+            else (answer.attribution_p,)
+        )
+    )
 
 
 async def test_every_element_missing_rejects_the_field_as_missing() -> None:

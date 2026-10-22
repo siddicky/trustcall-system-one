@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 from trustcall_system_one._names import Path, pretty
 
 if TYPE_CHECKING:
-    from trustcall_system_one._compile import SchemaPlan
+    from trustcall_system_one._compile import FieldGroup, SchemaPlan, UnionGroup
 
 __all__ = ["flatten", "prune_nulls", "unflatten"]
 
@@ -96,14 +96,60 @@ def _build(entries: list[tuple[Path, Any]], depth: int, warnings: list[str]) -> 
     return [_build(groups[index], depth + 1, warnings) for index in indexes]
 
 
-def _validation_keys(doc: Mapping[str, Any], plan: "SchemaPlan") -> dict[str, Any]:
-    """Rename top-level keys to the keys ``model_validate`` accepts."""
-    keys = {
-        spec.path[0]: spec.alias
-        for spec in plan.specs
-        if len(spec.path) == 1 and spec.alias is not None
+def _level_keys(
+    group: "FieldGroup", members: Mapping[Path, str]
+) -> dict[str, tuple[str | None, bool, "FieldGroup | None"]]:
+    """Map each field name of a group to ``(alias, has_default, nested group)``.
+
+    The nested group is the one that describes the field's value when that is a
+    document of its own: a sub-model's group, or the chosen member of a union.
+    """
+    keys: dict[str, tuple[str | None, bool, FieldGroup | None]] = {}
+    for spec in group.specs:
+        keys[str(spec.path[-1])] = (spec.alias, spec.has_default, None)
+    for child in group.children:
+        keys[str(child.path[-1])] = (child.alias, child.has_default, child)
+    for union in group.unions:
+        label = members.get(union.path)
+        chosen = next((m for m in union.members if m.label == label), None)
+        keys[str(union.path[-1])] = (
+            union.alias,
+            union.has_default,
+            chosen.group if chosen is not None else _guess_member(union),
+        )
+    return keys
+
+
+def _guess_member(union: "UnionGroup") -> "FieldGroup | None":
+    """Without a recorded choice, a union's value cannot be told apart by key."""
+    return union.members[0].group if len(union.members) == 1 else None
+
+
+def _walk_level(
+    doc: Mapping[str, Any],
+    group: "FieldGroup",
+    members: Mapping[Path, str],
+    *,
+    prune: bool,
+) -> dict[str, Any]:
+    """Rename one level's keys to validation keys (and prune defaultable nulls)."""
+    keys = _level_keys(group, members)
+    by_alias = {
+        alias: name for name, (alias, _, _) in keys.items() if alias is not None
     }
-    return {keys.get(key, key): value for key, value in doc.items()}
+    out: dict[str, Any] = {}
+    for key, value in doc.items():
+        name = key if key in keys else by_alias.get(key)
+        if name is None:
+            out[key] = value  # not a field of the plan: kept unchanged
+            continue
+        alias, has_default, nested = keys[name]
+        if prune and value is None and has_default:
+            continue
+        if nested is not None and isinstance(value, Mapping):
+            value = _walk_level(value, nested, members, prune=prune)
+        out[alias if alias is not None else name] = value
+    return out
 
 
 def unflatten(
@@ -111,6 +157,7 @@ def unflatten(
     warnings: list[str] | None = None,
     *,
     plan: "SchemaPlan | None" = None,
+    members: Mapping[Path, str] | None = None,
 ) -> dict[str, Any]:
     """Rebuild a nested document from ``{path: leaf}``.
 
@@ -121,9 +168,14 @@ def unflatten(
     Args:
         items: Leaf values keyed by path.
         warnings: Optional list that receives one message per compacted list.
-        plan: When given, top-level keys of fields that have an ``alias`` (or a
-            string ``validation_alias``) are renamed to it, so the result is
-            accepted by ``model_validate`` even without ``populate_by_name``.
+        plan: When given, the keys of fields that have an ``alias`` (or a
+            string ``validation_alias``) are renamed to it at every level of the
+            document (sub-models and the chosen member of a union included), so
+            the result is accepted by ``model_validate`` even without
+            ``populate_by_name``.
+        members: For a plan with unions of models, which member (by label) was
+            chosen at each union path, so its fields are renamed with their own
+            aliases.
 
     Returns:
         The document. An empty mapping gives ``{}``.
@@ -141,37 +193,36 @@ def unflatten(
     document = _build(entries, 0, collected)
     if not isinstance(document, dict):
         raise ValueError("the top level of a document must be an object")
-    return _validation_keys(document, plan) if plan is not None else document
+    if plan is None:
+        return document
+    return _walk_level(document, plan.root, members or {}, prune=False)
 
 
-def prune_nulls(doc: Mapping[str, Any], plan: "SchemaPlan") -> dict[str, Any]:
-    """Drop top-level ``None`` values that pydantic can default.
+def prune_nulls(
+    doc: Mapping[str, Any],
+    plan: "SchemaPlan",
+    *,
+    members: Mapping[Path, str] | None = None,
+) -> dict[str, Any]:
+    """Drop ``None`` values that pydantic can default, at every level.
 
     A ``None`` is removed when the field has a default (including the ``None``
     default of a ``NotRequired`` key), so validation supplies that default. A
     ``None`` for a field without a default is kept, which is what an
     ``Optional`` field without a default needs to validate; for a required
-    non-``Optional`` field it stays so validation reports the gap. Keys the
-    plan does not know are kept unchanged. Keys may be field names or their
+    non-``Optional`` field it stays so validation reports the gap. The same
+    applies inside sub-models and the chosen member of a union of models. Keys
+    the plan does not know are kept unchanged. Keys may be field names or their
     aliases; the result is keyed by the validation key (the alias when the field
     has one), so it can go straight to ``model_validate``.
 
     Args:
-        doc: A top-level document.
+        doc: A document.
         plan: The compiled schema.
+        members: For unions of models, the chosen member label at each union
+            path (see ``unflatten``).
 
     Returns:
         A new dict without the prunable ``None`` values.
     """
-    defaulted: set[str] = set()
-    for spec in plan.specs:
-        if len(spec.path) == 1 and spec.has_default:
-            defaulted.add(str(spec.path[0]))
-            if spec.alias is not None:
-                defaulted.add(spec.alias)
-    pruned = {
-        key: value
-        for key, value in doc.items()
-        if not (value is None and key in defaulted)
-    }
-    return _validation_keys(pruned, plan)
+    return _walk_level(doc, plan.root, members or {}, prune=True)

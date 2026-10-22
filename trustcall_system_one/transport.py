@@ -242,7 +242,9 @@ class AdaptiveLimiter:
                 indefinitely.
 
         Raises:
-            asyncio.TimeoutError: If no slot became free within ``timeout``.
+            asyncio.TimeoutError: If no slot became free within ``timeout``
+                (an ``_SlotTimeout``, so callers can tell the wait for a slot
+                from a timeout inside the guarded block).
 
         Yields:
             The model's generation at acquisition, to pass back to
@@ -252,15 +254,18 @@ class AdaptiveLimiter:
         state = self._state()
         cond = state.cond
         async with cond:
-            await asyncio.wait_for(
-                cond.wait_for(
-                    lambda: (
-                        state.in_flight < self.max_in_flight
-                        and state.active.get(model, 0) < self.limit(model)
-                    )
-                ),
-                timeout,
-            )
+            try:
+                await asyncio.wait_for(
+                    cond.wait_for(
+                        lambda: (
+                            state.in_flight < self.max_in_flight
+                            and state.active.get(model, 0) < self.limit(model)
+                        )
+                    ),
+                    timeout,
+                )
+            except asyncio.TimeoutError:
+                raise _SlotTimeout(timeout) from None
             state.in_flight += 1
             state.active[model] = state.active.get(model, 0) + 1
             generation = self.generation(model)
@@ -282,9 +287,17 @@ class AdaptiveLimiter:
                 raise
 
 
+class _SlotTimeout(asyncio.TimeoutError):
+    """No request slot became free in time (as opposed to any other timeout)."""
+
+    def __init__(self, timeout: float | None) -> None:
+        super().__init__(f"no request slot became free within {timeout}s")
+
+
 _DEFAULT_TIMEOUT = httpx.Timeout(60.0, connect=10.0)
 _RETRYABLE_STATUS = frozenset({408, 429})
 _RETRYABLE_ERRORS = (
+    asyncio.TimeoutError,
     httpx.TimeoutException,
     httpx.NetworkError,
     httpx.RemoteProtocolError,
@@ -676,7 +689,7 @@ class CloudflareTransport:
                         if status not in _RETRYABLE_STATUS and status < 500:
                             failure.retries = retries
                             raise failure
-            except asyncio.TimeoutError:
+            except _SlotTimeout:
                 timed_out = TransportError(
                     f"timed out after {self._queue_timeout}s waiting for a request slot"
                 )
