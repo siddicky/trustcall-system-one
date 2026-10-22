@@ -49,6 +49,8 @@ select = ["E", "F", "I", "D", "UP", "B", "SIM", "RUF", "ASYNC"]
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["D"]
 "examples/*" = ["D"]
+"evals/cases.py" = ["D"]
+"evals/scenarios.py" = ["D"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
@@ -61,7 +63,7 @@ python_version = "3.10"
 strict = true
 plugins = ["pydantic.mypy"]
 warn_unused_ignores = true
-files = ["trustcall_system_one", "tests", "examples"]
+files = ["trustcall_system_one", "tests", "examples", "evals"]
 mypy_path = "examples"
 
 [[tool.mypy.overrides]]

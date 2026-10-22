@@ -152,7 +152,8 @@ own), `field` = one per field.
 | `_nested.py` | nested collections: the guard (`max_depth`/`max_recursion`), an insert's items as the parent's document and answers, an update's item records as operations of the parent |
 | `_diff.py`, `_gates.py`, `_repair.py` | ops + apply; thresholds + change gate; repair loop |
 | `_run.py`, `_extractor.py` | per-invoke context (usage, call log, semaphores); factory + sync bridge |
-| `testing.py` (public) | `FakeTransport`, `FakeWorld`, recording/cassette transports |
+| `testing.py` (public) | `FakeTransport`, `FakeWorld`, `RecordingTransport`, `CassetteTransport` (+ `CassetteMissError`, `request_key`, `trace_to_cassette`) |
+| `evals/` (repo top level, not packaged) | smoke scenarios and invariants (later: the eval dataset, scorer, runner and sweeps) |
 
 ### Public API
 
@@ -1001,6 +1002,27 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
   returns a frozen `CostReport{usd, unpriced_models, complete}`: `usd` sums the priced models
   only, and `complete` is false (with the models listed) until the caller configures a price
   for every model that used input tokens.
+- Recording and replay (`testing.py`, public). `RecordingTransport(inner, path, append=True)` wraps
+  any transport and appends one JSON line per call: `{key, model, kind, scope, schema, field,
+  request, response, status, duration_ms}` (a failed call has `response: null` and an `error`
+  object, and is re-raised). `key = request_key(model, payload)` is a hash (sha256, 24 hex digits)
+  of the model id and the canonical JSON of the payload (sorted keys, no whitespace), so equal
+  requests always share a key and any change to a request is a new one. The transport never sees
+  headers; as a second line of defence the values of `CLOUDFLARE_ACCOUNT_ID`,
+  `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_AUTH_TOKEN` and any `Bearer` token are replaced by
+  `<redacted>` in the line (test: `test_recording.py` sets all three and a hostile body that echoes
+  them, and greps the file). `CassetteTransport(path, *, strict=True, inner=None)` loads a file, a
+  directory of `*.jsonl` or a list of them and replays by key; duplicate keys replay in recorded
+  order, and a key with no recording left raises `CassetteMissError` (an `AssertionError`) naming
+  the call kind, the field, the schema and the key. `strict=False` with an `inner` sends only the
+  misses to `inner` (wrap it in a `RecordingTransport` to keep what comes back). `hits`,
+  `misses`, `forwarded`, `unused()` and `reset()` support tests and sweeps. `trace_to_cassette`
+  converts a wire trace (`{url, http, request, response}`, bodies only) to a cassette: the model
+  is the end of the URL, the REST envelope is removed, the kind is left empty (lookups use the key
+  only). A cassette is a snapshot of the request bodies of one commit: a change to the library
+  that alters a request makes its key miss. That is the point (it never replays a stale
+  request as if it were current), and the fix is to record again (`make record`), not to loosen
+  the match.
 - Experimental, off: Workers AI queue mode (`queueRequest` + `request_id`) behind a live
   probe — the Clairic schema has no batch properties, so it may be unsupported.
 
@@ -1059,9 +1081,31 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
   calls; (6) 300 existing records → prefilter; (7) count reconciliation both directions;
   (8) nested `Person.pets` through the same engine; (9) ambiguous match; (10) update/delete
   conflict.
-- `tests/live/test_smoke.py` (`@pytest.mark.live`, needs `TRUSTCALL_S1_LIVE` + creds) runs the
-  README scenario and records cassettes for `tests/recorded/`; `tests/evals/` (opt-in) tunes
-  thresholds and `passes.split`.
+- `tests/live/test_smoke.py` (`@pytest.mark.live`, skipped unless `TRUSTCALL_S1_LIVE=1` and the
+  credentials are set; `make smoke`) runs the scenarios of `evals/smoke.py` against the real
+  models: the README people conversation, a `One` insert (an invoice), a `One` update (the CRM
+  contact note) and a nested order update (the order email). It asserts invariants only, from
+  `evals/invariants.py`: no exception, every patch applies to `before` and gives `after`, a field
+  no operation touches is as it was, updates and deletes name existing records once each, spans
+  lie in the input and an inserted text value is its span verbatim, no operation reaches another entity's
+  record (the unmentioned order lines, the existing notes stay in place, a short form never
+  renames, the dog is not a Person). Exact values belong to the evals. With
+  `TRUSTCALL_S1_RECORD=<dir>` each scenario is written to `<dir>/smoke_<name>.jsonl` (`make
+  record` writes into `tests/recorded/`); `tests/unit/test_recorded.py` replays whichever of those
+  files exist, strictly and offline, through the same invariants on every `make test` (a scenario
+  not recorded yet is skipped). `make test` runs `tests/unit` only, with sockets disabled; live
+  tests are never collected by it.
+- Legacy cassettes: `tests/recorded/legacy_05207aa_{03_update_contact,06_attribution_guard}.jsonl`
+  are the wire traces of the second live run (commit 05207aa) converted by `trace_to_cassette`.
+  Replayed at HEAD, 8 of 9 (03) and 7 of 9 (06) requests hit; the misses are exactly the
+  attribution requests, whose wording M9 changed (arithmetic and date math moved into the
+  question), so `test_recorded.py` answers those from the model's recorded answer to the same
+  question ids about the same entity (the one deliberate loosening, in the test, never in
+  `CassetteTransport`) and asserts the live outcomes: four `replace` operations and no note for
+  03, Tom's Lisbon kept at
+  attribution 0.7736 for 06. Example 05 was not converted into a test: since 05207aa discovery
+  realigns Clairic's list values and spans (M9), which changes the mentions (9 instead of 7) and
+  with them the key of every later request (12 of 36 requests hit); `make record` replaces it.
 
 ## Request and latency profile (information, not a constraint)
 

@@ -1,12 +1,15 @@
 """Test helpers: a fake transport, ``FakeWorld`` and response builders."""
 
 import copy
+import hashlib
 import inspect
 import json
+import os
 import re
+import threading
 import time
 import typing
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from datetime import time as dtime
@@ -14,6 +17,14 @@ from typing import Any, Literal
 
 from pydantic import BaseModel
 
+from trustcall_system_one._errors import (
+    AuthError,
+    BadRequestError,
+    ModelResponseError,
+    RateLimitError,
+    ServerError,
+    TransportError,
+)
 from trustcall_system_one._types import CallKind
 from trustcall_system_one._wire import (
     CLAIRIC,
@@ -31,19 +42,24 @@ from trustcall_system_one._wire import (
     parse_clairic,
     parse_clef,
 )
-from trustcall_system_one.transport import CallMeta, TransportResponse
+from trustcall_system_one.transport import CallMeta, Transport, TransportResponse
 
 __all__ = [
+    "CassetteMissError",
+    "CassetteTransport",
     "FakeTransport",
     "FakeWorld",
+    "RecordingTransport",
     "WorldEntity",
     "choice",
     "clairic_answer",
     "clairic_response",
     "clef_response",
     "noul",
+    "request_key",
     "route",
     "score",
+    "trace_to_cassette",
 ]
 
 Handler = Callable[
@@ -1756,3 +1772,457 @@ def _pick(option: str, options: Sequence[str], p: float) -> dict[str, Any]:
     """A choice answer: ``option`` gets ``p``, the others share the rest."""
     rest = (1 - p) / max(1, len(options) - 1)
     return choice(option, {o: (p if o == option else rest) for o in options})
+
+
+# --------------------------------------------------------------------------- #
+# Recording and replaying real traffic
+# --------------------------------------------------------------------------- #
+
+_SECRET_ENV = (
+    "CLOUDFLARE_ACCOUNT_ID",
+    "CLOUDFLARE_API_TOKEN",
+    "CLOUDFLARE_AUTH_TOKEN",
+)
+_BEARER = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}")
+_REDACTED = "<redacted>"
+
+
+def request_key(model: str, payload: Mapping[str, Any]) -> str:
+    """The stable key a recorded call is stored and found under.
+
+    A hash of the model id and the canonical JSON of the payload (sorted keys,
+    no insignificant whitespace), so the same request always has the same key
+    whatever order its dictionaries were built in, and any change to the request
+    (a different state, field, instruction or threshold-driven option) is a
+    different key.
+
+    Args:
+        model: Full ``@cf/...`` model id.
+        payload: The request body.
+
+    Returns:
+        A 24-character hexadecimal string.
+    """
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    return hashlib.sha256(f"{model}\n{canonical}".encode()).hexdigest()[:24]
+
+
+def _secrets() -> list[str]:
+    values = (os.environ.get(name, "") for name in _SECRET_ENV)
+    return [v for v in values if len(v) >= 4]
+
+
+def _scrub(text: str) -> str:
+    """Remove credentials from a serialised line.
+
+    The transport never sees headers, so this is a second line of defence: the
+    values of the Cloudflare environment variables and any ``Bearer`` token are
+    replaced, whatever field they ended up in.
+    """
+    for secret in _secrets():
+        text = text.replace(secret, _REDACTED)
+    return _BEARER.sub(f"Bearer {_REDACTED}", text)
+
+
+class CassetteMissError(AssertionError):
+    """A call has no recording in the cassette.
+
+    Attributes:
+        kind: The call kind (``CallMeta.kind``).
+        field: The field the call was about (``CallMeta.field``), if any.
+        schema: The schema (``CallMeta.schema``).
+        model: The full model id.
+        key: The key the request hashes to (``request_key``).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        kind: str,
+        field: str | None,
+        schema: str,
+        model: str,
+        key: str,
+    ) -> None:
+        """Create the error.
+
+        Args:
+            message: What went wrong.
+            kind: The call kind.
+            field: The field the call was about, if any.
+            schema: The schema.
+            model: The full model id.
+            key: The request key.
+        """
+        super().__init__(message)
+        self.kind = kind
+        self.field = field
+        self.schema = schema
+        self.model = model
+        self.key = key
+
+
+class RecordingTransport:
+    """A ``Transport`` that passes calls to another one and writes them down.
+
+    One JSON line is appended per call to ``path``::
+
+        {
+            "key",
+            "model",
+            "kind",
+            "scope",
+            "schema",
+            "field",
+            "request",
+            "response",
+            "status",
+            "duration_ms",
+        }
+
+    ``key`` is ``request_key(model, request)``. ``request`` is the payload that was
+    sent and ``response`` the bare response body. A call that fails is written with
+    ``response: null`` and an ``error`` object, then re-raised.
+
+    Only payloads and bodies are written: never headers, tokens or account ids
+    (the wrapped transport owns those). As a second line of defence the values of
+    ``CLOUDFLARE_ACCOUNT_ID``, ``CLOUDFLARE_API_TOKEN`` and
+    ``CLOUDFLARE_AUTH_TOKEN`` and any ``Bearer`` token are replaced by
+    ``<redacted>`` in the line before it is written.
+
+    Attributes:
+        path: The cassette file (its directory is created).
+        written: Lines written so far by this object.
+    """
+
+    def __init__(
+        self, inner: Transport, path: str | os.PathLike[str], *, append: bool = True
+    ) -> None:
+        """Wrap a transport.
+
+        Args:
+            inner: The transport that answers.
+            path: The JSONL file to write.
+            append: Append to an existing file; ``False`` starts it afresh.
+        """
+        self._inner = inner
+        self.path = os.fspath(path)
+        self.written = 0
+        self._lock = threading.Lock()
+        directory = os.path.dirname(self.path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        if not append:
+            with open(self.path, "w", encoding="utf-8"):
+                pass
+
+    def _write(self, line: Mapping[str, Any]) -> None:
+        text = _scrub(json.dumps(line, ensure_ascii=False, allow_nan=False))
+        with self._lock, open(self.path, "a", encoding="utf-8") as handle:
+            handle.write(text + "\n")
+            self.written += 1
+
+    async def run(
+        self,
+        model: str,
+        payload: Mapping[str, Any],
+        *,
+        meta: CallMeta,
+        timeout: float | None = None,
+    ) -> TransportResponse:
+        """Run the call on the wrapped transport and record it.
+
+        Args:
+            model: Full ``@cf/...`` model id.
+            payload: Request body.
+            meta: Routing context.
+            timeout: Passed on.
+
+        Returns:
+            What the wrapped transport returned.
+        """
+        request = json.loads(json.dumps(payload, allow_nan=False))
+        head = {
+            "key": request_key(model, request),
+            "model": model,
+            "kind": meta.kind,
+            "scope": meta.scope,
+            "schema": meta.schema,
+            "field": meta.field,
+            "request": request,
+        }
+        started = time.perf_counter()
+        try:
+            result = await self._inner.run(model, payload, meta=meta, timeout=timeout)
+        except Exception as exc:
+            self._write(
+                {
+                    **head,
+                    "response": None,
+                    "status": getattr(exc, "status_code", None),
+                    "duration_ms": (time.perf_counter() - started) * 1000,
+                    "error": {"type": type(exc).__name__, "message": str(exc)},
+                }
+            )
+            raise
+        self._write(
+            {
+                **head,
+                "response": result.body,
+                "status": result.status_code,
+                "duration_ms": result.duration_ms
+                or (time.perf_counter() - started) * 1000,
+            }
+        )
+        return result
+
+
+_ERRORS: dict[str, type[Exception]] = {
+    cls.__name__: cls
+    for cls in (
+        AuthError,
+        BadRequestError,
+        ModelResponseError,
+        RateLimitError,
+        ServerError,
+        TransportError,
+    )
+}
+
+
+class CassetteTransport:
+    """A ``Transport`` that replays recorded calls by request key.
+
+    The cassette is one JSONL file as ``RecordingTransport`` writes it, a
+    directory of ``*.jsonl`` files, or a list of either. A call is looked up under
+    ``request_key(model, payload)``. Several recordings of one key (the same
+    request made more than once) replay in the order they were recorded.
+
+    A call with no recording (or one more call than recordings) raises
+    ``CassetteMissError`` naming the kind and field, unless ``strict`` is false
+    and an ``inner`` transport is given: the call then goes to it, and only that
+    call. Wrap the inner transport in a ``RecordingTransport`` to keep what it
+    answers.
+
+    Attributes:
+        hits: Calls answered from the cassette.
+        misses: ``(model, payload, meta)`` of each call that was not found
+            (whether it then fell through or raised).
+        forwarded: Calls the inner transport answered.
+    """
+
+    def __init__(
+        self,
+        path: "str | os.PathLike[str] | Iterable[str | os.PathLike[str]]",
+        *,
+        strict: bool = True,
+        inner: Transport | None = None,
+    ) -> None:
+        """Load a cassette.
+
+        Args:
+            path: A JSONL file, a directory of them, or an iterable of those.
+            strict: Raise on a miss. When false, a miss goes to ``inner``.
+            inner: Where a miss goes when ``strict`` is false. Without one, a
+                miss raises even when not strict.
+
+        Raises:
+            FileNotFoundError: If a path does not exist.
+            ValueError: If a line is not a recorded call.
+        """
+        self.strict = strict
+        self._inner = inner
+        self._entries: dict[str, list[dict[str, Any]]] = {}
+        self._cursor: dict[str, int] = {}
+        self._lock = threading.Lock()
+        self.hits = 0
+        self.forwarded = 0
+        self.misses: list[tuple[str, dict[str, Any], CallMeta]] = []
+        paths = [path] if isinstance(path, (str, os.PathLike)) else list(path)
+        for entry in paths:
+            self._load(os.fspath(entry))
+
+    def _load(self, path: str) -> None:
+        if os.path.isdir(path):
+            for name in sorted(os.listdir(path)):
+                if name.endswith(".jsonl"):
+                    self._load(os.path.join(path, name))
+            return
+        with open(path, encoding="utf-8") as handle:
+            for number, raw in enumerate(handle, 1):
+                if not raw.strip():
+                    continue
+                try:
+                    entry = json.loads(raw)
+                    key = entry["key"]
+                    entry["model"], entry["request"]
+                except (ValueError, KeyError, TypeError) as exc:
+                    raise ValueError(f"{path}:{number}: not a recorded call") from exc
+                self._entries.setdefault(key, []).append(entry)
+
+    def __len__(self) -> int:
+        """The number of recorded calls."""
+        return sum(len(v) for v in self._entries.values())
+
+    def reset(self) -> None:
+        """Start replaying every key from its first recording again."""
+        with self._lock:
+            self._cursor.clear()
+            self.hits = self.forwarded = 0
+            self.misses.clear()
+
+    def unused(self) -> list[dict[str, Any]]:
+        """The recordings that were not replayed (``key``, ``kind``, ``field``)."""
+        out = []
+        for key, entries in self._entries.items():
+            for entry in entries[self._cursor.get(key, 0) :]:
+                out.append(
+                    {
+                        k: entry.get(k)
+                        for k in ("key", "model", "kind", "schema", "field")
+                    }
+                )
+        return out
+
+    async def run(
+        self,
+        model: str,
+        payload: Mapping[str, Any],
+        *,
+        meta: CallMeta,
+        timeout: float | None = None,
+    ) -> TransportResponse:
+        """Replay the recording of this request.
+
+        Args:
+            model: Full ``@cf/...`` model id.
+            payload: Request body.
+            meta: Routing context.
+            timeout: Ignored (or passed to ``inner`` on a fall-through).
+
+        Returns:
+            The recorded response, with the recorded status and duration.
+
+        Raises:
+            CassetteMissError: If nothing is recorded under the request's key (or
+                every recording of it was replayed) and there is no inner
+                transport to ask.
+            TransportError: The recorded error, if the recorded call failed.
+        """
+        body = json.loads(json.dumps(payload, allow_nan=False))
+        key = request_key(model, body)
+        with self._lock:
+            entries = self._entries.get(key, [])
+            index = self._cursor.get(key, 0)
+            entry = entries[index] if index < len(entries) else None
+            if entry is not None:
+                self._cursor[key] = index + 1
+                self.hits += 1
+            else:
+                self.misses.append((model, body, meta))
+        if entry is None:
+            if not self.strict and self._inner is not None:
+                self.forwarded += 1
+                return await self._inner.run(model, payload, meta=meta, timeout=timeout)
+            raise self._miss(model, key, meta, len(entries))
+        error = entry.get("error")
+        if error:
+            cls = _ERRORS.get(error.get("type", ""), TransportError)
+            failure = cls(error.get("message", "recorded failure"))
+            if isinstance(failure, TransportError):
+                failure.status_code = entry.get("status")
+            raise failure
+        return TransportResponse(
+            body=copy.deepcopy(entry["response"]),
+            retries=0,
+            duration_ms=float(entry.get("duration_ms") or 0.0),
+            status_code=entry.get("status"),
+        )
+
+    @staticmethod
+    def _miss(model: str, key: str, meta: CallMeta, recorded: int) -> CassetteMissError:
+        what = f"a {meta.kind!r} call" + (
+            f" about field {meta.field!r}" if meta.field else ""
+        )
+        why = (
+            f"all {recorded} recording(s) of it were already replayed"
+            if recorded
+            else "no call with this request was recorded"
+        )
+        return CassetteMissError(
+            f"cassette miss: {what} (schema {meta.schema!r}, scope {meta.scope!r}, "
+            f"model {model}, key {key}): {why}. The request changed since the "
+            "cassette was recorded; record it again, or replay with strict=False "
+            "and an inner transport.",
+            kind=meta.kind,
+            field=meta.field,
+            schema=meta.schema,
+            model=model,
+            key=key,
+        )
+
+
+def trace_to_cassette(
+    trace: str | os.PathLike[str], cassette: str | os.PathLike[str]
+) -> int:
+    """Turn a wire trace into a cassette.
+
+    A trace line is ``{"url", "http", "request", "response"}``: the request body
+    that was sent, the full REST response and the URL it went to (the model is the
+    part after ``/ai/run/``). Such a line has everything a cassette key needs,
+    except the call kind, which is left empty (it is informational; a lookup uses
+    the key only). The REST envelope is removed from the response.
+
+    Args:
+        trace: The JSONL trace file.
+        cassette: The JSONL file to write.
+
+    Returns:
+        The number of calls written.
+
+    Raises:
+        ValueError: If a line has no request, response or model url.
+    """
+    lines = []
+    with open(trace, encoding="utf-8") as handle:
+        for number, raw in enumerate(handle, 1):
+            if not raw.strip():
+                continue
+            row = json.loads(raw)
+            url = str(row.get("url", ""))
+            marker = "/ai/run/"
+            if marker not in url or not isinstance(row.get("request"), dict):
+                raise ValueError(f"{trace}:{number}: not a wire trace line")
+            model = url.split(marker, 1)[1].split("?", 1)[0]
+            response = row.get("response")
+            if (
+                isinstance(response, dict)
+                and "success" in response
+                and "result" in response
+            ):
+                response = response["result"]
+            lines.append(
+                {
+                    "key": request_key(model, row["request"]),
+                    "model": model,
+                    "kind": "",
+                    "scope": "",
+                    "schema": "",
+                    "field": None,
+                    "request": row["request"],
+                    "response": response,
+                    "status": row.get("http"),
+                    "duration_ms": 0.0,
+                }
+            )
+    with open(cassette, "w", encoding="utf-8") as out:
+        for line in lines:
+            out.write(_scrub(json.dumps(line, ensure_ascii=False)) + "\n")
+    return len(lines)
