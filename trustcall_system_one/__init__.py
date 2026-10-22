@@ -2,8 +2,11 @@
 
 from trustcall_system_one._cardinality import Many, One
 from trustcall_system_one._compile import (
+    FieldGroup,
     FieldSpec,
     SchemaPlan,
+    UnionGroup,
+    UnionMember,
     compile_schema,
     s1_field,
 )
@@ -73,6 +76,7 @@ __all__ = [
     "ExtractionValidationError",
     "Extractor",
     "FieldAnswer",
+    "FieldGroup",
     "FieldSpec",
     "GateConfig",
     "Limits",
@@ -95,6 +99,8 @@ __all__ = [
     "TransportError",
     "TransportResponse",
     "TrustcallSystemOneError",
+    "UnionGroup",
+    "UnionMember",
     "Usage",
     "VerifyConfig",
     "__version__",

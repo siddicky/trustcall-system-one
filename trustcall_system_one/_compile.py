@@ -51,11 +51,14 @@ from trustcall_system_one._wire import (
 __all__ = [
     "S1_KEY",
     "Engine",
+    "FieldGroup",
     "FieldSpec",
     "FrozenMap",
     "Question",
     "Role",
     "SchemaPlan",
+    "UnionGroup",
+    "UnionMember",
     "compile_schema",
     "render_instructions",
     "s1_field",
@@ -80,10 +83,14 @@ Engine = Literal[
 """Which part of the system answers a field.
 
 ``const`` is a single-option ``Literal`` or ``Enum`` on a required field: its
-value is filled in by code and nothing is asked.
+value is filled in by code and nothing is asked. ``submodel`` and
+``union_models`` are container fields: the compiler expands them into field
+groups (their ``clef`` is the presence question of an optional sub-model, or the
+member choice of a union). ``collection`` and ``mapping`` are recorded for later
+engines and not extracted yet.
 """
 
-_DEFERRED_ENGINES = frozenset({"submodel", "collection", "mapping", "union_models"})
+_DEFERRED_ENGINES = frozenset({"collection", "mapping"})
 _CLAIRIC_TYPES = (
     "text",
     "number",
@@ -397,8 +404,10 @@ class FieldSpec:
         required: False for ``Optional`` fields and fields with a default.
         has_default: Whether pydantic supplies a default when the key is absent.
         engine: Which part of the system answers the field. ``skip`` fields are
-            never asked; ``submodel``, ``collection``, ``mapping`` and
-            ``union_models`` are recognised but expanded by later engines.
+            never asked. ``submodel`` and ``union_models`` are containers that
+            the compiler expands into ``FieldGroup`` and ``UnionGroup`` objects;
+            ``collection`` and ``mapping`` are recognised but expanded by later
+            engines.
         clairic: The Clairic field to send, if any.
         clef: The Clef question to send, if any.
         key_map: For Clef choice and score, option id to Python value. For a
@@ -424,7 +433,7 @@ class FieldSpec:
             the field name (from ``alias`` or a plain-string
             ``validation_alias``); ``None`` when the name itself is the key.
         context: Parent context put in front of the Clairic instructions of a
-            field whose name was shortened (empty otherwise).
+            nested field or one whose name was shortened (empty otherwise).
         clef_context: The same for the Clef question.
         hints: Type and constraint sentences that follow the description in the
             Clairic instructions.
@@ -432,6 +441,12 @@ class FieldSpec:
             resolved model classes (a single one except for a union of models).
             Forward references are resolved once, here, so expanders never
             resolve names again. Empty for every other engine.
+        wire_path: The path the wire names were allocated for. It is ``path``
+            except below a union of models, where it carries the member's label
+            after the union field (members may share field names, while every
+            wire name is unique in the plan). Empty means ``path``.
+        scope: For a nested field, its ancestors' names (``"author → address"``);
+            empty at the top level.
     """
 
     path: Path
@@ -461,6 +476,137 @@ class FieldSpec:
     context: str = ""
     clef_context: str = ""
     hints: tuple[str, ...] = ()
+    wire_path: Path = ()
+    scope: str = ""
+
+    @property
+    def scoped(self) -> str:
+        """The description with the field's ancestors, for questions that stand alone.
+
+        ``"city (author → address)"`` for a nested field, the plain description
+        at the top level. Verification questions use it, since they do not carry
+        the parent-context prefix that the extraction instructions do.
+        """
+        return f"{self.description} ({self.scope})" if self.scope else self.description
+
+
+@dataclass(frozen=True, eq=False)
+class FieldGroup:
+    """The fields of one model in the plan: the root or a nested sub-model.
+
+    One group is one Clairic pass under ``passes.split="submodel"``.
+
+    Attributes:
+        path: Where the group sits in the document (``()`` for the root; below a
+            union of models, the union field's path).
+        model: The pydantic model the group's fields belong to.
+        optional: Whether the sub-model may be absent (its field is nullable or
+            has a default). An optional group is gated by a presence question;
+            a required group, the root and a union member are always asked.
+        nullable: Whether ``None`` is a valid value of the sub-model field.
+        has_default: Whether the sub-model field has a default.
+        description: What the group is (the sub-model field's description; the
+            model's docstring for the root).
+        alias: The key ``model_validate`` expects for the sub-model field when
+            it is not the field name.
+        spec: The sub-model field's own spec (``engine="submodel"``; its
+            ``clef`` is the presence question of an optional group). ``None``
+            for the root and for a union member.
+        specs: The fields directly in this group, not those of child groups:
+            leaves (Clairic, Clef and const fields) and the skipped and deferred
+            ones.
+        children: The nested sub-model groups, in declaration order.
+        unions: The unions of models that are fields of this group.
+        identity: Names of the group's fields that identify a record.
+        member: For the root group of a union member, the member's label.
+    """
+
+    path: Path
+    model: type[BaseModel]
+    optional: bool
+    nullable: bool
+    has_default: bool
+    description: str = ""
+    alias: str | None = None
+    spec: "FieldSpec | None" = None
+    specs: tuple["FieldSpec", ...] = ()
+    children: tuple["FieldGroup", ...] = ()
+    unions: tuple["UnionGroup", ...] = ()
+    identity: tuple[str, ...] = ()
+    member: str = ""
+
+    @property
+    def pretty(self) -> str:
+        """``path`` joined with dots (empty for the root)."""
+        return pretty(self.path)
+
+    def walk(self) -> Iterator["FieldGroup"]:
+        """Yield this group and every nested group below it, depth first.
+
+        Union members are not entered (see ``UnionGroup.members``).
+        """
+        yield self
+        for child in self.children:
+            yield from child.walk()
+
+
+@dataclass(frozen=True, eq=False)
+class UnionMember:
+    """One member model of a union, compiled as its own subtree.
+
+    Attributes:
+        label: The member's unique name (the model name, suffixed when two
+            members share it). It is the value of the union spec's ``key_map``.
+        model: The member model.
+        group: The member's fields; its ``path`` is the union field's path.
+        options: The Clef option ids that select this member (one per
+            discriminator value, or the single option named after the model).
+    """
+
+    label: str
+    model: type[BaseModel]
+    group: FieldGroup
+    options: tuple[str, ...]
+
+
+@dataclass(frozen=True, eq=False)
+class UnionGroup:
+    """A field that is a union of models.
+
+    The choice is one Clef question (``spec.clef``); the member subtrees are only
+    asked after the choice resolves.
+
+    Attributes:
+        path: Where the union field sits in the document.
+        spec: The union field's spec (``engine="union_models"``). Its ``clef`` is
+            the choice, ``key_map`` maps an option id to a member label (or to
+            ``UNSTATED`` for the ``unstated`` option of an optional union).
+        members: The compiled members.
+        discriminator: Name of the tag field when the members share one (from
+            ``Field(discriminator=...)`` or a common ``Literal`` field), else
+            ``None``. Options are then the tag values, else the model names.
+        option_tags: For a discriminated union, option id to tag value.
+        optional: Whether the union may be absent (nullable or defaulted).
+        nullable: Whether ``None`` is valid.
+        has_default: Whether the field has a default.
+        alias: The key ``model_validate`` expects, when not the field name.
+    """
+
+    path: Path
+    spec: "FieldSpec"
+    members: tuple[UnionMember, ...]
+    discriminator: str | None = None
+    option_tags: Mapping[str, Any] = field(default_factory=FrozenMap)
+    optional: bool = False
+    nullable: bool = False
+    has_default: bool = False
+    alias: str | None = None
+
+    def member_for(self, option: str) -> UnionMember | None:
+        """Return the member an option selects (``None`` for ``unstated``)."""
+        assert self.spec.key_map is not None
+        label = self.spec.key_map.get(option)
+        return next((m for m in self.members if m.label == label), None)
 
 
 @dataclass(frozen=True, eq=False)
@@ -472,11 +618,20 @@ class SchemaPlan:
         name: Model class name.
         title: Model title (``model_config["title"]`` or the class name).
         description: Model docstring, or an empty string.
-        specs: One spec per top-level field, in declaration order.
+        specs: One spec per field, depth first in declaration order: a sub-model
+            or union field comes first (the container), then the fields of its
+            group. Fields below a union of models are not here, because they are
+            only asked once a member is chosen (see ``all_specs``).
         clairic_names: Wire names of the Clairic fields.
         clef_names: Wire names of the Clef questions.
-        identity: Names of the fields that identify a record.
+        identity: Names of the root fields that identify a record.
         warnings: Human-readable compile warnings.
+        groups: The root group followed by one group per nested sub-model, depth
+            first (union members are reached through ``unions``).
+        unions: Every union of models outside the members of other unions.
+        member_groups: The groups inside the members of unions (member roots and
+            their nested sub-models), depth first.
+        member_specs: The specs of those groups, including nested union fields.
     """
 
     schema: type[BaseModel]
@@ -488,27 +643,50 @@ class SchemaPlan:
     clef_names: FieldNameMap
     identity: tuple[str, ...]
     warnings: tuple[str, ...]
+    groups: tuple[FieldGroup, ...] = ()
+    unions: tuple[UnionGroup, ...] = ()
+    member_groups: tuple[FieldGroup, ...] = ()
+    member_specs: tuple[FieldSpec, ...] = ()
+
+    @property
+    def root(self) -> FieldGroup:
+        """The group of the schema's own fields."""
+        return self.groups[0]
+
+    def all_groups(self) -> Iterator[FieldGroup]:
+        """Yield every group, including those inside union members."""
+        yield from self.groups
+        yield from self.member_groups
+
+    def all_specs(self) -> Iterator[FieldSpec]:
+        """Yield every spec: ``specs`` and then those below unions of models."""
+        yield from self.specs
+        yield from self.member_specs
 
     def spec(self, path: Path) -> FieldSpec:
         """Return the spec for a path.
 
+        Below a union of models several members may use the same path; the first
+        is returned.
+
         Raises:
             KeyError: If no field has that path.
         """
-        for spec in self.specs:
+        for spec in self.all_specs():
             if spec.path == path:
                 return spec
         raise KeyError(path)
 
     def _select(self, paths: Iterable[Path] | None) -> list[FieldSpec]:
+        every = list(self.all_specs())
         if paths is None:
-            return list(self.specs)
+            return every
         wanted = {tuple(path) for path in paths}
-        known = {spec.path for spec in self.specs}
+        known = {spec.path for spec in every}
         missing = wanted - known
         if missing:
             raise KeyError(sorted(pretty(path) for path in missing))
-        return [spec for spec in self.specs if spec.path in wanted]
+        return [spec for spec in every if spec.path in wanted]
 
     def clairic_fields(
         self, paths: Iterable[Path] | None = None
@@ -516,7 +694,9 @@ class SchemaPlan:
         """Return the Clairic fields to send, keyed by wire name.
 
         The fields are deep copies, so callers may change them without
-        affecting the cached plan.
+        affecting the cached plan. Fields below a union of models are included
+        (their wire names are unique in the plan), though the engine asks them
+        only after the union's choice.
 
         Args:
             paths: Restrict to these paths; ``None`` means every field.
@@ -536,7 +716,8 @@ class SchemaPlan:
         """Return the Clef questions to send, keyed by wire name.
 
         The questions are deep copies, so callers may change them without
-        affecting the cached plan.
+        affecting the cached plan. They include the presence questions of
+        optional sub-models and the choices of unions of models.
 
         Args:
             paths: Restrict to these paths; ``None`` means every field.
@@ -551,8 +732,10 @@ class SchemaPlan:
         }
 
     def deferred(self) -> tuple[FieldSpec, ...]:
-        """Return the specs that later engines expand (sub-models, collections)."""
-        return tuple(spec for spec in self.specs if spec.engine in _DEFERRED_ENGINES)
+        """Return the specs that later engines expand (collections, mappings)."""
+        return tuple(
+            spec for spec in self.all_specs() if spec.engine in _DEFERRED_ENGINES
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -787,6 +970,18 @@ class _Kind:
     union_names: list[str] = field(default_factory=list)
     bounds: dict[str, Any] = field(default_factory=dict)
     models: tuple[type[BaseModel], ...] = ()
+    union: "_UnionInfo | None" = None
+
+
+@dataclass
+class _UnionInfo:
+    """What the expander needs to know about a union of models."""
+
+    labels: list[str]
+    discriminator: str | None
+    option_members: dict[str, int]
+    option_tags: dict[str, Any]
+    criteria: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -802,6 +997,7 @@ class _Ctx:
     gates: GateConfig
     limits: Limits
     model: type[BaseModel]
+    discriminator: Any = None
 
 
 def _resolve(ctx: _Ctx, tp: Any) -> Any:
@@ -1072,23 +1268,157 @@ def _list_kind(ctx: _Ctx, container: str, item: _Shape) -> _Kind:
     return kind
 
 
+def _too_deep(ctx: _Ctx) -> bool:
+    """Whether the leaves of a sub-model at this field would be past ``max_depth``."""
+    return len(ctx.path) + 1 > ctx.limits.max_depth
+
+
 def _model_kind(ctx: _Ctx, engine: Engine, models: tuple[Any, ...]) -> _Kind:
     """Record a nested-model field, applying the depth guard.
 
-    Recursion is not detected here: a self-referencing model is recorded as a
-    deferred ``submodel`` or ``collection`` and the expander enforces
-    ``limits.max_depth`` as it descends.
+    A sub-model is expanded by the compiler down to ``limits.max_depth`` (the
+    longest leaf path): a self-referencing model expands until the limit, where
+    the field is skipped with a ``max_depth`` warning. An optional sub-model gets
+    a presence question. Collections are recorded for a later engine.
     """
-    if len(ctx.path) + 1 > ctx.limits.max_depth:
+    if _too_deep(ctx):
         return _Kind("skip", warnings=["max_depth"])
-    return _Kind(engine, models=tuple(_as_model(model) for model in models))
+    resolved = tuple(_as_model(model) for model in models)
+    if engine == "submodel" and not ctx.required:
+        return _Kind(engine, clef="noul", models=resolved)
+    return _Kind(engine, models=resolved)
+
+
+def _member_text(model: type[BaseModel], label: str) -> str:
+    """Describe a union member for the choice: its docstring, else its fields."""
+    doc = inspect.cleandoc(model.__doc__) if model.__doc__ else ""
+    if doc.strip():
+        return _clean(doc)
+    names = ", ".join(model.model_fields) or "no fields"
+    return f"{label}: has the fields {names}."
+
+
+def _tag_candidates(model: type[BaseModel], name: str) -> list[_Candidate] | None:
+    """The values of a model's ``Literal`` or ``Enum`` field, or ``None``."""
+    info = model.model_fields.get(name)
+    if info is None:
+        return None
+    shape = _strip(info.annotation)
+    if shape.members is not None or shape.nullable:
+        return None
+    base = shape.base
+    if typing_extensions.get_origin(base) in _LITERAL_ORIGINS or _is_enum(base):
+        return _candidates(base) or None
+    return None
+
+
+def _disjoint(per_member: list[list[_Candidate]]) -> bool:
+    flat = [repr(c.value) for candidates in per_member for c in candidates]
+    return len(set(flat)) == len(flat)
+
+
+def _find_discriminator(
+    ctx: _Ctx, models: list[type[BaseModel]]
+) -> tuple[str, list[list[_Candidate]]] | None:
+    """The tag field of a union of models and each member's tag values.
+
+    An explicit ``Field(discriminator="name")`` wins; otherwise the first field
+    of the first member that every member declares as a required ``Literal`` or
+    ``Enum`` with values no other member shares.
+    """
+    named = ctx.discriminator
+    if isinstance(named, str):
+        per = [_tag_candidates(m, named) for m in models]
+        found = [c for c in per if c is not None]
+        if len(found) == len(models) and _disjoint(found):
+            return named, found
+    for name in models[0].model_fields:
+        per = [_tag_candidates(m, name) for m in models]
+        found = [c for c in per if c is not None]
+        if (
+            len(found) == len(models)
+            and all(m.model_fields[name].is_required() for m in models)
+            and _disjoint(found)
+        ):
+            return name, found
+    return None
+
+
+def _union_models_kind(ctx: _Ctx, members: tuple[Any, ...]) -> _Kind:
+    """Classify a union of models: one Clef choice over its members.
+
+    The options are the discriminator's values when the members share a tag
+    field (from ``Field(discriminator=...)`` or a common ``Literal``), else the
+    member names; each option's criteria is the member's docstring, falling back
+    to its field list. An optional union gets an ``unstated`` option.
+    """
+    if _too_deep(ctx):
+        return _Kind("skip", warnings=["max_depth"])
+    models = [_as_model(m) for m in members]
+    labels: list[str] = []
+    for model in models:
+        base, number = model.__name__, 1
+        label = base
+        while label in labels:
+            number += 1
+            label = f"{base}_{number}"
+        labels.append(label)
+    if len(models) > _MAX_CHOICE_OPTIONS - (0 if ctx.required else 1):
+        raise ValueError(
+            f"field {ctx.pretty!r}: a union of {len(models)} models has too many "
+            f"options for one Clef choice (at most {_MAX_CHOICE_OPTIONS})"
+        )
+    tag = _find_discriminator(ctx, models)
+    candidates: list[_Candidate] = []
+    owners: list[int] = []
+    if tag is not None:
+        discriminator: str | None = tag[0]
+        for index, found in enumerate(tag[1]):
+            for candidate in found:
+                candidates.append(candidate)
+                owners.append(index)
+    else:
+        discriminator = None
+        for index, label in enumerate(labels):
+            candidates.append(_Candidate(label))
+            owners.append(index)
+    options = _options_for(candidates)
+    texts = [_member_text(m, label) for m, label in zip(models, labels, strict=True)]
+    info = _UnionInfo(
+        labels=labels,
+        discriminator=discriminator,
+        option_members={},
+        option_tags={},
+        criteria={},
+    )
+    key_map: dict[str, Any] = {}
+    for option, candidate, owner in zip(options, candidates, owners, strict=True):
+        option.value = labels[owner]
+        option.criterion = texts[owner]
+        key_map[option.id] = labels[owner]
+        info.option_members[option.id] = owner
+        if discriminator is not None:
+            info.option_tags[option.id] = candidate.value
+        info.criteria[option.id] = texts[owner]
+    if not ctx.required:
+        unstated = _unstated_option(options)
+        options.append(unstated)
+        key_map[unstated.id] = UNSTATED
+    return _Kind(
+        "union_models",
+        clef="choice",
+        options=options,
+        key_map=key_map,
+        models=tuple(models),
+        union=info,
+    )
 
 
 def _union_kind(ctx: _Ctx, shape: _Shape) -> _Kind:
     members = shape.members or ()
     resolved = [_resolve(ctx, m.base) for m in members]
     if all(_is_model(m) for m in resolved):
-        return _model_kind(ctx, "union_models", tuple(resolved))
+        return _union_models_kind(ctx, tuple(resolved))
     if all(typing_extensions.get_origin(m.base) in _LITERAL_ORIGINS for m in members):
         candidates: list[_Candidate] = []
         for member in members:
@@ -1275,7 +1605,7 @@ def _validation_key(name: str, info: FieldInfo) -> tuple[str | None, str | None]
     return None, "alias_path"
 
 
-Role = Literal["clairic", "noul", "choice", "score", "union_type"]
+Role = Literal["clairic", "noul", "choice", "score", "union_type", "presence"]
 
 
 def render_instructions(
@@ -1295,7 +1625,8 @@ def render_instructions(
     Args:
         role: ``"clairic"`` for a Clairic field, ``"noul"``, ``"choice"`` or
             ``"score"`` for a Clef question, ``"union_type"`` for the type
-            question of a union of primitives.
+            question of a union of primitives, ``"presence"`` for the question
+            whether the input states an optional sub-model.
         description: What is asked for (it is the part that gets templated).
         prefix: Parent context (``FieldSpec.context``), kept as is in front.
         hints: Type and constraint sentences, for a Clairic field.
@@ -1316,6 +1647,8 @@ def render_instructions(
         body = f"Pick the option that best fits: {description}"
     elif role == "score":
         body = f"Rate on the scale, lowest level first: {description}"
+    elif role == "presence":
+        body = f"Does `input` state {description}?"
     else:
         body = f"What kind of value is this: {description}?"
     return _clip(f"{prefix}: {body}" if prefix else body, limit)
@@ -1358,6 +1691,8 @@ class _Draft:
     """A classified field that still needs wire names and question text."""
 
     name: str
+    path: Path
+    wire_path: Path
     info: FieldInfo
     kind: _Kind
     options: Mapping[str, Any]
@@ -1371,10 +1706,6 @@ class _Draft:
     warnings: list[str]
     messages: list[str]
 
-    @property
-    def path(self) -> Path:
-        return (self.name,)
-
 
 _NUMBER_TYPES = frozenset({"number", "estimate", "forecast"})
 
@@ -1384,11 +1715,25 @@ def _draft_field(
     name: str,
     info: FieldInfo,
     *,
+    prefix: Path = (),
+    wire_prefix: Path | None = None,
     gates: GateConfig,
     limits: Limits,
 ) -> _Draft:
-    """Classify one field and resolve everything that does not need a name."""
-    path: Path = (name,)
+    """Classify one field and resolve everything that does not need a name.
+
+    Args:
+        model: The model that declares the field.
+        name: The field's name.
+        info: The field.
+        prefix: Document path of the model (empty for the root model).
+        wire_prefix: What wire names are allocated under (``prefix`` unless the
+            model is a member of a union).
+        gates: Thresholds.
+        limits: Structural limits.
+    """
+    path: Path = (*prefix, name)
+    wire_path: Path = (*(prefix if wire_prefix is None else wire_prefix), name)
     pretty_name = pretty(path)
     options = _s1_options(info, pretty_name)
     shape = _strip(info.annotation)
@@ -1406,6 +1751,7 @@ def _draft_field(
         gates=gates,
         limits=limits,
         model=model,
+        discriminator=info.discriminator,
     )
     kind = _Kind("skip") if options.get("skip") else _classify(ctx, shape)
     wanted_clef = options.get("clef")
@@ -1462,6 +1808,8 @@ def _draft_field(
         )
     return _Draft(
         name=name,
+        path=path,
+        wire_path=wire_path,
         info=info,
         kind=kind,
         options=options,
@@ -1493,9 +1841,10 @@ def _build_spec(
     clairic_field: ClairicField | None = None
     clef_question: Question | None = None
     instructions = description
+    nested = len(path) > 1  # nested fields always carry their parent context
 
     if kind.clairic is not None:
-        prefix = _context(title, path) if shortened_clairic else ""
+        prefix = _context(title, path) if shortened_clairic or nested else ""
         instructions = _synthesise(
             kind,
             description=description,
@@ -1525,9 +1874,13 @@ def _build_spec(
             raise ValueError(f"field {pretty_name!r}: {exc}") from exc
 
     if kind.clef is not None:
-        prefix = _context(title, path) if shortened_clef else ""
-        role: Literal["noul", "choice", "score", "union_type"] = (
-            "union_type" if kind.clairic is not None else kind.clef
+        prefix = _context(title, path) if shortened_clef or nested else ""
+        role: Role = (
+            "union_type"
+            if kind.clairic is not None
+            else "presence"
+            if kind.engine == "submodel"
+            else kind.clef
         )
         question_text = _synthesise(
             kind,
@@ -1546,11 +1899,14 @@ def _build_spec(
             true_text = mapping.get(
                 "true", f'The input states or clearly implies: "{description}".'
             )
-            false_text = mapping.get(
-                "false",
-                "The input states or clearly implies the opposite of: "
-                f'"{description}".',
-            )
+            if kind.engine == "submodel":
+                default_false = f'The input does not mention: "{description}".'
+            else:
+                default_false = (
+                    "The input states or clearly implies the opposite of: "
+                    f'"{description}".'
+                )
+            false_text = mapping.get("false", default_false)
             clef_question = NoulQuestion(
                 type="noul",
                 instructions=question_text,
@@ -1598,29 +1954,268 @@ def _build_spec(
         nullable=draft.nullable,
         alias=draft.alias,
         models=kind.models,
-        context=_context(title, path) if shortened_clairic and kind.clairic else "",
-        clef_context=_context(title, path) if shortened_clef and kind.clef else "",
+        context=(
+            _context(title, path)
+            if (shortened_clairic or nested) and kind.clairic
+            else ""
+        ),
+        clef_context=(
+            _context(title, path) if (shortened_clef or nested) and kind.clef else ""
+        ),
         hints=tuple(kind.hints) if kind.clairic is not None else (),
+        wire_path=draft.wire_path,
+        scope=" → ".join(_humanise(str(part)) for part in path[:-1]),
     )
 
 
 def _identity(specs: tuple[FieldSpec, ...]) -> tuple[str, ...]:
-    marked = tuple(str(spec.path[0]) for spec in specs if spec.identity)
+    """Names of the fields (of one group) that identify a record."""
+    marked = tuple(str(spec.path[-1]) for spec in specs if spec.identity)
     if marked:
         return marked
 
     def is_text(spec: FieldSpec) -> bool:
         return spec.engine == "clairic" and _strip(spec.annotation).base is str
 
-    by_name = {str(spec.path[0]): spec for spec in specs}
+    by_name = {str(spec.path[-1]): spec for spec in specs}
     for candidate in _IDENTITY_NAMES:
         spec = by_name.get(candidate)
         if spec is not None and is_text(spec):
             return (candidate,)
     for spec in specs:
         if spec.required and is_text(spec):
-            return (str(spec.path[0]),)
+            return (str(spec.path[-1]),)
     return ()
+
+
+@dataclass
+class _GroupDraft:
+    """The classified fields of one model, before names and text exist."""
+
+    model: type[BaseModel]
+    path: Path
+    wire_path: Path
+    container: _Draft | None
+    items: "list[_Draft | _GroupDraft | _UnionDraft]"
+    member: str = ""
+
+
+@dataclass
+class _UnionDraft:
+    """A classified union of models and the drafts of its members."""
+
+    draft: _Draft
+    members: list[_GroupDraft]
+
+
+def _expand(
+    model: type[BaseModel],
+    *,
+    path: Path,
+    wire_path: Path,
+    container: _Draft | None,
+    member: str,
+    gates: GateConfig,
+    limits: Limits,
+) -> _GroupDraft:
+    """Classify the fields of ``model`` and, recursively, of its sub-models.
+
+    Expansion stops where ``_model_kind`` skips a field for ``max_depth``, so a
+    self-referencing model unrolls down to the limit.
+    """
+    items: list[_Draft | _GroupDraft | _UnionDraft] = []
+    for name, info in model.model_fields.items():
+        draft = _draft_field(
+            model,
+            name,
+            info,
+            prefix=path,
+            wire_prefix=wire_path,
+            gates=gates,
+            limits=limits,
+        )
+        kind = draft.kind
+        if kind.engine == "submodel":
+            items.append(
+                _expand(
+                    kind.models[0],
+                    path=draft.path,
+                    wire_path=draft.wire_path,
+                    container=draft,
+                    member="",
+                    gates=gates,
+                    limits=limits,
+                )
+            )
+        elif kind.engine == "union_models":
+            assert kind.union is not None
+            members = [
+                _expand(
+                    sub,
+                    path=draft.path,
+                    wire_path=(*draft.wire_path, label),
+                    container=None,
+                    member=label,
+                    gates=gates,
+                    limits=limits,
+                )
+                for sub, label in zip(kind.models, kind.union.labels, strict=True)
+            ]
+            items.append(_UnionDraft(draft, members))
+        else:
+            items.append(draft)
+    return _GroupDraft(model, path, wire_path, container, items, member)
+
+
+def _name_requests(
+    node: _GroupDraft,
+    clairic: list[tuple[Path, str | None]],
+    clef: list[tuple[Path, str | None]],
+) -> None:
+    """List the wire names the tree needs, in a fixed (depth-first) order."""
+    if node.container is not None and node.container.kind.clef is not None:
+        clef.append((node.container.wire_path, "__presence"))
+    for item in node.items:
+        if isinstance(item, _GroupDraft):
+            _name_requests(item, clairic, clef)
+        elif isinstance(item, _UnionDraft):
+            clef.append((item.draft.wire_path, None))
+            for member in item.members:
+                _name_requests(member, clairic, clef)
+        else:
+            if item.kind.clairic is not None:
+                clairic.append((item.wire_path, None))
+            if item.kind.clef is not None:
+                clef.append(
+                    (
+                        item.wire_path,
+                        "__type" if item.kind.clairic is not None else None,
+                    )
+                )
+
+
+class _Assembler:
+    """Turns a tree of drafts into specs, groups and union groups."""
+
+    def __init__(
+        self,
+        title: str,
+        limits: Limits,
+        clairic_names: Mapping[Path, str],
+        clef_names: Mapping[Path, str],
+        clairic_short: frozenset[str],
+        clef_short: frozenset[str],
+    ) -> None:
+        self.title = title
+        self.limits = limits
+        self.clairic_names = clairic_names
+        self.clef_names = clef_names
+        self.clairic_short = clairic_short
+        self.clef_short = clef_short
+        self.flat: list[FieldSpec] = []
+        self.member_specs: list[FieldSpec] = []
+        self.groups: list[FieldGroup | None] = []
+        self.member_groups: list[FieldGroup | None] = []
+        self.unions: list[UnionGroup] = []
+        self.messages: list[str] = []
+
+    def spec(self, draft: _Draft, *, in_member: bool) -> FieldSpec:
+        wire = self.clairic_names.get(draft.wire_path, "")
+        clef_name = self.clef_names.get(draft.wire_path, "")
+        if draft.kind.clairic is None:
+            wire = clef_name
+        built = _build_spec(
+            draft,
+            title=self.title,
+            limits=self.limits,
+            wire=wire,
+            clef_name=clef_name,
+            shortened_clairic=wire in self.clairic_short
+            and draft.kind.clairic is not None,
+            shortened_clef=clef_name in self.clef_short,
+        )
+        self.messages.extend(draft.messages)
+        (self.member_specs if in_member else self.flat).append(built)
+        return built
+
+    def group(
+        self, node: _GroupDraft, *, in_member: bool, description: str = ""
+    ) -> FieldGroup:
+        sink = self.member_groups if in_member else self.groups
+        slot = len(sink)
+        sink.append(None)
+        container = (
+            self.spec(node.container, in_member=in_member)
+            if node.container is not None
+            else None
+        )
+        specs: list[FieldSpec] = []
+        children: list[FieldGroup] = []
+        unions: list[UnionGroup] = []
+        for item in node.items:
+            if isinstance(item, _GroupDraft):
+                children.append(self.group(item, in_member=in_member))
+            elif isinstance(item, _UnionDraft):
+                unions.append(self.union(item, in_member=in_member))
+            else:
+                specs.append(self.spec(item, in_member=in_member))
+        draft = node.container
+        built = FieldGroup(
+            path=node.path,
+            model=node.model,
+            optional=draft is not None and not draft.required,
+            nullable=draft is not None and draft.nullable,
+            has_default=draft is not None and draft.has_default,
+            description=draft.description if draft is not None else description,
+            alias=draft.alias if draft is not None else None,
+            spec=container,
+            specs=tuple(specs),
+            children=tuple(children),
+            unions=tuple(unions),
+            identity=_identity(tuple(specs)),
+            member=node.member,
+        )
+        sink[slot] = built
+        return built
+
+    def union(self, node: _UnionDraft, *, in_member: bool) -> UnionGroup:
+        draft = node.draft
+        spec = self.spec(draft, in_member=in_member)
+        info = draft.kind.union
+        assert info is not None
+        members: list[UnionMember] = []
+        for index, member in enumerate(node.members):
+            group = self.group(
+                member,
+                in_member=True,
+                description=_member_text(member.model, info.labels[index]),
+            )
+            members.append(
+                UnionMember(
+                    label=info.labels[index],
+                    model=member.model,
+                    group=group,
+                    options=tuple(
+                        option
+                        for option, owner in info.option_members.items()
+                        if owner == index
+                    ),
+                )
+            )
+        built = UnionGroup(
+            path=draft.path,
+            spec=spec,
+            members=tuple(members),
+            discriminator=info.discriminator,
+            option_tags=FrozenMap(info.option_tags),
+            optional=not draft.required,
+            nullable=draft.nullable,
+            has_default=draft.has_default,
+            alias=draft.alias,
+        )
+        if not in_member:
+            self.unions.append(built)
+        return built
 
 
 def _compile_model(
@@ -1628,23 +2223,22 @@ def _compile_model(
 ) -> SchemaPlan:
     title = model.model_config.get("title") or model.__name__
     doc = inspect.cleandoc(model.__doc__) if model.__doc__ else ""
-    drafts = [
-        _draft_field(model, name, info, gates=gates, limits=limits)
-        for name, info in model.model_fields.items()
-    ]
+    tree = _expand(
+        model,
+        path=(),
+        wire_path=(),
+        container=None,
+        member="",
+        gates=gates,
+        limits=limits,
+    )
     # Names are allocated for the whole schema at once so that a collision gives
     # every colliding path the digest form, whatever the declaration order.
-    clairic_builder = FieldNameMapBuilder("clairic")
-    clef_builder = FieldNameMapBuilder("clef")
     clairic_requests: list[tuple[Path, str | None]] = []
     clef_requests: list[tuple[Path, str | None]] = []
-    for draft in drafts:
-        if draft.kind.clairic is not None:
-            clairic_requests.append((draft.path, None))
-        if draft.kind.clef is not None:
-            clef_requests.append(
-                (draft.path, "__type" if draft.kind.clairic is not None else None)
-            )
+    _name_requests(tree, clairic_requests, clef_requests)
+    clairic_builder = FieldNameMapBuilder("clairic")
+    clef_builder = FieldNameMapBuilder("clef")
     clairic_names = dict(
         zip(
             (r[0] for r in clairic_requests),
@@ -1659,39 +2253,30 @@ def _compile_model(
             strict=True,
         )
     )
-    clairic_short = clairic_builder.shortened
-    clef_short = clef_builder.shortened
-    specs: list[FieldSpec] = []
-    messages: list[str] = []
-    for draft in drafts:
-        wire = clairic_names.get(draft.path, "")
-        clef_name = clef_assigned.get(draft.path, "")
-        if draft.kind.clairic is None:
-            wire = clef_name
-        specs.append(
-            _build_spec(
-                draft,
-                title=title,
-                limits=limits,
-                wire=wire,
-                clef_name=clef_name,
-                shortened_clairic=wire in clairic_short
-                and draft.kind.clairic is not None,
-                shortened_clef=clef_name in clef_short,
-            )
-        )
-        messages.extend(draft.messages)
-    frozen_specs = tuple(specs)
+    assembler = _Assembler(
+        title,
+        limits,
+        clairic_names,
+        clef_assigned,
+        clairic_builder.shortened,
+        clef_builder.shortened,
+    )
+    root = assembler.group(tree, in_member=False, description=doc)
+    groups = tuple(g for g in assembler.groups if g is not None)
     return SchemaPlan(
         schema=model,
         name=model.__name__,
         title=title,
         description=doc,
-        specs=frozen_specs,
+        specs=tuple(assembler.flat),
         clairic_names=clairic_builder.build(),
         clef_names=clef_builder.build(),
-        identity=_identity(frozen_specs),
-        warnings=tuple(messages),
+        identity=root.identity,
+        warnings=tuple(assembler.messages),
+        groups=groups,
+        unions=tuple(assembler.unions),
+        member_groups=tuple(g for g in assembler.member_groups if g is not None),
+        member_specs=tuple(assembler.member_specs),
     )
 
 

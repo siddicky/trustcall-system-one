@@ -9,15 +9,21 @@ mapped with an identity state.
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from decimal import Decimal
+from difflib import SequenceMatcher
+from typing import Any
 
 from trustcall_system_one._render import RenderedState
 from trustcall_system_one._wire import ClairicAnswer
 
 __all__ = [
     "DEFAULT_CHUNK_CHARS",
+    "Merged",
     "Part",
+    "agree",
     "chunk_size",
     "identity_state",
+    "merge_field",
     "merge_parts",
     "part_of",
     "split_ranges",
@@ -28,6 +34,7 @@ Span = tuple[int, int]
 DEFAULT_CHUNK_CHARS = 8_000
 """Chunk size used when the truncated response does not say how much it read."""
 _SAFETY = 0.8  # chunks are this fraction of what Clairic was seen to read
+_AGREE_RATIO = 0.9
 
 
 def split_ranges(ranges: Sequence[Span], size: int, overlap: int) -> list[Span]:
@@ -43,8 +50,19 @@ def split_ranges(ranges: Sequence[Span], size: int, overlap: int) -> list[Span]:
     Returns:
         The chunks in increasing order. A range no longer than ``size`` is one
         chunk.
+
+    Raises:
+        ValueError: If ``size`` is not positive or ``overlap`` is negative or
+            not smaller than ``size`` (the chunks could not make progress).
     """
-    step = max(1, size - overlap)
+    if size <= 0:
+        raise ValueError(f"chunk size must be positive, got {size}")
+    if overlap < 0 or overlap >= size:
+        raise ValueError(
+            f"chunk overlap must be at least 0 and smaller than the size "
+            f"({size}), got {overlap}"
+        )
+    step = size - overlap
     chunks: list[Span] = []
     for first, last in ranges:
         start = first
@@ -120,33 +138,98 @@ def _norm(value: object) -> str:
     return " ".join(str(value).casefold().split())
 
 
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float, Decimal)) and not isinstance(value, bool)
+
+
+def agree(first: Any, second: Any) -> bool:
+    """Whether two answers for one field say the same thing.
+
+    Text agrees when it is equal after case and whitespace folding or has a
+    ``difflib.SequenceMatcher`` ratio of at least 0.9; numbers compare by value;
+    lists agree when they have the same size and every element has a distinct
+    agreeing partner; anything else must be equal.
+    """
+    if first is None or second is None:
+        return first is None and second is None
+    if isinstance(first, str) and isinstance(second, str):
+        a, b = _norm(first), _norm(second)
+        return a == b or SequenceMatcher(None, a, b).ratio() >= _AGREE_RATIO
+    if isinstance(first, (list, tuple)) and isinstance(second, (list, tuple)):
+        if len(first) != len(second):
+            return False
+        remaining = list(second)
+        for item in first:
+            for index, other in enumerate(remaining):
+                if agree(item, other):
+                    del remaining[index]
+                    break
+            else:
+                return False
+        return True
+    if _is_number(first) and _is_number(second):
+        return Decimal(str(first)) == Decimal(str(second))
+    return bool(first == second)
+
+
 def _overlap(a: Span, b: Span) -> bool:
     return a[0] < b[1] and b[0] < a[1]
 
 
+def _confidence(part: Part) -> float:
+    confidence = part.answer.confidence
+    return confidence if confidence is not None else 0.0
+
+
+@dataclass
+class _Element:
+    value: object
+    span: Span | None
+    start: int
+    confidence: float
+
+    def beats(self, other: "_Element") -> bool:
+        """Whether this element replaces an overlapping one: longer, then surer."""
+        assert self.span is not None and other.span is not None
+        mine = self.span[1] - self.span[0]
+        theirs = other.span[1] - other.span[0]
+        return (mine, self.confidence) > (theirs, other.confidence)
+
+
 def _merge_lists(parts: list[Part]) -> ClairicAnswer:
-    elements: list[tuple[object, Span | None, int]] = []
+    elements: list[_Element] = []
     for part in parts:
-        values = part.answer.value
-        for index, value in enumerate(values):
+        for index, value in enumerate(part.answer.value):
             span = (
                 part.spans[index]
                 if part.spans is not None and index < len(part.spans)
                 else None
             )
-            duplicate = any(
-                (
-                    span is not None
-                    and kept_span is not None
-                    and _overlap(span, kept_span)
-                )
-                or ((span is None or kept_span is None) and _norm(value) == _norm(kept))
-                for kept, kept_span, _ in elements
-            )
-            if not duplicate:
-                elements.append((value, span, part.start))
-    elements.sort(key=lambda item: item[1][0] if item[1] is not None else item[2])
-    spans = [span for _, span, _ in elements]
+            new = _Element(value, span, part.start, _confidence(part))
+            if span is None:
+                if not any(
+                    kept.span is None and _norm(kept.value) == _norm(value)
+                    for kept in elements
+                ):
+                    elements.append(new)
+                continue
+            clashes = [
+                kept
+                for kept in elements
+                if (kept.span is not None and _overlap(span, kept.span))
+                or (kept.span is None and _norm(kept.value) == _norm(value))
+            ]
+            if not clashes:
+                elements.append(new)
+            elif all(
+                kept.span is None or new.beats(kept) for kept in clashes
+            ):  # the new element is the longer (or surer) of the overlapping ones
+                elements = [kept for kept in elements if kept not in clashes]
+                elements.append(new)
+    elements.sort(
+        key=lambda item: item.span[0] if item.span is not None else item.start
+    )
+    spans = [item.span for item in elements]
     best = min(
         parts, key=lambda p: p.answer.p_null if p.answer.p_null is not None else 1.0
     )
@@ -155,7 +238,7 @@ def _merge_lists(parts: list[Part]) -> ClairicAnswer:
     ]
     return best.answer.model_copy(
         update={
-            "value": [value for value, _, _ in elements],
+            "value": [item.value for item in elements],
             "spans": (
                 [[s[0], s[1]] for s in spans if s is not None]
                 if all(s is not None for s in spans) and spans
@@ -168,14 +251,88 @@ def _merge_lists(parts: list[Part]) -> ClairicAnswer:
     )
 
 
-def merge_parts(parts: list[Part]) -> ClairicAnswer | None:
-    """Merge one field's answers from several chunks into a single answer.
+def settled(part: Part) -> ClairicAnswer:
+    """Return one chunk's answer with its span in original-input offsets."""
+    span = part.span
+    return part.answer.model_copy(
+        update={
+            "span": [span[0], span[1]] if span is not None else None,
+            "spans": None,
+        }
+    )
 
-    Non-null beats null; among non-null scalars the higher confidence wins (the
-    earlier chunk on a tie); lists are united in input order, dropping an element
-    whose span overlaps one already kept (or, without spans, whose text matches).
-    The result carries spans in original-input offsets, so map it with
-    ``identity_state``.
+
+@dataclass(frozen=True)
+class Merged:
+    """The outcome of merging one field's chunk answers.
+
+    Attributes:
+        answer: The merged answer, with spans in original-input offsets
+            (``None`` when there were no answers). When the chunks disagree it
+            is the most confident candidate: what to use when nothing can
+            adjudicate.
+        candidates: The distinct non-null scalar candidates, most confident
+            first (the earlier chunk on a tie). More than one means the chunks
+            disagree and the caller should decide between them.
+    """
+
+    answer: ClairicAnswer | None
+    candidates: tuple[Part, ...] = ()
+
+    @property
+    def conflict(self) -> bool:
+        """Whether the chunks gave different non-null scalar values."""
+        return len(self.candidates) > 1
+
+
+def merge_field(parts: list[Part]) -> Merged:
+    """Merge one field's answers from several chunks.
+
+    Every non-null scalar is kept as a candidate. Candidates that agree (equal
+    after case and whitespace folding, a text ratio of at least 0.9, or equal
+    numbers) are one value, represented by the most confident of them. Lists
+    are united in input order; when spans of different chunks overlap the longer
+    span is kept (the more confident chunk on a tie). A null in one chunk never
+    hides a value from another; when every chunk says null the answer is the one
+    with the LOWEST ``p_null``, so a borderline null can still be checked.
+
+    Args:
+        parts: The field's per-chunk answers, in chunk order.
+
+    Returns:
+        The merged answer and, for disagreeing scalars, the candidates.
+    """
+    if not parts:
+        return Merged(None)
+    present = [p for p in parts if p.answer.value is not None]
+    if not present:
+        best = min(
+            parts,
+            key=lambda p: (
+                p.answer.p_null is None,
+                p.answer.p_null if p.answer.p_null is not None else 0.0,
+            ),
+        )
+        return Merged(best.answer.model_copy(update={"span": None, "spans": None}))
+    if all(isinstance(p.answer.value, list) for p in present):
+        return Merged(_merge_lists(present))
+    ranked = sorted(
+        enumerate(present), key=lambda item: (-_confidence(item[1]), item[0])
+    )
+    distinct: list[Part] = []
+    for _, candidate in ranked:
+        if not any(
+            agree(candidate.answer.value, kept.answer.value) for kept in distinct
+        ):
+            distinct.append(candidate)
+    return Merged(settled(distinct[0]), tuple(distinct))
+
+
+def merge_parts(parts: list[Part]) -> ClairicAnswer | None:
+    """Merge one field's chunk answers without adjudicating disagreements.
+
+    See ``merge_field``; when scalars disagree the most confident one is
+    returned.
 
     Args:
         parts: The field's per-chunk answers, in chunk order.
@@ -183,28 +340,4 @@ def merge_parts(parts: list[Part]) -> ClairicAnswer | None:
     Returns:
         The merged answer, or ``None`` when there were no answers.
     """
-    if not parts:
-        return None
-    present = [p for p in parts if p.answer.value is not None]
-    if not present:  # every chunk says null: report the surest one
-        best = max(
-            parts,
-            key=lambda p: p.answer.p_null if p.answer.p_null is not None else 0.0,
-        )
-        return best.answer.model_copy(update={"span": None, "spans": None})
-    if all(isinstance(p.answer.value, list) for p in present):
-        return _merge_lists(present)
-    winner = max(
-        enumerate(present),
-        key=lambda item: (
-            item[1].answer.confidence if item[1].answer.confidence is not None else 0.0,
-            -item[0],
-        ),
-    )[1]
-    span = winner.span
-    return winner.answer.model_copy(
-        update={
-            "span": [span[0], span[1]] if span is not None else None,
-            "spans": None,
-        }
-    )
+    return merge_field(parts).answer

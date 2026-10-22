@@ -576,8 +576,9 @@ async def test_chunking_merges_scalars_preferring_non_null_then_confidence() -> 
     assert city is not None and text[city[0] : city[1]] == "Paris"
 
 
-async def test_chunk_answers_for_a_scalar_pick_the_most_confident() -> None:
+async def test_chunk_answers_for_a_scalar_are_adjudicated() -> None:
     script = Script()
+    script.adjudicate = {"city": pick("a", ["a", "b", "neither"])}  # a: most confident
     texts = {"first": 0.6, "second": 0.9}
 
     def extract(model: str, payload: dict[str, Any], meta: Any) -> Any:
@@ -619,6 +620,7 @@ async def test_chunk_answers_for_a_scalar_pick_the_most_confident() -> None:
             presence=script._presence,
             extract=extract,
             attribution=script._attribution,
+            adjudicate=script._adjudicate,
         )
     )
     text = "Ada. first " + filler(3000, "w") + " second " + filler(3000, "z")
@@ -631,6 +633,134 @@ async def test_chunk_answers_for_a_scalar_pick_the_most_confident() -> None:
     assert isinstance(record.value, Located) and record.value.city == "second"
     span = record.fields["city"].span
     assert span is not None and text[span[0] : span[1]] == "second"
+
+
+CITY_TEXT = (
+    "Ada Lovelace. Grace lives in London. "
+    + filler(2000, "w")
+    + "Ada moved to Paris. "
+    + filler(2000, "z")
+)
+
+
+def conflict_script(**kwargs: Any) -> Script:
+    """Chunks that disagree: London (another person's, sure) vs Paris."""
+    from trustcall_system_one.testing import clairic_answer, clairic_response
+
+    script = Script(**kwargs)
+
+    def extract(model: str, payload: dict[str, Any], meta: Any) -> Any:
+        state = payload["state"]
+        cut = state[:4000] if len(state) > 6000 else state
+        answers = {}
+        for name in payload["fields"]:
+            if name == "name":
+                at = cut.find("Ada Lovelace")
+                answers[name] = (
+                    clairic_answer("text", "Ada Lovelace", span=[at, at + 12])
+                    if at >= 0
+                    else clairic_answer("text", None, p_null=0.99)
+                )
+                continue
+            for city, conf in (("London", 0.97), ("Paris", 0.90)):
+                at = cut.find(city)
+                if at >= 0:
+                    answers[name] = clairic_answer(
+                        "text", city, confidence=conf, span=[at, at + len(city)]
+                    )
+                    break
+            else:
+                answers[name] = clairic_answer("text", None, p_null=0.99)
+        return clairic_response(answers, truncated=cut is not state, state_text=cut)
+
+    script.transport = FakeTransport(
+        route(
+            presence=script._presence,
+            extract=extract,
+            attribution=script._attribution,
+            adjudicate=script._adjudicate,
+        )
+    )
+    return script
+
+
+def conflict_extractor(script: Script, **verify: Any) -> Any:
+    return make_extractor(
+        [Located],
+        script,
+        verify=VerifyConfig(window_chars=50, reask_low_confidence=False, **verify),
+    )
+
+
+async def test_disagreeing_chunks_are_adjudicated_over_every_candidate() -> None:
+    script = conflict_script()
+    # candidates by confidence: a = London (0.97), b = Paris (0.90)
+    script.adjudicate = {"city": pick("b", ["a", "b", "neither"])}
+    result = await conflict_extractor(script).ainvoke(CITY_TEXT)
+    record = result.records[0]
+    assert isinstance(record.value, Located) and record.value.city == "Paris"
+    span = record.fields["city"].span
+    assert span is not None and CITY_TEXT[span[0] : span[1]] == "Paris"
+    (call,) = script.calls("adjudicate")
+    question = call[1]["questions"]["adjudicate"]
+    assert question["criteria"] == {
+        "a": "London",
+        "b": "Paris",
+        "neither": "The input states none of these",
+    }
+    assert call[2].field == "city"
+    assert any("chunk_conflict" in w and "adjudicated" in w for w in result.warnings)
+    # only the ladder's own attribution check ran, not the fallback
+    assert [q for c in script.calls("attribution") for q in c[1]["questions"]] == [
+        "attr.name",
+        "attr.city",
+    ]
+
+
+async def test_an_indecisive_adjudication_falls_back_to_attribution() -> None:
+    script = conflict_script()
+    script.adjudicate = {"city": pick("neither", ["a", "b", "neither"])}
+    # London is the more confident chunk answer but is another person's
+    script.attribution = {"attr.city.0": 0.1, "attr.city.1": 0.95}
+    result = await conflict_extractor(script).ainvoke(CITY_TEXT)
+    record = result.records[0]
+    assert isinstance(record.value, Located) and record.value.city == "Paris"
+    asked = [q for c in script.calls("attribution") for q in c[1]["questions"]]
+    assert asked[:2] == ["attr.city.0", "attr.city.1"]  # in confidence order
+    assert any("first that is stated" in w for w in result.warnings)
+
+
+async def test_low_probability_adjudication_is_not_decisive_either() -> None:
+    script = conflict_script()
+    script.adjudicate = {"city": pick("b", ["a", "b", "neither"], p=0.5)}
+    script.attribution = {"attr.city.0": 0.05, "attr.city.1": 0.9}
+    record = (await conflict_extractor(script).ainvoke(CITY_TEXT)).records[0]
+    assert isinstance(record.value, Located) and record.value.city == "Paris"
+
+
+async def test_when_no_check_settles_it_the_ladder_judges_the_top_candidate() -> None:
+    script = conflict_script()
+    script.adjudicate = {"city": pick("neither", ["a", "b", "neither"])}
+    script.attribution = {
+        "attr.city.0": 0.1,
+        "attr.city.1": 0.2,
+        "attr.city": 0.1,  # the ladder's own check of the standing value
+    }
+    result = await conflict_extractor(script).ainvoke(CITY_TEXT)
+    record = result.records[0]
+    assert isinstance(record.value, Located) and record.value.city is None
+    assert record.fields["city"].rejected_reason == "attribution"
+    assert record.fields["city"].raw == "London"  # the most confident candidate
+    assert any("no check settled it" in w for w in result.warnings)
+
+
+async def test_without_attribution_the_most_confident_candidate_stands() -> None:
+    script = conflict_script()
+    script.adjudicate = {"city": pick("neither", ["a", "b", "neither"])}
+    result = await conflict_extractor(script, attribution=False).ainvoke(CITY_TEXT)
+    record = result.records[0]
+    assert isinstance(record.value, Located) and record.value.city == "London"
+    assert script.calls("attribution") == []
 
 
 class Notes(BaseModel):
@@ -964,42 +1094,42 @@ class Pet(BaseModel):
     name: str
 
 
-class WithNested(BaseModel):
+class WithDeferred(BaseModel):
     name: str
-    pet: Optional[Pet] = None
     pets: list[Pet] = []
     scores: dict[str, int] = {}
-    any_pet: Optional[Union[Pet, Ticket]] = None
 
 
-async def test_nested_fields_are_left_to_their_defaults_with_a_warning() -> None:
+async def test_collections_and_mappings_are_left_to_their_defaults_with_a_warning() -> (
+    None
+):
     script = Script()
     script.clairic = {"name": ca("text", "Ada", find="Ada")}
-    result = await make_extractor([WithNested], script).ainvoke("Ada has a dog.")
+    result = await make_extractor([WithDeferred], script).ainvoke("Ada has a dog.")
     (record,) = result.records
     assert record.valid
-    assert record.value == WithNested(name="Ada")
+    assert record.value == WithDeferred(name="Ada")
     assert set(record.fields) == {"name"}
     joined = "\n".join(result.warnings)
-    for field_name in ("pet", "pets", "scores", "any_pet"):
-        assert f"WithNested.{field_name}:" in joined
-    assert "M4" in joined and "M9" in joined
+    for field_name in ("pets", "scores"):
+        assert f"WithDeferred.{field_name}:" in joined
+    assert "M9" in joined
     assert sorted(script.calls("extract")[0][1]["fields"]) == ["name"]
 
 
-class NeedsNested(BaseModel):
+class NeedsDeferred(BaseModel):
     name: str
-    pet: Pet
+    pets: list[Pet]
 
 
-async def test_a_required_nested_field_makes_the_record_invalid() -> None:
+async def test_a_required_collection_makes_the_record_invalid() -> None:
     script = Script()
     script.clairic = {"name": ca("text", "Ada", find="Ada")}
-    result = await make_extractor([NeedsNested], script).ainvoke("Ada has a dog.")
+    result = await make_extractor([NeedsDeferred], script).ainvoke("Ada has a dog.")
     (record,) = result.records
     assert record.valid is False
-    assert record.errors[0].startswith("pet:")
-    assert any("NeedsNested.pet" in w and "M4" in w for w in result.warnings)
+    assert record.errors[0].startswith("pets:")
+    assert any("NeedsDeferred.pets" in w and "M9" in w for w in result.warnings)
 
 
 # --------------------------------------------------------------------------- #

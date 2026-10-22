@@ -78,6 +78,8 @@ class Script:
 
     Attributes:
         presence: Probability returned by the presence gate.
+        group_presence: Probability of an optional sub-model's presence question,
+            by the group's dotted path (``0.95`` for the rest).
         clairic: Clairic answers by wire name (see ``ca``) for ``extract`` calls.
         clef: Clef answers by question id for ``clef_fields`` calls.
         attribution: Attribution probability by question id (a list is consumed
@@ -95,6 +97,7 @@ class Script:
     """
 
     presence: float | None = 0.95
+    group_presence: dict[str, float] = field(default_factory=dict)
     clairic: dict[str, dict[str, Any]] = field(default_factory=dict)
     clef: dict[str, dict[str, Any]] = field(default_factory=dict)
     attribution: dict[str, float | list[float]] = field(default_factory=dict)
@@ -127,6 +130,13 @@ class Script:
     # ---- handlers ------------------------------------------------------ #
 
     def _presence(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
+        if meta.field:  # the presence question of an optional sub-model
+            return clef_response(
+                {
+                    qid: noul(self.group_presence.get(meta.field, 0.95))
+                    for qid in payload["questions"]
+                }
+            )
         assert self.presence is not None
         return clef_response({"presence": noul(self.presence)})
 

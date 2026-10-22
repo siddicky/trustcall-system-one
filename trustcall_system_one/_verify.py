@@ -16,18 +16,20 @@ Clef-engine answers are not verified further; they are decisions already.
 
 import dataclasses
 import enum
-import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from decimal import Decimal
-from difflib import SequenceMatcher
 from typing import Any
 
 from trustcall_system_one._chunk import (
+    Merged,
+    agree,
     chunk_size,
     identity_state,
-    merge_parts,
+    merge_field,
     part_of,
+    settled,
     split_ranges,
 )
 from trustcall_system_one._coerce import coerce, coerce_union
@@ -76,7 +78,6 @@ Span = tuple[int, int]
 
 REASK_SUFFIX = " Answer only from the text near these mentions."
 _SHORT_CODES = frozenset({"abstain", "unstated", "type_uncertain", "missing_answer"})
-_AGREE_RATIO = 0.9
 _NONE_OF_THESE = "none_of_these"
 _NOT_STATED = "The input states no value for this."
 
@@ -110,10 +111,16 @@ class Ctx:
         """Routing context for a call. The entity is its key, not its label."""
         return CallMeta(kind=kind, schema=self.plan.name, entity=self.key, field=field)
 
-    def desc(self, spec: FieldSpec) -> str:
-        """The field's description, put through ``verify.instruction_template``."""
+    def desc(self, spec: FieldSpec, *, scoped: bool = False) -> str:
+        """The field's description, put through ``verify.instruction_template``.
+
+        Args:
+            spec: The field.
+            scoped: Name the field's ancestors too (``FieldSpec.scoped``), for a
+                question that does not carry the parent-context prefix.
+        """
         return self.run.verify.instruction_template.format(
-            label=self.label, desc=spec.description
+            label=self.label, desc=spec.scoped if scoped else spec.description
         )
 
     def clairic_field(
@@ -149,10 +156,18 @@ class Ctx:
         """Return a copy of the spec's Clef question about this entity.
 
         Rebuilt from the field's parts (so a question the compiler clipped is not
-        a problem) with the templated description.
+        a problem) with the templated description. The presence question of an
+        optional sub-model, the choice of a union of models and the questions of
+        Clef-typed fields all come through here.
         """
         assert spec.clef is not None
-        role: Role = "union_type" if spec.clairic is not None else spec.clef.type
+        role: Role = (
+            "union_type"
+            if spec.clairic is not None
+            else "presence"
+            if spec.engine == "submodel"
+            else spec.clef.type
+        )
         text = render_instructions(
             role,
             self.desc(spec),
@@ -227,6 +242,7 @@ async def ask_clairic(
     *,
     meta: CallMeta,
     windows: list[Span] | None = None,
+    descriptions: Mapping[str, str] | None = None,
 ) -> Asked:
     """Ask Clairic for ``fields`` on the input (or on ``windows`` of it).
 
@@ -239,11 +255,19 @@ async def ask_clairic(
     recorded, or ``StateTruncatedError`` raised in strict mode. A warning is
     always recorded when the input is chunked.
 
+    When chunks give different non-null values for a scalar, every candidate is
+    kept: a Clef ``adjudicate`` question over the distinct candidates picks one
+    at ``verify.adjudicate_min``; failing that the candidates are checked for
+    attribution to the entity in confidence order and the first that passes is
+    kept; failing that the most confident one stands and the ladder judges it.
+
     Args:
         ctx: The entity context.
         fields: Clairic fields keyed by wire name.
         meta: Routing context (the call kind).
         windows: Ranges of the input to ask about; ``None`` for all of it.
+        descriptions: Field descriptions by wire name, for the questions that
+            settle disagreeing chunks (the instructions are used otherwise).
 
     Returns:
         Each field's answer and the state to map its spans with. For a chunked
@@ -301,16 +325,99 @@ async def ask_clairic(
         run.warn(f"clairic_truncated: {message}")
     if not responses:  # could not split: use what the full request returned
         return {name: (response.answers.get(name), anchored) for name in fields}
-    merged: Asked = {}
     identity = identity_state(ctx.text)
-    for name in fields:
-        parts = [
-            part_of(resp.answers[name], anch, chunk[0])
-            for chunk, resp, anch in responses
-            if name in resp.answers
-        ]
-        merged[name] = (merge_parts(parts), identity)
-    return merged
+    names = list(fields)
+    outcomes = {
+        name: merge_field(
+            [
+                part_of(resp.answers[name], anch, chunk[0])
+                for chunk, resp, anch in responses
+                if name in resp.answers
+            ]
+        )
+        for name in names
+    }
+    answers = await gather(
+        *(
+            _settle(
+                ctx,
+                name,
+                outcomes[name],
+                (descriptions or {}).get(name) or fields[name].instructions or name,
+            )
+            for name in names
+        )
+    )
+    return {
+        name: (answer, identity) for name, answer in zip(names, answers, strict=True)
+    }
+
+
+_LETTERS = "abcdefghij"
+
+
+async def _settle(
+    ctx: Ctx, name: str, merged: Merged, description: str
+) -> ClairicAnswer | None:
+    """Pick one answer when chunks disagree about a scalar (see ``ask_clairic``)."""
+    if not merged.conflict:
+        return merged.answer
+    run = ctx.run
+    candidates = merged.candidates
+    values = [part.answer.value for part in candidates]
+    anchors = [part.span for part in candidates if part.span is not None]
+    shown = candidates[: len(_LETTERS)]
+    question = ChoiceQuestion(
+        type="choice",
+        instructions=(
+            f"Which value does `input` state for {description} of `entity.label`?"
+        ),
+        criteria={
+            **{_LETTERS[i]: display(part.answer.value) for i, part in enumerate(shown)},
+            "neither": "The input states none of these",
+        },
+    )
+    answers = await run.call_clef(
+        {"adjudicate": question},
+        ctx.entity_state(anchors=anchors or None),
+        meta=ctx.meta("adjudicate", field=name),
+    )
+    verdict = answers.get("adjudicate")
+    if isinstance(verdict, ChoiceAnswer) and verdict.choice in _LETTERS[: len(shown)]:
+        p = verdict.probabilities.get(verdict.choice)
+        if p is not None and p >= run.verify.adjudicate_min:
+            run.warn(
+                f"chunk_conflict: the chunks of {ctx.plan.name} gave different "
+                f"values for {name} ({', '.join(display(v) for v in values)}); "
+                "adjudicated"
+            )
+            return settled(shown[_LETTERS.index(verdict.choice)])
+    if run.verify.attribution:
+        checks = await run.call_clef(
+            {
+                f"attr.{name}.{i}": _attribution_question(
+                    description, part.answer.value, element=False
+                )
+                for i, part in enumerate(candidates)
+            },
+            ctx.entity_state(anchors=anchors or None),
+            meta=ctx.meta("attribution", field=name),
+        )
+        for i, part in enumerate(candidates):
+            p = _p(checks, f"attr.{name}.{i}")
+            if p is not None and p >= run.verify.attribution_keep:
+                run.warn(
+                    f"chunk_conflict: the chunks of {ctx.plan.name} gave different "
+                    f"values for {name} ({', '.join(display(v) for v in values)}); "
+                    "the first that is stated about the entity was kept"
+                )
+                return settled(part)
+    run.warn(
+        f"chunk_conflict: the chunks of {ctx.plan.name} gave different values for "
+        f"{name} ({', '.join(display(v) for v in values)}) and no check settled it; "
+        "the most confident one was kept"
+    )
+    return merged.answer
 
 
 def _chars_read(
@@ -353,44 +460,6 @@ def display(value: Any) -> str:
     if isinstance(value, (list, tuple, set, frozenset)):
         return "; ".join(display(item) for item in value)
     return str(value)
-
-
-def _normalise(text: str) -> str:
-    return " ".join(text.casefold().split())
-
-
-def _is_number(value: Any) -> bool:
-    return isinstance(value, (int, float, Decimal)) and not isinstance(value, bool)
-
-
-def agree(first: Any, second: Any) -> bool:
-    """Whether two answers for one field say the same thing.
-
-    Text agrees when it is equal after case and whitespace folding or has a
-    ``difflib.SequenceMatcher`` ratio of at least 0.9; numbers compare by value;
-    lists agree when they have the same size and every element has a distinct
-    agreeing partner; anything else must be equal.
-    """
-    if first is None or second is None:
-        return first is None and second is None
-    if isinstance(first, str) and isinstance(second, str):
-        a, b = _normalise(first), _normalise(second)
-        return a == b or SequenceMatcher(None, a, b).ratio() >= _AGREE_RATIO
-    if isinstance(first, (list, tuple)) and isinstance(second, (list, tuple)):
-        if len(first) != len(second):
-            return False
-        remaining = list(second)
-        for item in first:
-            for index, other in enumerate(remaining):
-                if agree(item, other):
-                    del remaining[index]
-                    break
-            else:
-                return False
-        return True
-    if _is_number(first) and _is_number(second):
-        return Decimal(str(first)) == Decimal(str(second))
-    return bool(first == second)
 
 
 @dataclass(frozen=True)
@@ -444,7 +513,7 @@ class FieldState:
     reject: str | None = None
     reject_detail: str = ""
     reject_p: float | None = None
-    attribution_p: float | tuple[float, ...] | None = None
+    attribution_p: float | tuple[float | None, ...] | None = None
     reask: bool = False
     dropped: list[tuple[int, str, str, float | None]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
@@ -621,7 +690,8 @@ async def _choose_elements(
         questions[f"{spec.wire_name}.el{index}"] = ChoiceQuestion(
             type="choice",
             instructions=(
-                f'Which option is "{element}" in the input, for {ctx.desc(spec)}?'
+                f'Which option is "{element}" in the input, '
+                f"for {ctx.desc(spec, scoped=True)}?"
             ),
             criteria=criteria,
         )
@@ -782,6 +852,7 @@ async def _reask(
         },
         meta=ctx.meta("reask", field=spec.wire_name),
         windows=windows,
+        descriptions={spec.wire_name: spec.scoped},
     )
     answer, anchored = asked[spec.wire_name]
     return await resolve(ctx, spec, answer, anchored, st.type_answer)
@@ -807,7 +878,7 @@ async def _adjudicate(
     question = ChoiceQuestion(
         type="choice",
         instructions=(
-            f"Which value does `input` state for {spec.description} of `entity.label`?"
+            f"Which value does `input` state for {spec.scoped} of `entity.label`?"
         ),
         criteria={
             "a": display(first),
@@ -896,7 +967,7 @@ async def _borderline(ctx: Ctx, targets: list[FieldState]) -> None:
     questions: dict[str, Question] = {
         f"nullcheck.{st.spec.wire_name}": NoulQuestion(
             type="noul",
-            instructions=f"Does `input` state {ctx.desc(st.spec)}?",
+            instructions=f"Does `input` state {ctx.desc(st.spec, scoped=True)}?",
             criteria=NoulCriteria(
                 true="The input states it, directly or by clear implication.",
                 false="The input does not state it.",
@@ -940,14 +1011,14 @@ _ATTR_FALSE = (
 
 
 def _attribution_question(
-    spec: FieldSpec, value: Any, *, element: bool
+    description: str, value: Any, *, element: bool
 ) -> NoulQuestion:
     text = display(value)
     if element:
         instructions = f'Does `input` state this about `entity.label`: "{text}"?'
     else:
         instructions = (
-            f'Does `input` state that {spec.description} of `entity.label` is "{text}"?'
+            f'Does `input` state that {description} of `entity.label` is "{text}"?'
         )
     return NoulQuestion(
         type="noul",
@@ -973,11 +1044,11 @@ def _attribution_questions(
         if _is_list(st):
             for index, element in enumerate(st.resolved.value):
                 questions[_attr_id(st, index)] = _attribution_question(
-                    st.spec, element, element=True
+                    st.spec.scoped, element, element=True
                 )
         else:
             questions[_attr_id(st, None)] = _attribution_question(
-                st.spec, st.resolved.value, element=False
+                st.spec.scoped, st.resolved.value, element=False
             )
     return questions
 
@@ -1038,18 +1109,17 @@ async def _judge(ctx: Ctx, st: FieldState, answers: dict[str, Answer]) -> None:
         return
     elements = list(st.resolved.value)
     spans = list(st.resolved.spans) if st.resolved.spans else None
-    probabilities: list[float] = []
+    probabilities: list[float | None] = []
     keep: list[bool] = []
     pending: list[int] = []
     for index in range(len(elements)):
         answered = _p(answers, _attr_id(st, index))
-        p = math.nan if answered is None else answered
-        probabilities.append(p)
-        if answered is not None and p >= verify.attribution_keep:
+        probabilities.append(answered)
+        if answered is not None and answered >= verify.attribution_keep:
             keep.append(True)
-        elif answered is not None and p < verify.attribution_drop:
+        elif answered is not None and answered < verify.attribution_drop:
             keep.append(False)
-            _drop(st, index, elements[index], p, missing=False)
+            _drop(st, index, elements[index], answered, missing=False)
         else:  # in the middle band, or unanswered (which is not a pass)
             keep.append(False)
             pending.append(index)
@@ -1091,7 +1161,7 @@ async def _recheck_scalar(ctx: Ctx, st: FieldState) -> None:
     answers = await ctx.run.call_clef(
         {
             _attr_id(st, None): _attribution_question(
-                st.spec, checked.value, element=False
+                st.spec.scoped, checked.value, element=False
             )
         },
         ctx.entity_state(spans or None),
@@ -1120,7 +1190,7 @@ async def _recheck_elements(
     spans: list[Span] | None,
     pending: list[int],
     keep: list[bool],
-    probabilities: list[float],
+    probabilities: list[float | None],
 ) -> None:
     """Middle band for list elements: one isolated re-ask, one more check each."""
     verify = ctx.run.verify
@@ -1143,17 +1213,11 @@ async def _recheck_elements(
     for index in pending:
         if index not in candidates:
             was = probabilities[index]
-            _drop(
-                st,
-                index,
-                elements[index],
-                None if math.isnan(was) else was,
-                missing=math.isnan(was),
-            )
+            _drop(st, index, elements[index], was, missing=was is None)
     if not candidates:
         return
     questions: dict[str, Question] = {
-        _attr_id(st, index): _attribution_question(st.spec, value, element=True)
+        _attr_id(st, index): _attribution_question(st.spec.scoped, value, element=True)
         for index, (value, _) in candidates.items()
     }
     narrowed = [span for _, span in candidates.values() if span is not None]

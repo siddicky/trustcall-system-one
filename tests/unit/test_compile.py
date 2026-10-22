@@ -623,14 +623,10 @@ def test_skip_option_skips_a_field() -> None:
 @pytest.mark.parametrize(
     ("annotation", "engine"),
     [
-        (Pet, "submodel"),
-        (Optional[Pet], "submodel"),
         (list[Pet], "collection"),
         (set[Pet], "collection"),
         (dict[str, int], "mapping"),
         (dict[str, str], "mapping"),
-        (Union[Cat, Dog], "union_models"),
-        (Annotated[Cat | Dog, Field(discriminator="kind")], "union_models"),
     ],
 )
 def test_deferred_kinds_are_recorded_not_expanded(annotation: Any, engine: str) -> None:
@@ -651,13 +647,15 @@ def test_deferred_lists_the_deferred_specs() -> None:
         age: int
 
     plan = compile_schema(Owner)
-    assert [spec.pretty for spec in plan.deferred()] == [
-        "pet",
-        "pets",
-        "scores",
-        "any_pet",
+    # sub-models and unions of models are expanded; collections and mappings wait
+    assert [spec.pretty for spec in plan.deferred()] == ["pets", "scores"]
+    assert list(plan.clairic_fields()) == [
+        "name",
+        "pet.name",
+        "age",
+        "any_pet.Cat.lives",
+        "any_pet.Dog.tricks",
     ]
-    assert list(plan.clairic_fields()) == ["name", "age"]
 
 
 def test_models_are_resolved_and_stored_on_the_spec() -> None:
@@ -780,18 +778,23 @@ def test_max_depth_guard_skips_nested_models() -> None:
     assert any("max_depth" in message for message in shallow.warnings)
 
 
-def test_recursive_models_are_recorded_for_the_expander() -> None:
+def test_recursive_models_expand_down_to_the_depth_limit() -> None:
     class Node(BaseModel):
         name: str
         parent: Optional["Node"] = None
         children: list["Node"] = []
 
     Node.model_rebuild()
-    plan = compile_schema(Node)
+    plan = compile_schema(Node, limits=Limits(max_depth=3))
     assert plan.spec(("parent",)).engine == "submodel"
-    assert plan.spec(("children",)).engine == "collection"
-    assert plan.spec(("parent",)).warnings == ()
-    assert [spec.pretty for spec in plan.deferred()] == ["parent", "children"]
+    assert plan.spec(("parent", "parent")).engine == "submodel"
+    # leaves are at most 3 deep: the third `parent` would put `name` at depth 4
+    assert plan.spec(("parent", "parent", "parent")).engine == "skip"
+    assert plan.spec(("parent", "parent", "parent")).warnings == ("max_depth",)
+    # depth first in declaration order; the collection of the deepest level is
+    # past the limit and skipped
+    assert [spec.pretty for spec in plan.deferred()] == ["parent.children", "children"]
+    assert plan.spec(("parent", "parent", "children")).warnings == ("max_depth",)
     shallow = compile_schema(Node, limits=Limits(max_depth=1))
     assert shallow.spec(("parent",)).warnings == ("max_depth",)
 
@@ -1649,9 +1652,12 @@ def test_nested_typed_dicts_compile_as_submodels_and_collections() -> None:
     assert engines == {
         "name": "clairic",
         "geo": "submodel",
+        "geo.lat": "clairic",
         "spots": "collection",
         "maybe": "submodel",
+        "maybe.lat": "clairic",
         "later": "submodel",
+        "later.lat": "clairic",
     }
     geo = plan.spec(("geo",)).annotation
     assert issubclass(geo, BaseModel) and geo.__name__ == "Geo"
@@ -1669,6 +1675,7 @@ def test_typed_dict_fields_inside_a_model_are_recorded_for_the_expander() -> Non
 
     plan = compile_schema(Owner)
     assert plan.spec(("home",)).engine == "submodel"
+    assert plan.spec(("home", "lat")).engine == "clairic"
     assert plan.spec(("homes",)).engine == "collection"
 
 
@@ -1679,7 +1686,11 @@ def test_function_parameters_may_be_typed_dicts() -> None:
     def where(point: Geo, trail: list[Geo]) -> None: ...
 
     plan = compile_schema(where)
-    assert [spec.engine for spec in plan.specs] == ["submodel", "collection"]
+    assert [spec.engine for spec in plan.specs] == [
+        "submodel",
+        "clairic",
+        "collection",
+    ]
 
 
 class Tree(TypedDict):

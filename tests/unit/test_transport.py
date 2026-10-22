@@ -1341,6 +1341,44 @@ async def test_queue_timeout_fails_a_call_that_never_got_a_slot() -> None:
     assert (await run(transport)).body == BODY  # the transport still works
 
 
+async def test_a_timeout_during_the_post_is_not_a_queue_timeout() -> None:
+    # a timeout raised while the request is in flight (not while queueing) is
+    # an ordinary network timeout: retried, and never called a queue timeout
+    transport, rec = make(asyncio.TimeoutError(), ok(), queue_timeout=5.0)
+    result = await run(transport)
+    assert result.body == BODY and result.retries == 1
+    assert len(rec.requests) == 2
+    exhausted, _ = make(asyncio.TimeoutError(), queue_timeout=5.0, max_retries=0)
+    with pytest.raises(TransportError) as info:
+        await run(exhausted)
+    assert "waiting for a request slot" not in str(info.value)
+    assert "failed" in str(info.value)
+    assert isinstance(info.value.__cause__, asyncio.TimeoutError)
+    assert exhausted.limiter.in_flight == 0
+
+
+async def test_the_limiter_reports_a_slot_timeout_as_a_timeout_error() -> None:
+    transport, _, _ = make_clocked(
+        ok(), concurrency=ConcurrencyConfig(per_model={CLAIRIC: 1})
+    )
+    release = asyncio.Event()
+    acquired = asyncio.Event()
+
+    async def hold() -> None:
+        async with transport.limiter.slot(CLAIRIC):
+            acquired.set()
+            await release.wait()
+
+    holder = asyncio.create_task(hold())
+    await acquired.wait()
+    with pytest.raises(asyncio.TimeoutError):
+        async with transport.limiter.slot(CLAIRIC, 0.01):
+            pass
+    release.set()
+    await holder
+    assert transport.limiter.in_flight == 0
+
+
 async def test_queue_timeout_defaults_to_waiting_indefinitely() -> None:
     transport, _, _ = make_clocked(ok())
     assert transport._queue_timeout is None
