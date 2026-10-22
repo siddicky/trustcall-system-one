@@ -266,6 +266,29 @@ def test_03_update_contact_calls_follow_the_update_pipeline(
     assert len(kinds) == 9
 
 
+def test_00_raw_vs_library(capsys: pytest.CaptureFixture[str]) -> None:
+    """The raw httpx call (offline: a MockTransport) and the library, one task."""
+    result = run("00_raw_vs_library", capsys, keep_output=True)
+    out = capsys.readouterr().out
+    # part 1: trusting the raw values shrinks the name and drops the old notes
+    assert '"Dana Whitfield" -> "Dana"' in out
+    assert "notes: [" in out and "-> [" in out
+    # part 2: the library patches only what the note states and names each refusal
+    (record,) = result.records
+    assert {(p.op, p.path) for p in record.patches} == {
+        ("replace", "/phone"),
+        ("replace", "/city"),
+        ("replace", "/company"),
+        ("replace", "/title"),
+        ("add", "/notes/-"),
+    }
+    assert {r.path: r.reason for r in record.rejected} == {
+        "/name": "identity_subset",
+        "/email": "not_mentioned",
+    }
+    assert record.after is not None and record.after["name"] == "Dana Whitfield"
+
+
 def test_04_repair(capsys: pytest.CaptureFixture[str]) -> None:
     """Two fields fail validation; one repair round (two re-asks) fixes both."""
     result = run("04_repair", capsys, keep_output=True)
