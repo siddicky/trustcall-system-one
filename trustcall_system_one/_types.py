@@ -74,6 +74,7 @@ CallKind = Literal[
     "adjudicate",
     "list_dedup",
     "sentences",
+    "list_kind",
     "gate",
     "repair",
     "raw",

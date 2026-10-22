@@ -88,6 +88,7 @@ __all__ = [
     "contest_cross",
     "crosscheck",
     "display",
+    "reask",
     "resolve",
     "resolve_clef",
     "run_ladder",
@@ -158,12 +159,16 @@ class Placement:
         lineage: The names of its ancestors including the parent, outermost first.
         nest: How deep the item's plan is nested (see ``Nest``).
         scope: ``CallMeta.scope`` of its calls.
+        others: Where the input mentions the entities of the same collection (the
+            item's siblings and the item itself): a sentence that names another
+            of them ends the reach of an entity's sentences.
     """
 
     parent: EntityInfo | None = None
     lineage: tuple[str, ...] = ()
     nest: Nest = field(default_factory=Nest)
     scope: str = ""
+    others: tuple[Span, ...] = ()
 
 
 @dataclass
@@ -208,6 +213,8 @@ class Ctx:
         lineage: The names of the ancestors of a nested item, outermost first
             (``"Emma Thompson (e0)"``); run warnings start with them.
         nest: Where the plan sits in the document (see ``Nest``).
+        others: Mention spans of the entities of the same collection (see
+            ``Placement.others``).
         scope: ``CallMeta.scope`` of this context's calls: the parent key and the
             pointer of the collection (``"e0/pets"``), empty at the top level.
     """
@@ -234,6 +241,7 @@ class Ctx:
     lineage: tuple[str, ...] = ()
     nest: Nest = field(default_factory=Nest)
     scope: str = ""
+    others: tuple[Span, ...] = ()
 
     def input_only(self) -> "Ctx":
         """The same context without the record: every request is about the input.
@@ -1708,6 +1716,19 @@ async def _reask(
     )
     answer, anchored = asked[spec.wire_name]
     return await resolve(ctx, spec, answer, anchored, st.type_answer)
+
+
+async def reask(ctx: Ctx, st: FieldState) -> Resolved:
+    """Ask one field again, alone, over the whole input (no record, no mentions).
+
+    Args:
+        ctx: The entity context (an update's input-only one).
+        st: The field's state.
+
+    Returns:
+        The new answer, resolved; the state is not changed.
+    """
+    return await _reask(ctx, st, spans=None)
 
 
 def _effective(

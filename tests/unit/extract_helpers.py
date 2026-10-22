@@ -114,6 +114,8 @@ class Script:
         sentences: ``sentences`` probability by a part of the sentence asked about
             (the first part found in it wins); ``sentences_default`` answers the
             rest.
+        list_kinds: What ``list_kind`` says about a list field, by wire name
+            (``"items"`` or ``"statements"``, the default).
         truncated: Number of ``extract`` calls to flag as truncated.
         state_text: Rewrites the state Clairic says it read.
         limit: ``limit(state, n)`` gives how many characters of a state Clairic
@@ -143,6 +145,7 @@ class Script:
     dedup_default: float = 0.05
     sentences: dict[str, float] = field(default_factory=dict)
     sentences_default: float = 0.04
+    list_kinds: dict[str, str] = field(default_factory=dict)
     truncated: int = 0
     state_text: Callable[[str], str] | None = None
     limit: Callable[[str, int], int | None] | None = None
@@ -166,6 +169,7 @@ class Script:
                 list_dedup=self._dedup,
                 stated=self._stated,
                 sentences=self._sentences,
+                list_kind=self._list_kind,
             )
         )
 
@@ -317,6 +321,12 @@ class Script:
             )
             answers[qid] = noul(p)
         return clef_response(answers)
+
+    def _list_kind(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
+        wanted = self.list_kinds.get(meta.field or "", "statements")
+        return clef_response(
+            {qid: pick(wanted, ["items", "statements"]) for qid in payload["questions"]}
+        )
 
     def _sentences(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
         answers = {}

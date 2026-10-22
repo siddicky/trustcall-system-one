@@ -13,7 +13,7 @@ smoke tests.
 
 from typing import Any
 
-from evals.model import Case, MustNot, Op, Val
+from evals.model import Case, MustNot, Op, Rejected, Val
 from evals.scenarios import (
     CONTACT_EXISTING,
     CONTACT_NOTE,
@@ -140,6 +140,7 @@ def readme_people() -> Case:
         schemas=lambda: [Many(Person, identity="name")],
         existing=EXISTING_PEOPLE,
         options={"enable_inserts": True},
+        # the must-have notes ...
         expect_ops=[
             Op(
                 "add",
@@ -147,13 +148,23 @@ def readme_people() -> Case:
                 contains="promoted to Senior Marketing Manager",
                 who="0",
             ),
-            Op("add", "/notes/-", contains="rock climbing", who="0"),
             Op("add", "/notes/-", contains="Data Scientist", who="1"),
-            Op("add", "/notes/-", contains="going vegan", who="1"),
             Op("add", "/notes/-", contains="special education", who="2"),
             Op("insert", who="Olivia"),
         ],
-        expect_values=[Val("Olivia", "/name", "Olivia Davis")],
+        # ... and the true extras a model may legitimately add (the remark about
+        # climbing is Emma's, the diet is Michael's): they neither fail the case
+        # nor count against precision. Bleed still fails, through must_not.
+        allow_ops=[
+            Op("add", "/notes/-", contains="rock climbing", who="0"),
+            Op("add", "/notes/-", contains="going vegan", who="1"),
+            Op("add", "/notes/-", contains="puppy", who="0"),
+            Op("add", "/notes/-", contains="Sunny", who="0"),
+        ],
+        expect_values=[
+            Val("Olivia", "/name", "Olivia Davis"),
+            Val("Olivia", "/notes", contains="graphic designer"),
+        ],
         must_not=[
             MustNot.insert("Sunny"),
             MustNot.op("add", "/notes/-", who="1", contains="rock climbing"),
@@ -812,7 +823,7 @@ def notes_update_contact() -> Case:
         )
         # Clairic's list type, asked for an open-ended field, answers with
         # confidence ~1e-11 (live): the list answer is not trusted
-        w.low_confidence(entity, "notes", 1e-9)
+        w.low_confidence(entity, "notes", 1e-9, persistent=True)
         return w
 
     return Case(
@@ -860,7 +871,7 @@ def notes_insert_contact() -> Case:
             mentions=["Dana Ruiz"],
             fields={"name": "Dana Ruiz", "city": "Lyon", "notes": [meet, follow]},
         )
-        w.low_confidence(entity, "notes", 1e-9)
+        w.low_confidence(entity, "notes", 1e-9, persistent=True)
         return w
 
     return Case(
@@ -914,9 +925,8 @@ def notes_people_insert() -> Case:
         options={"enable_inserts": True},
         expect_ops=[Op("insert", who="Olivia"), Op("insert", who="Priya")],
         expect_values=[
+            # must-have; her other notes (art, the shelter) are fine but optional
             Val("Olivia", "/notes", contains="graphic designer"),
-            Val("Olivia", "/notes", contains="sketching"),
-            Val("Olivia", "/notes", contains="animal shelter"),
         ],
         must_not=[MustNot.value_at("Priya", "/notes", contains="sketching")],
         tags=("people", "insert", "notes", "scoped"),
@@ -946,6 +956,7 @@ def notes_near_duplicate() -> Case:
         schemas=lambda: [One(Contact)],
         existing=[("crm-1", "Contact", CONTACT_EXISTING)],
         expect_ops=[],
+        expect_rejected=[Rejected("duplicate", "/notes/-", "crm-1")],
         must_not=[MustNot.op("add", "/notes/-"), MustNot.op("remove")],
         tags=("contact", "update", "notes"),
         world=world,

@@ -42,7 +42,7 @@ and the path); the per-scenario request and token counts; every warning printed.
 make record 2>&1 | tee /tmp/record.txt
 ls -l tests/recorded/smoke_*.jsonl
 # credentials must not be in the files (prints a count, not the value):
-grep -rlF -e "$CLOUDFLARE_ACCOUNT_ID" -e "$CLOUDFLARE_API_TOKEN" tests/recorded | wc -l   # must be 0
+grep -rlF -e "$CLOUDFLARE_ACCOUNT_ID" -e "$CLOUDFLARE_API_TOKEN" tests/recorded evals/cassettes evals/results 2>/dev/null | wc -l   # must be 0
 # the recordings replay offline through the same invariants:
 uv run pytest --disable-socket tests/unit/test_recorded.py -v
 ```
@@ -90,7 +90,8 @@ of `summary.md`:
 | number | where | why it matters |
 | --- | --- | --- |
 | passed `x/24` | table | overall |
-| op precision, op recall | table | wrong operations, missed operations |
+| op precision, op recall | table | wrong operations, missed operations (a legitimate extra note is an allowed extra: it is in neither) |
+| notes recall | table | the expected notes that were produced, apart from the other operations |
 | value accuracy | table | inserts: right values |
 | bleed | table | a fact on the wrong record (`colleague_bleed`, `bleed_update`, `other_invoice_total`, `readme_people`) |
 | wrong deletes | table | `delete_request`, `change_not_delete` |

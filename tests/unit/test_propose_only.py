@@ -183,3 +183,39 @@ async def test_a_new_element_is_proposed_after_the_duplicate_check() -> None:
     outcome = await propose(world, JAZZ_TEXT, {**CONTACT, "notes": ["She likes jazz"]})
     assert world.calls("list_dedup")
     assert outcome.proposed == ("add /notes/-",)
+
+
+@pytest.mark.parametrize("updates", [True, False])
+@pytest.mark.parametrize("inserts", [True, False])
+async def test_a_new_item_of_a_flagged_parent_is_proposed_even_without_inserts(
+    updates: bool, inserts: bool
+) -> None:
+    text = "Emma Thompson got a new dog, Max, who is 2."
+    world = FakeWorld(text)
+    emma = world.entity(
+        "Emma Thompson",
+        schema=Person,
+        mentions=["Emma Thompson"],
+        fields={"name": "Emma Thompson"},
+        matches={"name": "Emma Thompson"},
+    )
+    world.entity(
+        "Max",
+        schema=Pet,
+        parent=emma,
+        mentions=["Max"],
+        fields={"name": "Max", "age": 2},
+    )
+    world.delete("e", 0.97)
+    extractor = create_extractor(
+        [Many(Person)],
+        transport=world.transport(),
+        enable_updates=updates,
+        enable_deletes=True,
+        enable_inserts=inserts,
+    )
+    result = await extractor.ainvoke(text, existing=EXISTING)
+    assert result.deleted == () and result.records == ()
+    (skip,) = result.skipped
+    assert skip.reason == "conflict_update_delete"
+    assert "add /pets/-" in skip.detail

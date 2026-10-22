@@ -27,6 +27,7 @@ nested list later (``parent``, ``pointer`` and ``existing`` are the parts that
 differ from a top-level ``Many``); at the top level ``parent`` is ``None``.
 """
 
+import dataclasses
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -183,6 +184,9 @@ class Scope:
             parent, outermost first (``("Emma Thompson (e0)",)``); warnings start
             with them.
         nest: How deep the item plan is nested in the whole document.
+        siblings: Where the input mentions the entities of this collection (set
+            once they are known); a sentence that names another one ends the
+            reach of an entity's sentences (``list_strategy="sentences"``).
     """
 
     plan: SchemaPlan
@@ -193,6 +197,7 @@ class Scope:
     existing: tuple[Any, ...] = ()
     lineage: tuple[str, ...] = ()
     nest: Nest = field(default_factory=Nest)
+    siblings: tuple[Span, ...] = ()
 
     @property
     def noun(self) -> str:
@@ -223,7 +228,9 @@ class Scope:
 
     def placement(self) -> Placement:
         """Where an item of this collection sits, for its own pipeline."""
-        return Placement(self.parent, self.lineage, self.nest, self.call_scope)
+        return Placement(
+            self.parent, self.lineage, self.nest, self.call_scope, self.siblings
+        )
 
     def scoped(self, message: str) -> str:
         """A warning, started with the ancestors and the field of a nested list."""
@@ -1286,6 +1293,11 @@ async def collect(
 # --------------------------------------------------------------------------- #
 
 
+def _mention_spans(entities: Sequence[EntityInfo]) -> tuple[Span, ...]:
+    """Every mention span of a set of entities, in input order."""
+    return tuple(sorted(m.span for e in entities for m in e.mentions if m.span))
+
+
 def _focuses(scope: Scope, info: EntityInfo) -> tuple[Any, Any]:
     """The focus header of an entity's Clairic requests, with and without offsets."""
     plan = scope.plan
@@ -1329,6 +1341,7 @@ async def _update_entity(
     *,
     enable_updates: bool,
     propose_only: bool = False,
+    nested_inserts: bool = False,
 ) -> UpdateOutcome:
     focus, plain = _focuses(scope, info)
     return await update_one(
@@ -1344,6 +1357,7 @@ async def _update_entity(
         identity=identity_fields(scope.plan, scope.cardinality),
         placement=scope.placement(),
         propose_only=propose_only,
+        nested_inserts=nested_inserts,
     )
 
 
@@ -1371,6 +1385,7 @@ async def insert_collection(
         TransportError: If a request failed.
     """
     outcome = await collect(scope, run, skip_presence=skip_presence)
+    scope = dataclasses.replace(scope, siblings=_mention_spans(outcome.entities))
     done = await gather(*(_insert_entity(run, scope, e) for e in outcome.entities))
     records: list[ResultRecord] = []
     skips: list[tuple[str, SkippedEntity]] = [
@@ -1524,6 +1539,7 @@ async def apply_collection(
     jobs: list[Any] = [matching(), deleting()]
     results = await gather(*jobs)
     matched: MatchOutcome = results[0]
+    scope = dataclasses.replace(scope, siblings=_mention_spans(matched.entities))
     delete_p: dict[str, float | None] = results[1]
     flagged = {
         rid
@@ -1552,6 +1568,7 @@ async def apply_collection(
             record,
             enable_updates=True,
             propose_only=not enable_updates,
+            nested_inserts=True,
         )
         if done.skipped is not None and done.skipped.reason == "ambiguous_match":
             return _Work(

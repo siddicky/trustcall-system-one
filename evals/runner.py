@@ -13,7 +13,7 @@ from evals.configs import build_options
 from evals.model import Case, CaseResult
 from evals.scoring import score
 from trustcall_system_one import CloudflareTransport, Transport, create_extractor
-from trustcall_system_one.testing import CassetteTransport, RecordingTransport
+from trustcall_system_one.testing import CassetteTransport, RecordingTransport, scrub
 
 __all__ = ["Settings", "SuiteResult", "aggregate", "run_suite"]
 
@@ -105,12 +105,17 @@ async def _run_case(
         )
         transport = cassette
     started = time.perf_counter()
+    secrets: tuple[str, ...] = ()
+    sensitive = getattr(live, "sensitive_values", None)
+    if callable(sensitive):
+        secrets = tuple(sensitive())
     try:
         extractor = create_extractor(case.schemas(), transport=transport, **options)
         result = await extractor.ainvoke(case.text, existing=case.existing)
     except Exception as exc:
         failed = CaseResult(case=case.id)
-        failed.error = f"{type(exc).__name__}: {str(exc)[:300]}"
+        # an error message can carry the request URL, and with it the account id
+        failed.error = scrub(f"{type(exc).__name__}: {str(exc)[:300]}", secrets)
         failed.wall_s = time.perf_counter() - started
         failed.n_expected = len(case.expect_ops)
         failed.n_values = len(case.expect_values)
@@ -118,6 +123,7 @@ async def _run_case(
             failed.forwarded = cassette.forwarded
         return failed
     scored = score(case, result)
+    scored.warnings = [scrub(w, secrets) for w in scored.warnings]
     scored.wall_s = time.perf_counter() - started
     if cassette is not None:
         scored.forwarded = cassette.forwarded
@@ -172,7 +178,8 @@ def aggregate(results: Sequence[CaseResult]) -> dict[str, Any]:
 
     Returns:
         ``op_precision``, ``op_recall``, ``value_accuracy`` (``None`` without
-        expected values), ``bleed`` and ``wrong_deletes`` (violations by kind),
+        expected values), ``notes_recall`` (the expected notes that were
+        produced), ``bleed`` and ``wrong_deletes`` (violations by kind),
         ``violations``, ``valid_rate``, ``requests``, ``input_tokens``,
         ``wall_s``, ``cases``, ``passed``, ``errors`` and ``forwarded``.
     """
@@ -196,6 +203,9 @@ def aggregate(results: Sequence[CaseResult]) -> dict[str, Any]:
         if expected
         else 1.0,
         "value_accuracy": ratio(sum(r.values_correct for r in results), values),
+        "notes_recall": ratio(
+            sum(r.notes_found for r in results), sum(r.n_notes for r in results)
+        ),
         "bleed": categories.count("bleed"),
         "wrong_deletes": categories.count("wrong_delete"),
         "violations": len(categories),

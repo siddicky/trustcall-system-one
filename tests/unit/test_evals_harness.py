@@ -427,6 +427,7 @@ def test_a_replay_with_a_live_fallback_sends_only_the_new_requests(
     assert result.forwarded >= 1
     assert {meta.kind for _, _, meta in live.calls} <= {
         "sentences",
+        "list_kind",
         "attribution",
         "gate",
         "list_dedup",
@@ -630,3 +631,202 @@ def test_the_smoke_invariants_hold_on_the_scripted_worlds(
     )
     result = extractor.invoke(chosen.text, existing=chosen.existing)
     chosen.check(result)
+
+
+@pytest.mark.parametrize("gateway", [None, "my-gw"])
+def test_an_account_id_in_an_error_never_reaches_the_results_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gateway: str | None
+) -> None:
+    import httpx
+
+    from evals.report import write_suite
+    from evals.runner import SuiteResult, _run_case
+    from trustcall_system_one import CloudflareTransport
+
+    for name in (
+        "CLOUDFLARE_ACCOUNT_ID",
+        "CLOUDFLARE_API_TOKEN",
+        "CLOUDFLARE_AUTH_TOKEN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    account, token = "0123456789abcdef0123456789abcdef", "secret-token-123456"
+
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    live = CloudflareTransport(
+        account_id=account,
+        api_token=token,
+        gateway=gateway,
+        client=httpx.AsyncClient(transport=httpx.MockTransport(refuse)),
+        max_retries=0,
+    )
+    (case,) = pick("readme_people")
+    cassettes = tmp_path / "cassettes"
+    settings = Settings(live=True, record=cassettes)
+    cassettes.mkdir()
+    result = asyncio.run(_run_case(case, settings, live))
+    assert result.error is not None and "TransportError" in result.error
+    assert account not in result.error and "<redacted>" in result.error
+    suite = SuiteResult("default", {}, [result], [], "live")
+    write_suite(suite, tmp_path / "out")
+    for folder in (tmp_path / "out", cassettes):
+        for path in folder.rglob("*"):
+            if path.is_file():
+                text = path.read_text()
+                assert account not in text and token not in text, path
+
+
+# --------------------------------------------------------------------------- #
+# Allowed extras, notes recall, rejections, comparison of values
+# --------------------------------------------------------------------------- #
+
+
+def test_an_allowed_extra_neither_fails_the_case_nor_lowers_precision() -> None:
+    result = ExtractionResult(
+        records=(
+            record(
+                "update",
+                "0",
+                [
+                    PatchOp("add", "/notes/-", "She got promoted."),
+                    PatchOp("add", "/notes/-", "She took up rock climbing."),
+                    PatchOp("add", "/notes/-", "Her cat is called Max."),
+                ],
+            ),
+        )
+    )
+    wanted = [Op("add", "/notes/-", contains="promoted", who="0")]
+    strict = score(case(expect_ops=wanted), result)
+    assert strict.precision == pytest.approx(1 / 3) and not strict.passed
+    lenient = score(
+        case(
+            expect_ops=wanted,
+            allow_ops=[Op("add", "/notes/-", contains="climbing", who="0")],
+        ),
+        result,
+    )
+    assert lenient.allowed == 1 and (lenient.matched_actual, lenient.n_actual) == (1, 2)
+    assert lenient.extra == ['0: add /notes/- "Her cat is called Max."']
+    both = score(
+        case(
+            expect_ops=wanted,
+            allow_ops=[
+                Op("add", "/notes/-", contains="climbing", who="0"),
+                Op("add", "/notes/-", contains="cat", who="0"),
+            ],
+        ),
+        result,
+    )
+    assert both.precision == 1.0 and both.passed
+    # an allowed operation on another record is still wrong
+    other = score(
+        case(
+            expect_ops=wanted,
+            allow_ops=[Op("add", "/notes/-", contains="climbing", who="1")],
+        ),
+        result,
+    )
+    assert other.extra and not other.passed
+
+
+def test_notes_recall_is_counted_apart() -> None:
+    result = ExtractionResult(
+        records=(
+            record("update", "0", [PatchOp("add", "/notes/-", "She got promoted.")]),
+            record("insert", "Olivia Davis", after={"notes": ["Graphic designer."]}),
+        )
+    )
+    scored = score(
+        case(
+            expect_ops=[
+                Op("add", "/notes/-", contains="promoted", who="0"),
+                Op("add", "/notes/-", contains="vegan", who="0"),
+                Op("replace", "/city", "Berlin", who="0"),
+            ],
+            expect_values=[
+                Val("Olivia", "/notes", contains="designer"),
+                Val("Olivia", "/notes", contains="sketching"),
+                Val("Olivia", "/city", None),
+            ],
+        ),
+        result,
+    )
+    assert (scored.notes_found, scored.n_notes) == (2, 4)
+    summary = aggregate([scored])
+    assert summary["notes_recall"] == 0.5 and summary["op_recall"] == pytest.approx(
+        1 / 3
+    )
+    assert aggregate([score(case(), result)])["notes_recall"] is None
+
+
+def test_digit_strings_are_not_numbers_when_both_sides_are_strings() -> None:
+    from evals.model import values_equal
+
+    assert not values_equal("02139", "2139")
+    assert values_equal("02139", "02139.")
+    assert values_equal("2139", 2139) and values_equal(1080, "1,080.00")
+    result = ExtractionResult(
+        records=(record("update", "0", [PatchOp("replace", "/zip", "2139")]),)
+    )
+    assert (
+        score(case(expect_ops=[Op("replace", "/zip", "02139", who="0")]), result).recall
+        == 0
+    )
+    assert (
+        score(case(expect_ops=[Op("replace", "/zip", 2139, who="0")]), result).recall
+        == 1
+    )
+
+
+def test_a_value_must_hold_in_every_record_it_is_about() -> None:
+    result = ExtractionResult(
+        records=(
+            record("insert", "Olivia Davis", after={"city": "Rome"}),
+            record("insert", "Olivia Davis", after={"city": "Paris"}),
+        )
+    )
+    assert (
+        score(
+            case(expect_values=[Val("Olivia", "/city", "Rome")]), result
+        ).values_correct
+        == 0
+    )
+    same = ExtractionResult(
+        records=(
+            record("insert", "Olivia Davis", after={"city": "Rome"}),
+            record("insert", "Olivia Davis", after={"city": "Rome"}),
+        )
+    )
+    assert (
+        score(case(expect_values=[Val("Olivia", "/city", "Rome")]), same).values_correct
+        == 1
+    )
+
+
+def test_an_expected_rejection_must_be_reported() -> None:
+    from evals.model import Rejected
+    from trustcall_system_one import RejectedOp
+
+    rejected = RejectedOp("add", "/notes/-", "duplicate", "same fact", 0.9)
+    result = ExtractionResult(records=(record("update", "c", rejected=(rejected,)),))
+    assert score(
+        case(expect_rejected=[Rejected("duplicate", "/notes/-", "c")]), result
+    ).passed
+    missing = score(case(expect_rejected=[Rejected("attribution")]), result)
+    assert not missing.passed and missing.missing == ["rejected attribution"]
+    # the shipped near-duplicate case asserts the rejection, not just the absence
+    (near,) = pick("notes_near_duplicate")
+    assert near.expect_rejected and near.expect_rejected[0].reason == "duplicate"
+    assert next(r for r in run([near]).results).passed
+
+
+def test_the_summary_has_a_notes_recall_column() -> None:
+    suite = run(pick("readme_people", "notes_update_contact"))
+    from evals.report import suite_markdown
+
+    markdown = suite_markdown(suite)
+    assert "notes recall" in markdown
+    assert aggregate(suite.results)["notes_recall"] == 1.0
+    readme = next(r for r in suite.results if r.case == "readme_people")
+    assert readme.allowed >= 1  # the legitimate extra notes were not held against it

@@ -24,6 +24,7 @@ Two kinds of cassette live there:
 
 import copy
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -84,10 +85,17 @@ def test_a_recorded_smoke_scenario_replays_offline(scenario: Scenario) -> None:
 # --------------------------------------------------------------------------- #
 
 
+def quoted(question: dict[str, Any]) -> str | None:
+    """The value an attribution question asks about (its first quoted text)."""
+    found = re.search(r'"((?:[^"\\]|\\.)*)"', question["instructions"])
+    return found.group(1) if found else None
+
+
 class RewordedAttribution:
     """Answers an attribution request with the recorded answer to the same questions.
 
-    The question ids (``attr.city``) and the entity are the key; the wording of the
+    The key is the question ids (``attr.city``), the entity, the whole state
+    (byte-identical) and the value each question quotes; the wording of the
     questions is what changed, so it is the one thing not compared. Any other kind
     of call is a miss that fails the test.
     """
@@ -115,9 +123,17 @@ class RewordedAttribution:
         ids = set(payload["questions"])
         label = payload["state"]["entity"]["label"]
         for row in self.rows:
-            state = row["request"]["state"]
-            if set(row["request"]["questions"]) == ids and (
-                state["entity"]["label"] == label
+            request = row["request"]
+            # the same questions about the same value, over a byte-identical state:
+            # only the wording of the question may differ
+            if (
+                set(request["questions"]) == ids
+                and request["state"] == payload["state"]
+                and request["state"]["entity"]["label"] == label
+                and all(
+                    quoted(request["questions"][q]) == quoted(payload["questions"][q])
+                    for q in ids
+                )
             ):
                 self.served.append(tuple(sorted(ids)))
                 return TransportResponse(

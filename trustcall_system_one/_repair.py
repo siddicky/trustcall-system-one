@@ -525,6 +525,8 @@ class Target:
     previous: Any = None
     type_answer: ChoiceAnswer | None = None
     show_input: bool = True
+    sentences: FieldState | None = None
+    held: int = 0
 
     @property
     def wire(self) -> str:
@@ -1088,6 +1090,79 @@ async def _ask_one(ctx: Ctx, state: RepairState, target: Target) -> Outcome:
     return await _ask_clairic(ctx, ask, target, blocks, label)
 
 
+def sentence_repair(state: "RepairState", target: Target) -> Outcome:
+    """Repair a list that was read by sentences, without asking Clairic.
+
+    Clairic's ``list`` type cannot read an open-ended field (that is why it was
+    read by sentences), so the field is never sent to it. A too-long list keeps the
+    sentences Clef was surest of, as many as the limit allows (``max_length``
+    minus the elements the record holds), in input order, and is validated again.
+    Any other error ends the field: the outcome says so and changes nothing, so
+    the record is left to the usual handling of a field that stays invalid (an
+    insert's optional field goes back to its default, an update drops the
+    operations that break validation).
+
+    Args:
+        state: The loop's memory (for the label).
+        target: The field, with its sentence state.
+
+    Returns:
+        A failfast outcome: with a new state when the list could be shortened.
+    """
+    category, problem = classify(target.hit, target.spec)
+    label = f"repair[{state.rounds + 1}] ({category})"
+    current = target.sentences
+    limit = problem.ctx.get("max_length") if problem.type == "too_long" else None
+    if (
+        current is None
+        or not isinstance(limit, int)
+        or not isinstance(current.resolved.value, list)
+    ):
+        return Outcome(
+            target,
+            target.spec,
+            f"{label} skipped: a list read by sentences is not re-asked of Clairic",
+            category,
+            failfast=True,
+        )
+    resolved = current.resolved
+    values = list(resolved.value)
+    spans = list(resolved.spans) if resolved.spans else None
+    room = max(0, limit - target.held)
+    odds = {
+        str(row["sentence"]): float(row["p"])
+        for row in (resolved.raw if isinstance(resolved.raw, list) else [])
+        if isinstance(row, dict) and row.get("p") is not None
+    }
+    best = sorted(range(len(values)), key=lambda i: -odds.get(str(values[i]), 0.0))
+    keep = sorted(best[:room])
+    note = (
+        f"{label}: kept the {len(keep)} surest of {len(values)} sentences "
+        f"(at most {limit} fit)"
+    )
+    shortened = dataclasses.replace(
+        resolved,
+        value=[values[i] for i in keep] or None,
+        spans=tuple(spans[i] for i in keep) if spans and keep else None,
+        origin=None,
+    )
+    new = dataclasses.replace(
+        current,
+        resolved=_stamp(shortened, note),
+        reject=None,
+        reject_detail="",
+        reject_p=None,
+        attribution_p=(
+            tuple(current.attribution_p[i] for i in keep)
+            if isinstance(current.attribution_p, tuple)
+            and len(current.attribution_p) == len(values)
+            else current.attribution_p
+        ),
+        notes=[*current.notes, note],
+    )
+    return Outcome(target, target.spec, note, category, state=new, failfast=True)
+
+
 async def run_round(
     ctx: Ctx, state: RepairState, targets: Sequence[Target]
 ) -> list[Outcome]:
@@ -1191,9 +1266,13 @@ async def repair_loop(
         state.seen.add(sig)
         targets: list[Target] = []
         skipped: list[Outcome] = []
+        local: list[Outcome] = []
         for hit in locate(plan, pending.problems, pending.chosen):
             target = target_for(hit)
             if target is None or target.wire in state.exhausted:
+                continue
+            if target.sentences is not None:
+                local.append(sentence_repair(state, target))
                 continue
             blocker = _blocker(ctx, state, target)
             if blocker is None:
@@ -1209,11 +1288,14 @@ async def repair_loop(
                 )
             )
         asked = await run_round(ctx, state, targets) if targets else []
-        outcomes = [*skipped, *asked]
+        outcomes = [*skipped, *local, *asked]
         state.exhausted.update(o.target.wire for o in outcomes if o.failfast)
         if outcomes:
             await apply(outcomes)
         if not targets:
+            if any(o.state is not None for o in local):
+                pending = await refresh()  # a shortened list costs no request
+                continue
             break
         state.rounds += 1
         chosen = pending.chosen

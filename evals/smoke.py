@@ -59,9 +59,33 @@ def _common(result: ExtractionResult, text: str, existing_ids: set[str]) -> None
     inv.spans_quote_the_input(result, text)
 
 
+def _accounted_for(result: ExtractionResult) -> set[str]:
+    """Folded names of everyone the run did something about.
+
+    A record (by label or by the existing record's name), a skipped entity or an
+    untouched existing record.
+    """
+    held = {rid: str(doc["name"]) for rid, _, doc in EXISTING_PEOPLE}
+    names: set[str] = set()
+    for record in result.records:
+        if record.entity is not None:
+            names.add(record.entity.label.casefold())
+        if record.json_doc_id in held:
+            names.add(held[record.json_doc_id].casefold())
+    names.update(s.entity.label.casefold() for s in result.skipped)
+    names.update(held[i].casefold() for i in result.untouched if i in held)
+    return names
+
+
 def _people(result: ExtractionResult) -> None:
     _common(result, CONVERSATION, {"0", "1", "2"})
     inv.only_kinds(result, {"add", "replace"})
+    assert result.records, "the conversation produced no record at all"
+    names = _accounted_for(result)
+    for person in ("emma", "michael", "sarah", "olivia"):
+        assert any(person in name for name in names), (
+            f"{person} is neither in a record nor skipped for a reason: {sorted(names)}"
+        )
     for record in inv.updates(result):
         assert record.before is not None and record.after is not None
         # a short form ("Sarah") never replaces the record's full name

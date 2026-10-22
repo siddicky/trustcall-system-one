@@ -92,7 +92,7 @@ from trustcall_system_one._repair import (
 )
 from trustcall_system_one._run import Answer, Run, gather
 from trustcall_system_one._sentences import eligible as sentences_eligible
-from trustcall_system_one._sentences import read_sentences
+from trustcall_system_one._sentences import list_kind, read_sentences
 from trustcall_system_one._types import (
     EntityInfo,
     FieldAnswer,
@@ -114,6 +114,7 @@ from trustcall_system_one._verify import (
     ask_clairic,
     contest_cross,
     crosscheck,
+    reask,
     resolve,
     resolve_clef,
     run_ladder,
@@ -357,7 +358,7 @@ def _list_strategy(ctx: Ctx, spec: FieldSpec) -> str:
     return str(own) if own else ctx.run.limits.list_strategy
 
 
-def _distrusted(ctx: Ctx, state: FieldState) -> bool:
+def _distrusted(ctx: Ctx, resolved: Resolved) -> bool:
     """Whether Clairic's list answer is one it does not trust itself.
 
     True when the answer is missing, or it holds elements whose confidence is
@@ -365,7 +366,6 @@ def _distrusted(ctx: Ctx, state: FieldState) -> bool:
     confidence 1e-6 to 1e-23 live). A null or empty answer is not distrust: the
     model said there is nothing.
     """
-    resolved = state.resolved
     if not resolved.ok and resolved.reason == "missing_answer":
         return True
     gave = isinstance(resolved.raw, list) and bool(resolved.raw)
@@ -398,21 +398,54 @@ async def _sentence_state(
     return state
 
 
+async def _auto(ctx: Ctx, spec: FieldSpec, state: FieldState) -> FieldState:
+    """``"auto"``: what to do with a list answer that Clairic does not trust.
+
+    The existing low-confidence re-ask comes first (one isolated question over the
+    input alone). If its answer is trusted it replaces the first one and the field
+    stays a Clairic list. If it is not either, Clef is asked once per field whether
+    its items are free-form statements (read them by sentences) or short named
+    values (a list of languages or tags that Clairic is unsure of is not turned
+    into sentences: it keeps the old low-confidence rejection).
+    """
+    plain = ctx.input_only()
+    second = await reask(plain, state)
+    if not _distrusted(ctx, second) and second.ok and second.value:
+        again = FieldState(
+            spec,
+            second,
+            state.type_answer,
+            notes=[*state.notes, "list_strategy:auto re-ask"],
+            reask=True,
+        )
+        rejection = accept(spec, second)
+        if rejection is not None:
+            again.set_reject(*rejection)
+        return again
+    if await list_kind(ctx, spec) == "statements":
+        return await _sentence_state(ctx, spec, instead_of=state)
+    state.notes.append(
+        "list_strategy:auto kept the list (the items are not statements)"
+    )
+    return state
+
+
 async def _resolve_field(
     ctx: Ctx,
     spec: FieldSpec,
     extracted: Mapping[str, tuple[ClairicAnswer | None, RenderedState | None]],
     clef_answers: dict[str, Answer],
+    early: "Mapping[str, asyncio.Future[FieldState]]",
 ) -> FieldState:
     """Resolve a Clairic-backed field, reading a list of text by sentences if asked."""
-    strategy = _list_strategy(ctx, spec)
-    if strategy == "sentences":
-        return await _sentence_state(ctx, spec)
+    future = early.get(spec.wire_name)
+    if future is not None:
+        return await future
     state = await _resolve_clairic(
         ctx, spec, extracted.get(spec.wire_name, (None, None)), clef_answers
     )
-    if strategy == "auto" and _distrusted(ctx, state):
-        return await _sentence_state(ctx, spec, instead_of=state)
+    if _list_strategy(ctx, spec) == "auto" and _distrusted(ctx, state.resolved):
+        return await _auto(ctx, spec, state)
     return state
 
 
@@ -525,6 +558,15 @@ async def _run_group(
     ensure = asyncio.ensure_future
     extract_f = ensure(_extract(ctx, clairic_specs, unit, group))
     clef_f = ensure(_clef_pass(ctx, [*clef_specs, *union_specs], group))
+    # a list read by sentences needs nothing from the other requests: it starts
+    # with them (the "auto" fallback does need Clairic's answer, and waits for it)
+    early: dict[str, asyncio.Future[FieldState]] = {
+        spec.wire_name: ensure(_sentence_state(ctx, spec))
+        for spec in group.specs
+        if spec.engine == "clairic"
+        and spec.path not in fixed
+        and _list_strategy(ctx, spec) == "sentences"
+    }
     presence_f = ensure(_ask_presences(ctx, optional, group)) if optional else None
 
     async def leaves_flow() -> list[_Leaf]:
@@ -546,7 +588,10 @@ async def _run_group(
                 resolved = resolve_clef(spec, clef_answers.get(spec.clef_name), ctx)
                 leaves.append(_Leaf(spec, resolved=resolved))
         states = await gather(
-            *(_resolve_field(ctx, spec, extracted, clef_answers) for spec, _ in pending)
+            *(
+                _resolve_field(ctx, spec, extracted, clef_answers, early)
+                for spec, _ in pending
+            )
         )
         for (_, index), state in zip(pending, states, strict=True):
             leaves[index].state = state
@@ -568,7 +613,7 @@ async def _run_group(
             *(_run_child(ctx, child, unit, presence_f) for child in group.children),
         )
     finally:
-        await _cancel(extract_f, clef_f, presence_f)
+        await _cancel(extract_f, clef_f, presence_f, *early.values())
     return _GroupResult(
         group, leaves=outcomes[0], children=list(outcomes[2:]), unions=outcomes[1]
     )
@@ -1364,6 +1409,12 @@ def _note_leaf(leaf: _Leaf, text: str) -> None:
         )
 
 
+def _by_sentences(leaf: _Leaf) -> FieldState | None:
+    """The state of a field that was read by sentences (never re-asked of Clairic)."""
+    state = leaf.state
+    return state if state is not None and state.sentences else None
+
+
 def _install(leaf: _Leaf, outcome: Outcome) -> bool:
     """Put a repair outcome into a leaf. Returns whether a new value went in.
 
@@ -1449,7 +1500,9 @@ async def _finish_insert(
             if leaf is None:
                 return None
             kind = leaf.state.type_answer if leaf.state is not None else None
-            return Target(hit, leaf.spec, leaf.final(), kind)
+            return Target(
+                hit, leaf.spec, leaf.final(), kind, sentences=_by_sentences(leaf)
+            )
 
         async def apply(outcomes: list[Outcome]) -> None:
             for outcome in outcomes:
@@ -1690,6 +1743,7 @@ async def insert_one(
         if placed.nest.chain
         else Nest(placed.nest.depth, (plan.schema,)),
         scope=placed.scope,
+        others=placed.others,
     )
     _note_plan(run, plan)
     qualify_p: float | None = presence
@@ -2216,7 +2270,16 @@ async def _repair_update(
         # the answer the operation came from: never the patched document, which
         # holds the record
         kind = leaf.state.type_answer if leaf.state is not None else None
-        return Target(hit, leaf.spec, leaf.final(), kind, show_input=False)
+        held = lookup(before, hit.entry.path)
+        return Target(
+            hit,
+            leaf.spec,
+            leaf.final(),
+            kind,
+            show_input=False,
+            sentences=_by_sentences(leaf),
+            held=len(held) if isinstance(held, list) else 0,
+        )
 
     async def apply(outcomes: list[Outcome]) -> None:
         installed: list[_Leaf] = []
@@ -2525,7 +2588,12 @@ def _existing_items(
 
 
 async def _update_nested(
-    ctx: Ctx, root: _GroupResult, before: dict[str, Any], parent: EntityInfo
+    ctx: Ctx,
+    root: _GroupResult,
+    before: dict[str, Any],
+    parent: EntityInfo,
+    *,
+    inserts: bool | None = None,
 ) -> NestedUpdate:
     """The operations that the nested items of an updated record need.
 
@@ -2537,6 +2605,9 @@ async def _update_nested(
     items the input says to remove are removed. Items the input does not mention
     are untouched, and nothing is computed from the old value ("two more" is read
     as what the text states, never added to the quantity of the record).
+
+    ``inserts`` overrides ``enable_inserts`` for the new items (used to see what
+    the input proposes for a record flagged for deletion).
     """
     from trustcall_system_one._collection import apply_collection
 
@@ -2557,7 +2628,7 @@ async def _update_nested(
         done = await apply_collection(
             ctx.run,
             scope,
-            enable_inserts=ctx.run.enable_inserts,
+            enable_inserts=ctx.run.enable_inserts if inserts is None else inserts,
             enable_updates=True,
             enable_deletes=ctx.run.enable_item_removals,
         )
@@ -2642,6 +2713,7 @@ async def update_one(
     identity: Sequence[str] = (),
     placement: Placement | None = None,
     propose_only: bool = False,
+    nested_inserts: bool = False,
 ) -> UpdateOutcome:
     """Update one existing record of a schema from ``text``.
 
@@ -2693,7 +2765,11 @@ async def update_one(
             record's own changes and its items'; a repeat of an existing list
             element is dropped by the same near-duplicate check as an update).
             The removal rule asks this of a record flagged for deletion when
-            updates are off.
+            updates are off. New items count as proposed whether or not
+            ``enable_inserts`` is on.
+        nested_inserts: Add the new items of the nested lists whether or not
+            ``enable_inserts`` is on (the removal rule's look at what the input
+            proposes for a flagged record; the record is not kept).
 
     Returns:
         The outcome.
@@ -2739,6 +2815,7 @@ async def update_one(
         if placed.nest.chain
         else Nest(placed.nest.depth, (plan.schema,)),
         scope=placed.scope,
+        others=placed.others,
     )
     _note_plan(run, plan)
     qualify_p: float | None = presence
@@ -2857,7 +2934,7 @@ async def update_one(
         )
         # the items are looked at too: a parent flagged for deletion whose items
         # the input changes is not a record the input merely asks to remove
-        nested_found = await _update_nested(plain, root, before, info)
+        nested_found = await _update_nested(plain, root, before, info, inserts=True)
         changes = [*found.changes, *nested_found.changes]
         dedups = await dedup_elements(plain, before, changes)
         kept = [
@@ -2896,7 +2973,9 @@ async def update_one(
     if conflict:
         plain = dataclasses.replace(plain, vetoed=conflict)
     else:
-        nested = await _update_nested(plain, root, before, info)
+        nested = await _update_nested(
+            plain, root, before, info, inserts=True if nested_inserts else None
+        )
     record, rounds = await _finish_update(plain, root, before, target, info, nested)
     refused: SkippedEntity | None = None
     if conflict:

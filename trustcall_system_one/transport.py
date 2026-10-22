@@ -495,6 +495,14 @@ class CloudflareTransport:
         self._concurrency = concurrency or ConcurrencyConfig()
         self.limiter = AdaptiveLimiter(self._concurrency)
 
+    def sensitive_values(self) -> tuple[str, ...]:
+        """The account id and API token that were passed in explicitly.
+
+        ``RecordingTransport`` redacts them from what it writes. (Those read from
+        the environment are redacted by value anyway.)
+        """
+        return tuple(v for v in (self._account_id, self._api_token) if v)
+
     async def __aenter__(self) -> "CloudflareTransport":
         """Enter the async context."""
         return self

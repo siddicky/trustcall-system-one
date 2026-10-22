@@ -59,6 +59,7 @@ __all__ = [
     "request_key",
     "route",
     "score",
+    "scrub",
     "trace_to_cassette",
 ]
 
@@ -681,7 +682,12 @@ class FakeWorld:
     * ``sentences`` (``sentence.<i>``, one per candidate sentence of a ``list[str]``
       field read by sentences; ``CallMeta.field`` is the field's wire name): 0.95
       if the quoted sentence contains (after folding) one of the focused entity's
-      values for that field, else 0.04.
+      values for that field, else 0.04. A ``bleed`` for the field counts as a value
+      here (a model that says yes to a sentence about someone else; attribution
+      then refuses it).
+    * ``list_kind`` (Clef choice ``kind``: ``items`` or ``statements``): the world's
+      values of that field (any entity of the schema) are ``statements`` at 0.9 if
+      one has four words or more, else ``items``.
     * ``gate`` (Clef ``gate``): 0.9 if ``proposed_change.to`` is new compared to
       ``record`` (not equal to what the record holds at the path, nor an element
       of the list it is appended to), else 0.05.
@@ -717,7 +723,7 @@ class FakeWorld:
         self._counts: dict[str, int] = {}
         self._doubts: list[tuple[str, str, float]] = []
         self._bleeds: list[tuple[str, str, Any]] = []
-        self._low: list[tuple[str, str, float]] = []
+        self._low: list[tuple[str, str, float, bool]] = []
         self._deletes: dict[tuple[str | None, str], float] = {}
         self._item_bleeds: list[tuple[str | None, str]] = []
         self._ready = False
@@ -880,14 +886,21 @@ class FakeWorld:
         return self
 
     def low_confidence(
-        self, entity: "WorldEntity | str", field_: str, confidence: float
+        self,
+        entity: "WorldEntity | str",
+        field_: str,
+        confidence: float,
+        *,
+        persistent: bool = False,
     ) -> "FakeWorld":
         """Inject a fault: the model is unsure of one field's first answer.
 
         ``extract`` and ``crosscheck`` answers for the field carry ``confidence``;
-        a re-ask (``reask``) is confident and gives the true value.
+        a re-ask (``reask``) is confident and gives the true value, unless
+        ``persistent``: then the model is as unsure of the re-ask (Clairic's list
+        type on an open-ended field: confidence 1e-6 to 1e-23 however it is asked).
         """
-        self._low.append((self._label(entity), field_, confidence))
+        self._low.append((self._label(entity), field_, confidence, persistent))
         return self
 
     def delete(
@@ -1230,6 +1243,7 @@ class FakeWorld:
             "adjudicate": self._adjudicate,
             "list_dedup": self._dedup,
             "sentences": self._sentences,
+            "list_kind": self._list_kind,
             "gate": self._gate,
             "match": self._match,
             "delete": self._delete,
@@ -1437,10 +1451,11 @@ class FakeWorld:
         if not present or value is None:
             return null
         confidence = 0.99
-        if primary:
-            for label, path, c in self._low:
-                if _fold(label) == _fold(element.label) and path in self._keys(wire):
-                    confidence = c
+        for label, path, c, persistent in self._low:
+            if (primary or persistent) and (
+                _fold(label) == _fold(element.label) and path in self._keys(wire)
+            ):
+                confidence = c
         if kind == "list":
             values = value if isinstance(value, list) else [value]
             texts = [_clairic_text(v) for v in values]
@@ -1642,10 +1657,27 @@ class FakeWorld:
             answers[qid] = _pick(chosen, list(options), 0.9)
         return clef_response(answers, model=payload["model"])
 
+    def _list_kind(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
+        wire = meta.field or ""
+        values: list[Any] = []
+        for item in self._items:
+            if item.schema != meta.schema:
+                continue
+            present, value = self._lookup(item, wire)
+            if present:
+                values.extend(value if isinstance(value, list) else [value])
+        statements = any(len(str(v).split()) >= 4 for v in values)
+        options = {"items": "items", "statements": "statements"}
+        answers = {
+            qid: _pick("statements" if statements else "items", list(options), 0.9)
+            for qid in payload["questions"]
+        }
+        return clef_response(answers, model=payload["model"])
+
     def _sentences(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
         element = self._focus(payload, meta)
         present, value = (
-            self._lookup(element, meta.field or "")
+            self._value(element, meta.field or "", bleed=True)
             if element is not None
             else (False, None)
         )
@@ -1843,15 +1875,31 @@ def _secrets() -> list[str]:
     return [v for v in values if len(v) >= 4]
 
 
-def _scrub(text: str) -> str:
-    """Remove credentials from a serialised line.
+_ACCOUNT_PATH = re.compile(r"(?<=accounts/)[^/\s\"'?#]+")
+_GATEWAY_PATH = re.compile(r"(?<=gateway\.ai\.cloudflare\.com/v1/)[^/\s\"'?#]+")
 
-    The transport never sees headers, so this is a second line of defence: the
-    values of the Cloudflare environment variables and any ``Bearer`` token are
-    replaced, whatever field they ended up in.
+
+def scrub(text: str, extra: Iterable[str] = ()) -> str:
+    """Remove credentials and account ids from text that is about to be written.
+
+    The transports never see headers, so this is a second line of defence for
+    payloads, bodies and error messages: the values of the Cloudflare environment
+    variables, ``extra`` (for example ``CloudflareTransport.sensitive_values()``),
+    any ``Bearer`` token, the account id in an ``accounts/<id>`` URL path and the
+    one in an AI Gateway ``/v1/<id>/`` URL path are replaced by ``<redacted>``,
+    whatever field they ended up in.
+
+    Args:
+        text: The text.
+        extra: Further secret values to replace (those of four characters or more).
+
+    Returns:
+        The text without them.
     """
-    for secret in _secrets():
+    for secret in [*_secrets(), *(v for v in extra if len(v) >= 4)]:
         text = text.replace(secret, _REDACTED)
+    text = _ACCOUNT_PATH.sub(_REDACTED, text)
+    text = _GATEWAY_PATH.sub(_REDACTED, text)
     return _BEARER.sub(f"Bearer {_REDACTED}", text)
 
 
@@ -1913,14 +1961,18 @@ class RecordingTransport:
         }
 
     ``key`` is ``request_key(model, request)``. ``request`` is the payload that was
-    sent and ``response`` the bare response body. A call that fails is written with
-    ``response: null`` and an ``error`` object, then re-raised.
+    sent and ``response`` the bare response body. A call that fails is re-raised and,
+    with ``record_errors``, also written with ``response: null`` and an ``error``
+    object. Failures are not recorded by default: a transient 429 or a network
+    error replayed later would poison every run that uses the cassette.
 
     Only payloads and bodies are written: never headers, tokens or account ids
     (the wrapped transport owns those). As a second line of defence the values of
     ``CLOUDFLARE_ACCOUNT_ID``, ``CLOUDFLARE_API_TOKEN`` and
-    ``CLOUDFLARE_AUTH_TOKEN`` and any ``Bearer`` token are replaced by
-    ``<redacted>`` in the line before it is written.
+    ``CLOUDFLARE_AUTH_TOKEN``, the account id and token of the wrapped
+    ``CloudflareTransport`` (``sensitive_values()``), any ``Bearer`` token and any
+    ``accounts/<id>`` or gateway ``/v1/<id>/`` URL path are replaced by
+    ``<redacted>`` in the line before it is written (see ``scrub``).
 
     Attributes:
         path: The cassette file (its directory is created).
@@ -1928,7 +1980,12 @@ class RecordingTransport:
     """
 
     def __init__(
-        self, inner: Transport, path: str | os.PathLike[str], *, append: bool = True
+        self,
+        inner: Transport,
+        path: str | os.PathLike[str],
+        *,
+        append: bool = True,
+        record_errors: bool = False,
     ) -> None:
         """Wrap a transport.
 
@@ -1936,8 +1993,10 @@ class RecordingTransport:
             inner: The transport that answers.
             path: The JSONL file to write.
             append: Append to an existing file; ``False`` starts it afresh.
+            record_errors: Also write the calls that failed.
         """
         self._inner = inner
+        self._record_errors = record_errors
         self.path = os.fspath(path)
         self.written = 0
         self._lock = threading.Lock()
@@ -1949,7 +2008,9 @@ class RecordingTransport:
                 pass
 
     def _write(self, line: Mapping[str, Any]) -> None:
-        text = _scrub(json.dumps(line, ensure_ascii=False, allow_nan=False))
+        sensitive = getattr(self._inner, "sensitive_values", None)
+        extra = tuple(sensitive()) if callable(sensitive) else ()
+        text = scrub(json.dumps(line, ensure_ascii=False, allow_nan=False), extra)
         with self._lock, open(self.path, "a", encoding="utf-8") as handle:
             handle.write(text + "\n")
             self.written += 1
@@ -1987,15 +2048,16 @@ class RecordingTransport:
         try:
             result = await self._inner.run(model, payload, meta=meta, timeout=timeout)
         except Exception as exc:
-            self._write(
-                {
-                    **head,
-                    "response": None,
-                    "status": getattr(exc, "status_code", None),
-                    "duration_ms": (time.perf_counter() - started) * 1000,
-                    "error": {"type": type(exc).__name__, "message": str(exc)},
-                }
-            )
+            if self._record_errors:
+                self._write(
+                    {
+                        **head,
+                        "response": None,
+                        "status": getattr(exc, "status_code", None),
+                        "duration_ms": (time.perf_counter() - started) * 1000,
+                        "error": {"type": type(exc).__name__, "message": str(exc)},
+                    }
+                )
             raise
         self._write(
             {
@@ -2034,7 +2096,9 @@ class CassetteTransport:
     ``CassetteMissError`` naming the kind and field, unless ``strict`` is false
     and an ``inner`` transport is given: the call then goes to it, and only that
     call. Wrap the inner transport in a ``RecordingTransport`` to keep what it
-    answers.
+    answers. A recorded failure is replayed as that failure only when there is no
+    inner transport to ask; with one it is skipped and the request is forwarded
+    (a 429 recorded once must not fail every later run).
 
     Attributes:
         hits: Calls answered from the cassette.
@@ -2168,11 +2232,18 @@ class CassetteTransport:
         with self._lock:
             entries = self._entries.get(key, [])
             index = self._cursor.get(key, 0)
+            # with a live fallback a recorded failure is a transient accident, not
+            # an answer: it is skipped and the request goes to the inner transport
+            skip_errors = not self.strict and self._inner is not None
+            while skip_errors and index < len(entries) and entries[index].get("error"):
+                index += 1
             entry = entries[index] if index < len(entries) else None
             if entry is not None:
                 self._cursor[key] = index + 1
                 self.hits += 1
             else:
+                if skip_errors:
+                    self._cursor[key] = index
                 self.misses.append((model, body, meta))
         if entry is None:
             if not self.strict and self._inner is not None:
@@ -2271,5 +2342,5 @@ def trace_to_cassette(
             )
     with open(cassette, "w", encoding="utf-8") as out:
         for line in lines:
-            out.write(_scrub(json.dumps(line, ensure_ascii=False)) + "\n")
+            out.write(scrub(json.dumps(line, ensure_ascii=False)) + "\n")
     return len(lines)

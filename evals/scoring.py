@@ -11,8 +11,8 @@ from evals.model import (
     Op,
     Val,
     folded,
-    normalise,
     split_pointer,
+    values_equal,
 )
 from trustcall_system_one import ExtractionResult, ResultRecord
 
@@ -82,7 +82,7 @@ def _holds(found: bool, node: Any, value: Any, contains: str | None) -> bool:
         return found and folded(contains) in folded(node)
     if value is None:
         return not found or node is None
-    return found and normalise(node) == normalise(value)
+    return found and values_equal(node, value)
 
 
 def _violated(
@@ -98,7 +98,7 @@ def _violated(
             if rule.contains is not None:
                 if folded(rule.contains) in folded(node):
                     return True
-            elif rule.value is ANY or normalise(node) == normalise(rule.value):
+            elif rule.value is ANY or values_equal(node, rule.value):
                 return True
         return False
     for op in ops:
@@ -114,7 +114,7 @@ def _violated(
             continue
         if rule.contains is not None and folded(rule.contains) not in folded(op.value):
             continue
-        if rule.value is not ANY and normalise(rule.value) != normalise(op.value):
+        if rule.value is not ANY and not values_equal(rule.value, op.value):
             continue
         return True
     return False
@@ -155,19 +155,45 @@ def score(case: Case, result: ExtractionResult) -> CaseResult:
         else:
             free.remove(hit)
             out.matched_expected += 1
+    # a legitimate extra (an allowed operation) is neither right nor wrong
+    allowed = [i for i in free if any(a.matches(ops[i]) for a in case.allow_ops)]
+    free = [i for i in free if i not in allowed]
+    out.allowed = len(allowed)
     out.n_expected = len(case.expect_ops)
-    out.n_actual = len(ops)
-    out.matched_actual = len(ops) - len(free)
+    out.n_actual = len(ops) - len(allowed)
+    out.matched_actual = out.n_actual - len(free)
     out.extra = [_shown(ops[i]) for i in free]
+    out.n_notes = sum(1 for e in case.expect_ops if _is_note(e))
+    out.notes_found = sum(
+        1 for e in case.expect_ops if _is_note(e) and not _missing(out, e.label())
+    )
     docs = final_documents(result)
     for val in case.expect_values:
         out.n_values += 1
-        if _value_holds(val, docs):
+        holds = _value_holds(val, docs)
+        if holds:
             out.values_correct += 1
         else:
             out.missing.append(
                 f"{val.who}: {val.path} == {val.contains or val.value!r}"
             )
+        if val.path.rsplit("/", 1)[-1] == "notes":
+            out.n_notes += 1
+            out.notes_found += holds
+    rejections = [
+        (r.path, r.reason, _who(rec)) for rec in result.records for r in rec.rejected
+    ]
+    for wanted in case.expect_rejected:
+        out.n_rejections += 1
+        if any(
+            reason == wanted.reason
+            and (wanted.path is None or path == wanted.path)
+            and (wanted.who is None or _record_matches(wanted.who, "update", who))
+            for path, reason, who in rejections
+        ):
+            out.rejections_found += 1
+        else:
+            out.missing.append(f"rejected {wanted.reason} {wanted.path or ''}".strip())
     for rule in case.must_not:
         if _violated(rule, ops, docs):
             out.violations.append((rule.category, rule.label()))
@@ -188,13 +214,28 @@ def score(case: Case, result: ExtractionResult) -> CaseResult:
     return out
 
 
+def _is_note(op: Op) -> bool:
+    """An operation that adds to a ``notes`` list."""
+    return op.kind == "add" and op.path.endswith("/notes/-")
+
+
+def _missing(out: CaseResult, label: str) -> bool:
+    return label in out.missing
+
+
 def _value_holds(val: Val, docs: list[tuple[str, str, dict[str, Any]]]) -> bool:
-    for kind, who, document in docs:
-        if not _record_matches(val.who, kind, who):
-            continue
+    """Whether the value holds in EVERY record the value is about."""
+    about = [
+        document for kind, who, document in docs if _record_matches(val.who, kind, who)
+    ]
+    if not about:
+        return False
+    for document in about:
         found, node = _walk(document, val.path)
         if val.contains is not None and isinstance(node, list):
-            return any(folded(val.contains) in folded(item) for item in node)
-        if _holds(found, node, val.value, val.contains):
-            return True
-    return False
+            ok = any(folded(val.contains) in folded(item) for item in node)
+        else:
+            ok = _holds(found, node, val.value, val.contains)
+        if not ok:
+            return False
+    return True

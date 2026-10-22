@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from evals.runner import SuiteResult, aggregate
+from trustcall_system_one.testing import scrub
 
 __all__ = ["suite_markdown", "sweep_markdown", "write_suite", "write_sweep"]
 
@@ -17,16 +18,18 @@ def _pct(value: float | None) -> str:
 def _row(label: str, agg: Mapping[str, Any]) -> str:
     return (
         f"| {label} | {agg['passed']}/{agg['cases']} | {_pct(agg['op_precision'])} "
-        f"| {_pct(agg['op_recall'])} | {_pct(agg['value_accuracy'])} "
+        f"| {_pct(agg['op_recall'])} | {_pct(agg['notes_recall'])} "
+        f"| {_pct(agg['value_accuracy'])} "
         f"| {agg['bleed']} | {agg['wrong_deletes']} | {_pct(agg['valid_rate'])} "
         f"| {agg['requests']} | {agg['input_tokens']} | {agg['wall_s']:.1f} |"
     )
 
 
 _HEADER = (
-    "| {first} | passed | op precision | op recall | value accuracy | bleed "
+    "| {first} | passed | op precision | op recall | notes recall "
+    "| value accuracy | bleed "
     "| wrong deletes | valid | requests | input tokens | wall s |\n"
-    "|---|---|---|---|---|---|---|---|---|---|---|"
+    "|---|---|---|---|---|---|---|---|---|---|---|---|"
 )
 
 
@@ -86,8 +89,8 @@ def write_suite(suite: SuiteResult, out: Path) -> tuple[Path, Path]:
         "cases": [r.as_dict() for r in suite.results],
     }
     js, md = out / "results.json", out / "summary.md"
-    js.write_text(json.dumps(payload, indent=2, default=str))
-    md.write_text(suite_markdown(suite))
+    js.write_text(scrub(json.dumps(payload, indent=2, default=str)))
+    md.write_text(scrub(suite_markdown(suite)))
     return js, md
 
 
@@ -127,6 +130,6 @@ def write_sweep(
         for values, suite in points
     ]
     js, md = out / "sweep.json", out / "sweep.md"
-    js.write_text(json.dumps(payload, indent=2, default=str))
-    md.write_text(sweep_markdown(params, points))
+    js.write_text(scrub(json.dumps(payload, indent=2, default=str)))
+    md.write_text(scrub(sweep_markdown(params, points)))
     return js, md

@@ -542,7 +542,10 @@ schema title: "Person").
      `conflict_update_delete` whatever `enable_updates` says, not a deletion. Propose-only runs
      the same near-duplicate check as an update before it counts a list element as proposed (a
      repeat of an element the record holds is not a change), and an answer the ladder refused
-     counts only when it differs from the record's value. An
+     counts only when it differs from the record's value. A NEW item counts as proposed whether or
+     not `enable_inserts` is on ("Emma got a new dog, Max" with Emma flagged is a conflict, not a
+     deletion): the flagged record's extraction runs with the nested inserts forced on, and what it
+     produces is only read, never kept. An
      identity-conflict refusal (a wrong match) is reported as such and holds the delete. Cost: every
      flagged and matched entity costs one extraction (Clairic per group plus the cross-check and
      the ladder; with updates on also the gate for its changes), and, if it holds collections, their
@@ -714,22 +717,40 @@ every field with `limits.list_strategy`:
 | --- | --- |
 | `"list"` | Clairic's `list` type only (the behaviour before M10a) |
 | `"sentences"` | Clairic is not asked about the field at all. The input is split into sentences in code; Clef is asked one `noul` per candidate sentence (call kind `sentences`, `CallMeta.field` the wire name): "Is this sentence one of the <field description>, about `entity.label`: "<sentence>"?", with criteria. A sentence at or above `verify.sentence_keep` (0.6) is an element, verbatim, with its span |
-| `"auto"` (default) | Clairic's list first (the request and the cross-check are the same as `"list"`). If its answer holds elements but its confidence is below `limits.list_auto_below` (0.5; a null or empty answer is the model saying there is nothing, not distrust), or the answer is missing, the field is read by sentences instead |
+| `"auto"` (default) | Clairic's list first (the request and the cross-check are the same as `"list"`). If its answer holds elements but its confidence is below `limits.list_auto_below` (0.5; a null or empty answer is the model saying there is nothing, not distrust), or the answer is missing, the existing low-confidence re-ask runs first (one isolated Clairic question over the input alone, kind `reask`). A re-ask that is trusted replaces the answer and the field stays a Clairic list. Otherwise Clef is asked once per schema and field and run (kind `list_kind`, memoised; entities that run at the same time share the one request) a `choice` between `items` ("short named values: names, languages, tags, ids") and `statements` ("free-form statements or facts"). `statements` → the field is read by sentences; `items` → the old low-confidence rejection stands, so a list of languages Clairic is merely unsure of is never turned into sentences. An unclear or missing classification is `items` |
+
+An explicit `s1_field(list_strategy="sentences")` (or `limits.list_strategy="sentences"`) skips Clairic and the classification altogether and starts together with the field's other requests; the `auto` fallback needs Clairic's answer first, so it cannot.
 
 Splitting (`split_sentences`, no dependency): a boundary is `.`, `!` or `?` (with closing quotes and
-brackets) followed by whitespace and a capital, digit, quote or bracket; not after an abbreviation or
-an initial ("Dr.", "Mrs.", "Inc.", "J.", "e.g.", "i.e.", "U.S.", "a.m."), not inside a number or an
-address ("3.5", "$1.5M", "example.com"), not before a lower-case word; a line break always splits, a
-leading bullet or speaker label ("Me: ") is not part of the sentence, and `;` splits clauses. A word
-that is also a common word ("no", "am", "sat") ends a sentence, except in front of a number ("No. 5",
-"Oct. 5"). Offsets are exact: `text[start:end] == sentence`.
+brackets) followed by whitespace and a capital, digit, quote or bracket, or a CJK `。！？`; not after
+an abbreviation ("Dr.", "Mrs.", "Inc.", "St.", "e.g.", "i.e.", "U.S."), not after an initial (a
+single capital before a capitalised word and after a capitalised word or another initial: "J. R. R.
+Tolkien" is one name, "So did I. We left." and "She got a B. Then" are two sentences), not inside a
+number or an address ("3.5", "$1.5M", "example.com"), not before a lower-case word; "a.m./p.m." end a
+sentence before a capital. A line break always splits, a leading bullet is dropped and `;` splits
+clauses. A word that is also a common word ("no", "am", "sat") ends a sentence, except in front of a
+number ("No. 5", "Oct. 5"). Offsets are exact: `text[start:end] == sentence`. Known limits: text
+written entirely in lower case has no capital to start a sentence and stays one; "Inc." or "St."
+followed by a capital keeps its sentence together.
+
+A transcript is text where at least two lines start with the same `Name:` label ("Me: ...",
+"Sarah: ..."). Only there is the label not part of the sentences; it is kept as `Sentence.speaker`
+and `label_span`, and still counts for scoping (Sarah's own lines are candidates for Sarah). A label
+that starts a single line ("Her email: a@b.co.", "Plan A: go home.") is ordinary text.
 
 Scoping: a `One` (no mentions) asks about every sentence. An entity of a `Many` is asked only about
-the sentences that mention it (a mention span overlapping the sentence, or a mention text as a whole
-word) and the next `limits.sentence_follow` sentences (4: conversational filler sits between a
-name and the facts, "have you heard from Michael Chen? Actually, yes. We had a video call last
-week. He's switched jobs..."). More than `limits.max_sentences` (200) candidates are cut with a
-warning. `Run.call_clef` batches the questions: at most 64 per request, concurrent.
+the sentences that mention it and the next `limits.sentence_follow` sentences (4: conversational
+filler sits between a name and the facts, "have you heard from Michael Chen? Actually, yes. We had a
+video call last week. He's switched jobs..."). A mention is found by its span when it has one (two
+people called Emma are told apart); mention texts are matched as whole words only for a mention
+without a span. The reach of a mention stops before a sentence that names another entity of the same
+collection (their mention spans travel with the entity: `Scope.siblings`, `Placement.others`,
+`Ctx.others`). More than `limits.max_sentences` (200) candidates are cut with a warning. The questions
+share the Clef window with the state: a request holds as many as fit in half of
+`limits.clef_state_token_budget` (at most 64, so up to four requests run concurrently for 200
+candidates), and the input is narrowed to windows around the candidates if the rest still does not
+fit. An element needs `verify.sentence_keep` and the field's `min_confidence`; one below either is
+dropped, the list is kept.
 
 The elements then take the usual path. The ladder runs on them (attribution per element; an element
 in the middle band is dropped, since Clairic's list type cannot re-read it; no low-confidence
@@ -737,10 +758,14 @@ re-ask; no input-only cross-check, the sentences come from the input alone and t
 `crosscheck_agree=True`); on an update `_diff` keeps only the elements the record lacks, a
 near-duplicate of an existing note goes to the `list_dedup` question and is rejected as `duplicate`
 when it is the same fact, and each remaining `add /notes/-` passes the change gate. Existing notes
-are never touched. `FieldAnswer.warnings` says how the field was read (`list_strategy:sentences`,
-`list_strategy:auto->sentences (the list answer had confidence ...)`, `sentences:k/n`) and
-`FieldAnswer.raw` lists every candidate with its probability. `list_strategy` on a field that is not
-a `list[str]` of free text is a compile-time `ValueError`.
+are never touched. Repair never sends such a field to Clairic's `list`: a list over its `max_length`
+keeps the sentences Clef was surest of, as many as the limit allows (minus the elements the record
+holds, on an update), in input order, and is validated again at no cost in requests; any other error
+ends the field (an insert's optional field goes back to its default, an update drops the operations
+that break validation). `FieldAnswer.warnings` says how the field was read (`list_strategy:sentences`,
+`list_strategy:auto->sentences (the list answer had confidence ...)`, `list_strategy:auto re-ask`,
+`sentences:k/n`) and `FieldAnswer.raw` lists every candidate with its probability. `list_strategy` on
+a field that is not a `list[str]` of free text is a compile-time `ValueError`.
 
 The change is not free: elements are whole sentences, not tidy paraphrases (Clairic is extractive
 and so is this), and an entity's notes depend on the scoping window. `python -m evals run --config
@@ -1051,18 +1076,24 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
   for every model that used input tokens.
 - Recording and replay (`testing.py`, public). `RecordingTransport(inner, path, append=True)` wraps
   any transport and appends one JSON line per call: `{key, model, kind, scope, schema, field,
-  request, response, status, duration_ms}` (a failed call has `response: null` and an `error`
-  object, and is re-raised). `key = request_key(model, payload)` is a hash (sha256, 24 hex digits)
+  request, response, status, duration_ms}`. A failed call is re-raised and, only with
+  `record_errors=True`, also written with `response: null` and an `error` object; the default is
+  not to, since a 429 recorded once would otherwise fail every later run of the cassette (the evals
+  and smoke recorders use the default). `key = request_key(model, payload)` is a hash (sha256, 24 hex digits)
   of the model id and the canonical JSON of the payload (sorted keys, no whitespace), so equal
   requests always share a key and any change to a request is a new one. The transport never sees
-  headers; as a second line of defence the values of `CLOUDFLARE_ACCOUNT_ID`,
-  `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_AUTH_TOKEN` and any `Bearer` token are replaced by
-  `<redacted>` in the line (test: `test_recording.py` sets all three and a hostile body that echoes
-  them, and greps the file). `CassetteTransport(path, *, strict=True, inner=None)` loads a file, a
+  headers; as a second line of defence `testing.scrub` replaces by `<redacted>` the values of
+  `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_AUTH_TOKEN`, the account id and
+  token given explicitly to the wrapped `CloudflareTransport` (`sensitive_values()`), any `Bearer`
+  token, and the id in an `accounts/<id>` URL path or a gateway `/v1/<id>/` path (an error message
+  quotes the request URL). The evals scrub the case errors and warnings and the reports they write
+  with the same function (tests: `test_recording.py` and `test_evals_harness.py` set the ids and
+  tokens in the environment and explicitly, with and without a gateway, and grep the files). `CassetteTransport(path, *, strict=True, inner=None)` loads a file, a
   directory of `*.jsonl` or a list of them and replays by key; duplicate keys replay in recorded
   order, and a key with no recording left raises `CassetteMissError` (an `AssertionError`) naming
   the call kind, the field, the schema and the key. `strict=False` with an `inner` sends only the
-  misses to `inner` (wrap it in a `RecordingTransport` to keep what comes back). `hits`,
+  misses to `inner` (wrap it in a `RecordingTransport` to keep what comes back), and skips a
+  recorded failure instead of replaying it. `hits`,
   `misses`, `forwarded`, `unused()` and `reset()` support tests and sweeps. `trace_to_cassette`
   converts a wire trace (`{url, http, request, response}`, bodies only) to a cassette: the model
   is the end of the URL, the REST envelope is removed, the kind is left empty (lookups use the key
@@ -1156,12 +1187,15 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
 - Evals (`evals/`, `make evals`, `uv run python -m evals ...`): a dataset of 24 small cases
   (`evals/cases.py`), each with the input, schemas, existing records, expected operations (`Op`:
   kind, path, value or a text it must contain, the record), expected final values (`Val`) and
-  `must_not` checks (`MustNot`: an operation, a final value, an insert, a delete), plus a
+  `must_not` checks (`MustNot`: an operation, a final value, an insert, a delete), optional
+  `allow_ops` (legitimate extras, such as a true extra note, count neither for nor against
+  precision) and `expect_rejected` (a rejection the result must report), plus a
   `FakeWorld` that answers it offline like an ideal model (with the odd injected fault: a fact
   offered for the wrong person, an open-ended list Clairic is unsure of). The runner scores each
   case: op precision and recall (one-to-one matching of produced and expected operations), field
   value accuracy, `must_not` violations by kind (bleed, wrong deletes, wrong inserts), valid-record
-  rate, requests, input tokens and wall time, and writes `results.json` and `summary.md`.
+  rate, notes recall (the expected notes, apart from the other operations), requests, input
+  tokens and wall time, and writes `results.json` and `summary.md`.
   `python -m evals run [--cases a,b] [--tag notes] [--config default|list|sentences|auto|
   no_verify|strict|lenient] [--set group.field=value] [--live] [--record DIR] [--replay DIR]
   [--out DIR]`; `python -m evals sweep --param group.field=v1,v2,... [--param ...]` runs the grid

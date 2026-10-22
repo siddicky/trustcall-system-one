@@ -16,9 +16,11 @@ __all__ = [
     "CaseResult",
     "MustNot",
     "Op",
+    "Rejected",
     "Val",
     "WorldLike",
     "normalise",
+    "values_equal",
 ]
 
 
@@ -58,6 +60,18 @@ def normalise(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [normalise(v) for v in value]
     return normalise(str(value))
+
+
+def values_equal(first: Any, second: Any) -> bool:
+    """Whether two values are the same after ``normalise``.
+
+    Two strings never meet as numbers ("02139" is not "2139").
+    """
+    if isinstance(first, str) and isinstance(second, str):
+        return " ".join(first.split()).casefold().rstrip(".;,") == " ".join(
+            second.split()
+        ).casefold().rstrip(".;,")
+    return bool(normalise(first) == normalise(second))
 
 
 def folded(text: Any) -> str:
@@ -102,7 +116,7 @@ class Op:
             return folded(self.contains) in folded(actual.value)
         if self.value is ANY:
             return True
-        return bool(normalise(self.value) == normalise(actual.value))
+        return values_equal(self.value, actual.value)
 
     def label(self) -> str:
         """A short description for reports."""
@@ -142,6 +156,21 @@ class Val:
     path: str
     value: Any = None
     contains: str | None = None
+
+
+@dataclass(frozen=True)
+class Rejected:
+    """Something the run must have thrown away, and say so (a ``RejectedOp``).
+
+    Attributes:
+        reason: The rejection's reason (``duplicate``, ``attribution``, ...).
+        path: Its JSON Pointer; ``None`` for any.
+        who: The record (see ``Op.who``); ``None`` for any.
+    """
+
+    reason: str
+    path: str | None = None
+    who: str | None = None
 
 
 @dataclass(frozen=True)
@@ -235,7 +264,12 @@ class Case:
             and the like). A configuration's overrides come on top.
         expect_ops: Operations the run must produce (recall) and nothing else
             (precision).
+        allow_ops: Operations that may also happen: a legitimate extra note
+            ("Emma took up rock climbing") neither fails the case nor lowers
+            precision. Anything else not in ``expect_ops`` still does.
         expect_values: Values the final records must hold.
+        expect_rejected: Rejections the result must report (a near-duplicate that
+            was recognised as such, not merely never proposed).
         must_not: Things that must not happen.
         tags: Groups for ``--tag`` (``notes``, ``bleed``, ``update``, ...).
         world: Builds the scripted ground truth that answers the case offline
@@ -250,7 +284,9 @@ class Case:
     existing: Any = None
     options: Mapping[str, Any] = field(default_factory=dict)
     expect_ops: Sequence[Op] = ()
+    allow_ops: Sequence[Op] = ()
     expect_values: Sequence[Val] = ()
+    expect_rejected: Sequence[Rejected] = ()
     must_not: Sequence[MustNot] = ()
     tags: Sequence[str] = ()
     world: Callable[[], WorldLike] | None = None
@@ -281,6 +317,13 @@ class CaseResult:
         missing: Expected operations and values that did not happen.
         extra: Produced operations that were not expected.
         forwarded: Requests that went to the live API during a replay.
+        n_notes: Expected notes: operations that add to a ``notes`` list and
+            values of a ``notes`` list.
+        notes_found: How many of those were produced.
+        allowed: Produced operations that were allowed extras (not counted in
+            precision).
+        n_rejections: Expected rejections.
+        rejections_found: How many were reported.
         probabilities: The attribution and change-gate probabilities behind the
             result, keyed ``"<record> <field> attribution"`` / ``"... gate"``
             (a list field has one attribution per element). These are the margins
@@ -307,6 +350,11 @@ class CaseResult:
     extra: list[str] = field(default_factory=list)
     forwarded: int = 0
     probabilities: dict[str, Any] = field(default_factory=dict)
+    n_notes: int = 0
+    notes_found: int = 0
+    allowed: int = 0
+    n_rejections: int = 0
+    rejections_found: int = 0
 
     @property
     def precision(self) -> float:
@@ -326,6 +374,7 @@ class CaseResult:
             and self.matched_expected == self.n_expected
             and self.matched_actual == self.n_actual
             and self.values_correct == self.n_values
+            and self.rejections_found == self.n_rejections
             and not self.violations
         )
 

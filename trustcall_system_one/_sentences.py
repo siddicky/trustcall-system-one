@@ -12,13 +12,21 @@ dedup-against-the-record check and the change gate.
 This module holds the pure parts (splitting, scoping) and the Clef pass.
 """
 
+import asyncio
 import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
+from trustcall_system_one._run import gather
 from trustcall_system_one._types import Span
-from trustcall_system_one._wire import NoulAnswer, NoulCriteria, NoulQuestion
+from trustcall_system_one._wire import (
+    ChoiceAnswer,
+    ChoiceQuestion,
+    NoulAnswer,
+    NoulCriteria,
+    NoulQuestion,
+)
 
 if TYPE_CHECKING:
     from trustcall_system_one._compile import FieldSpec
@@ -29,6 +37,7 @@ __all__ = [
     "Sentence",
     "candidate_sentences",
     "eligible",
+    "list_kind",
     "read_sentences",
     "split_sentences",
 ]
@@ -67,10 +76,15 @@ _OPENERS = "\"'([{\N{LEFT DOUBLE QUOTATION MARK}\N{LEFT SINGLE QUOTATION MARK}"
 _APOSTROPHES = "'\N{RIGHT SINGLE QUOTATION MARK}"
 _TERMINATOR = re.compile(rf"[.!?]+[{re.escape(_CLOSERS)}]*")
 _WORD = rf"[A-Za-z{_APOSTROPHES}-]"
-# "Me: ", "Friend: ", "Dr Wu: ", "Speaker 2: " (a short run of words, then a colon)
+# A speaker label at the start of a line: "Me: ", "Friend: ", "Dr Wu: ",
+# "Speaker 2: " (a short run of words, then a colon). It is only a label when the
+# same one starts at least two lines (see ``_speakers``).
 _LABEL = re.compile(
-    rf"^[A-Z]{_WORD}*(?: {_WORD}+){{0,2}}:[ \t]+(?=\S)"
-    rf"|^[A-Z]{_WORD}* \d{{1,2}}:[ \t]+(?=\S)"
+    rf"^(?P<label>[A-Z]{_WORD}*(?: {_WORD}+){{0,2}}|[A-Z]{_WORD}* \d{{1,2}}):"
+    r"[ \t]+(?=\S)"
+)
+_CJK_TERMINATOR = re.compile(
+    "[\N{IDEOGRAPHIC FULL STOP}\uff01\uff1f]+[\u300d\u300f\uff09]*"
 )
 _BULLET = re.compile(r"^(?:[-*]|\N{BULLET}|\(?\d{1,3}[.)])[ \t]+(?=\S)")
 _WORD_BEFORE = re.compile(r"([A-Za-z](?:[A-Za-z.]*[A-Za-z])?)$")
@@ -84,11 +98,17 @@ class Sentence:
         text: The sentence exactly as written (``text[start:end]`` of the input).
         start: Offset of its first character in the input.
         end: Offset after its last character.
+        speaker: In a transcript, the label of the line the sentence is on
+            ("Sarah" for "Sarah: I got promoted."); the label is not part of
+            ``text``.
+        label_span: Where that label is in the input.
     """
 
     text: str
     start: int
     end: int
+    speaker: str | None = None
+    label_span: Span | None = None
 
     @property
     def span(self) -> Span:
@@ -96,7 +116,23 @@ class Sentence:
         return (self.start, self.end)
 
 
-def _is_abbreviation(line: str, dot: int, number_follows: bool) -> bool:
+def _is_initial(line: str, start: int, rest: str) -> bool:
+    """Whether the single capital at ``start`` is an initial ("J. R. R. Tolkien").
+
+    It is one when a capitalised word follows and the word before it is a
+    capitalised word or another initial (or there is none: the start of the line).
+    "So did I. We left." and "She got a B. Then" are sentence ends.
+    """
+    if not rest[:1].isupper():
+        return False
+    before = line[:start].rstrip()
+    if not before:
+        return True
+    previous = before.split()[-1].lstrip("\"'([{" + _OPENERS)
+    return previous[:1].isupper()
+
+
+def _is_abbreviation(line: str, dot: int, rest: str) -> bool:
     """Whether the period at ``dot`` ends an abbreviation or an initial."""
     found = _WORD_BEFORE.search(line[:dot])
     if found is None:
@@ -106,11 +142,13 @@ def _is_abbreviation(line: str, dot: int, number_follows: bool) -> bool:
     if before >= 0 and line[before].isdigit():
         return False  # the M of "$1.5M": a unit, not an initial
     bare = word.replace(".", "").lower()
-    if len(bare) == 1 and word[0].isalpha():
-        return True  # an initial ("J. Smith") or the "e" of "e.g."
-    if bare in _ABBREVIATIONS or (number_follows and bare in _BEFORE_NUMBER):
+    if word.lower() in ("a.m", "p.m"):
+        return False  # "at 5 p.m. Then": the time ends the sentence
+    if len(bare) == 1 and "." not in word:
+        return word.isupper() and _is_initial(line, found.start(1), rest)
+    if bare in _ABBREVIATIONS or (rest[:1].isdigit() and bare in _BEFORE_NUMBER):
         return True
-    # "U.S", "a.m", "e.g": single letters separated by dots
+    # "U.S", "e.g": single letters separated by dots
     return "." in word and all(len(part) == 1 for part in word.split("."))
 
 
@@ -129,11 +167,15 @@ def _boundaries(line: str) -> list[int]:
         if not starts_sentence:
             continue  # "approx. five", "e.g. lowercase"
         if terminator.rstrip(_CLOSERS) == "." and _is_abbreviation(
-            line, match.start(), rest[0].isdigit()
+            line, match.start(), rest
         ):
             continue
         ends.append(end)
-    return ends
+    # CJK terminators need no space after them
+    for match in _CJK_TERMINATOR.finditer(line):
+        if line[match.end() :].strip():
+            ends.append(match.end())
+    return sorted(set(ends))
 
 
 def _clauses(line: str, offset: int) -> Iterable[tuple[str, int]]:
@@ -153,17 +195,40 @@ def _clauses(line: str, offset: int) -> Iterable[tuple[str, int]]:
             yield part, offset + start + index
 
 
+def _speakers(text: str) -> set[str]:
+    """The labels that start at least two lines: the speakers of a transcript."""
+    seen: dict[str, int] = {}
+    for line in re.finditer(r"[^\r\n]+", text):
+        body = _BULLET.sub("", line.group(), count=1)
+        found = _LABEL.match(body)
+        if found is not None:
+            label = found.group("label")
+            seen[label] = seen.get(label, 0) + 1
+    return {label for label, n in seen.items() if n >= 2}
+
+
 def split_sentences(text: str) -> list[Sentence]:
     """Split ``text`` into sentences and clauses, keeping offsets.
 
     A boundary is a ``.``, ``!`` or ``?`` (with any closing quote or bracket)
-    followed by whitespace and a capital letter, digit, quote or bracket. It is
-    not a boundary after an abbreviation or an initial ("Dr.", "Mrs.", "J.",
-    "e.g.", "i.e.", "U.S.", "a.m.", "Inc."), inside a number ("3.5") or a name
-    with dots ("example.com"), or before a lower-case word. A line break always
-    ends a sentence, a leading bullet or list number and a leading speaker label
-    ("Me: ", "Friend: ") are not part of the sentence, and ``;`` ends a clause.
+    followed by whitespace and a capital letter, digit, quote or bracket, or a
+    CJK full stop, exclamation or question mark. It is not a boundary after an
+    abbreviation ("Dr.", "Mrs.", "Inc.", "St.", "e.g.", "i.e.", "U.S."), after an
+    initial (a single capital in front of a capitalised word, after a capitalised
+    word or another initial: "J. R. R. Tolkien"), inside a number ("3.5") or an
+    address ("example.com"), or before a lower-case word. "a.m./p.m." end a
+    sentence in front of a capital. A line break always ends a sentence, a leading
+    bullet or list number is not part of the sentence, and ``;`` ends a clause.
     Pieces with no letter or digit are dropped.
+
+    A transcript is text where at least two lines start with the same label
+    ("Me: ...", "Sarah: ..."): there the label is not part of the sentence (it is
+    kept in ``Sentence.speaker`` and ``label_span``). A label that starts a single
+    line ("Her email: a@b.co", "Plan A: go home") is text like any other.
+
+    Known limits: text written entirely in lower case has no capital to start a
+    sentence and stays one sentence; and "Inc.", "St." and the like keep their
+    sentence together even when a capital follows ("We met on Main St. Then ...").
 
     Args:
         text: The input.
@@ -172,12 +237,19 @@ def split_sentences(text: str) -> list[Sentence]:
         The sentences in order. ``text[s.start:s.end] == s.text`` for each.
     """
     out: list[Sentence] = []
+    speakers = _speakers(text)
     for line in re.finditer(r"[^\r\n]+", text):
         body, origin = line.group(), line.start()
-        for pattern in (_BULLET, _LABEL):
-            found = pattern.match(body)
-            if found is not None:
-                body, origin = body[found.end() :], origin + found.end()
+        found = _BULLET.match(body)
+        if found is not None:
+            body, origin = body[found.end() :], origin + found.end()
+        speaker: str | None = None
+        label_span: Span | None = None
+        found = _LABEL.match(body)
+        if found is not None and found.group("label") in speakers:
+            speaker = found.group("label")
+            label_span = (origin, origin + len(speaker))
+            body, origin = body[found.end() :], origin + found.end()
         for piece, start in _clauses(body, origin):
             stripped = piece.strip()
             if not any(ch.isalnum() for ch in stripped):
@@ -185,7 +257,7 @@ def split_sentences(text: str) -> list[Sentence]:
             stripped = stripped.rstrip(";").rstrip()
             lead = len(piece) - len(piece.lstrip())
             at = start + lead
-            out.append(Sentence(stripped, at, at + len(stripped)))
+            out.append(Sentence(stripped, at, at + len(stripped), speaker, label_span))
     return out
 
 
@@ -194,14 +266,13 @@ def split_sentences(text: str) -> list[Sentence]:
 # --------------------------------------------------------------------------- #
 
 
-def _mentions(sentence: Sentence, spans: Sequence[Span], texts: Sequence[str]) -> bool:
-    if any(a < sentence.end and sentence.start < b for a, b in spans):
-        return True
-    low = sentence.text.casefold()
-    return any(
-        re.search(rf"(?<!\w){re.escape(t.casefold())}(?!\w)", low)
-        for t in texts
-        if t.strip()
+def _overlaps(spans: Sequence[Span], start: int, end: int) -> bool:
+    return any(a < end and start < b for a, b in spans)
+
+
+def _word_in(text: str, needle: str) -> bool:
+    return bool(
+        re.search(rf"(?<!\w){re.escape(needle.casefold())}(?!\w)", text.casefold())
     )
 
 
@@ -211,30 +282,65 @@ def candidate_sentences(
     spans: Sequence[Span] = (),
     texts: Sequence[str] = (),
     follow: int = 4,
+    others: Sequence[Span] = (),
 ) -> list[Sentence]:
     """The sentences worth asking about for one entity.
 
     Without mentions (a ``One``) every sentence is a candidate. For an entity
-    that is mentioned, a candidate is a sentence that mentions it (a mention span
-    that overlaps it, or one of the mention texts as a whole word) or one of the
-    next ``follow`` sentences after such a sentence ("Sarah is doing well. She
-    is teaching special education.").
+    that is mentioned, a candidate is a sentence that mentions it or one of the
+    next ``follow`` sentences after such a sentence ("Sarah is doing well. She is
+    teaching special education."). In a transcript the speaker's own lines count
+    as mentioning her (the label is not part of the sentence).
+
+    A mention is found by its span when it has one (``spans``); ``texts`` are the
+    mentions that have none, matched as whole words. That keeps two people called
+    "Emma" apart. The reach of a mention stops at a sentence that names another
+    entity of the same collection (``others``: their mention spans), so Emma
+    Thompson's sentences do not run on into Emma Watson's.
 
     Args:
         sentences: The input's sentences.
         spans: Where the input mentions the entity.
-        texts: How the input refers to the entity (matched when it has no span).
+        texts: Mentions of the entity that have no span.
         follow: How many sentences after a mention still count.
+        others: Where the input mentions the other entities of the collection
+            (those of the entity itself may be included: they are ignored).
 
     Returns:
         The candidates, in input order.
     """
     if not spans and not any(t.strip() for t in texts):
         return list(sentences)
+    foreign = [o for o in others if o not in set(spans)]
+
+    def mentions(s: Sentence) -> bool:
+        if _overlaps(spans, s.start, s.end):
+            return True
+        if s.label_span is not None and _overlaps(spans, *s.label_span):
+            return True
+        if s.speaker is not None and any(
+            t.strip() and s.speaker.casefold() == t.strip().casefold() for t in texts
+        ):
+            return True
+        return any(t.strip() and _word_in(s.text, t) for t in texts)
+
+    def names_another(s: Sentence) -> bool:
+        if _overlaps(foreign, s.start, s.end):
+            return True
+        return s.label_span is not None and _overlaps(foreign, *s.label_span)
+
     keep: set[int] = set()
     for index, sentence in enumerate(sentences):
-        if _mentions(sentence, spans, texts):
-            keep.update(range(index, min(len(sentences), index + follow + 1)))
+        if not mentions(sentence):
+            continue
+        keep.add(index)
+        for j in range(index + 1, min(len(sentences), index + follow + 1)):
+            if mentions(sentences[j]):
+                keep.add(j)
+            elif names_another(sentences[j]):
+                break
+            else:
+                keep.add(j)
     return [s for i, s in enumerate(sentences) if i in keep]
 
 
@@ -283,7 +389,9 @@ async def read_sentences(ctx: "Ctx", spec: "FieldSpec") -> "Resolved":
     Splits the input, keeps the sentences that concern the entity, asks Clef one
     ``noul`` question per candidate (call kind ``sentences``; more than 64 are
     split over several requests by the run) and keeps the sentences at or above
-    ``verify.sentence_keep``.
+    ``verify.sentence_keep`` (and the field's ``min_confidence``, per element).
+    The tokens of the questions count against the Clef state budget: the input is
+    narrowed to windows around the candidates by as much as they need.
 
     Args:
         ctx: The entity context (the input, the entity and its mentions).
@@ -294,16 +402,22 @@ async def read_sentences(ctx: "Ctx", spec: "FieldSpec") -> "Resolved":
         input, ``confidence`` the lowest probability among them. No kept sentence
         is a null answer. ``raw`` lists every candidate with its probability.
     """
+    from trustcall_system_one._render import estimate_tokens
     from trustcall_system_one._verify import Resolved
 
     limits, verify = ctx.run.limits, ctx.run.verify
     sentences = split_sentences(ctx.text)
     spans = ctx.mention_spans()
-    texts = list(ctx.mentions)
-    if ctx.info is not None:
-        texts = [m.text for m in ctx.info.mentions] or texts
+    texts = [m.text for m in ctx.info.mentions if m.span is None] if ctx.info else []
+    if ctx.info is None:
+        texts = list(ctx.mentions)
+    own = set(spans)
     candidates = candidate_sentences(
-        sentences, spans=spans, texts=texts, follow=limits.sentence_follow
+        sentences,
+        spans=spans,
+        texts=texts,
+        follow=limits.sentence_follow,
+        others=[o for o in ctx.others if o not in own],
     )
     notes = ["list_strategy:sentences"]
     if len(candidates) > limits.max_sentences:
@@ -320,18 +434,48 @@ async def read_sentences(ctx: "Ctx", spec: "FieldSpec") -> "Resolved":
     questions = {
         f"sentence.{i}": _question(s, described) for i, s in enumerate(candidates)
     }
-    answers = await ctx.run.call_clef(
-        questions,
-        ctx.entity_state(anchors=[s.span for s in candidates]),
-        meta=ctx.meta("sentences", field=spec.wire_name),
+    # The questions of a request share the model's window with the state. A
+    # request carries as many questions as fit in half the budget (at most 64), the
+    # state gets the rest and is narrowed to windows around the candidates if it
+    # needs to be.
+    budget = limits.clef_state_token_budget
+    ids = list(questions)
+    per_question = max(estimate_tokens({q: questions[q].model_dump()}) for q in ids)
+    size = max(1, min(64, int(budget / 2 / per_question)))
+    chunks = [ids[i : i + size] for i in range(0, len(ids), size)]
+    room = max(
+        1000,
+        int(
+            budget
+            - max(
+                estimate_tokens({q: questions[q].model_dump() for q in c})
+                for c in chunks
+            )
+        ),
     )
+    state = ctx.fitted(spans=[s.span for s in candidates], budget=room)
+    meta = ctx.meta("sentences", field=spec.wire_name)
+    parts = await gather(
+        *(
+            ctx.run.call_clef({q: questions[q] for q in chunk}, state, meta=meta)
+            for chunk in chunks
+        )
+    )
+    answers: dict[str, Any] = {}
+    for part in parts:
+        answers.update(part)
+    floor = spec.min_confidence or 0.0
     scored: list[tuple[Sentence, float | None]] = []
     for index, sentence in enumerate(candidates):
         answer = answers.get(f"sentence.{index}")
         scored.append(
             (sentence, answer.noul if isinstance(answer, NoulAnswer) else None)
         )
-    kept = [(s, p) for s, p in scored if p is not None and p >= verify.sentence_keep]
+    kept = [
+        (s, p)
+        for s, p in scored
+        if p is not None and p >= verify.sentence_keep and p >= floor
+    ]
     raw = [{"sentence": s.text, "p": p} for s, p in scored]
     notes.append(f"sentences:{len(kept)}/{len(scored)}")
     if not kept:
@@ -343,3 +487,54 @@ async def read_sentences(ctx: "Ctx", spec: "FieldSpec") -> "Resolved":
         confidence=min(p for _, p in kept),
         notes=tuple(notes),
     )
+
+
+async def _ask_kind(ctx: "Ctx", spec: "FieldSpec") -> str:
+    description = " ".join(spec.description.split()) or spec.pretty
+    question = ChoiceQuestion(
+        type="choice",
+        instructions=(
+            f"Are the items of `field.name` ({description}) short named values "
+            "(names, languages, tags, ids) or free-form statements and facts?"
+        ),
+        criteria={
+            "items": "Short named values: names, languages, tags, ids, places.",
+            "statements": "Free-form statements or facts, written as clauses or "
+            "whole sentences.",
+        },
+    )
+    state = {"field": {"name": spec.pretty, "description": description}}
+    answers = await ctx.run.call_clef(
+        {"kind": question}, state, meta=ctx.meta("list_kind", field=spec.wire_name)
+    )
+    answer = answers.get("kind")
+    if (
+        isinstance(answer, ChoiceAnswer)
+        and answer.choice == "statements"
+        and answer.probabilities.get("statements", 0.0) >= ctx.run.gates.min_choice_prob
+    ):
+        return "statements"
+    return "items"
+
+
+async def list_kind(ctx: "Ctx", spec: "FieldSpec") -> str:
+    """Whether a ``list[str]`` field holds short named values or free-form statements.
+
+    One Clef ``choice`` (call kind ``list_kind``), asked once per schema and field
+    in a run however many entities have the field: the answer is kept on the run
+    (concurrent askers share one request). Only statements are worth reading by
+    sentences; a list of names or languages that Clairic is unsure of is not turned
+    into sentences. An unclear or missing answer is ``"items"``.
+
+    Args:
+        ctx: The entity context.
+        spec: A list-of-text field.
+
+    Returns:
+        ``"items"`` or ``"statements"``.
+    """
+    key = (ctx.plan.name, spec.wire_name)
+    pending = ctx.run.list_kinds.get(key)
+    if pending is None:
+        pending = ctx.run.list_kinds[key] = asyncio.ensure_future(_ask_kind(ctx, spec))
+    return await asyncio.shield(pending)

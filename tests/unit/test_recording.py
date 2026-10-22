@@ -13,6 +13,7 @@ from trustcall_system_one import (
     BadRequestError,
     CallMeta,
     CloudflareTransport,
+    TransportError,
     TransportResponse,
 )
 from trustcall_system_one.testing import (
@@ -26,6 +27,7 @@ from trustcall_system_one.testing import (
     noul,
     request_key,
     route,
+    scrub,
     trace_to_cassette,
 )
 
@@ -145,7 +147,7 @@ async def test_a_failed_call_is_written_and_raised(tmp_path: Path) -> None:
 
     path = tmp_path / "c.jsonl"
     with pytest.raises(BadRequestError):
-        await RecordingTransport(Failing(), path).run(
+        await RecordingTransport(Failing(), path, record_errors=True).run(
             CLAIRIC, clairic_payload(), meta=META
         )
     (line,) = lines(path)
@@ -415,3 +417,110 @@ async def test_a_fork_replays_the_same_recordings_from_the_start(
     open_fork = first.fork(strict=False, inner=inner)
     await open_fork.run(CLAIRIC, clairic_payload(name="x"), meta=META)
     assert open_fork.forwarded == 1 and len(inner.calls) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Recorded failures, and what the files may contain
+# --------------------------------------------------------------------------- #
+
+
+class Flaky:
+    """Fails the first call with a 429, answers the others."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def run(
+        self, model: str, payload: Any, *, meta: CallMeta, timeout: Any = None
+    ) -> TransportResponse:
+        from trustcall_system_one import RateLimitError
+
+        self.calls += 1
+        if self.calls == 1:
+            raise RateLimitError("429 too many requests")
+        return TransportResponse(
+            body=clef_response({"q": noul(0.9)}, model="clef"), status_code=200
+        )
+
+
+async def test_failures_are_not_recorded_unless_asked(tmp_path: Path) -> None:
+    from trustcall_system_one import RateLimitError
+
+    path = tmp_path / "c.jsonl"
+    with pytest.raises(RateLimitError):
+        await RecordingTransport(Flaky(), path).run(CLEF, clef_payload(), meta=GATE)
+    assert not path.exists() or path.read_text() == ""
+
+
+async def test_a_recorded_failure_is_skipped_when_there_is_a_live_fallback(
+    tmp_path: Path,
+) -> None:
+    from trustcall_system_one import RateLimitError
+
+    path = tmp_path / "c.jsonl"
+    live = Flaky()
+    with pytest.raises(RateLimitError):
+        await RecordingTransport(live, path, record_errors=True).run(
+            CLEF, clef_payload(), meta=GATE
+        )
+    assert len(lines(path)) == 1 and lines(path)[0]["error"]
+    # without a fallback the recorded failure is what the cassette says
+    with pytest.raises(RateLimitError):
+        await CassetteTransport(path).run(CLEF, clef_payload(), meta=GATE)
+    # with one, it is a transient accident: the request goes out, and is recorded
+    cassette = CassetteTransport(
+        path, strict=False, inner=RecordingTransport(live, path)
+    )
+    result = await cassette.run(CLEF, clef_payload(), meta=GATE)
+    assert result.status_code == 200
+    assert (cassette.hits, cassette.forwarded, live.calls) == (0, 1, 2)
+    # the next run replays the success, not the failure
+    again = CassetteTransport(path, strict=False, inner=RecordingTransport(live, path))
+    assert (await again.run(CLEF, clef_payload(), meta=GATE)).status_code == 200
+    assert (again.hits, again.forwarded) == (1, 0)
+
+
+ACCOUNT = "0123456789abcdef0123456789abcdef"
+TOKEN = "secret-token-123456"
+
+
+def refusing_cloudflare(gateway: str | None) -> CloudflareTransport:
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    return CloudflareTransport(
+        account_id=ACCOUNT,
+        api_token=TOKEN,
+        gateway=gateway,
+        client=httpx.AsyncClient(transport=httpx.MockTransport(refuse)),
+        max_retries=0,
+    )
+
+
+@pytest.mark.parametrize("gateway", [None, "my-gw"])
+async def test_an_explicit_account_id_never_reaches_a_cassette(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gateway: str | None
+) -> None:
+    for name in SECRETS:
+        monkeypatch.delenv(name, raising=False)  # nothing in the environment
+    path = tmp_path / "c.jsonl"
+    with pytest.raises(TransportError):
+        await RecordingTransport(
+            refusing_cloudflare(gateway), path, record_errors=True
+        ).run(CLEF, clef_payload(), meta=GATE)
+    text = path.read_text()
+    assert "Request to https://" in text  # the error message is there ...
+    assert ACCOUNT not in text and TOKEN not in text  # ... without the ids
+    assert "<redacted>" in text
+
+
+def test_scrub_removes_urls_ids_and_tokens() -> None:
+    text = (
+        "https://api.cloudflare.com/client/v4/accounts/abc123/ai/run/@cf/x "
+        "https://gateway.ai.cloudflare.com/v1/abc123/gw/workers-ai/@cf/x "
+        "Authorization: Bearer abcdefghijklmnop and extra-secret"
+    )
+    out = scrub(text, extra=["extra-secret"])
+    assert "abc123" not in out and "abcdefghijklmnop" not in out
+    assert "extra-secret" not in out
+    assert "/ai/run/@cf/x" in out and "/gw/workers-ai/" in out  # the rest is kept

@@ -175,6 +175,8 @@ class Run:
         usage: Token and request totals so far.
         calls: One record per transport call, failed calls included.
         warnings: Notes about anything that was degraded, without duplicates.
+        list_kinds: What kind of items a ``list[str]`` field holds (``"items"`` or
+            ``"statements"``), asked of Clef once per schema and field in this run.
     """
 
     transport: Transport
@@ -198,6 +200,9 @@ class Run:
     usage: Usage = field(default_factory=Usage)
     calls: list[CallRecord] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    list_kinds: "dict[tuple[str, str], asyncio.Future[str]]" = field(
+        default_factory=dict
+    )
 
     def warn(self, message: str) -> None:
         """Record a warning once."""
