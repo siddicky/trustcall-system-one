@@ -1467,7 +1467,7 @@ wheels = [
 
 [[package]]
 name = "trustcall-system-one"
-version = "0.1.0a0"
+version = "0.1.0a1"
 source = { editable = "." }
 dependencies = [
     { name = "annotated-types" },

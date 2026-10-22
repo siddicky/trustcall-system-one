@@ -9,7 +9,7 @@ echoes them).
 ## 0. Set-up
 
 ```bash
-cd /home/user/trustcall-system-one
+cd trustcall-system-one                # your checkout of the repository
 export CLOUDFLARE_ACCOUNT_ID=...      # from the environment only
 export CLOUDFLARE_API_TOKEN=...       # (CLOUDFLARE_AUTH_TOKEN also works)
 git rev-parse --short HEAD            # the commit under test: put it in the report

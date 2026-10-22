@@ -2,7 +2,7 @@
 
 ## Context
 
-`trustcall` (reference impl at `/home/user/trustcall`) solves two problems with tool-calling
+`trustcall` (reference impl at https://github.com/langchain-ai/trustcall) solves two problems with tool-calling
 LLMs: they fail at populating large nested schemas, and they clobber existing data when asked
 to update it. Its fix is to make the LLM emit **RFC-6902 JSON Patch** tool calls
 (`PatchDoc`, `PatchFunctionErrors`) instead of whole documents, validate every call against
@@ -186,7 +186,7 @@ class Extractor:  # frozen; per-invoke state lives in _Run
 - **`existing`:** trustcall's five shapes (`{name: rec}`, `list[SchemaInstance]`,
   `(id, name, rec)`, `(id, BaseModel)`, bare `list[BaseModel]` with minted ids), `"__any__"`,
   and `existing_schema_policy` True/False/"ignore" — behavioural spec is
-  `_validate_existing` in `/home/user/trustcall/trustcall/_base.py:850-990`.
+  `_validate_existing` in trustcall's `trustcall/_base.py` (https://github.com/langchain-ai/trustcall).
 - **Matching:** `match=MatchConfig(accept, min_confidence, render_fields, collision, on_ambiguous,
   delete_threshold)` configures how a `Many` schema's entities are matched to its existing records
   (see "Collection engine", steps 8-9); `on_ambiguous="raise"` raises `AmbiguousMatchError`
@@ -1191,47 +1191,29 @@ README scenario (Many(Person), 3 existing, 4 people + Sunny, ~9 mentions): ~39 r
 
 ## Delivery
 
-### Execution model: Sonnet and Haiku subagents only
+### Packaging, CI and release
 
-All execution — file edits, `uv`/`make` commands, tests, commits, pushes, PR creation — is done
-by subagents launched with `Agent(subagent_type="general-purpose", model=...)`. The main
-session only orchestrates and reviews (read-only). The model is chosen per task: **Haiku**
-for mechanical work with no design judgement, **Sonnet** wherever the code carries the
-library's logic.
-
-| task | model | why |
-| --- | --- | --- |
-| M0 skeleton: pyproject, Makefile, package dirs, `_errors`, `_types` stubs, `docs/DESIGN.md` copy, `AGENTS.md` | Haiku | boilerplate fully specified by this plan |
-| M1 transport + exact wire models + `FakeTransport` | Sonnet | retry/limiter/envelope logic, strict schema fidelity |
-| M2 compiler, names, flatten, coerce | Sonnet | the type mapping is the core of the library |
-| M3 `One` insert pipeline + verification ladder + sync bridge | Sonnet | orchestration and thresholds |
-| M4 nested sub-models / field groups | Sonnet | compiler and unflatten interplay |
-| M5 update path: diff, change gate, cross-check, apply | Sonnet | correctness-critical patch generation |
-| M6 repair loop | Sonnet | error-to-field mapping and spec adaptation |
-| M7 collection engine discovery + coreference + `FakeWorld` | Sonnet | clustering and multi-entity logic |
-| M8 matching, assignment, deletes, flags | Sonnet | Hungarian assignment and the README scenario |
-| M9 nested collections through the engine | Sonnet | scope handling |
-| M10a cassette/recording transports, live smoke + evals harness | Sonnet | test infrastructure with behaviour to get right |
-| M10b README, CI workflow, Makefile polish | Haiku | prose and config from this plan's outline |
-| Push branch + open draft PR | Haiku | mechanical |
-| CI fixes on the PR | Haiku for lint/format/lockfile/config failures; Sonnet for failing tests or type errors in logic | match the fix to its difficulty |
-
-1. **One subagent per milestone, run sequentially** (each milestone builds on the previous
-   one's code). M0's subagent copies this plan into the repo as `docs/DESIGN.md`, so every later
-   brief points at that file plus the milestone's section rather than restating it.
-2. **Each brief states:** the milestone's scope and exit criteria from the table below; the
-   modules and tests to write; the reference code in `/home/user/trustcall` to reimplement by
-   behaviour, never copy; the exact Clairic/Clef schemas in `_wire.py`; and that the subagent
-   must run `make lint` and `make test`, include their real output in its report, and commit
-   only when both pass, with the session's commit attribution lines.
-3. **Review between milestones (main session, read-only):** read the subagent's diff
-   (`git diff`/`git show` via read-only commands) against this plan, look for silently
-   narrowed scope, copied MIT code, and tests that assert nothing. Check the reported lint and
-   test output. If something is wrong, send the findings back to the same subagent with
-   `SendMessage` for a fix before starting the next milestone.
-4. **Push and PR:** after M10, a Haiku subagent pushes the branch and opens the draft PR;
-   CI fixes go to Haiku or Sonnet per the table above. If a Haiku subagent's work fails
-   review or its fix doesn't hold, the task is re-run on Sonnet.
+- `pyproject.toml`: hatchling build. Runtime dependencies `pydantic>=2.7,<3`, `httpx>=0.27,<1`,
+  `jsonpatch>=1.33,<2`, `jsonpointer>=2.4`, `typing-extensions>=4.9`, `annotated-types>=0.4`;
+  optional extra `jsonschema` (`dydantic`). Dev group: pytest, pytest-asyncio, pytest-socket,
+  pytest-xdist, pytest-cov, hypothesis, ruff, mypy (strict, pydantic plugin). Ruff enforces
+  Google-style docstrings.
+- `uv` only, with `uv.lock` committed; `make lint` fails if the lock is stale.
+- The wheel ships `trustcall_system_one/` (with `py.typed`) and nothing else. The sdist also
+  carries `tests/`, `examples/`, `evals/` and `docs/`.
+- `Makefile`: `help`, `install`, `test`, `cov`, `smoke`, `record`, `evals`, `lint`, `format`,
+  `build`, `clean`.
+- CI (`.github/workflows/ci.yml`): on every push and pull request, `make lint` (on Python 3.13)
+  and `make test` on Python 3.10, 3.11, 3.12 and 3.13. The live smoke test (`make smoke`) runs
+  only from a manual dispatch, with `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` taken from
+  repository secrets. Jobs are capped at 20 minutes and the token is read-only.
+- Release (`.github/workflows/release.yml`): a tag `v*` builds the sdist and wheel, fails unless
+  the tag (without the `v`) equals the `pyproject.toml` version, and publishes to PyPI with
+  trusted publishing (environment `pypi`, `id-token: write`, no stored API token). The one-time
+  pending publisher on pypi.org is: owner `siddicky`, repository `trustcall-system-one`, workflow
+  `release.yml`, environment `pypi`.
+- The first PyPI release is `0.1.0a1` (alpha). Install it with `pip install --pre
+  trustcall-system-one` or `uv add --prerelease=allow trustcall-system-one`.
 
 ### Design decisions settled from the examples review
 
@@ -1264,16 +1246,9 @@ library's logic.
   `repair.max_attempts` is a termination guard, not a cost cap; `ExtractionResult.attempts` counts
   the extraction round too.
 
-### Branch, packaging, tooling
+### Milestones
 
-- Branch `feat/system-one-extractor` off `main` in `/home/user/trustcall-system-one`; one
-  commit per milestone, each leaving `make lint test` green; push and open a draft PR.
-- `pyproject.toml`: hatchling; deps `pydantic>=2.7,<3`, `httpx>=0.27,<1`,
-  `jsonpatch>=1.33,<2`, `jsonpointer>=2.4`, `typing-extensions>=4.9`; optional
-  `jsonschema = ["dydantic"]`; dev group pytest, pytest-asyncio, pytest-socket, pytest-xdist,
-  pytest-cov, hypothesis, ruff, mypy (strict, pydantic plugin); ruff google docstrings.
-  `uv` only, committed `uv.lock`. `Makefile`: install/test/cov/smoke/record/evals/lint/
-  format/build. CI: lint + test on 3.10–3.13; live jobs manual only. Add `AGENTS.md`.
+Each milestone landed as one commit that left `make lint` and `make test` green.
 
 | # | milestone |
 | --- | --- |
@@ -1290,10 +1265,39 @@ library's logic.
 | M10a | cassette/recording transports, live smoke, evals harness |
 | M10b | README, CI workflow, Makefile polish |
 
-README: pitch (patch, don't regenerate; verify, don't generate), install/env, `One` insert,
-the multi-entity scenario printing ids/kinds/patches/spans/skipped/untouched, "unmentioned
-fields never clobbered", type table, cardinality rules, verification knobs, request profile,
-`existing` shapes, testing with `FakeWorld`, limitations vs trustcall, credits.
+### README
+
+The README opens with a **without vs with** comparison: the raw Clairic/Clef calls a developer
+would make by hand (curl and httpx, with real response bodies from the live traces) and
+everything they would still have to build, next to the same task done with
+`create_extractor` (real live output). Then: pitch (patch, don't regenerate; verify, don't
+generate), quickstart and install/env, `One` insert, the multi-entity scenario printing
+ids/kinds/patches/spans/skipped/untouched, "unmentioned fields never clobbered", type table,
+cardinality rules, verification knobs, request profile, `existing` shapes, testing with
+`FakeWorld`, examples, limitations vs trustcall, credits (trustcall, MIT, by LangChain:
+https://github.com/langchain-ai/trustcall).
+
+### Curated examples
+
+Each example is a runnable story on realistic text. It runs live when `CLOUDFLARE_ACCOUNT_ID`
+and `CLOUDFLARE_API_TOKEN` are set; otherwise it runs with `--offline` against a scripted
+transport and prints a clear "offline demo, scripted answers" banner.
+`tests/unit/test_examples.py` runs every example offline and asserts its key outputs. An
+example whose feature belonged to an unbuilt milestone was marked
+`xfail(strict=True, reason="needs Mn")`, so the milestone that built the feature had to turn it
+green. The examples were the acceptance tests for M5 to M9.
+
+| example | shows | needs |
+| --- | --- | --- |
+| `00_raw_vs_library.py` | the raw httpx call and a naive merge of its values, then the library, on the CRM note | M3 |
+| `01_invoice.py` | typed flat extraction: dates, Decimal, Clef-typed Literal/bool, spans highlighted in the source, confidence, verification notes, maths done in code via `computed_field` | M3 |
+| `02_support_ticket.py` | nested sub-models, an optional sub-model the text never mentions, a discriminated union of issue types, an ordered score enum | M4 |
+| `03_update_contact.py` | updating a CRM record from a short note: only the mentioned fields change, the patch list is the audit trail, the rejected ops say why each other field was left alone | M5 |
+| `04_repair.py` | a constrained schema whose first answer fails validation and is fixed by a narrow re-ask | M6 |
+| `05_people_memory.py` | trustcall's Emma/Michael/Sarah/Olivia scenario: `Many(Person)`, coreference, updates plus inserts, Sunny filtered out, untouched records, notes appended with `/-` | M7–M8 |
+| `06_attribution_guard.py` | two people in one passage; a value that belongs to one is rejected on the other | M7 |
+| `07_order_line_items.py` | nested `list[LineItem]`: add an item and change a quantity through the collection engine | M9 |
+| `08_testing_your_extractor.py` | unit-testing your own extractor with `FakeTransport`/`FakeWorld` | M7 |
 
 ## Risks
 

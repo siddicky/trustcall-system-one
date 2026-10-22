@@ -1,0 +1,80 @@
+# Release to PyPI with trusted publishing: GitHub Actions mints a short-lived
+# OIDC token, so no PyPI API token is stored anywhere.
+#
+# One-time setup on pypi.org, before the first tag is pushed: open the
+# trustcall-system-one project (or create it as a pending publisher), go to
+# "Publishing", and add a GitHub publisher with:
+#   owner:        siddicky
+#   repository:   trustcall-system-one
+#   workflow:     release.yml
+#   environment:  pypi
+# The GitHub repository also needs an environment named "pypi"
+# (Settings > Environments).
+#
+# To release: set `version` in pyproject.toml, merge it to main, then push a tag
+# `v<version>` on that commit (for example `v0.1.0a1`). The build job fails if the
+# tag and the pyproject version differ.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Check the tag matches pyproject.toml
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          expected="${TAG#v}"
+          actual="$(uv run --no-project --python 3.13 python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          echo "tag version: ${expected}, pyproject version: ${actual}"
+          if [ "${expected}" != "${actual}" ]; then
+            echo "::error::tag ${TAG} does not match pyproject.toml version ${actual}"
+            exit 1
+          fi
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: pypi
+      url: https://pypi.org/project/trustcall-system-one/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Publish to PyPI
+        run: uv publish --trusted-publishing always

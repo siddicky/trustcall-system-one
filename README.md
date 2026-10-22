@@ -1,5 +1,8 @@
 # trustcall-system-one
 
+[![CI](https://github.com/siddicky/trustcall-system-one/actions/workflows/ci.yml/badge.svg)](https://github.com/siddicky/trustcall-system-one/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/trustcall-system-one.svg)](https://pypi.org/project/trustcall-system-one/)
+
 Extract typed data from text, and update the records you already have, on Cloudflare's
 **System One** models. Patch, don't regenerate. Verify, don't generate.
 
@@ -10,8 +13,8 @@ This library turns those probabilities into validated pydantic objects, and turn
 "what does this note say?" into RFC 6902 JSON Patch operations that are **computed in
 code and checked one by one**, so a field the text never mentions is never touched.
 
-It is a reimplementation of the ideas of [trustcall](https://github.com/hinthornw/trustcall)
-(see [Credits](#credits)) with no LangChain or LangGraph. Status: alpha (`0.1.0a0`),
+It is a reimplementation of the ideas of [trustcall](https://github.com/langchain-ai/trustcall)
+(see [Credits](#credits)) with no LangChain or LangGraph. Status: alpha (`0.1.0a1`),
 the API may still move.
 
 On this page: [quickstart](#quickstart) · [raw calls vs the library](#without-the-library-vs-with-the-library) ·
@@ -24,7 +27,10 @@ On this page: [quickstart](#quickstart) · [raw calls vs the library](#without-t
 ## Quickstart
 
 ```bash
+# Until 0.1.0a1 is on PyPI, install from the branch:
 uv add "git+https://github.com/siddicky/trustcall-system-one@feat/system-one-extractor"
+# Once 0.1.0a1 is on PyPI, use this instead:
+# uv add --prerelease=allow trustcall-system-one
 export CLOUDFLARE_ACCOUNT_ID=...   # your Cloudflare account id
 export CLOUDFLARE_API_TOKEN=...    # a token with Workers AI access
 ```
@@ -613,8 +619,16 @@ The library gives Clef the note, the record and the proposed change, and asks on
 
 ## Install
 
-Python 3.10 or newer. The package is a pre-release; install it from the repository with
-[uv](https://docs.astral.sh/uv/):
+Python 3.10 or newer. The package is a pre-release (alpha). Once `0.1.0a1` is on PyPI, install
+it with pip or uv (a pre-release needs the `--pre` or `--prerelease=allow` flag):
+
+```bash
+pip install --pre trustcall-system-one
+# or, with uv:
+uv add --prerelease=allow trustcall-system-one
+```
+
+Until 0.1.0a1 is on PyPI, install from the repository with [uv](https://docs.astral.sh/uv/):
 
 ```bash
 uv add "git+https://github.com/siddicky/trustcall-system-one@feat/system-one-extractor"
@@ -638,7 +652,8 @@ export CLOUDFLARE_API_TOKEN=...    # a token with Workers AI access
 read on the first request, so building an extractor needs none (tests build them with
 `FakeTransport`). To go through AI Gateway pass `CloudflareTransport(gateway="<id>")`.
 
-For development: `make install`, `make format`, `make lint`, `make test`.
+For development: `make install`, `make format`, `make lint`, `make test` (`make help` lists every
+target). See [`CONTRIBUTING.md`](CONTRIBUTING.md) for releases.
 
 ## Extract one record
 
@@ -1077,8 +1092,9 @@ the Clairic and Clef request and response schemas it implements are in [`docs/sc
 
 The idea (let the model emit RFC 6902 JSON Patch instead of regenerating records, validate
 every result, narrow the repair) and the `existing` conventions come from
-[trustcall](https://github.com/hinthornw/trustcall) by hinthornw, which is MIT-licensed. This
-is a clean reimplementation of its behaviour on different models, not a port of its code.
+[trustcall](https://github.com/langchain-ai/trustcall) by [LangChain](https://www.langchain.com/),
+which is MIT-licensed. This is a clean reimplementation of its behaviour on different models, not
+a port of its code.
 Clairic and Clef are Cloudflare's System One models.
 
 This repository is released into the public domain under the Unlicense; see [`LICENSE`](LICENSE).
