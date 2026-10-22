@@ -186,6 +186,43 @@ def test_numbers_agree_by_value() -> None:
     assert merge_field([part(3), part(4, 1000)]).conflict
 
 
+def test_dates_codes_and_digit_heavy_text_compare_exactly() -> None:
+    assert not agree("2020-01-01", "2020-01-02")
+    assert not agree("978-3-16-148410-0", "978-3-16-148410-1")
+    assert not agree("Apt 12B", "Apt 12C")
+    assert agree("978-3-16-148410-0", " 978-3-16-148410-0 ")
+    assert agree("Ada Lovelace", "Ada Lovelaces")  # free text keeps the ratio
+    assert not agree("Ada Lovelace", "Ada Lovelaces", fuzzy=False)
+    assert agree(["Ada Lovelace"], ["ada lovelace"], fuzzy=False)
+    assert not agree(["2020-01-01"], ["2020-01-02"])
+
+
+def test_chunk_dates_that_differ_are_a_conflict() -> None:
+    def dated(value: str, start: int, confidence: float) -> Part:
+        raw = ClairicAnswer(type="date", value=value, confidence=confidence)
+        return part_of(raw, identity_state("x" * 10_000), start)
+
+    merged = merge_field([dated("2020-01-01", 0, 0.9), dated("2020-01-02", 900, 0.8)])
+    assert merged.conflict
+    assert [c.answer.value for c in merged.candidates] == ["2020-01-01", "2020-01-02"]
+    same = merge_field([dated("2020-01-01", 0, 0.9), dated("2020-01-01", 900, 0.8)])
+    assert not same.conflict
+
+
+def test_chunk_text_candidates_that_differ_by_a_digit_are_a_conflict() -> None:
+    merged = merge_field(
+        [
+            part("ISBN 978-3-16-148410-0", confidence=0.9),
+            part("ISBN 978-3-16-148410-1", 900, confidence=0.8),
+        ]
+    )
+    assert merged.conflict
+    # near-identical free text is still one value
+    assert not merge_field(
+        [part("Ada Lovelace", confidence=0.9), part("Ada Lovelaces", 900)]
+    ).conflict
+
+
 def test_a_single_candidate_and_null_chunks_never_conflict() -> None:
     merged = merge_field([part(None, p_null=0.9), part("x", 10, confidence=0.5)])
     assert not merged.conflict and merged.candidates == merged.candidates[:1]
@@ -250,7 +287,7 @@ def test_a_contained_span_loses_to_the_container() -> None:
     assert merged is not None and merged.value == ["Ada Lovelace"]
 
 
-def test_one_long_span_replaces_every_shorter_one_it_overlaps() -> None:
+def test_a_span_bridging_two_elements_replaces_neither() -> None:
     merged = merge_parts(
         [
             part(["Ada", "Lovelace"], 0, spans=[[100, 103], [104, 112]]),
@@ -258,7 +295,19 @@ def test_one_long_span_replaces_every_shorter_one_it_overlaps() -> None:
         ]
     )
     assert merged is not None
-    assert merged.value == ["Ada Lovelace"] and merged.spans == [[100, 112]]
+    assert merged.value == ["Ada", "Lovelace"]
+    assert merged.spans == [[100, 103], [104, 112]]
+
+
+def test_a_partly_overlapping_span_does_not_replace_the_kept_one() -> None:
+    merged = merge_parts(
+        [
+            part(["Ada Love"], 0, spans=[[100, 108]]),
+            part(["Lovelace is"], 90, spans=[[104, 115]]),
+        ]
+    )
+    assert merged is not None
+    assert merged.value == ["Ada Love"]  # no containment: the first reading stays
 
 
 def test_equal_spans_prefer_the_more_confident_chunk() -> None:

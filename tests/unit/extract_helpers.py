@@ -130,10 +130,13 @@ class Script:
     # ---- handlers ------------------------------------------------------ #
 
     def _presence(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
-        if meta.field:  # the presence question of an optional sub-model
+        if "presence" not in payload["questions"]:
+            # the presence questions of optional sub-models, one id per group
             return clef_response(
                 {
-                    qid: noul(self.group_presence.get(meta.field, 0.95))
+                    qid: noul(
+                        self.group_presence.get(qid.removesuffix(".__presence"), 0.95)
+                    )
                     for qid in payload["questions"]
                 }
             )
@@ -202,7 +205,12 @@ class Script:
 
     def _adjudicate(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
         assert meta.field is not None
-        return clef_response({"adjudicate": self.adjudicate[meta.field]})
+        answers = {}
+        for qid in payload["questions"]:
+            # one id per field when chunk answers disagree, else a bare "adjudicate"
+            name = qid.removeprefix("adjudicate.") if "." in qid else meta.field
+            answers[qid] = self.adjudicate[name]
+        return clef_response(answers)
 
     # ---- inspection ----------------------------------------------------- #
 

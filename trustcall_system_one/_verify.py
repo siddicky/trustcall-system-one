@@ -16,6 +16,7 @@ Clef-engine answers are not verified further; they are decisions already.
 
 import dataclasses
 import enum
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
@@ -79,6 +80,7 @@ Span = tuple[int, int]
 REASK_SUFFIX = " Answer only from the text near these mentions."
 _SHORT_CODES = frozenset({"abstain", "unstated", "type_uncertain", "missing_answer"})
 _NONE_OF_THESE = "none_of_these"
+_ARTICLE = re.compile(r"^(?:the|an|a)\s+", re.IGNORECASE)
 _NOT_STATED = "The input states no value for this."
 
 
@@ -98,6 +100,9 @@ class Ctx:
         label: How prompts name the entity (``"the Person"``).
         key: The entity's key in results.
         mentions: How the input refers to the entity (empty for a ``One``).
+        attribution_hints: Attribution probabilities already measured for a
+            field's value (by wire name, with the value shown as text), so the
+            ladder does not ask the same question again.
     """
 
     run: Run
@@ -106,22 +111,22 @@ class Ctx:
     label: str
     key: str = "e0"
     mentions: tuple[str, ...] = ()
+    attribution_hints: dict[str, tuple[str, float]] = field(default_factory=dict)
 
     def meta(self, kind: CallKind, *, field: str | None = None) -> CallMeta:
         """Routing context for a call. The entity is its key, not its label."""
         return CallMeta(kind=kind, schema=self.plan.name, entity=self.key, field=field)
 
-    def desc(self, spec: FieldSpec, *, scoped: bool = False) -> str:
+    def desc(self, spec: FieldSpec) -> str:
         """The field's description, put through ``verify.instruction_template``.
 
-        Args:
-            spec: The field.
-            scoped: Name the field's ancestors too (``FieldSpec.scoped``), for a
-                question that does not carry the parent-context prefix.
+        A nested field is named through its owners, so ``author.name`` of a Book
+        reads "the Book's author's name" and not "the Book's name". A leading
+        article of the description is dropped so the template does not double it.
         """
-        return self.run.verify.instruction_template.format(
-            label=self.label, desc=spec.scoped if scoped else spec.description
-        )
+        leaf = _ARTICLE.sub("", spec.description, count=1)
+        chain = "'s ".join([*spec.owners, leaf])
+        return self.run.verify.instruction_template.format(label=self.label, desc=chain)
 
     def clairic_field(
         self,
@@ -337,87 +342,150 @@ async def ask_clairic(
         )
         for name in names
     }
-    answers = await gather(
-        *(
-            _settle(
-                ctx,
-                name,
-                outcomes[name],
-                (descriptions or {}).get(name) or fields[name].instructions or name,
-            )
+    settled_answers = await _settle_all(
+        ctx,
+        outcomes,
+        {
+            name: (descriptions or {}).get(name) or fields[name].instructions or name
             for name in names
-        )
+        },
     )
-    return {
-        name: (answer, identity) for name, answer in zip(names, answers, strict=True)
-    }
+    return {name: (settled_answers[name], identity) for name in names}
 
 
 _LETTERS = "abcdefghij"
 
 
-async def _settle(
-    ctx: Ctx, name: str, merged: Merged, description: str
-) -> ClairicAnswer | None:
-    """Pick one answer when chunks disagree about a scalar (see ``ask_clairic``)."""
-    if not merged.conflict:
-        return merged.answer
+async def _settle_all(
+    ctx: Ctx,
+    outcomes: dict[str, Merged],
+    descriptions: dict[str, str],
+) -> dict[str, ClairicAnswer | None]:
+    """Pick one answer per field where chunks disagree about a scalar.
+
+    All disagreeing fields share one ``adjudicate`` request (their questions are
+    ``adjudicate.<wire name>``), and the fields it leaves open share one
+    attribution request. A decisive ``neither`` makes the field null.
+    """
+    result: dict[str, ClairicAnswer | None] = {
+        name: merged.answer for name, merged in outcomes.items()
+    }
+    conflicts = {name: merged for name, merged in outcomes.items() if merged.conflict}
+    if not conflicts:
+        return result
     run = ctx.run
-    candidates = merged.candidates
-    values = [part.answer.value for part in candidates]
-    anchors = [part.span for part in candidates if part.span is not None]
-    shown = candidates[: len(_LETTERS)]
-    question = ChoiceQuestion(
-        type="choice",
-        instructions=(
-            f"Which value does `input` state for {description} of `entity.label`?"
-        ),
-        criteria={
-            **{_LETTERS[i]: display(part.answer.value) for i, part in enumerate(shown)},
-            "neither": "The input states none of these",
-        },
-    )
-    answers = await run.call_clef(
-        {"adjudicate": question},
+    shown = {
+        name: merged.candidates[: len(_LETTERS)] for name, merged in conflicts.items()
+    }
+    anchors = [
+        part.span
+        for merged in conflicts.values()
+        for part in merged.candidates
+        if part.span is not None
+    ]
+    questions: dict[str, Question] = {
+        f"adjudicate.{name}": ChoiceQuestion(
+            type="choice",
+            instructions=(
+                f"Which value does `input` state for {descriptions[name]} "
+                "of `entity.label`?"
+            ),
+            criteria={
+                **{
+                    _LETTERS[i]: display(part.answer.value)
+                    for i, part in enumerate(parts)
+                },
+                "neither": "The input states none of these",
+            },
+        )
+        for name, parts in shown.items()
+    }
+    verdicts = await run.call_clef(
+        questions,
         ctx.entity_state(anchors=anchors or None),
-        meta=ctx.meta("adjudicate", field=name),
+        meta=ctx.meta("adjudicate", field=",".join(conflicts)),
     )
-    verdict = answers.get("adjudicate")
-    if isinstance(verdict, ChoiceAnswer) and verdict.choice in _LETTERS[: len(shown)]:
-        p = verdict.probabilities.get(verdict.choice)
-        if p is not None and p >= run.verify.adjudicate_min:
-            run.warn(
-                f"chunk_conflict: the chunks of {ctx.plan.name} gave different "
-                f"values for {name} ({', '.join(display(v) for v in values)}); "
-                "adjudicated"
-            )
-            return settled(shown[_LETTERS.index(verdict.choice)])
+    pending: dict[str, Merged] = {}
+    for name, merged in conflicts.items():
+        values = ", ".join(display(part.answer.value) for part in merged.candidates)
+        where = f"the chunks of {ctx.plan.name} gave different values for {name}"
+        verdict = verdicts.get(f"adjudicate.{name}")
+        p = (
+            verdict.probabilities.get(verdict.choice)
+            if isinstance(verdict, ChoiceAnswer)
+            else None
+        )
+        if (
+            isinstance(verdict, ChoiceAnswer)
+            and p is not None
+            and p >= run.verify.adjudicate_min
+        ):
+            if verdict.choice in _LETTERS[: len(shown[name])]:
+                run.warn(f"chunk_conflict: {where} ({values}); adjudicated")
+                result[name] = settled(shown[name][_LETTERS.index(verdict.choice)])
+                continue
+            if verdict.choice == "neither" and merged.answer is not None:
+                run.warn(
+                    f"chunk_conflict: {where} ({values}); the input states none "
+                    "of them, so the field is null"
+                )
+                result[name] = merged.answer.model_copy(
+                    update={
+                        "value": None,
+                        "span": None,
+                        "spans": None,
+                        "p_null": max(merged.answer.p_null or 0.0, 0.95),
+                    }
+                )
+                continue
+        pending[name] = merged
+    if not pending:
+        return result
+    passed: set[str] = set()
     if run.verify.attribution:
         checks = await run.call_clef(
             {
                 f"attr.{name}.{i}": _attribution_question(
-                    description, part.answer.value, element=False
+                    descriptions[name], part.answer.value, element=False
                 )
-                for i, part in enumerate(candidates)
+                for name, merged in pending.items()
+                for i, part in enumerate(merged.candidates)
             },
-            ctx.entity_state(anchors=anchors or None),
-            meta=ctx.meta("attribution", field=name),
+            ctx.entity_state(
+                anchors=[
+                    part.span
+                    for merged in pending.values()
+                    for part in merged.candidates
+                    if part.span is not None
+                ]
+                or None
+            ),
+            meta=ctx.meta("attribution", field=",".join(pending)),
         )
-        for i, part in enumerate(candidates):
-            p = _p(checks, f"attr.{name}.{i}")
-            if p is not None and p >= run.verify.attribution_keep:
-                run.warn(
-                    f"chunk_conflict: the chunks of {ctx.plan.name} gave different "
-                    f"values for {name} ({', '.join(display(v) for v in values)}); "
-                    "the first that is stated about the entity was kept"
-                )
-                return settled(part)
-    run.warn(
-        f"chunk_conflict: the chunks of {ctx.plan.name} gave different values for "
-        f"{name} ({', '.join(display(v) for v in values)}) and no check settled it; "
-        "the most confident one was kept"
-    )
-    return merged.answer
+        for name, merged in pending.items():
+            values = ", ".join(display(part.answer.value) for part in merged.candidates)
+            for i, part in enumerate(merged.candidates):
+                p = _p(checks, f"attr.{name}.{i}")
+                if p is not None and p >= run.verify.attribution_keep:
+                    run.warn(
+                        f"chunk_conflict: the chunks of {ctx.plan.name} gave "
+                        f"different values for {name} ({values}); the first that "
+                        "is stated about the entity was kept"
+                    )
+                    result[name] = settled(part)
+                    # the ladder would ask this very question next: hand it over
+                    ctx.attribution_hints[name] = (display(part.answer.value), p)
+                    passed.add(name)
+                    break
+    for name, merged in pending.items():
+        if name not in passed:
+            values = ", ".join(display(part.answer.value) for part in merged.candidates)
+            run.warn(
+                f"chunk_conflict: the chunks of {ctx.plan.name} gave different "
+                f"values for {name} ({values}) and no check settled it; the most "
+                "confident one was kept"
+            )
+    return result
 
 
 def _chars_read(
@@ -690,8 +758,7 @@ async def _choose_elements(
         questions[f"{spec.wire_name}.el{index}"] = ChoiceQuestion(
             type="choice",
             instructions=(
-                f'Which option is "{element}" in the input, '
-                f"for {ctx.desc(spec, scoped=True)}?"
+                f'Which option is "{element}" in the input, for {ctx.desc(spec)}?'
             ),
             criteria=criteria,
         )
@@ -911,6 +978,19 @@ def _adopt(st: FieldState, resolved: Resolved) -> None:
     st.reject_p = None
 
 
+def _fuzzy(spec: FieldSpec) -> bool:
+    """Whether answers for this field may agree on text similarity alone.
+
+    Free text does; dates, times, durations, numbers and codes compare exactly.
+    """
+    clairic = spec.clairic
+    if clairic is None:
+        return False
+    if clairic.type == "list":
+        return clairic.items == "text" and spec.item_kind in ("str", "choice")
+    return clairic.type == "text"
+
+
 async def _low_confidence(ctx: Ctx, st: FieldState) -> None:
     """Re-ask one answer; keep the better of two agreeing, adjudicate otherwise."""
     spec = st.spec
@@ -921,7 +1001,7 @@ async def _low_confidence(ctx: Ctx, st: FieldState) -> None:
     if (
         checked is not None
         and checked.value is not None
-        and agree(first.value, checked.value)
+        and agree(first.value, checked.value, fuzzy=_fuzzy(spec))
     ):
         if (checked.confidence or 0.0) > (first.confidence or 0.0):
             _adopt(st, checked)
@@ -967,7 +1047,7 @@ async def _borderline(ctx: Ctx, targets: list[FieldState]) -> None:
     questions: dict[str, Question] = {
         f"nullcheck.{st.spec.wire_name}": NoulQuestion(
             type="noul",
-            instructions=f"Does `input` state {ctx.desc(st.spec, scoped=True)}?",
+            instructions=f"Does `input` state {ctx.desc(st.spec)}?",
             criteria=NoulCriteria(
                 true="The input states it, directly or by clear implication.",
                 false="The input does not state it.",
@@ -1079,14 +1159,29 @@ async def _attribution(ctx: Ctx, targets: list[FieldState]) -> None:
     if not targets:
         return
     questions = _attribution_questions(targets)
-    if not questions:
+    known: dict[str, Answer] = {}
+    for st in targets:
+        hint = ctx.attribution_hints.get(st.spec.wire_name)
+        qid = _attr_id(st, None)
+        if (
+            hint is not None
+            and not _is_list(st)
+            and qid in questions
+            and hint[0] == display(st.resolved.value)
+        ):
+            del questions[qid]
+            known[qid] = NoulAnswer(type="noul", noul=hint[1])
+    if not questions and not known:
         return
     anchors = [span for st in targets for span in st.spans]
-    answers = await ctx.run.call_clef(
-        questions,
-        ctx.entity_state(anchors=anchors or None),
-        meta=ctx.meta("attribution"),
-    )
+    answers: dict[str, Answer] = {}
+    if questions:
+        answers = await ctx.run.call_clef(
+            questions,
+            ctx.entity_state(anchors=anchors or None),
+            meta=ctx.meta("attribution"),
+        )
+    answers.update(known)
     await gather(*(_judge(ctx, st, answers) for st in targets))
 
 
@@ -1204,7 +1299,7 @@ async def _recheck_elements(
         found_spans = list(checked.spans) if checked.spans else None
         for index in pending:
             for j, other in enumerate(found):
-                if agree(elements[index], other):
+                if agree(elements[index], other, fuzzy=_fuzzy(st.spec)):
                     candidates[index] = (other, found_spans[j] if found_spans else None)
                     del found[j]
                     if found_spans:

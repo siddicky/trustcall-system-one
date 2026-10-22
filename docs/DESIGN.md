@@ -81,25 +81,39 @@ Clef-typed fields and the choices of its unions go out together; its sub-models 
 `passes.split`: `submodel` (default) = one Clairic request per group, `entity` = one request for
 every group of the unit (the root and its sub-models; each chosen union member is a unit of its
 own), `field` = one per field.
-* *Optional sub-model:* one Clef `noul` per optional group (call kind `presence`, `field` = the
-  group's dotted path, "Does `input` state {description}?"), asked while the parent's own request
-  is in flight. `p < presence.threshold_absent` → the group is not asked at all (`None` if
+* *Optional sub-model:* one Clef `noul` per optional group (call kind `presence`, "Does `input`
+  state the Book's author's address?"); the optional siblings of one group share a request
+  (`meta.field` lists their dotted paths, comma-joined), asked while the parent's own request is
+  in flight. A missing answer counts as a borderline probability, never as present. `p < presence.threshold_absent` → the group is not asked at all (`None` if
   nullable, else the default; `prune_nulls` applies a default to a `None`); between the two
   thresholds → asked, and if every leaf then comes back null (after the verification ladder) the
-  sub-model is treated as absent; at or above `threshold_present` it stands. Required sub-models
+  sub-model is treated as absent; at or above `threshold_present` it stands. Only verified non-null
+  Clairic values count as evidence: a `bool` or a required `Literal` always resolves and says
+  nothing about the group. Required sub-models
   are always asked, and a group below an absent one is never reached.
 * *Union of models:* the choice (call kind `clef_fields`) is answered with the parent group's
-  Clef questions; then only the chosen member's subtree is extracted, and a tag that the choice
+  Clef questions; then, as soon as it is in (the parent's Clairic pass may still be running),
+  only the chosen member's subtree is extracted, and a tag that the choice
   fixes is filled in from it (a single-valued tag is a `const`; a multi-valued one is not
   asked). A choice below `gates.min_choice_prob`/`min_choice_confidence`: an optional union is
   treated as unstated; a required one extracts every member and keeps the one with the most
-  verified non-null fields (ties to the earlier member; none → unset), with a warning.
+  verified non-null Clairic values (ties to the earlier member; none → unset), with a warning.
+* *Validation is bottom-up.* An optional sub-model and the chosen union member are validated as
+  their own model (`member.model.model_validate`, aliases applied) and the *instance* goes into
+  the parent document, so pydantic's smart-union cannot hand the value to another member whose
+  keys overlap; required sub-models stay documents validated with the root (`TypedDict`s stay
+  dicts). An optional sub-model that fails validation is treated as absent (`None`/default) with
+  a warning and `RejectedOp(path=<group>, reason="invalid_optional_group")`, and the leaf
+  answers it held are reported as dropped; a required union member that fails makes the record
+  invalid with its errors under the union's path.
 * All leaves of all groups share one verification ladder run, so the attribution check is one
   request over every leaf. Ladder questions carry `FieldSpec.scoped` (`city (author → address)`).
   Assembly builds the nested document level by level (`unflatten(..., plan=, members=)` renames
   each level's keys to their aliases, `prune_nulls` prunes per level) and validates the root;
   `ResultRecord.fields` is keyed by full dotted path, and holds an extra entry for each presence
-  question and union choice (`engine="clef"`, `rejected_reason="absent"` when it is not there).
+  question and union choice with the container's own engine (`submodel` / `union_models`; the
+  question's answer is in `raw`, `rejected_reason` is `absent`, `invalid_optional_group` or
+  `low_confidence_fallback`), so a consumer that walks leaf answers skips them by engine.
 
 ## Package layout (`trustcall_system_one/`)
 
@@ -178,7 +192,8 @@ optional, ...}`; each `UnionMember{label, model, group, options}` is a compiled 
 live in `member_specs`/`member_groups`, not in `specs`, because they are only asked once the choice
 resolves. Members may share field names, so wire names below a union are allocated under
 `FieldSpec.wire_path` (the member label follows the union field: `pet.Cat.name`); `spec.path` stays
-the document path.
+the document path; `plan.spec(path, member=...)` and `plan.spec_by_wire_path(...)` look a member's field
+up, and a bare `spec(path)` that several members share raises instead of guessing.
 
 | annotation | engine / emitted |
 | --- | --- |
@@ -194,16 +209,16 @@ the document path.
 | `Literal` / `Enum` | Clef `choice` (2–255 options), `key_map` back to values; option ids are the sanitised value (Enum: the member name) and the criteria text keeps the original value/name and member description; `s1_field(clef="score")` for ordered enums |
 | `Literal` / `Enum` / bool-as-choice that is nullable or has a default | the same `choice` plus an `unstated` option (`unstated_2`, … on a collision) mapping to the `UNSTATED` sentinel, so an unmentioned field is not forced to a real value: `coerce` gives `ok=True, value=None, reason="unstated"` for both (like a Clairic null; `prune_nulls` applies a default). A required non-nullable field gets no `unstated` option |
 | single-option `Literal` / `Enum` | required field: engine `const`, filled in code, no request (discriminator tags); nullable or defaulted: skipped with a `single_option` warning |
-| nested `BaseModel` / `TypedDict` (also self-referencing) | dotted leaf paths (`author.address.city`); each sub-model is its own `FieldGroup` and, when optional (nullable or defaulted), carries a Clef `noul` presence question (`<path>.__presence`). `limits.max_depth` is the longest leaf path: a sub-model whose leaves would be deeper is `skip` with a `max_depth` warning, so a self-referencing `Optional[Node]` unrolls to the limit |
+| nested `BaseModel` / `TypedDict` (also self-referencing) | dotted leaf paths (`author.address.city`); each sub-model is its own `FieldGroup` and, when optional (nullable or defaulted), carries a Clef `noul` presence question (`<path>.__presence`). `limits.max_depth` is the longest leaf path and `limits.max_recursion` (default 2) how many times a model may reappear on its own ancestor chain: past either the field is `skip` with one `max_depth`/`max_recursion` warning per (model, field), so a self-referencing `Optional[Node]` unrolls to the limits and never further. `limits.max_groups` (default 128, union members included) turns a runaway schema into a compile-time `ValueError` naming the model, never a silent truncation. A union member is left out when it would reappear too often, or when a required field of it was skipped by a limit (it could never validate); a union with no member left is skipped, and one with a single option left asks nothing |
 | `list[BaseModel]`, `dict[str, prim]` | handed to the collection engine |
 | `Union[prim, prim]` | Clairic `text` + Clef `choice` over the member types (`<field>.__type`); `coerce_union` parses the text as the chosen member |
-| `Union` of models (also `Optional[A \| B]`) | one Clef `choice` (`UnionGroup.spec`): options are the discriminator's literal values (`Field(discriminator=...)`, else a required `Literal`/`Enum` field every member declares with values no other member shares), else the member names; an option's criteria is the member docstring, else its field list; an optional union adds an `unstated` option. Each member is compiled as a subtree (const tags included) and asked only after the choice resolves |
+| `Union` of models (also `Optional[A \| B]`) | one Clef `choice` (`UnionGroup.spec`): options are the discriminator's literal values (`Field(discriminator=...)`, else a required `Literal`/`Enum` field every member declares with values no other member shares), else the member names; an option's criteria is the member docstring, else its field list; an optional union adds an `unstated` option (the 255-option cap counts options, not models). Each member is compiled as a subtree (const tags included) and asked only after the choice resolves |
 | `dict[str, Any]`, `Any` | skipped (pydantic default), opt-in `limits.any_policy="text"` |
 | required / optional | `null_threshold` 0.7 / 0.3 |
 | recursion | sub-models and unions expand down to `limits.max_depth = 8`; collections (`list[Model]`) and `dict[str, X]` are recorded as deferred (`plan.deferred()`, at any depth) and warned about at run time until the collection engine lands |
 
 `ge/le/gt/lt` go into prose (Clairic `min`/`max` are estimate/forecast-only); opt-in
-`limits.estimate_for_bounded_numbers`. Instructions = parent context (" → "-joined model title and ancestor field names; always present for a nested field, and mandatory when a name was shortened: `Book → author → address: the Book's city`) + description (`Field.description` →
+`limits.estimate_for_bounded_numbers`. Instructions = parent context (" → "-joined model title and ancestor field names, with the member after a union field: `Book → author → address`, `Owner → pet (Dog)`; always present for a nested field, and mandatory when a name was shortened) + description, templated through the owner chain (`the Book's author's address's city`; a leading article of the description is dropped so the template does not double it) (`Field.description` →
 `typing_extensions.Doc` → title → attribute docstring → humanised name) + type/constraint hints, templated per entity
 ("{label}'s {desc}"). A lint warns on aggregation-style descriptions ("total of…").
 
@@ -277,7 +292,7 @@ elements only. Order: replace → remove (highest index first) → add. Apply wi
 `jsonpatch.apply_patch` on a deep copy; on conflict try `_fix_string_concat` then
 `_fix_missing_parents`, recording `repaired_from`. Clairic requests always send
 `options.return_state_text=true` so span offsets are re-anchored on sentinel markers;
-`truncated: true` → re-ask the same fields on overlapping chunks that cover the whole input (size from the returned `state_text`, overlap ≥ `verify.window_chars`), concurrently, and merge per field: every non-null scalar is kept as a candidate, ranked by confidence; candidates that agree (normalised equality / text ratio ≥ 0.9 / equal numbers) are one value, disagreeing ones go to a Clef `adjudicate` over the distinct candidates (≥ `verify.adjudicate_min`), then to attribution in confidence order (first to pass wins), then the most confident stands for the ladder to judge; lists are united in input order and overlapping spans keep the longer one (confidence breaks ties); an all-null merge reports the lowest `p_null` so the borderline-null check still fires; a chunk that is still truncated is split smaller once, then warn/raise `StateTruncatedError`. Any part of the input that is not sent always produces a warning.
+`truncated: true` → re-ask the same fields on overlapping chunks that cover the whole input (size from the returned `state_text`, overlap ≥ `verify.window_chars`), concurrently, and merge per field: every non-null scalar is kept as a candidate, ranked by confidence; candidates that agree (normalised equality / text ratio ≥ 0.9 / equal numbers) are one value, disagreeing ones go to a Clef `adjudicate` over the distinct candidates (≥ `verify.adjudicate_min`; one request for all conflicting fields, and a decisive `neither` makes the field null), then to attribution in confidence order (one request, first to pass wins; its probability is handed to the ladder so it is not asked twice), then the most confident stands for the ladder to judge; dates, times, durations, numbers and digit-heavy strings agree only when equal after normalisation, never on text similarity; lists are united in input order and an overlapping span replaces a kept element only if it contains exactly that one (confidence breaks ties for equal spans); an all-null merge reports the lowest `p_null` so the borderline-null check still fires; a chunk that is still truncated is split smaller once, then warn/raise `StateTruncatedError`. Any part of the input that is not sent always produces a warning.
 
 ## Repair loop (`_repair.py`)
 

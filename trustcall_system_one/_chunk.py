@@ -35,6 +35,7 @@ DEFAULT_CHUNK_CHARS = 8_000
 """Chunk size used when the truncated response does not say how much it read."""
 _SAFETY = 0.8  # chunks are this fraction of what Clairic was seen to read
 _AGREE_RATIO = 0.9
+_DIGIT_SHARE = 0.3  # at this share of digits a string is compared exactly
 
 
 def split_ranges(ranges: Sequence[Span], size: int, overlap: int) -> list[Span]:
@@ -142,26 +143,44 @@ def _is_number(value: Any) -> bool:
     return isinstance(value, (int, float, Decimal)) and not isinstance(value, bool)
 
 
-def agree(first: Any, second: Any) -> bool:
+def _digit_heavy(text: str) -> bool:
+    """Whether a string is mostly digits (a date, a code, an amount)."""
+    chars = [c for c in text if not c.isspace()]
+    return bool(chars) and sum(c.isdigit() for c in chars) / len(chars) >= _DIGIT_SHARE
+
+
+def agree(first: Any, second: Any, *, fuzzy: bool = True) -> bool:
     """Whether two answers for one field say the same thing.
 
-    Text agrees when it is equal after case and whitespace folding or has a
-    ``difflib.SequenceMatcher`` ratio of at least 0.9; numbers compare by value;
-    lists agree when they have the same size and every element has a distinct
-    agreeing partner; anything else must be equal.
+    Text agrees when it is equal after case and whitespace folding; with
+    ``fuzzy`` it also agrees at a ``difflib.SequenceMatcher`` ratio of at least
+    0.9, unless either string is mostly digits (``2020-01-01`` and
+    ``2020-01-02``, or ISBNs that differ in one digit, are different values).
+    Numbers compare by value; lists agree when they have the same size and every
+    element has a distinct agreeing partner; anything else must be equal.
+
+    Args:
+        first: One answer.
+        second: The other.
+        fuzzy: Allow the text ratio. Pass ``False`` for dates, times, durations,
+            numbers and codes, which compare exactly after normalisation.
     """
     if first is None or second is None:
         return first is None and second is None
     if isinstance(first, str) and isinstance(second, str):
         a, b = _norm(first), _norm(second)
-        return a == b or SequenceMatcher(None, a, b).ratio() >= _AGREE_RATIO
+        if a == b:
+            return True
+        if not fuzzy or _digit_heavy(a) or _digit_heavy(b):
+            return False
+        return SequenceMatcher(None, a, b).ratio() >= _AGREE_RATIO
     if isinstance(first, (list, tuple)) and isinstance(second, (list, tuple)):
         if len(first) != len(second):
             return False
         remaining = list(second)
         for item in first:
             for index, other in enumerate(remaining):
-                if agree(item, other):
+                if agree(item, other, fuzzy=fuzzy):
                     del remaining[index]
                     break
             else:
@@ -188,12 +207,19 @@ class _Element:
     start: int
     confidence: float
 
-    def beats(self, other: "_Element") -> bool:
-        """Whether this element replaces an overlapping one: longer, then surer."""
-        assert self.span is not None and other.span is not None
+    def replaces(self, other: "_Element") -> bool:
+        """Whether this element replaces the one it overlaps.
+
+        It must contain it, and be longer or (for the same span) more confident.
+        An element without a span is replaced by any span with the same text.
+        """
+        assert self.span is not None
+        if other.span is None:
+            return True
+        contains = self.span[0] <= other.span[0] and other.span[1] <= self.span[1]
         mine = self.span[1] - self.span[0]
         theirs = other.span[1] - other.span[0]
-        return (mine, self.confidence) > (theirs, other.confidence)
+        return contains and (mine, self.confidence) > (theirs, other.confidence)
 
 
 def _merge_lists(parts: list[Part]) -> ClairicAnswer:
@@ -221,11 +247,11 @@ def _merge_lists(parts: list[Part]) -> ClairicAnswer:
             ]
             if not clashes:
                 elements.append(new)
-            elif all(
-                kept.span is None or new.beats(kept) for kept in clashes
-            ):  # the new element is the longer (or surer) of the overlapping ones
-                elements = [kept for kept in elements if kept not in clashes]
-                elements.append(new)
+            elif len(clashes) == 1 and new.replaces(clashes[0]):
+                # one element that the new span contains (or equals, with more
+                # confidence): the fuller reading wins. A span that bridges two
+                # kept elements replaces neither.
+                elements[elements.index(clashes[0])] = new
     elements.sort(
         key=lambda item: item.span[0] if item.span is not None else item.start
     )
@@ -319,10 +345,12 @@ def merge_field(parts: list[Part]) -> Merged:
     ranked = sorted(
         enumerate(present), key=lambda item: (-_confidence(item[1]), item[0])
     )
+    fuzzy = present[0].answer.type == "text"  # dates, numbers, ... compare exactly
     distinct: list[Part] = []
     for _, candidate in ranked:
         if not any(
-            agree(candidate.answer.value, kept.answer.value) for kept in distinct
+            agree(candidate.answer.value, kept.answer.value, fuzzy=fuzzy)
+            for kept in distinct
         ):
             distinct.append(candidate)
     return Merged(settled(distinct[0]), tuple(distinct))
