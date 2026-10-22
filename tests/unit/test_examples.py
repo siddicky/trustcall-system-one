@@ -19,6 +19,8 @@ from typing import Any
 
 import pytest
 
+from trustcall_system_one import One, create_extractor
+
 EXAMPLES = Path(__file__).resolve().parents[2] / "examples"
 
 NAMES = [
@@ -102,6 +104,10 @@ def test_mode_selection() -> None:
 
     both = {"CLOUDFLARE_ACCOUNT_ID": "acct", "CLOUDFLARE_API_TOKEN": "token"}
     assert live_available(both) is True
+    assert (
+        live_available({"CLOUDFLARE_ACCOUNT_ID": "a", "CLOUDFLARE_AUTH_TOKEN": "t"})
+        is True
+    )
     assert live_available({"CLOUDFLARE_ACCOUNT_ID": "acct"}) is False
     assert live_available({}) is False
     assert resolve_offline(False, both) is False  # live: credentials, no flag
@@ -264,6 +270,51 @@ def test_03_update_contact_calls_follow_the_update_pipeline(
     assert kinds.count("gate") == 5 and kinds.count("attribution") == 1
     assert kinds[-5:] == ["gate"] * 5
     assert len(kinds) == 9
+
+
+def test_00_raw_vs_library(capsys: pytest.CaptureFixture[str]) -> None:
+    """The raw httpx call (offline: a MockTransport) and the library, one task."""
+    result = run("00_raw_vs_library", capsys, keep_output=True)
+    out = capsys.readouterr().out
+    # part 1: trusting the raw values shrinks the name and drops the old notes
+    assert '  name: "Dana Whitfield" -> "Dana"\n' in out
+    assert (
+        '  notes: ["Prefers email over phone", "Met at the 2023 logistics summit"]'
+        ' -> ["asked to be introduced to our logistics team"]\n'
+    ) in out
+    assert "p_null=0.04" not in out  # a real list answer has no p_null
+    # part 2: the library patches only what the note states and names each refusal
+    (record,) = result.records
+    assert {(p.op, p.path) for p in record.patches} == {
+        ("replace", "/phone"),
+        ("replace", "/city"),
+        ("replace", "/company"),
+        ("replace", "/title"),
+        ("add", "/notes/-"),
+    }
+    assert {r.path: r.reason for r in record.rejected} == {
+        "/name": "identity_subset",
+        "/email": "not_mentioned",
+    }
+    assert record.after is not None and record.after["name"] == "Dana Whitfield"
+
+
+def test_00_raw_request_is_the_librarys_crosscheck_request(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The hand-made body is exactly what the library sends as its input-only pass."""
+    module = load("00_raw_vs_library")
+    script = module.contact.offline_script()
+    with create_extractor(
+        [One(module.contact.Contact)], transport=script.transport
+    ) as ex:
+        ex.invoke(
+            module.NOTE,
+            existing=[("crm-4711", "Contact", module.contact.EXISTING.model_dump())],
+        )
+    crosschecks = [p for _, p, meta in script.calls if meta.kind == "crosscheck"]
+    assert crosschecks == [module.request_body(module.NOTE)]
+    capsys.readouterr()
 
 
 def test_04_repair(capsys: pytest.CaptureFixture[str]) -> None:

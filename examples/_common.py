@@ -63,7 +63,6 @@ __all__ = [
     "snippet",
 ]
 
-LIVE_VARIABLES = ("CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN")
 Span = tuple[int, int]
 
 
@@ -73,9 +72,14 @@ Span = tuple[int, int]
 
 
 def live_available(environ: Mapping[str, str] | None = None) -> bool:
-    """Whether both Cloudflare credentials are set (live mode is possible)."""
+    """Whether both Cloudflare credentials are set (live mode is possible).
+
+    ``CLOUDFLARE_AUTH_TOKEN`` is accepted in place of ``CLOUDFLARE_API_TOKEN``, as
+    the transport does.
+    """
     env = os.environ if environ is None else environ
-    return all(env.get(name) for name in LIVE_VARIABLES)
+    token = env.get("CLOUDFLARE_API_TOKEN") or env.get("CLOUDFLARE_AUTH_TOKEN")
+    return bool(env.get("CLOUDFLARE_ACCOUNT_ID") and token)
 
 
 def resolve_offline(offline: bool, environ: Mapping[str, str] | None = None) -> bool:

@@ -25,13 +25,14 @@ uv run python examples/01_invoice.py --offline  # force the scripted transport
 
 Every example is a module with `main(offline: bool)` returning its result, so
 `tests/unit/test_examples.py` runs them all offline. An example that needs a milestone
-that is not built yet is `xfail(strict=True)` there, and flips when it lands (all eight
-work now).
+that is not built yet is `xfail(strict=True)` there, and flips when it lands (all of
+them work now).
 
 ## The examples
 
 | example | shows | runs | needs |
 | --- | --- | --- | --- |
+| [`00_raw_vs_library.py`](00_raw_vs_library.py) | The CRM update of example 03 twice: the raw Clairic call with `httpx` and a naive merge of its values (the name shrinks to "Dana", the notes are replaced), then `create_extractor(...).invoke(...)` on the same note. Mirrors the "Without the library / With the library" section of the main README. | live or offline (offline answers the raw call through `httpx.MockTransport`) | M5 (works now) |
 | [`01_invoice.py`](01_invoice.py) | An invoice email into a typed `Invoice`: spans, a confident null that a `guess` never fills, a low-confidence answer re-asked, a disagreeing re-ask settled by Clef adjudication, a value refused by the attribution check, the due date computed in code. | live or offline | M3 (works now) |
 | [`02_support_ticket.py`](02_support_ticket.py) | Nested sub-models, a discriminated union of models, an optional sub-model skipped by the presence gate (the request log shows nothing asked about it), an ordered enum scored by Clef. | live or offline | M4 (works now) |
 | [`03_update_contact.py`](03_update_contact.py) | Updating a CRM record as a JSON Patch: four `replace` ops and an `add /notes/-`, each printed next to the text it came from; every other field rejected with its reason (`identity_subset` for the short name "Dana", `not_mentioned` for the email). | live or offline | M5 |
