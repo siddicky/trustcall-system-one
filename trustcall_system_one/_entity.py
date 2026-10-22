@@ -64,6 +64,7 @@ from trustcall_system_one._diff import (
 from trustcall_system_one._errors import ExtractionValidationError
 from trustcall_system_one._existing import ExistingRecord, normalise_record
 from trustcall_system_one._gates import dedup_elements, gate_changes
+from trustcall_system_one._match import candidate_options, identity_compatible
 from trustcall_system_one._names import Path
 from trustcall_system_one._render import Focus, RenderedState
 from trustcall_system_one._repair import (
@@ -1462,7 +1463,9 @@ class UpdateOutcome:
         record: The update record (also when it made no change), or ``None``
             when the presence gate found nothing about the record in the input
             or updates are disabled.
-        skipped: The skipped entity, when updates are disabled.
+        skipped: The skipped entity, when updates are disabled; for a collection
+            entity whose match was refused (``identity_conflict``) it comes next
+            to the record, which then holds no change.
         handled: ``(schema name, record id)`` of the existing record when it was
             dealt with (updated or skipped; the schema name is ``"__any__"`` for
             such a record); ``None`` when it stays untouched.
@@ -1615,6 +1618,18 @@ async def _judge_changes(
     ctx: Ctx, before: dict[str, Any], changes: list[Change]
 ) -> list[_Verdict]:
     """Run the near-duplicate check and the change gate over the operations."""
+    if ctx.vetoed:  # every operation is refused, nothing is asked
+        return [
+            _Verdict(
+                change,
+                "identity_conflict",
+                None,
+                RejectedOp(
+                    change.op, change.path, "identity_conflict", ctx.vetoed, None
+                ),
+            )
+            for change in changes
+        ]
     verdicts = [_Verdict(change) for change in changes]
     dedups = await dedup_elements(ctx, before, changes)
     for index, found in dedups.items():
@@ -2188,6 +2203,39 @@ async def _check_stated(
     await gather(*(one(leaves) for leaves in groups.values()))
 
 
+def _identity_conflict(
+    plan: SchemaPlan,
+    names: Sequence[str],
+    by_wire: Mapping[str, FieldState],
+    before: Mapping[str, Any],
+) -> str:
+    """Why the entity cannot be the record it was matched to, or ``""``.
+
+    The identity the input gives the entity (its extracted, verified value) and the
+    record's own must be forms of one name (``identity_compatible``). With several
+    identity fields the match stands as soon as one of them fits; a field the input
+    gave no value for says nothing. A schema without identity never conflicts.
+    """
+    seen: list[tuple[str, str, str]] = []
+    for name in names:
+        spec = next((s for s in plan.specs if s.path == (name,)), None)
+        state = by_wire.get(spec.wire_name) if spec is not None else None
+        if spec is None or state is None or not state.has_value():
+            continue
+        new, old = state.resolved.value, before.get(spec.alias or name)
+        if not isinstance(new, str) or not isinstance(old, str):
+            continue
+        if identity_compatible(new, old):
+            return ""
+        seen.append((name, new, old))
+    if not seen:
+        return ""
+    return "identity conflict: " + "; ".join(
+        f"the input calls the entity {new!r} ({name}) but the record says {old!r}"
+        for name, new, old in seen
+    )
+
+
 async def update_one(
     run: Run,
     plan: SchemaPlan,
@@ -2201,6 +2249,7 @@ async def update_one(
     entity: EntityInfo | None = None,
     focus: Focus | None = None,
     focus_plain: Focus | None = None,
+    identity: Sequence[str] = (),
 ) -> UpdateOutcome:
     """Update one existing record of a schema from ``text``.
 
@@ -2239,6 +2288,12 @@ async def update_one(
         focus: The focus header of the Clairic requests (a collection entity's).
         focus_plain: The same without offsets, for requests that carry only
             windows of the input.
+        identity: The identity fields of a collection entity. When what the
+            input says the entity is called and what the record is called share
+            no name (``identity_compatible``), the match was wrong: the whole
+            update is refused (every operation is ``RejectedOp(reason=
+            "identity_conflict")``, nothing is gated or applied) and the outcome
+            carries an ``ambiguous_match`` skip next to the no-change record.
 
     Returns:
         The outcome.
@@ -2368,5 +2423,25 @@ async def update_one(
 
     await gather(verify_clairic(), _check_stated(plain, nodes, before))
     _settle(root)
+    conflict = (
+        _identity_conflict(plan, identity, by_wire, before)
+        if entity is not None
+        else ""
+    )
+    if conflict:
+        plain = dataclasses.replace(plain, vetoed=conflict)
     record, rounds = await _finish_update(plain, root, before, target, info)
-    return UpdateOutcome(record, None, handle, True, 1 + rounds)
+    refused: SkippedEntity | None = None
+    if conflict:
+        options = dict(candidate_options(info.match_probs))
+        options.setdefault(
+            target.record_id, info.match_probs.get(target.record_id, 0.0)
+        )
+        refused = SkippedEntity(
+            plan.name,
+            info,
+            "ambiguous_match",
+            f"{conflict}; the update of record {target.record_id!r} was refused",
+            tuple(sorted(options.items(), key=lambda item: (-item[1], item[0]))),
+        )
+    return UpdateOutcome(record, refused, handle, True, 1 + rounds)

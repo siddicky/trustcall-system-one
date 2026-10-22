@@ -1137,6 +1137,7 @@ async def _update_entity(
         entity=info,
         focus=focus,
         focus_plain=plain,
+        identity=identity_fields(scope.plan, scope.cardinality),
     )
 
 
@@ -1191,6 +1192,10 @@ async def insert_collection(
 # --------------------------------------------------------------------------- #
 
 
+_LIKELY_RECORD = 0.25
+"""Probability from which a record is an ambiguous entity's likely match."""
+
+
 @dataclass
 class _Work:
     """What happened to one entity once it was matched."""
@@ -1203,14 +1208,8 @@ class _Work:
     handled: tuple[str, str] | None = None
 
 
-def _delete_record(
-    plan: SchemaPlan, candidate: Candidate, p: float, names: Sequence[str]
-) -> ResultRecord:
+def _delete_record(plan: SchemaPlan, candidate: Candidate, p: float) -> ResultRecord:
     """The result record of a deletion: the record as it was, and nothing after."""
-    label = next(
-        (str(candidate.data[k]) for k in names if candidate.data.get(k) is not None),
-        candidate.record_id,
-    )
     return ResultRecord(
         schema_name=plan.name,
         json_doc_id=candidate.record_id,
@@ -1218,9 +1217,7 @@ def _delete_record(
         value=None,
         before=dict(candidate.data),
         after=None,
-        entity=EntityInfo(
-            key=candidate.record_id, label=label, match_probs={candidate.record_id: p}
-        ),
+        delete_p=p,
     )
 
 
@@ -1324,7 +1321,7 @@ async def apply_collection(
         target = matched.targets[info.key]
         if target is not None:
             record = by_id[target]
-            if target in flagged and enable_updates:
+            if target in flagged:
                 p = delete_p[target] or 0.0
                 return _Work(
                     info,
@@ -1333,7 +1330,7 @@ async def apply_collection(
                         info,
                         "conflict_update_delete",
                         f"{info.label!r} matches the record {target!r}, and the "
-                        f"input also says that record should be removed "
+                        f"input also says that record should be deleted "
                         f"(p={p:.2f}); it was neither updated nor deleted",
                         ((target, info.match_probs.get(target, 0.0)),),
                     ),
@@ -1396,11 +1393,31 @@ async def apply_collection(
         if w.skipped is not None and w.skipped.reason == "conflict_update_delete"
         if w.handled is not None
     }
+    # a record an ambiguous entity most likely is must not be deleted on the same
+    # input: the entity may be the very thing the input says to delete or update
+    unsure: dict[str, str] = {}
+    for _, skip in skips:
+        if skip.reason != "ambiguous_match":
+            continue
+        best = max(
+            ((rid, p) for rid, p in skip.candidates if rid in by_id),
+            key=lambda pair: pair[1],
+            default=None,
+        )
+        if best is not None and best[1] >= _LIKELY_RECORD:
+            unsure[best[0]] = skip.entity.label
     deletes: list[ResultRecord] = []
     for candidate in candidates:
         rid = candidate.record_id
+        if rid in flagged and rid in unsure:
+            run.warn(
+                f"match_delete_held: the record {rid!r} is flagged for deletion, but "
+                f"{unsure[rid]!r} could not be matched with certainty and the record "
+                "is its most likely match, so it was not deleted"
+            )
+            continue
         if rid in flagged and rid not in conflicts:
-            deletes.append(_delete_record(plan, candidate, delete_p[rid] or 0.0, keys))
+            deletes.append(_delete_record(plan, candidate, delete_p[rid] or 0.0))
             record = by_id[rid]
             handled.append((record.schema_name, rid))
     records.sort(key=lambda pair: pair[0])

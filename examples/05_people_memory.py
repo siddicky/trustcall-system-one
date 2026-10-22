@@ -27,8 +27,12 @@ What to look at:
   (``rejected``). Sarah's name comes back as the short form "Sarah", which a naive
   diff would write over "Sarah Johnson": the diff itself refuses to replace an identity
   field with a part of it (``identity_subset``, before any model is asked). The
-  relationship "neighbor" differs from the record's "Neighbor" only in case, so it
-  becomes a ``replace`` that the change gate refuses (the input states nothing new).
+  relationship "neighbor" is the record's "Neighbor" up to case, which free text does
+  not count as a change: no operation, no gate request.
+* The match itself is checked twice. Each person is matched to one record by a Clef
+  choice (one-to-one over all of them); and a person whose extracted name shares no
+  name with the record they were matched to would have the whole update refused
+  (``identity_conflict``). "Sarah" and "Sarah Johnson" share one, so it goes through.
 * Each mention is shown with its span in context.
 
 Live mode runs on the real models (about forty requests); offline mode scripts the
@@ -192,7 +196,7 @@ def offline_script() -> OfflineScript:
             "Sunny": None,
         }
     )
-    script.handlers["gate"] = change_gate(0.94, deny={'"neighbor"': 0.06})
+    script.handlers["gate"] = change_gate(0.94)
     return script
 
 

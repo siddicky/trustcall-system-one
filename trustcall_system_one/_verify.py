@@ -153,6 +153,9 @@ class Ctx:
             entity and its mentions with their offsets).
         focus_plain: The same header without offsets, used when the state holds
             only windows of the input (the offsets would not match it).
+        vetoed: Why every operation of an update is refused without being judged
+            (an identity conflict between the entity and the record it was matched
+            to); empty when nothing is.
     """
 
     run: Run
@@ -172,6 +175,7 @@ class Ctx:
     info: EntityInfo | None = None
     focus: Focus | None = None
     focus_plain: Focus | None = None
+    vetoed: str = ""
 
     def input_only(self) -> "Ctx":
         """The same context without the record: every request is about the input.

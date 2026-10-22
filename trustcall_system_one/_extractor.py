@@ -745,12 +745,16 @@ class Extractor:
         floor = run.presence.threshold_absent
         for record in records.named(ANY):
             if not open_:
-                if candidates:
-                    run.warn(
-                        f"the {ANY!r} record {record.record_id!r} was claimed by "
-                        "no schema (each candidate took another such record); it "
-                        "is left untouched"
+                run.warn(
+                    f"the {ANY!r} record {record.record_id!r} was claimed by no "
+                    "schema ("
+                    + (
+                        "each candidate took another such record"
+                        if candidates
+                        else "every schema has records of its own"
                     )
+                    + "); it is left untouched"
+                )
                 continue
             if len(candidates) <= 1:
                 claims[record.record_id] = open_.pop().plan.name

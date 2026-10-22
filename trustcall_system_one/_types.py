@@ -235,8 +235,7 @@ class EntityInfo:
             one ran.
         match_probs: Probability of each existing record as the match, by record
             id, and ``"__new__"`` for "none of them" (a ``Many`` schema with
-            existing records; empty otherwise). A deleted record's entity holds
-            ``{record id: probability that the input says to remove it}``.
+            existing records; empty otherwise).
         parent: Key of the parent entity for nested items.
     """
 
@@ -354,7 +353,8 @@ class ResultRecord:
             no operation is still ``"update"``, with empty ``patches`` and
             ``after == before``. A delete (a ``Many`` schema with
             ``enable_deletes``) names the record in ``json_doc_id``, keeps it as
-            ``before`` and has no ``value`` and no ``after``.
+            ``before`` and has no ``value``, no ``after`` and no ``entity``; its
+            ``delete_p`` is the probability that the input says to delete it.
         value: The validated model, or ``None`` when validation failed.
         before: The record before the change (updates and deletes).
         after: The document after the change; for an invalid insert, the
@@ -365,6 +365,8 @@ class ResultRecord:
         entity: What is known about the entity.
         valid: Whether ``value`` passed validation.
         errors: Pydantic error strings when it did not.
+        delete_p: For a delete, the probability that the input says the record
+            should be deleted; ``None`` otherwise.
     """
 
     schema_name: str
@@ -379,6 +381,7 @@ class ResultRecord:
     entity: EntityInfo | None = None
     valid: bool = True
     errors: tuple[str, ...] = ()
+    delete_p: float | None = None
 
 
 @dataclass(frozen=True)

@@ -564,6 +564,8 @@ async def test_a_many_with_its_own_records_does_not_claim_an_any_record() -> Non
     )
     assert [r.json_doc_id for r in result.records] == ["0"]
     assert result.untouched == ("loose",)
+    (warning,) = [w for w in result.warnings if "'loose'" in w]
+    assert "every schema has records of its own" in warning
 
 
 # --------------------------------------------------------------------------- #
@@ -576,6 +578,7 @@ def matcher(
     table: dict[str, dict[str, float]],
     *,
     confidence: float | None = None,
+    **handlers: Any,
 ) -> FakeTransport:
     """A transport answering ``match`` as scripted, by entity label and record name."""
 
@@ -594,7 +597,7 @@ def matcher(
             {"match": choice(best, probs, confidence)}, model=payload["model"]
         )
 
-    return FakeTransport(route(default=world.handler, match=answer))
+    return FakeTransport(route(default=world.handler, match=answer, **handlers))
 
 
 def two_people() -> FakeWorld:
@@ -678,32 +681,65 @@ async def test_a_confidence_below_the_minimum_is_ambiguous_too() -> None:
     assert [r.json_doc_id for r in result.records] == ["0", "1"]
 
 
-async def test_on_ambiguous_insert_inserts_the_entity() -> None:
+async def test_on_ambiguous_insert_inserts_an_entity_that_is_likely_new() -> None:
     world = two_people()
+    # not sure of any answer (low confidence): Emma is most likely new, Bob a record
     table = {
-        "Emma Thompson": {"Emma Thompson": 0.5, "__new__": 0.5},
+        "Emma Thompson": {"Emma Thompson": 0.05, "__new__": 0.95},
         "Bob Roe": {"Bob Roe": 0.95, "__new__": 0.05},
     }
     extractor = create_extractor(
         [Many(Person, identity="name")],
-        transport=matcher(world, table),
+        transport=matcher(world, table, confidence=0.3),
         enable_inserts=True,
         match=MatchConfig(on_ambiguous="insert"),
     )
     result = await extractor.ainvoke(world.text, existing=RECORDS)
-    assert [(r.json_doc_id, r.kind) for r in result.records] == [
-        (None, "insert"),
-        ("1", "update"),
-    ]
-    assert result.skipped == ()
+    assert [(r.json_doc_id, r.kind) for r in result.records] == [(None, "insert")]
+    # Bob is not likely new: "insert" does not make a duplicate of his record
+    (skip,) = result.skipped
+    assert (skip.reason, skip.entity.label) == ("ambiguous_match", "Bob Roe")
     # inserts still obey enable_inserts
     extractor = create_extractor(
         [Many(Person, identity="name")],
-        transport=matcher(world, table),
+        transport=matcher(world, table, confidence=0.3),
         match=MatchConfig(on_ambiguous="insert"),
     )
     result = await extractor.ainvoke(world.text, existing=RECORDS)
-    assert [s.reason for s in result.skipped] == ["inserts_disabled"]
+    assert [s.reason for s in result.skipped] == [
+        "inserts_disabled",
+        "ambiguous_match",
+    ]
+
+
+async def test_declared_match_odds_exercise_the_ambiguous_paths() -> None:
+    text = "Emma Thompson met Bob Roe."
+    world = FakeWorld(text)
+    world.entity(
+        "Emma Thompson",
+        schema=Person,
+        mentions=["Emma Thompson"],
+        fields={"name": "Emma Thompson", "notes": ["met Bob Roe"]},
+        match_odds={"Emma Thompson": 0.55, "Bob Roe": 0.05, "__new__": 0.4},
+    )
+    world.entity(
+        "Bob Roe",
+        schema=Person,
+        mentions=["Bob Roe"],
+        fields={"name": "Bob Roe", "notes": ["met Emma"]},
+        match_odds={"Bob Roe": 0.9, "__new__": 0.1},
+        match_confidence=0.3,  # sure of the option, not of the answer
+    )
+    result = await invoke(world, RECORDS, Many(Person, identity="name"), text=text)
+    assert result.records == ()
+    reasons = {s.entity.label: s for s in result.skipped}
+    assert reasons["Emma Thompson"].candidates == (
+        ("0", 0.55),
+        ("__new__", 0.4),
+        ("1", 0.05),
+    )
+    assert "confidence is 0.30" in reasons["Bob Roe"].detail
+    assert result.untouched == ("0", "1")
 
 
 async def test_on_ambiguous_raise_stops_before_any_extraction() -> None:
@@ -887,17 +923,33 @@ async def test_a_record_the_input_says_to_remove_is_deleted_last() -> None:
     delete = result.records[-1]
     assert delete.before == zed[2] and delete.after is None
     assert delete.value is None and delete.valid and delete.patches == ()
-    assert delete.entity is not None
-    assert delete.entity.match_probs == {"3": 0.95}
+    assert delete.entity is None and delete.delete_p == 0.95
+    assert [r.delete_p for r in result.records[:-1]] == [None] * 4
     assert result.deleted == ("3",)
     assert result.untouched == ()  # a deleted record was dealt with
     assert len(result.responses) == 4  # a delete has no model
     assert len(result.response_metadata) == 4
-    # one question per record, the records of a request named in the call
+    # one request for the four records, one question each over a shared state
+    ((_, payload, meta),) = of_kind(world, "delete")
+    assert meta.entity is None and meta.field == "0,1,2,3"
+    assert set(payload["state"]) == {"input", "records"}
+    assert list(payload["state"]["records"]) == ["r0", "r1", "r2", "r3"]
+    assert list(payload["questions"]) == [f"delete.r{k}" for k in range(4)]
+
+
+async def test_a_long_list_of_records_costs_one_delete_request_per_64() -> None:
+    world = people_world(bleed=False)
+    records: list[Record] = [
+        (f"z{i}", "Person", {"name": f"Zed Qux{i:03d}", "notes": []})
+        for i in range(130)
+    ]
+    result = await invoke(
+        world, [*EXISTING, *records], enable_inserts=True, enable_deletes=True
+    )
     asked = of_kind(world, "delete")
-    assert sorted(meta.entity or "" for _, _, meta in asked) == ["0", "1", "2", "3"]
-    for _, payload, _ in asked:
-        assert set(payload["state"]) == {"input", "record"}
+    assert sorted(len(p["questions"]) for _, p, _ in asked) == [5, 64, 64]
+    assert kinds(result)["delete"] == 3
+    assert result.deleted == ()
 
 
 async def test_deletes_follow_the_threshold() -> None:
@@ -957,7 +1009,7 @@ async def test_a_record_both_updated_and_deleted_is_a_conflict() -> None:
     )
 
 
-async def test_with_updates_disabled_a_matched_record_can_still_be_deleted() -> None:
+async def test_a_matched_flagged_record_is_a_conflict_even_without_updates() -> None:
     world = people_world()
     world.delete("1", 0.97)
     result = await invoke(
@@ -967,21 +1019,50 @@ async def test_with_updates_disabled_a_matched_record_can_still_be_deleted() -> 
         enable_updates=False,
         enable_deletes=True,
     )
-    assert [(r.json_doc_id, r.kind) for r in result.records] == [
-        (None, "insert"),
-        ("1", "delete"),
-    ]
-    assert result.deleted == ("1",)
+    assert [(r.json_doc_id, r.kind) for r in result.records] == [(None, "insert")]
+    assert result.deleted == ()
     reasons = {s.entity.label: s.reason for s in result.skipped}
-    assert reasons["Michael Chen"] == "updates_disabled"  # not a conflict
-    assert "conflict_update_delete" not in reasons.values()
+    assert reasons["Michael Chen"] == "conflict_update_delete"
+    assert reasons["Emma Thompson"] == "updates_disabled"
+    assert result.untouched == ()
+
+
+async def test_a_flagged_record_an_ambiguous_entity_may_be_is_not_deleted() -> None:
+    world = two_people()
+    table = {
+        "Emma Thompson": {"Emma Thompson": 0.5, "Bob Roe": 0.3, "__new__": 0.2},
+        "Bob Roe": {"Bob Roe": 0.95, "__new__": 0.05},
+    }
+    delete_p = {"0": 0.95}
+
+    def answer(model: str, payload: Body, meta: CallMeta) -> Any:
+        ids = (meta.field or "").split(",")
+        return clef_response(
+            {
+                qid: {"type": "noul", "noul": delete_p.get(rid, 0.05)}
+                for qid, rid in zip(payload["questions"], ids, strict=True)
+            },
+            model=payload["model"],
+        )
+
+    transport = matcher(world, table, delete=answer)
+    extractor = create_extractor(
+        [Many(Person, identity="name")], transport=transport, enable_deletes=True
+    )
+    result = await extractor.ainvoke(world.text, existing=RECORDS)
+    # record "0" is flagged, and Emma (ambiguous) most likely is that record
+    assert result.deleted == ()
+    assert [r.kind for r in result.records] == ["update"]  # Bob
+    assert result.untouched == ("0",)
+    (warning,) = [w for w in result.warnings if w.startswith("match_delete_held")]
+    assert "'0'" in warning and "Emma Thompson" in warning
 
 
 async def test_deletes_run_with_the_matching_not_after_it() -> None:
     world = people_world()
     result = await invoke(world, EXISTING, enable_inserts=True, enable_deletes=True)
     order = [c.kind for c in result.calls]
-    assert order.count("delete") == 3
+    assert order.count("delete") == 1  # one request for the three records
     assert order.index("delete") < order.index("extract")
     assert result.deleted == ()
 
@@ -1017,3 +1098,144 @@ async def test_coreference_settings_still_apply_next_to_matching() -> None:
         coref=CorefConfig(strategy="pairwise"),
     )
     assert [r.json_doc_id for r in result.records] == ["0", "1", "2", None]
+
+
+# --------------------------------------------------------------------------- #
+# A confident wrong match must not rewrite another entity's record
+# --------------------------------------------------------------------------- #
+
+
+class Resident(BaseModel):
+    """A person."""
+
+    name: str = Field(description="full name")
+    city: Optional[str] = Field(None, description="the city they live in")
+    notes: list[str] = Field([], description="things worth remembering")
+
+
+WATSON = "Emma Watson moved to Lyon and took up fencing."
+THOMPSON: Record = (
+    "a",
+    "Resident",
+    {"name": "Emma Thompson", "city": "Paris", "notes": ["likes tea"]},
+)
+
+
+def watson_world() -> FakeWorld:
+    world = FakeWorld(WATSON)
+    world.entity(
+        "Emma Watson",
+        schema=Resident,
+        mentions=["Emma Watson"],
+        fields={"name": "Emma Watson", "city": "Lyon", "notes": ["took up fencing"]},
+        matches={"name": "Emma Thompson"},  # Clef picks the wrong Emma, p=0.92
+    )
+    return world
+
+
+async def test_an_entity_with_another_name_than_its_record_is_refused() -> None:
+    world = watson_world()
+    extractor = create_extractor([Many(Resident)], transport=world.transport())
+    result = await extractor.ainvoke(WATSON, existing=[THOMPSON])
+    (record,) = result.records
+    # nothing was applied: the record is as it was, and every proposed operation
+    # is reported
+    assert (record.kind, record.json_doc_id) == ("update", "a")
+    assert record.patches == () and record.after == record.before == THOMPSON[2]
+    assert [(r.op, r.path, r.reason) for r in record.rejected] == [
+        ("replace", "/name", "identity_conflict"),
+        ("replace", "/city", "identity_conflict"),
+        ("add", "/notes/-", "identity_conflict"),
+    ]
+    assert "Emma Watson" in record.rejected[0].detail
+    assert "Emma Thompson" in record.rejected[0].detail
+    (skip,) = result.skipped
+    assert (skip.reason, skip.entity.label) == ("ambiguous_match", "Emma Watson")
+    assert skip.detail.startswith("identity conflict:")
+    assert dict(skip.candidates) == {"a": 0.92, "__new__": pytest.approx(0.08)}
+    # the change gate was never asked
+    assert kinds(result)["gate"] == 0
+    assert result.responses[0].name == "Emma Thompson"  # type: ignore[attr-defined]
+
+
+async def test_a_short_form_or_diminutive_of_the_records_name_still_updates() -> None:
+    text = "Liz moved to Lyon and took up fencing."
+    world = FakeWorld(text)
+    world.entity(
+        "Liz",
+        schema=Resident,
+        mentions=["Liz"],
+        fields={"name": "Liz", "city": "Lyon", "notes": ["took up fencing"]},
+        matches={"name": "Elizabeth Smith"},
+    )
+    existing: Record = (
+        "b",
+        "Resident",
+        {"name": "Elizabeth Smith", "city": "Paris", "notes": []},
+    )
+    extractor = create_extractor([Many(Resident)], transport=world.transport())
+    result = await extractor.ainvoke(text, existing=[existing])
+    (record,) = result.records
+    assert result.skipped == ()
+    assert [(p.op, p.path) for p in record.patches] == [
+        ("replace", "/city"),
+        ("add", "/notes/-"),
+    ]
+    assert record.after is not None and record.after["name"] == "Elizabeth Smith"
+    assert [r.reason for r in record.rejected if r.path == "/name"] == [
+        "identity_subset"
+    ]
+
+
+async def test_a_schema_without_an_identity_field_skips_the_guard() -> None:
+    class Reading(BaseModel):
+        """A temperature reading."""
+
+        value: float
+        note: Optional[str] = None
+
+    text = "The probe read 21.5 degrees."
+    world = FakeWorld(text)
+    world.entity(
+        "r",
+        schema=Reading,
+        mentions=["probe"],
+        fields={"value": 21.5},
+        matches={"value": 19.0},
+    )
+    extractor = create_extractor([Many(Reading)], transport=world.transport())
+    result = await extractor.ainvoke(
+        text, existing=[("r1", "Reading", {"value": 19.0, "note": None})]
+    )
+    (record,) = result.records
+    assert [(p.op, p.path) for p in record.patches] == [("replace", "/value")]
+    assert result.skipped == ()
+    assert any("no_identity_field" in w for w in result.warnings)
+
+
+async def test_the_guard_applies_per_entity_and_leaves_the_others_alone() -> None:
+    text = "Emma Watson moved to Lyon. Later Bob Roe thanked her."
+    world = FakeWorld(text)
+    world.entity(
+        "Emma Watson",
+        schema=Resident,
+        mentions=["Emma Watson"],
+        fields={"name": "Emma Watson", "city": "Lyon"},
+        matches={"name": "Emma Thompson"},
+    )
+    world.entity(
+        "Bob Roe",
+        schema=Resident,
+        mentions=["Bob Roe"],
+        fields={"name": "Bob Roe", "notes": ["thanked her"]},
+        matches={"name": "Bob Roe"},
+    )
+    existing = [
+        THOMPSON,
+        ("b", "Resident", {"name": "Bob Roe", "city": None, "notes": []}),
+    ]
+    extractor = create_extractor([Many(Resident)], transport=world.transport())
+    result = await extractor.ainvoke(text, existing=existing)
+    thompson, bob = result.records
+    assert thompson.patches == () and [p.path for p in bob.patches] == ["/notes/-"]
+    assert [s.entity.label for s in result.skipped] == ["Emma Watson"]

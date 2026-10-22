@@ -359,13 +359,13 @@ def test_05_people_memory(capsys: pytest.CaptureFixture[str]) -> None:
         "2",
         None,
     ]
-    # Sarah: the short form never overwrites the full name, and the case-only
-    # relationship change is refused by the gate
+    # Sarah: the short form never overwrites the full name, and "neighbor" for the
+    # record's "Neighbor" is no change at all (no operation, nothing to gate)
     sarah_record = result.records[2]
-    assert {(r.path, r.reason) for r in sarah_record.rejected} >= {
-        ("/name", "identity_subset"),
-        ("/relationship", "gate_noul"),
+    assert {(r.path, r.reason) for r in sarah_record.rejected} == {
+        ("/name", "identity_subset")
     }
+    assert sarah_record.fields["relationship"].rejected_reason is None
     # the match probabilities are reported per entity: the record, or __new__
     chosen = []
     for record in result.records:
@@ -388,10 +388,10 @@ def test_05_calls_follow_the_matching_pipeline(
     result = run("05_people_memory", capsys, keep_output=True)
     counts = Counter(call.kind for call in result.calls)
     assert counts["match"] == 4  # one choice per person that qualifies; not Sunny
-    assert counts["qualify"] == 1 and counts["gate"] == 9
+    assert counts["qualify"] == 1 and counts["gate"] == 8
     # a request as the library sent it: the options are the records as JSON
     out = capsys.readouterr().out
-    assert "match 4" in out and "29 requests" in out
+    assert "match 4" in out and "28 requests" in out
 
 
 def test_06_attribution_guard(capsys: pytest.CaptureFixture[str]) -> None:

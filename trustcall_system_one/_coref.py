@@ -27,6 +27,7 @@ Two strategies, picked by ``CorefConfig.strategy``:
   compared, so only the pairs inside a batch land in the pair cache.
 """
 
+import difflib
 import logging
 import re
 from collections.abc import Callable, Mapping, Sequence
@@ -52,8 +53,10 @@ __all__ = [
     "canonical_label",
     "cluster_mentions",
     "has_context",
+    "identity_compatible",
     "mention_entry",
     "name_part",
+    "name_tokens",
     "near",
     "nicknames",
     "normalise",
@@ -189,7 +192,8 @@ def canonical_label(texts: Sequence[str]) -> str:
     return shown[best]
 
 
-def _name_tokens(text: str) -> list[str]:
+def name_tokens(text: str) -> list[str]:
+    """The case-folded words of a name or title (hyphens split words)."""
     return [t for t in normalise(text).replace("-", " ").split() if t]
 
 
@@ -263,6 +267,63 @@ def nicknames(first: str, second: str) -> bool:
     return any(first in group and second in group for group in _NICKNAMES)
 
 
+_TYPO = 0.8
+
+
+def _token_fits(short: str, long: str) -> bool:
+    """Whether two name tokens can be the same word written two ways."""
+    if short == long or nicknames(short, long):
+        return True
+    if len(short) == 1 or len(long) == 1:  # an initial
+        return short[0] == long[0]
+    if any(ch.isdigit() for ch in short + long):
+        return False  # numbers must be equal
+    if (
+        len(short) >= 2
+        and len(long) >= 2
+        and (long.startswith(short) or short.startswith(long))
+    ):
+        return True  # Ann/Anne, Em/Emma
+    if min(len(short), len(long)) < 4:
+        return False
+    return difflib.SequenceMatcher(None, short, long).ratio() >= _TYPO
+
+
+def identity_compatible(first: str, second: str) -> bool:
+    """Whether two identity values can name one entity.
+
+    They can when every word of the one with fewer words is a form of a different
+    word of the other: the same word, a diminutive (Liz and Elizabeth), an initial,
+    a prefix (Ann and Anne), a small typo (Thomson and Thompson), or the initials
+    of the whole name ("JS" for John Smith). "Sarah" fits "Sarah Johnson"; "Emma
+    Watson" does not fit "Emma Thompson" (a shared first name is not enough), and
+    two ids that differ in a number never fit.
+
+    Args:
+        first: One identity value (a name, a title, an id).
+        second: The other.
+    """
+    a, b = name_tokens(first), name_tokens(second)
+    if not a or not b:
+        return True  # nothing to compare
+    short, long = (a, b) if len(a) <= len(b) else (b, a)
+    if (
+        len(short) == 1
+        and len(short[0]) >= 2
+        and short[0] == "".join(t[0] for t in long)
+    ):
+        return True
+    free = list(long)
+    for token in short:
+        for other in free:
+            if _token_fits(token, other):
+                free.remove(other)
+                break
+        else:
+            return False
+    return True
+
+
 def near(source: str, first: Mention, second: Mention) -> bool:
     """Whether two mentions stand in one sentence or within about 200 characters."""
     if first.span is None or second.span is None:
@@ -291,7 +352,7 @@ def plausible(first: str, second: str, *, near: bool = False) -> bool:
     """
     if name_part(first) is None or name_part(second) is None:
         return True
-    a, b = _name_tokens(first), _name_tokens(second)
+    a, b = name_tokens(first), name_tokens(second)
     if set(a) & set(b):
         return True
     for x in a:

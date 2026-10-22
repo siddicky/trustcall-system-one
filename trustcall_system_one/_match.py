@@ -27,7 +27,6 @@ Steps 8 and 9 of "Collection engine" in ``docs/DESIGN.md``:
 
 import difflib
 import itertools
-import json
 import math
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -37,8 +36,9 @@ from trustcall_system_one._compile import SchemaPlan
 from trustcall_system_one._coref import (
     NEW,
     canonical_label,
+    identity_compatible,
+    name_tokens,
     nicknames,
-    normalise,
 )
 from trustcall_system_one._errors import AmbiguousMatchError
 from trustcall_system_one._render import estimate_tokens
@@ -61,10 +61,12 @@ __all__ = [
     "MatchAnswer",
     "MatchOutcome",
     "assign",
+    "candidate_options",
     "collisions",
     "compact_record",
     "flag_deletes",
     "hungarian",
+    "identity_compatible",
     "identity_keys",
     "match_entities",
     "similarity",
@@ -83,7 +85,7 @@ _SHOWN_CANDIDATES = 10
 _NOTICEABLE = 0.01
 _DIMINUTIVE = 0.9
 _PRUNE = 1e-3
-"""Records no entity gives this probability are no columns of the assignment."""
+"""Below this probability the options of an entity are not told apart."""
 
 
 @dataclass(frozen=True)
@@ -215,21 +217,26 @@ def assign(
 ) -> list[str]:
     """One-to-one assignment of entities to records, any number of them new.
 
-    The cost of giving an entity an option is ``-log(max(p, 1e-9))``. The columns
-    are the records plus one ``__new__`` column per entity (so every entity can be
-    new, and ``__new__`` costs each entity its own ``__new__`` probability); a
-    record goes to at most one entity, and the entity that loses a contested record
-    takes the best option that is still free. Exact ties go to the earlier entity
-    and the earlier record, so the result never depends on dictionary order.
+    The cost of giving an entity an option is ``-log(max(p, floor))``, the floor
+    being ``prune`` (at least 1e-9): every probability below it costs the same. The
+    columns are the records plus one ``__new__`` column per entity (so every entity
+    can be new, and ``__new__`` costs each entity its own ``__new__`` probability);
+    a record goes to at most one entity, and the entity that loses a contested
+    record takes the best option that is still free. Exact ties go to the earlier
+    entity and the earlier record, so the result never depends on dictionary order.
+
+    The result is the exact optimum of that cost matrix. A record that every entity
+    gives no more than the floor is left out of the matrix: it costs each of them
+    exactly what its own ``__new__`` column costs at most, so it is never worth
+    taking, and leaving it out keeps the matrix small with hundreds of records. A
+    larger ``prune`` makes more of the small probabilities equal (a stronger claim
+    still always beats a weaker one above it).
 
     Args:
         probabilities: For each entity the probability of each option (a record id
             or ``"__new__"``); an option that is missing has probability 0.
         records: The record ids that are columns, in order.
-        prune: Leave out the records that no entity gives a probability of at
-            least this much (they cost every entity the same and are never worth
-            taking; with hundreds of records this keeps the matrix small). The
-            default keeps them all, so the result is exactly optimal.
+        prune: The floor below which probabilities are not told apart.
 
     Returns:
         For each entity the record id it gets, or ``"__new__"``.
@@ -237,16 +244,20 @@ def assign(
     n = len(probabilities)
     if n == 0:
         return []
+    floor = max(prune, _FLOOR)
+
+    def cost(probs: Mapping[str, float], option: str) -> float:
+        return -math.log(max(probs.get(option, 0.0), floor))
+
     ids = [
         rid
         for rid in records
-        if prune <= 0 or any(probs.get(rid, 0.0) >= prune for probs in probabilities)
+        if any(probs.get(rid, 0.0) > floor for probs in probabilities)
     ]
     matrix: list[list[float]] = []
     for i, probs in enumerate(probabilities):
-        row = [-math.log(max(probs.get(rid, 0.0), _FLOOR)) for rid in ids]
-        new = -math.log(max(probs.get(NEW, 0.0), _FLOOR))
-        row.extend([new] * n)
+        row = [cost(probs, rid) for rid in ids]
+        row.extend([cost(probs, NEW)] * n)
         # break exact ties towards the earlier entity (the lower column)
         weight = (n - i) * _TIE_EPS
         matrix.append([c + weight * j for j, c in enumerate(row)])
@@ -283,17 +294,13 @@ def collisions(
 # --------------------------------------------------------------------------- #
 
 
-def _tokens(text: str) -> list[str]:
-    return normalise(text).replace("-", " ").split()
-
-
 def token_set_ratio(first: str, second: str) -> float:
     """How alike two texts are as sets of words, from 0 to 1.
 
     The words both have are compared with each text's own extra words, so
     "Sarah" fits "Sarah Johnson" fully and word order does not matter.
     """
-    a, b = set(_tokens(first)), set(_tokens(second))
+    a, b = set(name_tokens(first)), set(name_tokens(second))
     if not a or not b:
         return 0.0
     both = " ".join(sorted(a & b))
@@ -318,11 +325,11 @@ def similarity(values: Sequence[str], mentions: Sequence[str]) -> float:
     """
     best = 0.0
     for value in values:
-        mine = _tokens(value)
+        mine = name_tokens(value)
         for mention in mentions:
             score = token_set_ratio(value, mention)
             if score < _DIMINUTIVE and any(
-                nicknames(x, y) for x in mine for y in _tokens(mention)
+                nicknames(x, y) for x in mine for y in name_tokens(mention)
             ):
                 score = _DIMINUTIVE
             best = max(best, score)
@@ -601,7 +608,7 @@ def _collision_note(
     )
 
 
-def _candidates(probs: Mapping[str, float]) -> tuple[tuple[str, float], ...]:
+def candidate_options(probs: Mapping[str, float]) -> tuple[tuple[str, float], ...]:
     shown = sorted(
         ((option, p) for option, p in probs.items() if p >= _NOTICEABLE),
         key=lambda item: (-item[1], item[0]),
@@ -734,7 +741,7 @@ async def match_entities(
         if sure:
             targets[info.key] = None if pick == NEW else pick
             continue
-        candidates_ = _candidates(answer.probs)
+        candidates_ = candidate_options(answer.probs)
         detail = f"{info.label!r} could not be matched with enough certainty: " + (
             f"the best option {pick!r} has p={p:.2f} (accept at "
             f"{config.accept:g}) and the answer's confidence is "
@@ -749,8 +756,8 @@ async def match_entities(
                 label=info.label,
                 candidates=candidates_,
             )
-        if config.on_ambiguous == "insert":
-            targets[info.key] = None
+        if config.on_ambiguous == "insert" and answer.p(NEW) >= config.accept:
+            targets[info.key] = None  # new is a likely reading: insert it
             continue
         skipped.append(
             SkippedEntity(plan.name, info, "ambiguous_match", detail, candidates_)
@@ -763,6 +770,10 @@ async def match_entities(
 # --------------------------------------------------------------------------- #
 
 
+DELETE_BATCH = 64
+"""Records one delete request asks about (Clef takes 64 questions per request)."""
+
+
 async def flag_deletes(
     run: Run,
     plan: SchemaPlan,
@@ -770,13 +781,16 @@ async def flag_deletes(
     candidates: Sequence[Candidate],
     identity: Sequence[str],
 ) -> dict[str, float | None]:
-    """Ask, per existing record, whether the input says it should be removed.
+    """Ask, per existing record, whether the input says it should be deleted.
 
-    One Clef ``noul`` per record (call kind ``delete``) over the state ``{input,
-    record}``; records with the same state share a request. A record that would
-    make the state too large for Clef is rendered compactly (``match_compacted``).
-    ``CallMeta.entity`` holds the ids of the records of the request, comma-joined, in
-    question order (the questions are ``delete.0``, ``delete.1`` ...).
+    The records go into requests of up to 64, in order, one Clef ``noul`` each (call
+    kind ``delete``): the state is ``{input, records: {r0: <record>, r1: ...}}`` and
+    the question ``delete.r<k>`` names ``records.r<k>`` (``k`` is the record's place
+    in ``candidates``). A request that would be over the Clef state budget takes
+    fewer records, and a record that does not fit beside the input alone is rendered
+    compactly (``match_compacted``). ``CallMeta.entity`` is not set;
+    ``CallMeta.field`` holds the ids of the request's records, comma-joined, in
+    question order.
 
     Args:
         run: The invoke's context.
@@ -789,47 +803,68 @@ async def flag_deletes(
         The probability by record id (``None`` for a missing answer).
     """
     budget = run.limits.clef_state_token_budget
-    groups: dict[str, tuple[dict[str, Any], list[str]]] = {}
+    base = estimate_tokens(run.clef_state(text, extra={"records": {}}))
+    batches: list[dict[int, dict[str, Any]]] = []
+    used = base
     compacted = 0
-    for candidate in candidates:
+    for index, candidate in enumerate(candidates):
         record: dict[str, Any] = dict(candidate.data)
-        state = run.clef_state(text, record=record)
-        if estimate_tokens(state) > budget:
+        size = _size({f"r{index}": record})
+        if base + size > budget:
             record = compact_record(candidate.data, identity, run.match.render_fields)
-            state = run.clef_state(text, record=record)
+            size = _size({f"r{index}": record})
             compacted += 1
-        key = json.dumps(state, sort_keys=True, default=str)
-        groups.setdefault(key, (state, []))[1].append(candidate.record_id)
+        if (
+            not batches
+            or len(batches[-1]) >= DELETE_BATCH
+            or (used + size > budget and batches[-1])
+        ):
+            batches.append({})
+            used = base
+        batches[-1][index] = record
+        used += size
     if compacted:
         run.warn(
             f"match_compacted: {compacted} existing {plan.name} record(s) did not "
             "fit one Clef request in full, so the delete question saw them "
             "rendered compactly"
         )
-    question = NoulQuestion(
-        type="noul",
-        instructions=(
-            "Does `input` state that `record` should be removed or no longer applies?"
-        ),
-        criteria=NoulCriteria(
-            true="The input says the record should be removed or no longer applies.",
-            false="The input does not say that about the record.",
-        ),
-    )
+    question_for = {
+        index: NoulQuestion(
+            type="noul",
+            instructions=(
+                f"Does `input` state that `records.r{index}` should be deleted "
+                "\u2014 e.g. the person/item was removed, has died, or should no "
+                "longer be tracked? A change to its details is NOT deletion."
+            ),
+            criteria=NoulCriteria(
+                true="The input says the record should be deleted.",
+                false="The input does not say that about the record: at most its "
+                "details change.",
+            ),
+        )
+        for index in range(len(candidates))
+    }
 
-    async def ask(state: dict[str, Any], rids: list[str]) -> dict[str, float | None]:
+    async def ask(batch: dict[int, dict[str, Any]]) -> dict[str, float | None]:
+        state = run.clef_state(
+            text, extra={"records": {f"r{i}": r for i, r in batch.items()}}
+        )
+        ids = [candidates[i].record_id for i in batch]
         answers = await run.call_clef(
-            {f"delete.{k}": question for k in range(len(rids))},
+            {f"delete.r{i}": question_for[i] for i in batch},
             state,
-            meta=CallMeta(kind="delete", schema=plan.name, entity=",".join(rids)),
+            meta=CallMeta(kind="delete", schema=plan.name, field=",".join(ids)),
         )
         found: dict[str, float | None] = {}
-        for k, rid in enumerate(rids):
-            answer = answers.get(f"delete.{k}")
-            found[rid] = answer.noul if isinstance(answer, NoulAnswer) else None
+        for i in batch:
+            answer = answers.get(f"delete.r{i}")
+            found[candidates[i].record_id] = (
+                answer.noul if isinstance(answer, NoulAnswer) else None
+            )
         return found
 
-    parts = await gather(*(ask(state, rids) for state, rids in groups.values()))
+    parts = await gather(*(ask(batch) for batch in batches))
     merged: dict[str, float | None] = {}
     for part in parts:
         merged.update(part)

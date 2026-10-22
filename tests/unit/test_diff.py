@@ -205,6 +205,58 @@ def test_equal_after_normalisation_is_no_change(
     assert result.changes == [], (field, answer, stored)
 
 
+class Coded(BaseModel):
+    name: str
+    sku: Optional[str] = Field(None, pattern=r"^[A-Z]{2}-\d+$")
+    colour: Optional[Literal["Red", "red"]] = None
+    mood: Optional[Mood] = None
+    tags: list[str] = Field(default_factory=list)
+
+
+@pytest.mark.parametrize(
+    ("answer", "stored"),
+    [
+        ("neighbor", "Neighbor"),
+        ("NEIGHBOR", "neighbor"),
+        ("next  door\tneighbor", "Next door neighbor"),
+        ("  Austin ", "austin"),
+    ],
+)
+def test_free_text_differing_only_in_case_or_spacing_is_no_change(
+    answer: str, stored: str
+) -> None:
+    assert run(Flat, {"city": answer}, {"name": "Dana", "city": stored}).changes == []
+    # lists too: the same fact in other case is not a new element
+    assert new_positions(_spec(Flat, "notes"), [answer], [stored]) == []
+
+
+def _spec(model: type[BaseModel], name: str) -> Any:
+    return compile_schema(model).spec((name,))
+
+
+def test_free_text_still_changes_when_the_words_differ() -> None:
+    result = run(Flat, {"city": "Austin Texas"}, {"name": "Dana", "city": "austin"})
+    assert summary(result) == [("replace", "/city", "Austin Texas")]
+
+
+def test_a_pattern_constrained_string_compares_exactly() -> None:
+    # "ab-1" would not even validate: case is part of the format
+    result = run(Coded, {"sku": "AB-1"}, {"name": "x", "sku": "ab-1"})
+    assert summary(result) == [("replace", "/sku", "AB-1")]
+
+
+def test_a_vocabulary_compares_exactly() -> None:
+    result = run(Coded, {"colour": "Red"}, {"name": "x", "colour": "red"})
+    assert summary(result) == [("replace", "/colour", "Red")]
+
+
+def test_the_fold_is_only_for_free_text_kinds() -> None:
+    assert same("freetext", "Neighbor", "neighbor")
+    assert not same("text", "Neighbor", "neighbor")  # exact: strip only
+    assert not same("date", "2025-03-04", "2025-03-05")
+    assert same("text", "  a ", "a")
+
+
 @pytest.mark.parametrize(
     ("field", "answer", "stored"),
     [
@@ -291,6 +343,31 @@ def test_an_identity_value_is_never_replaced_by_a_token_subset(
 def test_other_identity_changes_go_on_to_the_gate(answer: str, stored: str) -> None:
     result = run(Flat, {"name": answer}, {"name": stored})
     assert summary(result) == [("replace", "/name", answer)]
+
+
+@pytest.mark.parametrize(
+    ("answer", "stored"),
+    [
+        ("Liz", "Elizabeth Smith"),  # a diminutive
+        ("J. Smith", "John Smith"),  # an initial
+        ("Emma Thomson", "Emma Thompson"),  # a slip of the reading
+    ],
+)
+def test_a_short_form_of_the_identity_never_replaces_it(
+    answer: str, stored: str
+) -> None:
+    result = run(Flat, {"name": answer}, {"name": stored})
+    assert result.changes == []
+    assert [(r.op, r.reason) for r in result.rejected if r.path == "/name"] == [
+        ("replace", "identity_subset")
+    ]
+
+
+def test_a_fuller_identity_or_a_reordering_is_not_a_short_form() -> None:
+    assert summary(run(Flat, {"name": "Sarah Johnson"}, {"name": "Sarah"})) == [
+        ("replace", "/name", "Sarah Johnson")
+    ]
+    assert summary(run(Flat, {"name": "Whitfield Dana"}, {"name": "Dana Whitfield"}))
 
 
 def test_a_non_identity_field_may_be_replaced_by_a_subset() -> None:

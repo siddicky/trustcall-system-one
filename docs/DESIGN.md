@@ -427,9 +427,13 @@ schema title: "Person").
      One warning `match_compacted` says so (and how few records an entity was offered).
    * **Assignment.** The probabilities of all entities go into ONE one-to-one assignment: the
      Hungarian algorithm (pure Python, `hungarian`; O(rows² · columns)) over the cost
-     `-log(max(p, 1e-9))`, with the records as columns (those no entity gives 0.001 are left out)
-     plus one `__new__` column per entity, so any number of entities can be new and the loser of a
-     contested record falls to its best feasible alternative. Exact ties go to the earlier
+     `-log(max(p, 0.001))` (every probability below 0.001 costs the same, so a stronger claim
+     always beats a weaker one above the floor, and the result is the exact optimum of that
+     clipped matrix, cross-checked against brute force), with the records as columns plus one
+     `__new__` column per entity, so any number of entities can be new and the loser of a
+     contested record falls to its best feasible alternative. A record that every entity gives
+     no more than the floor is no column (it can never beat the entity's own `__new__` column;
+     this keeps the matrix small with hundreds of records). Exact ties go to the earlier
      entity and the earlier record (a perturbation of 1e-12 per column index, not dictionary
      order). **Collisions:** two entities that both claim one record, each with its most likely
      option being that record at `p >= 0.5`, warn `match_collision` (both entities, the record, the
@@ -443,9 +447,24 @@ schema title: "Person").
      accept` AND the answer's confidence is `>= min_confidence`. Else the entity is ambiguous:
      `SkippedEntity(reason="ambiguous_match", candidates=((option, p), …))` (the options with p ≥
      0.01, the most likely first; the records it might have been are NOT handled, so they stay
-     untouched), or, with `on_ambiguous="insert"`, it is treated as new (still subject to the
-     insert rule of step 9), or `"raise"` raises `AmbiguousMatchError` (before any extraction).
-     A collision loser whose fallback is below `accept` is ambiguous too.
+     untouched), or, with `on_ambiguous="insert"`, it is treated as new when its `__new__`
+     probability is at least `accept` (still subject to the insert rule of step 9; else it is
+     skipped as ambiguous: "insert" never duplicates a record the entity most likely is), or
+     `"raise"` raises `AmbiguousMatchError` (before any extraction). A collision loser whose
+     fallback is below `accept` is ambiguous too.
+   * **Identity guard** (`update_one(identity=)`). A match is a model's guess, so after the
+     entity's identity has been extracted (and verified) it is compared with the record's:
+     they must be forms of one name (`_coref.identity_compatible`: every word of the one with
+     fewer words is a form of a different word of the other, i.e. the same word, a diminutive,
+     an initial, a prefix or a small typo; or the initials of the whole name; words with digits
+     must be equal). "Liz" fits "Elizabeth Smith", "Sarah" fits "Sarah Johnson", "Emma Watson"
+     does NOT fit "Emma Thompson" (a shared first name is not enough). With several identity
+     fields the match stands as soon as one fits; a field the input gave no value for says
+     nothing; a schema without an identity field has no guard. On a conflict the WHOLE update
+     is refused: nothing is gated or applied, every proposed operation is
+     `RejectedOp(op, path, "identity_conflict", detail)`, the record is an `update` with no
+     patches (`after == before`) and the entity is also reported as `SkippedEntity(reason=
+     "ambiguous_match", detail="identity conflict: …", candidates=…)`.
    * **Result.** `EntityInfo.match_probs` holds `{record id: p, …, "__new__": p}` for the options
      it was offered; `ExtractionResult.records` are ordered by first mention (updates and inserts
      mixed), then the deletes in record order; `skipped` is in entity order; `json_doc_id` is
@@ -463,18 +482,23 @@ schema title: "Person").
      only case here, so "or no existing records of S were given" is the plain insert path of
      step 6);
    * **deletes** (`enable_deletes`; skipped when the presence question found no mention of S at
-     all): one Clef `noul` per existing record (call kind `delete`, ids `delete.<k>`), state
-     `{input, record}` (the record compacted as above if over budget; records with identical
-     states share a request), "Does `input` state that `record` should be removed or no longer
-     applies?"; `CallMeta.entity` holds the ids of the request's records, comma-joined, in
-     question order. They run concurrently with matching. At `>= delete_threshold` the record is
+     all): the records go into Clef requests of up to 64 (fewer when the state would be over the
+     budget; a record too big even alone is compacted as above), one `noul` each (call kind
+     `delete`), over the structured state `{input, records: {r0: <record>, r1: …}}` with the
+     question `delete.r<k>` ("Does `input` state that `records.r<k>` should be deleted — e.g. the
+     person/item was removed, has died, or should no longer be tracked? A change to its details
+     is NOT deletion."; `k` is the record's place in the list). `CallMeta.entity` is unset and
+     `CallMeta.field` holds the ids of the request's records, comma-joined, in question order.
+     They run concurrently with matching. At `>= delete_threshold` the record is
      `ResultRecord(kind="delete", json_doc_id=<id>, before=<record>, after=None, value=None,
-     entity.match_probs={id: p})` and `ExtractionResult.deleted` lists its id;
-   * a record both matched for update and flagged for delete → `SkippedEntity(
+     entity=None, delete_p=p)` and `ExtractionResult.deleted` lists its id;
+   * a record both matched (accepted) and flagged for delete → `SkippedEntity(
      reason="conflict_update_delete", candidates=((id, match p),))`: neither an update nor a
-     delete (and no extraction request). With `enable_updates=False` nothing is updated, so the
-     delete goes ahead next to the entity's `updates_disabled`;
-   * records nothing happened to (not matched, not flagged, or matched ambiguously) →
+     delete (and no extraction request), whatever `enable_updates` says;
+   * a record flagged for delete that an `ambiguous_match` entity most likely is (its best record
+     candidate, at 0.25 or more, including an identity-conflict refusal) is not deleted either:
+     run warning `match_delete_held`;
+   * records nothing happened to (not matched, not flagged, held back, or matched ambiguously) →
      `ExtractionResult.untouched`, keyed by (schema, id) so that an `"__any__"` record is told
      apart; no ops. With no entities at all (presence below `discovery.presence_absent`, or
      nothing found) nothing but the discovery requests is made.
@@ -494,7 +518,10 @@ schema title: "Person").
 | `guess` as a value | never | metadata only |
 
 Diff walks the field plan, never the document (`_diff.py`): absent → `add`; differs
-(normalised: ISO dates, `math.isclose` numbers, stripped text, enum values) → `replace`;
+(normalised: ISO dates, `math.isclose` numbers, stripped text, enum values; free-text `str` fields
+and their list elements also case-folded with internal whitespace collapsed, so "neighbor" for
+"Neighbor" is no change, while a `Literal`/`Enum`, a union or a `pattern`-constrained string
+compares exactly) → `replace`;
 equal → nothing; null answer → **no op**, recorded as `RejectedOp(op=None,
 reason="not_mentioned")` (silence is not deletion; opt-in `gates.allow_null_removals`);
 scalar lists use set semantics → `add /notes/-` for new elements only. Order: replace →
@@ -572,8 +599,10 @@ its entities against them (steps 8-9 of "Collection engine").
 
 **Operation shapes.** Leaf the record lacks (key absent or null) → `add /field`; leaf that
 differs → `replace /field`; paths use the schema's validation keys. An *identity* field
-(`plan.identity`, `s1_field(identity=True)`) is never replaced by a proper token subset of the
-existing value ("Dana" for "Dana Whitfield"): `identity_subset`, before any model is asked;
+(`plan.identity`, `s1_field(identity=True)`) is never replaced by a short form of the
+existing value: a proper token subset ("Dana" for "Dana Whitfield"), or a diminutive, initials,
+a prefix or a typo of it with no more words ("Liz" for "Elizabeth Smith"); a fuller name or a
+reordering is not one: `identity_subset`, before any model is asked;
 other identity edits go to the gate. A scalar list the record lacks → one `add /list` of the
 deduplicated list; otherwise one `add /list/-` per new element (elements of the record that the
 answer omits are left alone). A new element equal to a record element after folding case, punctuation and spacing
@@ -633,7 +662,9 @@ ones).
 sub-models `invalid_optional_group`; `unsupported` (a collection or mapping field an update cannot extract before M9;
 the record keeps its value; `validation` for an error left after the drops). Computed operations that were thrown away (`op` is the
 operation): `identity_subset`, `duplicate`, `required_field`, `gate_noul`, `gate_missing`
-(no gate answer), `apply_failed`, `validation`. Paths are JSON Pointers of the document.
+(no gate answer), `apply_failed`, `validation`; `identity_conflict` (a collection entity whose
+extracted identity shares no name with the record it was matched to: every operation of the
+update, see "Collection engine" step 8). Paths are JSON Pointers of the document.
 
 ## Repair loop (`_repair.py`)
 
@@ -808,7 +839,10 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
   model, a dict whose keys must equal the record's, or a string that occurs in the record's JSON)
   picks the offered record a `match` call answers at 0.92 (the rest share 0.08; no `matches=` is
   `__new__` at 0.92; one that fits no offered record, or several, is an `AssertionError`);
-  `.delete(record_id, p)` declares the `delete` answer (default 0.05).
+  `match_odds={"Emma Thompson": 0.55, "__new__": 0.4}` (keys: a string occurring in exactly one
+  offered record, or `__new__`; the rest share what is left) and `match_confidence=` declare the
+  probabilities and confidence instead, for the ambiguous paths; `.delete(record_id, p)`
+  declares the `delete` answer (default 0.05).
 - Unit tests (`pytest --disable-socket --allow-unix-socket`): `test_wire`, `test_compile` (one
   case per type-table row), `test_names` (regex property, pinned hash), `test_flatten`,
   `test_coerce`, `test_diff` (ordering, `/-` repair, list set semantics, echo spans),

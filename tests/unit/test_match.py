@@ -26,11 +26,13 @@ from trustcall_system_one._match import (
     compact_record,
     flag_deletes,
     hungarian,
+    identity_compatible,
     identity_keys,
     match_entities,
     similarity,
     token_set_ratio,
 )
+from trustcall_system_one._render import estimate_tokens
 from trustcall_system_one._run import Run
 from trustcall_system_one.testing import FakeTransport, choice, clef_response, noul
 
@@ -221,11 +223,59 @@ def test_records_nobody_gives_a_probability_are_left_out_of_the_matrix() -> None
         {NEW: 0.99},
     ]
     # every other record has probability 0: with 3000 of them the full matrix would
-    # be slow; the pruned one decides exactly as the full one would
+    # be slow; leaving them out decides exactly as the full matrix would
     pruned = assign(table, ids, prune=1e-3)
     assert pruned == ["r5", "r2999", NEW]
     assert pruned == assign(table, ["r5", "r6", "r2999"])
     assert assign(table, ids[:10], prune=1e-3) == ["r5", NEW, NEW]
+
+
+def test_pruning_is_the_exact_optimum_of_the_clipped_matrix() -> None:
+    rng = random.Random(77)
+
+    def clipped(p: float, floor: float) -> float:
+        return -math.log(max(p, floor))
+
+    for _ in range(400):
+        floor = rng.choice([1e-3, 1e-2, 0.05])
+        n, m = rng.randint(1, 4), rng.randint(1, 4)
+        ids = [f"r{i}" for i in range(m)]
+        table = []
+        for _ in range(n):
+            # many tiny probabilities, some of them below the floor
+            weights = [
+                rng.choice([0, 1e-4, 5e-4, 0.002, 0.02, 0.3, 1, 3])
+                for _ in range(m + 1)
+            ]
+            scale = sum(weights) or 1
+            options = [*ids, NEW]
+            table.append({o: w / scale for o, w in zip(options, weights, strict=True)})
+        chosen = assign(table, ids, prune=floor)
+        used = [c for c in chosen if c != NEW]
+        assert len(used) == len(set(used))
+        got = sum(clipped(table[i].get(c, 0.0), floor) for i, c in enumerate(chosen))
+        best = math.inf
+        for picks in itertools.product([*ids, NEW], repeat=n):
+            taken = [p for p in picks if p != NEW]
+            if len(taken) != len(set(taken)):
+                continue
+            best = min(
+                best,
+                sum(clipped(table[i].get(p, 0.0), floor) for i, p in enumerate(picks)),
+            )
+        assert got == pytest.approx(best, abs=1e-6)
+
+
+def test_a_contested_record_goes_to_the_stronger_claim_with_pruning_on() -> None:
+    # the weaker claim is above the floor, so it is still told apart from nothing
+    table = [
+        {"a": 0.3, "b": 0.02, NEW: 0.68},
+        {"a": 0.6, "b": 0.02, NEW: 0.38},
+    ]
+    assert assign(table, ["a", "b"], prune=1e-3) == [NEW, "a"]
+    # below the floor nothing separates the options: the earlier entity keeps its tie
+    tiny = [{"a": 0.0005, NEW: 0.5}, {"a": 0.0002, NEW: 0.5}]
+    assert assign(tiny, ["a"], prune=1e-3) == [NEW, NEW]
 
 
 # --------------------------------------------------------------------------- #
@@ -275,6 +325,35 @@ def test_a_diminutive_counts_as_a_close_match() -> None:
     assert similarity(["Liz Warren"], ["Elizabeth Warren"]) >= 0.9
     assert similarity(["Zed Qux"], ["Bob"]) < 0.5
     assert similarity([], ["Bob"]) == 0.0
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "same"),
+    [
+        ("Sarah", "Sarah Johnson", True),
+        ("Liz", "Elizabeth Smith", True),
+        ("Bob", "Robert Smith", True),
+        ("J. Smith", "John Smith", True),
+        ("JS", "John Smith", True),
+        ("Ann", "Anne Lee", True),
+        ("Emma Thomson", "Emma Thompson", True),  # a typo
+        ("Dr. Emma Thompson", "Emma Thompson", True),
+        ("emma thompson", "Emma  Thompson", True),
+        ("Acme Corp", "ACME Corporation", True),
+        ("Emma Watson", "Emma Thompson", False),  # a shared first name is not enough
+        ("Olivia Davis", "Emma Thompson", False),
+        ("SO-10442", "SO-10443", False),  # ids that differ in a number
+        ("Tom Ford", "Tim Ford", False),
+    ],
+)
+def test_identity_compatible(first: str, second: str, same: bool) -> None:
+    assert identity_compatible(first, second) is same
+    assert identity_compatible(second, first) is same
+
+
+def test_an_identity_with_nothing_to_compare_is_compatible() -> None:
+    assert identity_compatible("", "Emma")
+    assert identity_compatible("...", "Emma")
 
 
 def test_compact_records_keep_identity_scalars_and_list_heads() -> None:
@@ -639,8 +718,9 @@ async def test_a_new_entity_needs_the_accept_threshold_too() -> None:
     assert skip.reason == "ambiguous_match" and skip.candidates[0] == (NEW, 0.55)
 
 
-async def test_on_ambiguous_insert_makes_the_entity_new() -> None:
-    fixed = Fixed({"Emma Thompson": {"Ann": 0.5, NEW: 0.5}})
+async def test_on_ambiguous_insert_makes_a_likely_new_entity_new() -> None:
+    # not sure of the answer (low confidence), but "new" is what it says
+    fixed = Fixed({"Emma Thompson": {"Ann": 0.05, NEW: 0.95}}, confidence=0.3)
     outcome, _ = await run_fixed(
         fixed,
         [entity("e0", "Emma Thompson", "Emma Thompson")],
@@ -648,6 +728,26 @@ async def test_on_ambiguous_insert_makes_the_entity_new() -> None:
         MatchConfig(on_ambiguous="insert"),
     )
     assert outcome.targets == {"e0": None} and outcome.skipped == ()
+
+
+async def test_on_ambiguous_insert_skips_an_entity_that_is_not_likely_new() -> None:
+    for table in (
+        {"Ann": 0.5, NEW: 0.5},  # new is no more likely than accept
+        {"Ann": 0.9, NEW: 0.1},  # a record is likely: low confidence only
+    ):
+        fixed = Fixed(
+            {"Emma Thompson": table},
+            confidence=0.3 if table["Ann"] > 0.8 else None,
+        )
+        outcome, _ = await run_fixed(
+            fixed,
+            [entity("e0", "Emma Thompson", "Emma Thompson")],
+            candidates("Ann"),
+            MatchConfig(on_ambiguous="insert"),
+        )
+        assert outcome.targets == {}
+        (skip,) = outcome.skipped
+        assert skip.reason == "ambiguous_match"
 
 
 async def test_on_ambiguous_raise_names_the_entity_and_the_options() -> None:
@@ -841,72 +941,91 @@ async def test_a_missing_merge_answer_does_not_merge() -> None:
 # --------------------------------------------------------------------------- #
 
 
-async def test_one_delete_question_per_record_with_the_record_in_the_state() -> None:
-    seen: list[tuple[CallMeta, dict[str, Any]]] = []
+class DeleteLog:
+    """A handler for ``delete`` requests that records them."""
 
-    def handler(model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
-        seen.append((meta, payload))
+    def __init__(self, p: Any = 0.1) -> None:
+        self.p = p
+        self.seen: list[tuple[CallMeta, dict[str, Any]]] = []
+        self.transport = FakeTransport(self.handle)
+
+    def handle(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
+        self.seen.append((meta, payload))
+        records = payload["state"]["records"]
         return clef_response(
             {
-                qid: noul(0.9 if "Zed" in str(payload["state"]) else 0.1)
+                qid: noul(
+                    self.p(records[qid.removeprefix("delete.")])
+                    if callable(self.p)
+                    else self.p
+                )
                 for qid in payload["questions"]
             },
             model=payload["model"],
         )
 
-    run = Run(transport=FakeTransport(handler))
+
+async def test_the_delete_questions_are_batched_in_one_structured_state() -> None:
+    log = DeleteLog(lambda record: 0.9 if record["name"] == "Zed" else 0.1)
+    run = Run(transport=log.transport)
     records = candidates("Ann", "Zed")
     found = await flag_deletes(run, compile_schema(Person), TEXT, records, ("name",))
     assert found == {"0": 0.1, "1": 0.9}
-    assert sorted(m.kind for m, _ in seen) == ["delete", "delete"]
-    by_entity = {m.entity: p for m, p in seen}
-    assert set(by_entity) == {"0", "1"}
-    payload = by_entity["1"]
-    assert set(payload["state"]) == {"input", "record"}
-    assert payload["state"]["record"]["name"] == "Zed"
-    (question,) = payload["questions"].values()
+    ((meta, payload),) = log.seen  # one request for both
+    assert meta.kind == "delete" and meta.entity is None and meta.field == "0,1"
+    assert set(payload["state"]) == {"input", "records"}
+    assert payload["state"]["input"] == TEXT
+    assert payload["state"]["records"] == {
+        "r0": records[0].data,
+        "r1": records[1].data,
+    }
+    assert list(payload["questions"]) == ["delete.r0", "delete.r1"]
+    question = payload["questions"]["delete.r1"]
     assert question["type"] == "noul"
-    assert "should be removed or no longer applies" in question["instructions"]
+    assert question["instructions"] == (
+        "Does `input` state that `records.r1` should be deleted \u2014 e.g. the "
+        "person/item was removed, has died, or should no longer be tracked? A "
+        "change to its details is NOT deletion."
+    )
 
 
-async def test_records_that_share_a_state_share_a_request() -> None:
-    seen: list[tuple[CallMeta, dict[str, Any]]] = []
+async def test_more_than_64_records_go_in_requests_of_64() -> None:
+    log = DeleteLog()
+    run = Run(transport=log.transport)
+    records = candidates(*[f"Zed Qux{i:03d}" for i in range(150)])
+    found = await flag_deletes(run, compile_schema(Person), TEXT, records, ("name",))
+    assert len(found) == 150
+    sizes = sorted(len(p["questions"]) for _, p in log.seen)
+    assert sizes == [22, 64, 64]
+    # every record is asked once, under its place in the whole list
+    asked = sorted(
+        int(qid.removeprefix("delete.r")) for _, p in log.seen for qid in p["questions"]
+    )
+    assert asked == list(range(150))
+    for meta, payload in log.seen:
+        assert len((meta.field or "").split(",")) == len(payload["questions"])
 
-    def handler(model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
-        seen.append((meta, payload))
-        return clef_response(
-            {qid: noul(0.2) for qid in payload["questions"]}, model=payload["model"]
-        )
 
-    run = Run(transport=FakeTransport(handler))
-    twins = [
-        Candidate("a", {"name": "Twin", "notes": []}),
-        Candidate("b", {"name": "Twin", "notes": []}),
-        Candidate("c", {"name": "Other", "notes": []}),
-    ]
-    found = await flag_deletes(run, compile_schema(Person), TEXT, twins, ("name",))
-    assert found == {"a": 0.2, "b": 0.2, "c": 0.2}
-    assert len(seen) == 2
-    (twin_meta, twin_payload) = next(s for s in seen if len(s[1]["questions"]) == 2)
-    assert twin_meta.entity == "a,b"
-    assert list(twin_payload["questions"]) == ["delete.0", "delete.1"]
+async def test_records_that_do_not_fit_one_request_are_split_by_the_budget() -> None:
+    log = DeleteLog()
+    run = Run(transport=log.transport, limits=Limits(clef_state_token_budget=2_000))
+    records = candidates(
+        *[f"Zed Qux{i}" for i in range(40)],
+        extra={"relationship": "colleague " * 30},
+    )
+    await flag_deletes(run, compile_schema(Person), TEXT, records, ("name",))
+    assert len(log.seen) > 1
+    for _, payload in log.seen:
+        assert estimate_tokens(payload["state"]) <= 2_000
 
 
 async def test_a_huge_record_is_compacted_for_the_delete_question() -> None:
-    states: list[Any] = []
-
-    def handler(model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
-        states.append(payload["state"])
-        return clef_response(
-            {qid: noul(0.1) for qid in payload["questions"]}, model=payload["model"]
-        )
-
-    run = Run(
-        transport=FakeTransport(handler), limits=Limits(clef_state_token_budget=1_000)
-    )
+    log = DeleteLog()
+    run = Run(transport=log.transport, limits=Limits(clef_state_token_budget=1_000))
     records = bulky(["Ann"])
     await flag_deletes(run, compile_schema(Person), TEXT, records, ("name",))
-    assert len(states[0]["record"]["notes"]) == 3
+    ((_, payload),) = log.seen
+    assert len(payload["state"]["records"]["r0"]["notes"]) == 3
     assert any(w.startswith("match_compacted") for w in run.warnings)
 
 

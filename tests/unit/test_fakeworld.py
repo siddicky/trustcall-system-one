@@ -932,10 +932,13 @@ async def delete_asks(world: FakeWorld, ids: str, count: int) -> Body:
         CLEF,
         {
             "model": "clef",
-            "state": {"input": TEXT, "record": {"name": "x"}},
-            "questions": {f"delete.{k}": question("?") for k in range(count)},
+            "state": {
+                "input": TEXT,
+                "records": {f"r{k}": {"name": "x"} for k in range(count)},
+            },
+            "questions": {f"delete.r{k}": question("?") for k in range(count)},
         },
-        meta=CallMeta(kind="delete", schema="Person", entity=ids),
+        meta=CallMeta(kind="delete", schema="Person", field=ids),
     )
     answers: Body = response.body["answers"]
     return answers
@@ -945,12 +948,57 @@ async def test_a_delete_is_unlikely_unless_the_world_declares_it() -> None:
     world = people()
     world.delete("r2", 0.93).delete("r3")
     answers = await delete_asks(world, "r1,r2,r3", 3)
-    assert [answers[f"delete.{k}"]["noul"] for k in range(3)] == [0.05, 0.93, 0.97]
+    assert [answers[f"delete.r{k}"]["noul"] for k in range(3)] == [0.05, 0.93, 0.97]
 
 
 async def test_a_delete_request_must_name_one_record_id_per_question() -> None:
     with pytest.raises(AssertionError, match="record id"):
         await delete_asks(people(), "r1", 2)
+
+
+async def test_declared_match_odds_pick_the_likeliest_and_share_the_rest() -> None:
+    world = FakeWorld(TEXT)
+    world.entity(
+        "Emma Thompson",
+        schema=Person,
+        mentions=["Emma Thompson"],
+        fields={"name": "Emma Thompson"},
+        match_odds={"Emma Thompson": 0.55, "__new__": 0.3},
+        match_confidence=0.4,
+    )
+    start = TEXT.index("Emma Thompson")
+    answers = await ask(
+        world,
+        "match",
+        state=match_state("Emma Thompson", start, start + 13),
+        questions={"match": question("?", "choice", criteria=RECORDS)},
+    )
+    match = answers["match"]
+    assert match["choice"] == "rec_1"
+    assert match["probabilities"]["rec_1"] == 0.55
+    assert match["probabilities"]["__new__"] == 0.3
+    assert match["probabilities"]["rec_0"] == pytest.approx(0.075)
+    assert match["probabilities"]["rec_2"] == pytest.approx(0.075)
+    assert match["confidence"] == 0.4
+
+
+async def test_declared_match_odds_must_name_exactly_one_record() -> None:
+    world = FakeWorld(TEXT)
+    world.entity(
+        "Emma Thompson",
+        schema=Person,
+        mentions=["Emma Thompson"],
+        fields={"name": "Emma Thompson"},
+        match_odds={"nobody": 0.5},
+    )
+    start = TEXT.index("Emma Thompson")
+    with pytest.raises(AssertionError, match=r"match_odds key 'nobody' .* fits 0"):
+        await ask(
+            world,
+            "match",
+            state=match_state("Emma Thompson", start, start + 13),
+            questions={"match": question("?", "choice", criteria=RECORDS)},
+        )
 
 
 async def test_a_call_kind_the_world_cannot_answer_is_an_error() -> None:
@@ -981,7 +1029,7 @@ async def test_the_handler_can_be_wrapped_to_override_one_kind() -> None:
     other = await transport.run(
         CLEF,
         {"model": "clef", "state": {"input": TEXT}, "questions": {"q": question("?")}},
-        meta=CallMeta(kind="delete", schema="Person"),
+        meta=CallMeta(kind="null_check", schema="Person"),
     )
     assert "q" in other.body["answers"]
 

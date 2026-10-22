@@ -464,6 +464,8 @@ class WorldEntity:
         real: ``True`` for an entity, ``False`` for a non-entity.
         matches: The existing record it is (see ``FakeWorld.entity``), or ``None``
             for an entity that is new.
+        odds: Declared match probabilities (see ``FakeWorld.entity``).
+        odds_confidence: The confidence of the declared match answer.
         descriptive: Mentions that only a broadened discovery finds (see
             ``FakeWorld.entity``).
         flat: The field values by dotted path.
@@ -477,6 +479,8 @@ class WorldEntity:
     fields: dict[str, Any]
     real: bool
     matches: Any = None
+    odds: dict[str, float] | None = None
+    odds_confidence: float | None = None
     descriptive: tuple[tuple[str, int | None], ...] = ()
     flat: dict[str, Any] = field(default_factory=dict)
     spans: list[Span] = field(default_factory=list)
@@ -632,10 +636,12 @@ class FakeWorld:
       record it describes gets 0.92 and the other options share the rest; an entity
       without ``matches=`` gets ``__new__`` at 0.92. A ``matches=`` that fits no
       offered record, or several, is an ``AssertionError`` (see ``entity``).
-    * ``delete`` (Clef ``noul``): questions ``delete.<k>`` over the state ``{input,
-      record}``; ``CallMeta.entity`` holds the ids of the records of the request,
-      comma-joined, in question order. The probability is the one declared with
-      ``delete(record_id, p)``, else 0.05.
+      ``match_odds=`` declares the probabilities instead (and ``match_confidence=``
+      the confidence), for the ambiguous paths.
+    * ``delete`` (Clef ``noul``): up to 64 questions ``delete.r<k>`` per request, over
+      the state ``{input, records: {r<k>: <record>, ...}}``; ``CallMeta.field`` holds
+      the ids of the records of the request, comma-joined, in question order. The
+      probability is the one declared with ``delete(record_id, p)``, else 0.05.
     """
 
     def __init__(self, text: str, *, check_state: bool = True) -> None:
@@ -675,6 +681,8 @@ class FakeWorld:
         *,
         real: bool,
         matches: Any = None,
+        match_odds: Mapping[str, float] | None = None,
+        match_confidence: float | None = None,
         descriptive: Sequence[str | tuple[str, int]] = (),
     ) -> WorldEntity:
         def specs(
@@ -699,6 +707,8 @@ class FakeWorld:
             matches=matches,
             descriptive=specs(descriptive),
         )
+        element.odds = None if match_odds is None else dict(match_odds)
+        element.odds_confidence = match_confidence
         for key, value in element.fields.items():
             _flatten(key, value, element.flat)
         self._items.append(element)
@@ -713,6 +723,8 @@ class FakeWorld:
         mentions: Sequence[str | tuple[str, int]],
         fields: Mapping[str, Any] | None = None,
         matches: Any = None,
+        match_odds: Mapping[str, float] | None = None,
+        match_confidence: float | None = None,
         descriptive: Sequence[str | tuple[str, int]] = (),
     ) -> "WorldEntity":
         """Declare an entity of a schema that the text really contains.
@@ -728,6 +740,14 @@ class FakeWorld:
                 or a dict (every key it names must equal the record's), or a
                 string that occurs in the record's JSON text ("Emma"). Left out
                 (``None``), the entity is new: ``__new__`` is its match.
+            match_odds: The probabilities a ``match`` call gives instead of the
+                0.92 of ``matches``, to exercise ambiguous and low-confidence
+                matching without overriding the handler: each key is a string that
+                occurs in exactly one record's JSON text ("Emma Thompson"), or
+                ``"__new__"``, and each value its probability; the options left
+                out share the rest equally. The chosen option is the likeliest.
+            match_confidence: The answer's confidence (default the likeliest
+                option's probability).
             descriptive: Mentions of the entity that only a broadened discovery
                 (one that allows descriptive references such as "my cousin") finds;
                 the first, plain discovery does not list them.
@@ -746,6 +766,8 @@ class FakeWorld:
             fields,
             real=True,
             matches=matches,
+            match_odds=match_odds,
+            match_confidence=match_confidence,
             descriptive=descriptive,
         )
 
@@ -788,7 +810,7 @@ class FakeWorld:
 
         ``delete`` calls about the record with this id answer ``p`` instead of the
         default 0.05 (a ``delete`` request names the ids of its records in
-        ``CallMeta.entity``, comma-joined).
+        ``CallMeta.field``, comma-joined, in question order).
         """
         self._deletes[record_id] = p
         return self
@@ -1531,6 +1553,9 @@ class FakeWorld:
         for qid, question in payload["questions"].items():
             options = dict(question["criteria"])
             chosen = "__new__"
+            if element is not None and element.odds is not None:
+                answers[qid] = self._odds_answer(element, options)
+                continue
             if element is not None and element.matches is not None:
                 found = [
                     option
@@ -1548,13 +1573,46 @@ class FakeWorld:
             answers[qid] = _pick(chosen, list(options), 0.92)
         return clef_response(answers, model=payload["model"])
 
+    def _odds_answer(
+        self, element: WorldEntity, options: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """A match answer with the probabilities the entity was declared with."""
+        assert element.odds is not None
+        probs: dict[str, float] = {}
+        for spec, p in element.odds.items():
+            if spec == "__new__":
+                probs["__new__"] = p
+                continue
+            found = [
+                option
+                for option, record in options.items()
+                if option != "__new__" and self._is_record(spec, record)
+            ]
+            if len(found) != 1:
+                raise AssertionError(
+                    f"FakeWorld: match_odds key {spec!r} of {element.label!r} fits "
+                    f"{len(found)} of the {len(options) - 1} records offered (it "
+                    "must fit exactly one)"
+                )
+            probs[found[0]] = p
+        rest = [o for o in options if o not in probs]
+        left = max(0.0, 1.0 - sum(probs.values()))
+        for option in rest:
+            probs[option] = left / len(rest)
+        best = max(probs, key=lambda option: probs[option])
+        return choice(best, {o: probs[o] for o in options}, element.odds_confidence)
+
     def _delete(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
-        ids = (meta.entity or "").split(",")
+        ids = (meta.field or "").split(",")
         questions = list(payload["questions"])
-        if len(ids) != len(questions):
+        state = payload["state"]
+        if len(ids) != len(questions) or not all(
+            qid.removeprefix("delete.") in state.get("records", {}) for qid in questions
+        ):
             raise AssertionError(
-                f"FakeWorld: a delete request names {len(questions)} question(s) "
-                f"but CallMeta.entity {meta.entity!r} holds {len(ids)} record id(s)"
+                f"FakeWorld: a delete request asks {questions} about "
+                f"{sorted(state.get('records', {}))} but CallMeta.field "
+                f"{meta.field!r} holds {len(ids)} record id(s)"
             )
         answers = {
             qid: noul(self._deletes.get(rid, 0.05))

@@ -49,6 +49,7 @@ from trustcall_system_one._compile import (
     UnionGroup,
     UnionMember,
 )
+from trustcall_system_one._coref import identity_compatible, name_tokens
 from trustcall_system_one._types import PatchOp, RejectedOp
 
 __all__ = [
@@ -300,7 +301,9 @@ def _moment(kind: str | None, text: str) -> datetime | date | time | None:
 def same(kind: str | None, first: Any, second: Any) -> bool:
     """Whether two JSON values are the same after normalisation.
 
-    Strings compare stripped; numbers by value (``math.isclose``, and a numeric
+    Strings compare stripped (free text, kind ``"freetext"``, also with case and
+    internal spacing folded: "Neighbor" and "neighbor  " are one value); numbers by
+    value (``math.isclose``, and a numeric
     string against a number when the field is numeric); ISO dates, times and
     datetimes as the moments they name (``Z`` is ``+00:00``); everything else by
     equality.
@@ -328,6 +331,8 @@ def same(kind: str | None, first: Any, second: Any) -> bool:
     if isinstance(first, str) and isinstance(second, str):
         if first.strip() == second.strip():
             return True
+        if kind == "freetext" and _plain(first) == _plain(second):
+            return True
         if kind in ("date", "datetime", "time"):
             a_moment, b_moment = _moment(kind, first), _moment(kind, second)
             if a_moment is not None and type(a_moment) is type(b_moment):
@@ -339,11 +344,32 @@ def same(kind: str | None, first: Any, second: Any) -> bool:
     return bool(first == second)
 
 
+def _plain(text: str) -> str:
+    """Case folded and internal whitespace collapsed (free-text comparison)."""
+    return " ".join(text.casefold().split())
+
+
+def _free_text(spec: FieldSpec) -> bool:
+    """Whether a Clairic text field holds free text, not a vocabulary or a format.
+
+    A field a ``Literal``/``Enum`` or a union decides, a parsed value (dates and
+    durations in a text list) and a ``pattern``-constrained string compare exactly:
+    their case and spacing mean something.
+    """
+    return (
+        spec.element_choices is None
+        and spec.post != "union"
+        and spec.item_kind in (None, "str")
+        and not any(hint.startswith("Must match the pattern") for hint in spec.hints)
+    )
+
+
 def _kind(spec: FieldSpec) -> str | None:
     clairic = spec.clairic
     if clairic is None:
         return None
-    return (clairic.items or None) if clairic.type == "list" else clairic.type
+    kind = (clairic.items or None) if clairic.type == "list" else clairic.type
+    return "freetext" if kind == "text" and _free_text(spec) else kind
 
 
 def _is_list_spec(spec: FieldSpec) -> bool:
@@ -351,6 +377,23 @@ def _is_list_spec(spec: FieldSpec) -> bool:
 
 
 _TOKEN = re.compile(r"\w+")
+
+
+def short_form(new: str, old: str) -> bool:
+    """Whether ``new`` is only a shorter or looser way to say ``old``.
+
+    A proper token subset (``"Sarah"`` of ``"Sarah Johnson"``), or a form of it
+    with no more words (and not merely reordered) that ``identity_compatible``
+    accepts: a diminutive (``"Liz"`` for ``"Elizabeth Smith"``), initials, a prefix,
+    a typo. ``"Sarah Johnson"`` for ``"Sarah"`` is not: it adds a word.
+    """
+    if token_subset(new, old):
+        return True
+    return (
+        len(_TOKEN.findall(new)) <= len(_TOKEN.findall(old))
+        and sorted(name_tokens(new)) != sorted(name_tokens(old))  # not a reordering
+        and identity_compatible(new, old)
+    )
 
 
 def token_subset(new: str, old: str) -> bool:
@@ -678,13 +721,13 @@ class _Differ:
             leaf.identity
             and isinstance(new, str)
             and isinstance(old, str)
-            and token_subset(new, old)
+            and short_form(new, old)
         ):
             self.reject(
                 "replace",
                 path,
                 "identity_subset",
-                f"{new!r} is only part of the record's {old!r}",
+                f"{new!r} is only a short form of the record's {old!r}",
             )
             return
         self.result.changes.append(
