@@ -876,6 +876,24 @@ async def test_fakeworld_novelty_depends_on_what_the_record_holds() -> None:
         ("seats", "number of seats to book", True),
         ("guests", "number of guests", True),
         ("capacity", "number of seats in the hall", False),
+        # M10e: bare count words are requested quantities on a line of an order
+        ("units", None, True),
+        ("count", None, True),
+        ("pieces", None, True),
+        ("boxes", None, True),
+        ("num_items", None, True),
+        ("nr_of_units", None, True),
+        ("qtyOrdered", None, True),
+        ("quantityOrdered", None, True),
+        ("n", None, False),
+        ("amount", None, False),
+        ("page_count", None, False),
+        # and a count that is only stated is not, however it is worded
+        ("age", "how many years old the person is", False),
+        ("employees", "how many employees the company has", False),
+        ("children", "how many children she has", False),
+        ("stars", "how many stars the review gives", False),
+        ("guests", "how many guests to reserve for", True),
     ],
 )
 def test_only_an_ordered_quantity_is_asked_for(
@@ -889,7 +907,7 @@ def test_only_an_ordered_quantity_is_asked_for(
     field = (int, Field(description=description) if description else Field())
     plan = compile_schema(create_model("Line", **{name: field}))  # type: ignore[call-overload]
     (spec,) = plan.specs
-    assert requestable(spec) is asked, (name, description)
+    assert requestable(spec, plan) is asked, (name, description)
 
 
 @pytest.mark.parametrize(
@@ -1150,55 +1168,133 @@ def _yes(p: float) -> Any:
     return handler
 
 
-async def test_a_short_form_the_world_calls_new_is_matched_by_the_confirmation() -> (
-    None
-):
+async def _confirm_case(
+    text: str,
+    mentions: list[str],
+    fields: dict[str, Any],
+    *,
+    odds: dict[str, float] | None,
+    confidence: float | None = None,
+    confirm: float = 0.75,
+    inserts: bool = True,
+) -> Any:
+    """A new person ("matches=" left out) next to the record Emma Thompson, and a
+    gullible pairwise Clef that says ``confirm`` whatever the truth."""
     from trustcall_system_one import Many, create_extractor
-    from trustcall_system_one.testing import route
 
-    text = "Emma just moved to Denver."
     world = FakeWorld(text)
-    world.entity(  # no matches=: the choice answers __new__ (0.92)
-        "Emma",
+    world.entity(
+        mentions[0],
         schema=Member,
-        mentions=["Emma"],
-        fields={"name": "Emma", "city": "Denver"},
+        mentions=mentions,
+        fields=fields,
+        match_odds=odds,
+        match_confidence=confidence,
+        confirm=confirm,
     )
-    transport = FakeTransport(route(default=world.handler, match_confirm=_yes(0.9)))
+    transport = world.transport()
     result = await create_extractor(
-        [Many(Member, identity="name")], transport=transport
+        [Many(Member, identity="name")], transport=transport, enable_inserts=inserts
     ).ainvoke(
-        text, existing=[("0", "Member", {"name": "Emma Thompson", "city": "Austin"})]
+        text,
+        existing=[("0", "Member", {"name": "Emma Thompson", "city": "Austin"})],
+    )
+    asked = [m.kind for _, _, m in transport.calls].count("match_confirm")
+    return result, asked
+
+
+UNSURE = {"Emma Thompson": 0.17, "__new__": 0.83}
+
+
+async def test_an_unsure_short_form_is_matched_by_the_confirmation() -> None:
+    result, asked = await _confirm_case(
+        "Emma just moved to Denver.",
+        ["Emma"],
+        {"name": "Emma", "city": "Denver"},
+        odds=UNSURE,
+        confidence=0.4377,
+        confirm=0.85,
     )
     (record,) = result.records
-    assert record.kind == "update" and record.json_doc_id == "0"
+    assert asked == 1 and record.kind == "update" and record.json_doc_id == "0"
     assert [(p.op, p.path, p.value) for p in record.patches] == [
         ("replace", "/city", "Denver")
     ]
     assert any(w.startswith("match_confirmed") for w in result.warnings)
 
 
-async def test_the_identity_conflict_guard_still_refuses_a_confirmed_match() -> None:
-    from trustcall_system_one import Many, create_extractor
-    from trustcall_system_one.testing import route
+async def test_a_sure_new_hire_is_not_written_onto_the_record_of_a_gullible_clef() -> (
+    None
+):
+    """M10d review: "A new hire, Emma, joined the Oslo office" with a pairwise 0.75."""
+    result, asked = await _confirm_case(
+        "A new hire, Emma, joined the Oslo office today.",
+        ["Emma"],
+        {"name": "Emma", "city": "Oslo"},
+        odds=None,  # the choice says __new__ at 0.92 and is sure
+    )
+    (record,) = result.records
+    assert asked == 0
+    assert record.kind == "insert" and record.json_doc_id is None
+    assert record.after is not None and record.after["city"] == "Oslo"
+    assert result.untouched == ("0",)
 
-    text = "Emma Watson just moved to Denver."
-    world = FakeWorld(text)
-    world.entity(
-        "Emma",
-        schema=Member,
-        mentions=["Emma"],
-        fields={"name": "Emma Watson", "city": "Denver"},
+
+async def test_a_full_name_that_is_not_the_record_is_a_new_person_not_a_conflict() -> (
+    None
+):
+    """M10d review: "Emma Davis, my new neighbour" was lost to `identity_conflict`."""
+    text = "Emma Davis, my new neighbour, moved in next door in Oslo. Emma has a cat."
+    mentions: list[Any] = ["Emma Davis", ("Emma", 1)]
+    fields = {"name": "Emma Davis", "city": "Oslo"}
+    result, asked = await _confirm_case(text, mentions, fields, odds=None)
+    (record,) = result.records
+    assert asked == 0 and record.kind == "insert"
+    assert record.after is not None and record.after["name"] == "Emma Davis"
+    # even when the choice is unsure, a full name that contradicts the record is
+    # never confirmed onto it: nothing is written to Emma Thompson
+    result, asked = await _confirm_case(
+        text, mentions, fields, odds=UNSURE, confidence=0.3
     )
-    transport = FakeTransport(route(default=world.handler, match_confirm=_yes(0.99)))
-    result = await create_extractor(
-        [Many(Member, identity="name")], transport=transport
-    ).ainvoke(
-        text, existing=[("0", "Member", {"name": "Emma Thompson", "city": "Austin"})]
+    assert asked == 0 and not [p for r in result.records for p in r.patches]
+
+
+async def test_a_confirmed_match_whose_name_conflicts_falls_back_to_new() -> None:
+    """The pairwise check said yes ("Emma"), the extraction found "Emma Davis": the
+    entity is treated as new (an insert) and never dropped."""
+    text = "Emma moved to Oslo. Her surname is Davis: Emma Davis."
+    result, asked = await _confirm_case(
+        text,
+        ["Emma"],
+        {"name": "Emma Davis", "city": "Oslo"},
+        odds=UNSURE,
+        confidence=0.3,
+        confirm=0.9,
     )
-    assert not [p for r in result.records for p in r.patches]
-    assert [s.reason for s in result.skipped] == ["ambiguous_match"]
-    assert result.skipped[0].detail.startswith("identity conflict:")
+    assert asked == 1
+    (record,) = result.records
+    assert record.kind == "insert" and record.after is not None
+    assert record.after["name"] == "Emma Davis"
+    assert not [p for r in result.records for p in r.patches]  # Emma Thompson untouched
+    assert any(w.startswith("match_confirmed_reverted") for w in result.warnings)
+    assert result.skipped == ()
+
+
+async def test_a_conflicting_confirmed_match_with_inserts_off_is_a_visible_skip() -> (
+    None
+):
+    text = "Emma moved to Oslo. Her surname is Davis: Emma Davis."
+    result, _ = await _confirm_case(
+        text,
+        ["Emma"],
+        {"name": "Emma Davis", "city": "Oslo"},
+        odds=UNSURE,
+        confidence=0.3,
+        confirm=0.9,
+        inserts=False,
+    )
+    assert result.records == ()
+    assert [s.reason for s in result.skipped] == ["inserts_disabled"]
 
 
 # --------------------------------------------------------------------------- #
@@ -1279,7 +1375,9 @@ async def test_a_refused_non_person_does_not_cover_the_count() -> None:
         ("Sunrise", "Sunrise came late. We met Sunrise at noon.", True),
         ("Anna", "We met Anna. Anna called.", True),
         ("my cousin Anna", "I met my cousin Anna.", True),
-        ("The Printer Ticket", "The Printer Ticket is open.", True),
+        ("The Printer Ticket", "The Printer Ticket is open.", False),
+        ("The Hague", "We flew to The Hague.", True),
+        ("The Beatles", "We saw The Beatles.", True),
     ],
 )
 def test_a_proper_noun_is_not_a_pronoun_a_role_or_a_sentence_initial_capital(
@@ -1301,3 +1399,95 @@ async def test_the_fallback_never_invents_a_name_from_a_role_or_pronoun(
     )
     assert not any(r.valid for r in result.records)
     assert not [w for w in result.warnings if "identity_from_mention" in w]
+
+
+def test_a_bare_count_word_is_not_requested_outside_an_order_like_schema() -> None:
+    from pydantic import create_model
+
+    from trustcall_system_one._compile import compile_schema
+    from trustcall_system_one._verify import requestable
+
+    plan = compile_schema(create_model("Survey", units=(int, Field())))
+    (spec,) = plan.specs
+    assert requestable(spec, plan) is False
+    assert requestable(spec) is False  # and without a plan at all
+
+
+@pytest.mark.parametrize(
+    ("name", "description", "relative"),
+    [
+        ("quantity", None, True),
+        ("units", None, True),
+        ("count", None, True),
+        ("num_items", None, True),
+        ("qty_ordered", None, True),
+        ("amount", None, True),
+        ("n", None, True),
+        ("pieces", "pieces wanted", True),
+        ("unit_price", "price per unit", False),
+        ("total", "the amount due", False),
+        ("order_id", "the id", False),
+        ("sold", "copies sold to date", False),
+        ("birth_year", None, False),
+        ("age", None, False),
+        ("age", "how old", False),
+        ("founded", "year founded", False),
+        ("totalPrice", None, False),
+    ],
+)
+def test_a_relative_edit_is_checked_for_any_number_that_is_not_only_stated(
+    name: str, description: str | None, relative: bool
+) -> None:
+    from pydantic import create_model
+
+    from trustcall_system_one._compile import compile_schema
+    from trustcall_system_one._verify import relative_candidate
+
+    field = (int, Field(description=description) if description else Field())
+    plan = compile_schema(create_model("Line", **{name: field}))  # type: ignore[call-overload]
+    (spec,) = plan.specs
+    assert relative_candidate(spec) is relative, (name, description)
+
+
+@pytest.mark.parametrize(
+    ("title", "kind"),
+    [
+        ("PersonModel", "person"),
+        ("HTTPRequest", "http request"),
+        ("Item_v2", "item"),
+        ("CustomerOrder", "customer order"),
+        ("UserDTO", "user"),
+        ("invoice_line_schema", "invoice line"),
+        ("OrderRecordV3", "order"),
+        ("Member", "member"),
+        ("Data", "data"),  # nothing but a suffix keeps it
+        ("PersonInfoData", "person"),
+    ],
+)
+def test_a_class_name_is_split_cleaned_and_lower_cased_as_a_kind(
+    title: str, kind: str
+) -> None:
+    from trustcall_system_one._collection import _title_kind
+
+    assert _title_kind(title) == kind
+
+
+async def test_the_title_fallback_is_used_cleaned_in_the_questions() -> None:
+    from trustcall_system_one import Many, create_extractor
+
+    class GadgetModel(BaseModel):
+        """Something we keep."""
+
+        name: str
+
+    text = "The Zorb is here."
+    world = FakeWorld(text)
+    world.entity("Zorb", schema=GadgetModel, mentions=["Zorb"], fields={"name": "Zorb"})
+    transport = FakeTransport(world.handler)
+    await create_extractor(
+        [Many(GadgetModel, identity="name")], transport=transport, enable_inserts=True
+    ).ainvoke(text)
+    ((_, payload, _),) = [c for c in transport.calls if c[2].kind == "qualify"]
+    assert payload["questions"]["qualify.e0"]["instructions"] == (
+        "Is `entities.e0.label` a gadget?"
+    )

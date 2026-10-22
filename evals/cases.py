@@ -487,10 +487,62 @@ def short_form() -> Case:
         schemas=lambda: [Many(Member, identity="name")],
         existing=existing,
         expect_ops=[Op("replace", "/city", "Denver", who="0")],
+        # live 7: the sentence itself is also a grounded note (attribution 0.95)
+        allow_ops=[Op("add", "/notes/-", contains="moved to Denver", who="0")],
         must_not=[MustNot.op("replace", "/name"), MustNot.insert(), MustNot.delete()],
         tags=("people", "update", "identity"),
         world=world,
         note="'Emma' is a short form of the record's 'Emma Thompson': matched, and not a rename.",
+    )
+
+
+def _other_emma(case_id: str, text: str, mentions: list[Any], note: str) -> Case:
+    label = str(mentions[0])
+    existing = [("0", "Member", member("Emma Thompson", city="Austin")[1])]
+
+    def world() -> FakeWorld:
+        w = FakeWorld(text)
+        # truly new; a gullible pairwise Clef would say yes to the record anyway
+        w.entity(
+            label,
+            schema=Member,
+            mentions=mentions,
+            fields={"name": label, "city": "Oslo"},
+            confirm=0.75,
+        )
+        return w
+
+    return Case(
+        id=case_id,
+        text=text,
+        schemas=lambda: [Many(Member, identity="name")],
+        existing=existing,
+        options={"enable_inserts": True},
+        expect_ops=[Op("insert", who=label)],
+        must_not=[MustNot.op(who="0"), MustNot.delete()],
+        tags=("people", "insert", "identity", "negative"),
+        world=world,
+        note=note,
+    )
+
+
+def different_emma() -> Case:
+    return _other_emma(
+        "different_emma",
+        "Emma Davis, my new neighbour, moved in next door in Oslo.",
+        ["Emma Davis"],
+        "A new Emma next to the existing Emma Thompson is a new person: her city "
+        "is never written onto Emma Thompson, whatever the pairwise check says.",
+    )
+
+
+def new_hire_same_first_name() -> Case:
+    return _other_emma(
+        "new_hire_same_first_name",
+        "A new hire, Emma, joined the Oslo office today.",
+        ["Emma"],
+        "A bare first name that the choice question calls new is not Emma "
+        "Thompson: the pairwise confirmation never overrides a sure __new__.",
     )
 
 
@@ -1155,6 +1207,8 @@ CASES: list[Case] = [
     bill_insert(),
     rename(),
     short_form(),
+    different_emma(),
+    new_hire_same_first_name(),
     order_line_items(),
     order_remove_item(),
     relative_edit(),

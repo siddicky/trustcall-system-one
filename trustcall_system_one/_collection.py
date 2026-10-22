@@ -213,7 +213,11 @@ class Scope:
         ``Many(kind=...)``, else its ``label``, else the leading noun phrase of the
         schema's description, else the schema title.
         """
-        return self.cardinality.kind or _derive_kind(self.plan) or self.plan.title
+        return (
+            self.cardinality.kind
+            or _derive_kind(self.plan)
+            or _title_kind(self.plan.title)
+        )
 
     @property
     def kind_fell_back(self) -> bool:
@@ -814,6 +818,33 @@ _META_NOUNS = frozenset(
 )
 """Nouns that say a schema is a description, not what it describes."""
 _OF_WORDS = frozenset(["of", "about", "for", "on", "describing"])
+_LEADING_ADJECTIVES = frozenset(
+    [
+        "very",
+        "really",
+        "quite",
+        "highly",
+        "extremely",
+        "most",
+        "more",
+        "important",
+        "key",
+        "main",
+        "primary",
+        "major",
+        "various",
+        "typical",
+        "simple",
+        "basic",
+        "known",
+        "official",
+        "valid",
+        "unique",
+        "single",
+        "particular",
+    ]
+)
+"""Words that qualify a kind without being part of it ("Very important customer")."""
 _BOILERPLATE = re.compile(
     r"^(?:this\s+(?:class|model|schema)\s+)?"
     r"(?:represents?|describes?|models?|stores?|holds?|contains?|defines?|is|are)\s+",
@@ -835,6 +866,29 @@ def _singular(word: str) -> str:
     if lower.endswith("s") and not lower.endswith(("ss", "us", "is")) and len(word) > 3:
         return word[:-1]
     return word
+
+
+_TITLE_SUFFIXES = frozenset(
+    ["model", "schema", "dto", "info", "record", "data", "entity"]
+)
+
+
+def _title_kind(title: str) -> str:
+    """A class name as words for a question: ``PersonModel`` is "person".
+
+    CamelCase and snake_case are split into words, the suffixes that only say what
+    the class is (Model, Schema, DTO, Info, Record, Data, Entity, V2) are dropped,
+    and the rest is lower-cased: ``HTTPRequest`` is "http request", ``Item_v2``
+    "item". A title that is nothing but suffixes keeps them.
+    """
+    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", " ", title)
+    words = spaced.replace("_", " ").split()
+    kept = list(words)
+    while kept and (
+        kept[-1].casefold() in _TITLE_SUFFIXES or re.fullmatch(r"v\d+", kept[-1], re.I)
+    ):
+        kept.pop()
+    return " ".join(w.lower() for w in (kept or words)) or title
 
 
 def _derive_kind(plan: SchemaPlan) -> str | None:
@@ -874,6 +928,8 @@ def _derive_kind(plan: SchemaPlan) -> str | None:
     following = sentence.split()[len(words) :] if words else []
     while words and words[0].casefold() in ("a", "an", "the", "one"):
         words.pop(0)
+    while len(words) > 1 and words[0].casefold() in _LEADING_ADJECTIVES:
+        words.pop(0)  # "Very important customer record": a customer
     if words and re.fullmatch(r"\w+['\u2019]s", words[0]) and len(words) > 1:
         words.pop(0)  # "The user's pet": the owner is not part of the kind
     if words and words[0].casefold() in _KIND_HEADS:
@@ -1459,6 +1515,71 @@ _STOPWORDS = frozenset(
 """Words that never make a record worth asking about, in any case."""
 
 
+_COMMON_VERBS = frozenset(
+    [
+        "set",
+        "get",
+        "add",
+        "drop",
+        "remove",
+        "send",
+        "make",
+        "take",
+        "give",
+        "put",
+        "change",
+        "update",
+        "move",
+        "keep",
+        "hold",
+        "call",
+        "use",
+        "run",
+        "check",
+        "book",
+        "buy",
+        "sell",
+        "order",
+        "cancel",
+        "pay",
+        "ship",
+        "deliver",
+        "need",
+        "want",
+        "see",
+        "tell",
+        "ask",
+        "show",
+        "let",
+        "go",
+        "come",
+        "bring",
+        "leave",
+        "look",
+        "find",
+        "mark",
+        "open",
+        "close",
+        "start",
+        "stop",
+        "turn",
+        "sign",
+        "save",
+        "list",
+        "file",
+        "note",
+        "print",
+        "review",
+        "fix",
+        "plan",
+        "meet",
+        "reply",
+    ]
+)
+"""Verbs and other everyday words that name nobody: "set the date" is not the
+"Wooden spoon set"."""
+
+
 def _name_words(text: str) -> list[str]:
     """The words of an identity value that can be looked for in the input.
 
@@ -1468,7 +1589,9 @@ def _name_words(text: str) -> list[str]:
     return [
         w
         for w in re.findall(r"\w+", text)
-        if len(w) >= _WORD_MIN and w.casefold() not in _STOPWORDS
+        if len(w) >= _WORD_MIN
+        and w.casefold() not in _STOPWORDS
+        and w.casefold() not in _COMMON_VERBS
     ]
 
 
@@ -1502,16 +1625,23 @@ def _present(words: Sequence[str], source: str) -> bool:
     return any(re.search(_word_pattern(w, flat=flat), source) for w in words)
 
 
-def _mentioned(value: str, source: str) -> bool:
+def _mentioned(value: str, source: str, *, nested: bool = False) -> bool:
     """Whether the input names a record by this identity value.
 
     A whole name of two words or more ("Emma Thompson") is distinctive in any case;
-    a single word is looked for by ``_present``'s rule.
+    a single word is looked for by ``_present``'s rule. For the items of a nested
+    list, whose names are everyday words ("Wooden spoon set", "Steel kettle"), one
+    matching word is not enough: two must match, or one capitalised word of an input
+    that has case ("Kettle" in "the Kettle is late").
     """
     words = _name_words(value)
     if len(words) >= 2 and re.search(_word_pattern(value.strip(), flat=True), source):
         return True
-    return _present(words, source)
+    if not nested:
+        return _present(words, source)
+    flat = _case_flat(source)
+    hits = [w for w in words if re.search(_word_pattern(w, flat=flat), source)]
+    return len(hits) >= 2 or (len(hits) == 1 and not flat and hits[0][:1].isupper())
 
 
 def _locate(source: str, values: Sequence[str]) -> Mention | None:
@@ -1632,7 +1762,9 @@ async def _adopt_records(
             for v in values
         ):
             continue
-        if not any(_mentioned(v, scope.source) for v in values):
+        if not any(
+            _mentioned(v, scope.source, nested=scope.parent is not None) for v in values
+        ):
             continue
         wanted[record.record_id] = values
         asked.append(
@@ -2217,24 +2349,8 @@ async def apply_collection(
             handled=handle,
         )
 
-    async def work(info: EntityInfo) -> _Work:
-        target = matched.targets[info.key]
-        if target is not None:
-            record = by_id[target]
-            if target in flagged:
-                return await flagged_work(info, record)
-            done = await _update_entity(
-                run, scope, info, record, enable_updates=enable_updates
-            )
-            return _Work(
-                info,
-                done.record,
-                done.skipped,
-                done.attempts,
-                done.extracted,
-                done.handled,
-                done.nested_skipped,
-            )
+    async def as_new(info: EntityInfo) -> _Work:
+        """An entity that is no existing record: inserted, if inserts are on."""
         if not (enable_inserts or not existing):
             return _Work(
                 info,
@@ -2256,6 +2372,42 @@ async def apply_collection(
             inserted.extracted,
             nested_skipped=inserted.nested_skipped,
         )
+
+    async def work(info: EntityInfo) -> _Work:
+        target = matched.targets[info.key]
+        if target is not None:
+            record = by_id[target]
+            if target in flagged:
+                return await flagged_work(info, record)
+            done = await _update_entity(
+                run, scope, info, record, enable_updates=enable_updates
+            )
+            if (
+                info.key in matched.confirmed
+                and done.skipped is not None
+                and done.skipped.reason == "ambiguous_match"
+                and done.skipped.detail.startswith("identity conflict")
+            ):
+                # the pairwise check said yes and the extraction found another name:
+                # the entity is somebody new, not a dropped one
+                run.warn(
+                    scope.scoped(
+                        f"match_confirmed_reverted: {info.label!r} was confirmed as "
+                        f"the record {target!r}, but the name extracted for it "
+                        "contradicts the record; it is treated as new"
+                    )
+                )
+                return await as_new(info)
+            return _Work(
+                info,
+                done.record,
+                done.skipped,
+                done.attempts,
+                done.extracted,
+                done.handled,
+                done.nested_skipped,
+            )
+        return await as_new(info)
 
     todo = [e for e in matched.entities if e.key in matched.targets]
     done_all = await gather(*(work(e) for e in todo))

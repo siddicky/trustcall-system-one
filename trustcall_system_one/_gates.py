@@ -270,12 +270,14 @@ def numeric_replace(change: Change) -> bool:
     """Whether an operation replaces one number with another.
 
     Such an operation is a candidate for a relative edit ("two more" read as the
-    stated 2).
+    stated 2): both numbers are whole (a count, not a weight or a rate) and differ.
     """
     return (
         change.op == "replace"
         and all(
-            isinstance(v, (int, float)) and not isinstance(v, bool)
+            isinstance(v, (int, float))
+            and not isinstance(v, bool)
+            and float(v).is_integer()
             for v in (change.old, change.value)
         )
         and change.old != change.value

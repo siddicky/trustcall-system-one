@@ -699,12 +699,15 @@ class MatchConfig:
             name that fits is the strongest evidence of a match. A fit that is
             only a prefix, a typo or an initial of a one-word mention ("Dan" for
             "Daniela Cruz") does not count.
-        confirm_accept: Probability the pairwise confirmation ("is the entity the same
-            kind of thing as this record?", call kind ``match_confirm``) needs to match
-            an entity to a record the choice question did not pick. Asked only when
-            the choice is ``__new__`` or ambiguous and EXACTLY ONE existing record is
-            a strong name fit for the entity (never for "Emma" with both Emma
-            Thompson and Emma Watson). 0 switches it off.
+        confirm_accept: Probability the pairwise confirmation (call kind
+            ``match_confirm``) needs to settle an AMBIGUOUS match: one where the
+            choice question was not sure (``accept`` and ``min_confidence``) and
+            exactly one existing record is a strong name fit for the entity. The
+            question is "is this entity the same kind of thing as that record?"; its
+            answer must also exceed the choice's own probability of ``__new__``.
+            It never overrides a sure choice, is never asked when two records fit
+            ("Emma" with Emma Thompson and Emma Watson) or when a full name of the
+            entity contradicts the record ("Emma Davis"). 0 switches it off.
         compatible_margin: By how much that record must beat the runner-up
             option (``__new__`` included) for ``accept_compatible`` to apply; 0.51
             against 0.49 is a coin flip, not a decision.

@@ -1959,47 +1959,90 @@ def _element_phrase(description: str) -> str:
     return f"{article} {core}{scope}"
 
 
-_ORDERED_NAME = re.compile(r"^(?:\w+_)?(?:quantity|qty)(?:_\w+)?$", re.IGNORECASE)
+_ORDERED_NAME = re.compile(r"^(?:\w+_)?(?:quantity|qty)(?:_\w+)?$")
+# a bare count word is a requested quantity only on a line of an order or the like
+_UNIT_NAME = re.compile(
+    r"^(?:units?|counts?|pieces?|pcs|seats?|tickets?|copies|boxes|items?"
+    r"|(?:num|nr|no|n)_\w+|number_of_\w+)$"
+)
+_ORDER_LIKE = re.compile(
+    r"\b(?:line|lines|item|items|order|orders|product|products|cart|basket|booking|"
+    r"bookings|reservation|purchase|invoice|shipment|ticket|tickets)\b",
+    re.IGNORECASE,
+)
 _NOT_REQUESTED = re.compile(
     r"\b(?:price|prices|cost|costs|fee|rate|total|totals|sum|subtotal|id|ids|"
     r"identifier|sku|code|to date|so far|sold|shipped|delivered|received|stock|"
     r"inventory|available|pages?)\b|\bnumber of the\b",
     re.IGNORECASE,
 )
+_STATED_NUMBER = re.compile(r"\b(?:years?|ages?|aged|old|born|yob)\b", re.IGNORECASE)
 _ORDERED_UNITS = re.compile(
     r"\b(?:units?|items?|pieces?|copies|pcs|quantity|qty|number|count|how many)\b"
     r".*\b(?:ordered|wanted|requested|needed|"
     r"to\s+(?:order|buy|add|purchase|book|reserve))\b"
     r"|\b(?:ordered|requested|wanted)\s+(?:quantity|units?|items?)\b"
-    # a head count is asked for by whoever books: "how many tickets", "number of guests"
-    r"|\bhow many\b"
+    # a head count is asked for by whoever books: "how many tickets to book"; a
+    # count that is only stated ("how many children she has") is not
+    r"|\bhow many\b.*\bto\s+(?:book|order|attend|reserve|buy|bring)\b"
     r"|\bnumber of\s+(?:guests|attendees|passengers|people|diners|participants)\b",
     re.IGNORECASE,
 )
 
 
-def requestable(spec: FieldSpec) -> bool:
+def _snake(name: str) -> str:
+    """A field name as lower-case words joined by underscores (``qtyOrdered``)."""
+    return re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name).lower()
+
+
+def relative_candidate(spec: FieldSpec) -> bool:
+    """Whether a changed number could be a RELATIVE edit ("two more") of its old value.
+
+    Any number field except those whose name or description says what is only ever
+    stated: a price, cost, total, id, a count to date, a year or an age. The check
+    does not rely on the field being NAMED like a quantity (``units``, ``count``,
+    ``num_items`` carried the data loss again when it did).
+    """
+    if spec.clairic is None or spec.clairic.type != "number":
+        return False
+    words = _snake(str(spec.path[-1])).replace("_", " ")
+    return not (
+        _NOT_REQUESTED.search(words)
+        or _NOT_REQUESTED.search(spec.description)
+        or _STATED_NUMBER.search(words)
+        or _STATED_NUMBER.search(spec.description)
+    )
+
+
+def requestable(spec: FieldSpec, plan: SchemaPlan | None = None) -> bool:
     """Whether the input may ASK for the field's value instead of stating it.
 
     An ORDERED quantity can be requested ("add two more of the blue mugs": a
     quantity of 2 that no sentence states): a number field named ``quantity`` or
-    ``qty``, or whose description is a number of units, items or copies ordered,
-    wanted or to order. A total, a price, a cost, an id, a count to date ("copies
-    sold to date", "total units shipped so far", "page count") or "the number of
-    the invoice" is stated: asking "state or ask for" about a derived total made
+    ``qty`` (or ``units``, ``count``, ``pieces``, ``seats``, ``tickets``, ``copies``,
+    ``boxes``, ``num_*`` when the schema is a line of an order, a booking or the
+    like: ``plan``), or whose description is a number of units, items or copies
+    ordered, wanted or to order. A total, a price, a cost, an id, a count to date
+    ("copies sold to date", "total units shipped so far", "page count") or "the number
+    of the invoice" is stated: asking "state or ask for" about a derived total made
     Clef less sure of it (0.88 became 0.52).
     """
     if spec.clairic is None or spec.clairic.type != "number":
         return False
-    name = str(spec.path[-1])
+    name = _snake(str(spec.path[-1]))
     if _NOT_REQUESTED.search(name.replace("_", " ")) or _NOT_REQUESTED.search(
         spec.description
     ):
         return False
-    return (
-        _ORDERED_NAME.match(name) is not None
-        or _ORDERED_UNITS.search(spec.description) is not None
-    )
+    if _ORDERED_NAME.match(name) is not None:
+        return True
+    if (
+        plan is not None
+        and _UNIT_NAME.match(name) is not None
+        and _ORDER_LIKE.search(f"{plan.title} {plan.description}") is not None
+    ):
+        return True
+    return _ORDERED_UNITS.search(spec.description) is not None
 
 
 def _attribution_question(
@@ -2171,7 +2214,7 @@ def _attr_id(st: FieldState, index: int | None) -> str:
 
 
 def _attribution_questions(
-    states: list[FieldState],
+    states: list[FieldState], plan: SchemaPlan
 ) -> dict[str, Question]:
     questions: dict[str, Question] = {}
     for st in states:
@@ -2185,7 +2228,7 @@ def _attribution_questions(
                 st.spec.scoped,
                 st.resolved.value,
                 element=False,
-                ask_for=requestable(st.spec),
+                ask_for=requestable(st.spec, plan),
             )
     return questions
 
@@ -2215,7 +2258,7 @@ async def _attribution(ctx: Ctx, targets: list[FieldState]) -> None:
     """Check that each value, and each list element, is stated about the entity."""
     if not targets:
         return
-    questions = _attribution_questions(targets)
+    questions = _attribution_questions(targets, ctx.plan)
     known: dict[str, Answer] = {}
     for st in targets:
         hint = ctx.attribution_hints.get(st.spec.wire_name)
@@ -2323,7 +2366,7 @@ async def _recheck_scalar(ctx: Ctx, st: FieldState) -> None:
                     st.spec.scoped,
                     checked.value,
                     element=False,
-                    ask_for=requestable(st.spec),
+                    ask_for=requestable(st.spec, ctx.plan),
                 ),
                 ctx.text,
                 checked.span,

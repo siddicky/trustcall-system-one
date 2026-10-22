@@ -285,6 +285,9 @@ KINDS: list[tuple[str, str | None]] = [
     ("Something the user owns", None),
     ("Extracted named entity", None),
     ("Anyone mentioned", "person"),
+    # leading intensifiers and adjectives are not part of the kind
+    ("Very important customer record that we track", "customer"),
+    ("A key partner", "partner"),
 ]
 
 

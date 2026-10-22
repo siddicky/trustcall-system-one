@@ -650,7 +650,7 @@ class Fixed:
     def __init__(
         self,
         table: dict[str, dict[str, float]],
-        confidence: float | None = None,
+        confidence: float | dict[str, float] | None = None,
         confirm: dict[str, float] | None = None,
     ) -> None:
         self.table, self.confidence = table, confidence
@@ -673,8 +673,13 @@ class Fixed:
             for option in options
         }
         best = max(probs, key=lambda o: probs[o])
+        confidence = (
+            self.confidence.get(label)
+            if isinstance(self.confidence, dict)
+            else self.confidence
+        )
         return clef_response(
-            {"match": choice(best, probs, self.confidence)}, model=payload["model"]
+            {"match": choice(best, probs, confidence)}, model=payload["model"]
         )
 
 
@@ -803,23 +808,50 @@ async def test_the_readme_emma_at_0_506_is_confirmed_pairwise() -> None:
 
 
 async def test_a_short_form_the_choice_calls_new_is_confirmed_pairwise() -> None:
-    """short_form (live 6): __new__ 0.83 for "Emma" against the record Emma Thompson,
-    while the record-presence check said 0.87."""
-    fixed = Fixed({"Emma": {"Emma Thompson": 0.15, NEW: 0.83}}, confirm={"Emma": 0.9})
+    """short_form (live 7): __new__ 0.831 with confidence 0.4377 (not sure) for
+    "Emma" against the record Emma Thompson; the pairwise answer was 0.8472."""
+    fixed = Fixed(
+        {"Emma": {"Emma Thompson": 0.169, NEW: 0.831}},
+        confidence=0.4377,
+        confirm={"Emma": 0.8472},
+    )
     outcome, _ = await run_fixed(
         fixed, [entity("e0", "Emma", "Emma")], candidates("Emma Thompson")
     )
-    assert outcome.targets == {"e0": "0"}
+    assert outcome.targets == {"e0": "0"} and outcome.confirmed == {"e0"}
+    # the pairwise answer must beat the choice's own p(__new__)
+    weak = Fixed(
+        {"Emma": {"Emma Thompson": 0.169, NEW: 0.831}},
+        confidence=0.4377,
+        confirm={"Emma": 0.80},
+    )
+    outcome, _ = await run_fixed(
+        weak, [entity("e0", "Emma", "Emma")], candidates("Emma Thompson")
+    )
+    assert outcome.targets == {} and outcome.skipped[0].reason == "ambiguous_match"
 
 
-async def test_two_first_names_the_choice_calls_new_are_confirmed_one_by_one() -> None:
-    """bleed_update (live 6): "Maria" 0.84 __new__ against Maria Costa; Jon matched."""
+async def test_a_sure_new_is_never_overridden_by_the_pairwise_answer() -> None:
+    """bleed_update (live 7): Maria __new__ 0.836, confidence 0.5827 (sure). A gullible
+    pairwise 0.99 does not turn a new person into Maria Costa."""
+    fixed = Fixed(
+        {"Maria": {"Maria Costa": 0.15, NEW: 0.836}},
+        confidence=0.5827,
+        confirm={"Maria": 0.99},
+    )
+    outcome, _ = await run_fixed(
+        fixed, [named("e0", "Maria")], candidates("Maria Costa")
+    )
+    assert outcome.targets == {"e0": None} and fixed.confirmed == []
+
+
+async def test_two_first_names_are_confirmed_one_by_one_when_unsure() -> None:
     fixed = Fixed(
         {
             "Maria": {"Maria Costa": 0.15, "Jon Petit": 0.01, NEW: 0.84},
             "Jon": {"Maria Costa": 0.01, "Jon Petit": 0.852, NEW: 0.138},
         },
-        confidence=0.8,
+        confidence={"Maria": 0.4, "Jon": 0.616},
         confirm={"Maria": 0.93},
     )
     outcome, _ = await run_fixed(
@@ -829,6 +861,30 @@ async def test_two_first_names_the_choice_calls_new_are_confirmed_one_by_one() -
     )
     assert outcome.targets == {"e0": "0", "e1": "1"}
     assert [label for label, _ in fixed.confirmed] == ["Maria"]  # Jon was sure
+
+
+async def test_a_full_name_that_contradicts_the_record_is_never_confirmed() -> None:
+    from trustcall_system_one._match import _Matcher
+
+    run = Run(transport=FakeTransport(lambda m, p, meta: None))
+    matcher = _Matcher(
+        run,
+        compile_schema(Person),
+        TEXT,
+        "Person",
+        candidates("Emma Thompson"),
+        ("name",),
+    )
+    emma = named("e0", "Emma")
+    davis = EntityInfo(
+        key="e1",
+        label="Emma Davis",
+        mentions=(Mention("Emma Davis", None), Mention("Emma", None)),
+        first_mention=Mention("Emma Davis", None),
+        qualify_p=0.97,
+    )
+    assert matcher.sole_fit(emma) == 0
+    assert matcher.sole_fit(davis) is None  # "Emma Davis" is not "Emma Thompson"
 
 
 async def test_a_new_person_who_is_not_a_strong_fit_is_never_asked_about() -> None:
@@ -857,13 +913,26 @@ async def test_two_compatible_records_are_never_confirmed() -> None:
     assert outcome.targets == {"e0": None} and fixed.confirmed == []
 
 
-async def test_a_different_person_stays_new_when_the_pairwise_answer_is_low() -> None:
-    fixed = Fixed({"Emma": {"Emma Thompson": 0.1, NEW: 0.85}}, confirm={"Emma": 0.12})
+async def test_a_different_person_is_not_forced_onto_the_record_by_a_low_answer() -> (
+    None
+):
+    fixed = Fixed(
+        {"Emma": {"Emma Thompson": 0.1, NEW: 0.85}},
+        confidence=0.3,
+        confirm={"Emma": 0.12},
+    )
     outcome, _ = await run_fixed(
         fixed, [entity("e0", "Emma", "Emma")], candidates("Emma Thompson")
     )
-    assert outcome.targets == {"e0": None}
+    # the choice was not sure, the pairwise answer is low: the old outcome stands
+    assert outcome.targets == {} and outcome.skipped[0].reason == "ambiguous_match"
     assert len(fixed.confirmed) == 1
+    # with on_ambiguous="insert" the likely-new reading is a new person
+    inserting = MatchConfig(on_ambiguous="insert", accept=0.6)
+    outcome, _ = await run_fixed(
+        fixed, [entity("e0", "Emma", "Emma")], candidates("Emma Thompson"), inserting
+    )
+    assert outcome.targets == {"e0": None}
 
 
 async def test_a_record_another_entity_holds_is_not_confirmed_for_a_second() -> None:

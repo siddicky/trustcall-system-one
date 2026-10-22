@@ -2118,3 +2118,122 @@ async def test_a_nested_presence_below_the_floor_asks_the_existing_items() -> No
     assert [r.path for r in refused] == ["/items/3/quantity"]
     asked = [c[2].field for c in transport.calls if c[2].kind == "record_presence"]
     assert asked == ["3"]  # only the line the input names
+
+
+@pytest.mark.parametrize(
+    "qty", ["quantity", "units", "count", "num_items", "qty_ordered", "pieces"]
+)
+async def test_two_more_is_refused_whatever_the_quantity_field_is_called(
+    qty: str,
+) -> None:
+    """M10d review: `units`, `count` and `num_items` got 2 written over 3 unchecked."""
+    from typing import Annotated
+
+    from pydantic import BaseModel
+
+    line_cls = type(
+        "Line",
+        (BaseModel,),
+        {
+            "__doc__": "One product line on an order.",
+            "__annotations__": {"name": str, qty: int},
+        },
+    )
+    order_cls = type(
+        "Order",
+        (BaseModel,),
+        {
+            "__doc__": "A customer order.",
+            "__annotations__": {
+                "order_id": str,
+                "items": Annotated[list[line_cls], Many(identity="name")],  # type: ignore[valid-type]
+            },
+        },
+    )
+    text = "Order SO-1: please add two more of the blue mugs."
+    world = FakeWorld(text)
+    world.entity(
+        "the Order", schema=order_cls, mentions=["SO-1"], fields={"order_id": "SO-1"}
+    )
+    world.entity(
+        "blue mugs",
+        schema=line_cls,
+        parent="Order",
+        mentions=["blue mugs"],
+        fields={"name": "blue mugs", qty: 2},
+        matches={"name": "Blue mugs"},
+    )
+    result = await create_extractor(
+        [One(order_cls)], transport=world.transport()
+    ).ainvoke(
+        text,
+        existing=[
+            (
+                "SO-1",
+                "Order",
+                {"order_id": "SO-1", "items": [{"name": "Blue mugs", qty: 3}]},
+            )
+        ],
+    )
+    (record,) = result.records
+    assert ops(record) == []
+    assert [r.reason for r in record.rejected if "relative" in r.reason] == [
+        "relative_edit_unsupported"
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# M10e: the nested record-presence rescue does not trigger on everyday words
+# --------------------------------------------------------------------------- #
+
+
+def _yes_to_records(p: float) -> Any:
+    from trustcall_system_one.testing import clef_response, noul
+
+    def handler(model: str, payload: dict[str, Any], meta: Any) -> Any:
+        return clef_response(
+            {q: noul(p) for q in payload["questions"]}, model=payload["model"]
+        )
+
+    return handler
+
+
+async def _rescue(text: str, p_record: float) -> tuple[Any, list[Any]]:
+    world = FakeWorld(text)
+    world.entity(
+        "the Order",
+        schema=Order,
+        mentions=["SO-10442"],
+        fields={"order_id": "SO-10442"},
+    )
+    transport = FakeTransport(
+        route(default=world.handler, record_presence=_yes_to_records(p_record))
+    )
+    result = await create_extractor(
+        [One(Order)], transport=transport, enable_inserts=True
+    ).ainvoke(text, existing=[("SO-10442", "Order", ORDER)])
+    asked = [c for c in transport.calls if c[2].kind == "record_presence"]
+    return result, asked
+
+
+async def test_a_common_verb_does_not_revive_a_line_of_the_order() -> None:
+    """ "set the delivery date ..." must not bring back "Wooden spoon set"."""
+    text = (
+        "Order SO-10442: set the delivery date to Friday, and the steel frame of "
+        "the shed is fine."
+    )
+    result, asked = await _rescue(text, 0.6)  # even a gullible Clef is not asked
+    assert asked == []
+    (record,) = result.records
+    assert ops(record) == []
+
+
+async def test_one_capitalised_word_of_an_input_with_case_is_enough_for_an_item() -> (
+    None
+):
+    _, asked = await _rescue("Order SO-10442: Steel prices rose today.", 0.04)
+    assert [c[2].field for c in asked] == ["0"]  # "Steel kettle", by "Steel"
+    # two matching words are enough in any case
+    flat = "ORDER SO-10442: MORE TEA TOWELS PLEASE"
+    _, asked = await _rescue(flat, 0.04)
+    assert "1" in [c[2].field for c in asked]

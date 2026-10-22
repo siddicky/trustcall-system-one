@@ -624,6 +624,8 @@ class WorldEntity:
             for an entity that is new.
         odds: Declared match probabilities (see ``FakeWorld.entity``).
         odds_confidence: The confidence of the declared match answer.
+        confirm: What the pairwise ``match_confirm`` answers about this entity, when
+            declared (a Clef that says yes to a new person: 0.75).
         descriptive: Mentions that only a broadened discovery finds (see
             ``FakeWorld.entity``).
         flat: The field values by dotted path.
@@ -641,6 +643,7 @@ class WorldEntity:
     matches: Any = None
     odds: dict[str, float] | None = None
     odds_confidence: float | None = None
+    confirm: float | None = None
     descriptive: tuple[tuple[str, int | None], ...] = ()
     flat: dict[str, Any] = field(default_factory=dict)
     spans: list[Span] = field(default_factory=list)
@@ -845,10 +848,11 @@ class FakeWorld:
       to ``proposed_change.to`` instead of giving the new value (``states_relative_
       change``: "two more" for 3 to 2, not "the tea towels at 5" for 4 to 5), else
       0.04.
-    * ``match_confirm`` (``confirm``, asked only when the choice left an entity new or
-      undecided and exactly one record is a strong name fit): 0.95 if the entity's
-      ``matches=`` describes the record in the state and no ``match_odds=`` was
-      declared, else 0.05.
+    * ``match_confirm`` (``confirm``, asked only when the choice left an entity
+      undecided and exactly one record is a strong name fit): the entity's
+      ``confirm=`` if declared (a gullible Clef), else 0.95 if its ``matches=``
+      describes the record in the state and no ``match_odds=`` was declared, else
+      0.05.
     * ``match`` (Clef choice, question id ``match``): the state is ``{input, entity:
       {label, mentions}}`` (the focused entity is found as for every Clef request)
       and the options are ``rec_<i>``, whose criteria is the existing record as a
@@ -953,6 +957,7 @@ class FakeWorld:
         match_confidence: float | None = None,
         descriptive: Sequence[str | tuple[str, int]] = (),
         parent: "str | WorldEntity | None" = None,
+        confirm: float | None = None,
     ) -> "WorldEntity":
         """Declare an entity of a schema that the text really contains.
 
@@ -985,6 +990,11 @@ class FakeWorld:
                 does not matter). Requests about the items of one parent see only
                 the items declared with it. For a mapping, declare the entry's
                 ``key`` and ``value`` as its fields.
+            confirm: The probability the pairwise ``match_confirm`` question gives
+                for this entity and ANY record, true or not: a gullible Clef that
+                says 0.75 to a new "Emma" next to the record "Emma Thompson". Left
+                out, it answers from what the world declares: 0.95 for the record
+                ``matches`` describes, else 0.05.
 
         Returns:
             The declared entity (pass it, or its label, to ``bleed`` and
@@ -993,7 +1003,7 @@ class FakeWorld:
         Raises:
             ValueError: If a mention is not in the text.
         """
-        return self._add(
+        element = self._add(
             label,
             schema,
             mentions,
@@ -1005,6 +1015,8 @@ class FakeWorld:
             descriptive=descriptive,
             parent=parent,
         )
+        element.confirm = confirm
+        return element
 
     def non_entity(
         self,
@@ -1994,15 +2006,18 @@ class FakeWorld:
     ) -> Any:
         element = self._focus(payload, meta)
         record = payload["state"].get("record")
-        same = (
-            element is not None
-            and element.matches is not None
-            and element.odds is None  # a declared doubt is a doubt here too
-            and self._is_record(element.matches, record)
-        )
+        if element is not None and element.confirm is not None:
+            p = element.confirm
+        else:
+            same = (
+                element is not None
+                and element.matches is not None
+                and element.odds is None  # a declared doubt is a doubt here too
+                and self._is_record(element.matches, record)
+            )
+            p = 0.95 if same else 0.05
         return clef_response(
-            {qid: noul(0.95 if same else 0.05) for qid in payload["questions"]},
-            model=payload["model"],
+            {qid: noul(p) for qid in payload["questions"]}, model=payload["model"]
         )
 
     def _match(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:

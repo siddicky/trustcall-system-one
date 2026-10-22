@@ -368,7 +368,9 @@ schema title: "Person").
    gives "customer"; a possessive owner is dropped ("The user's pet" is a "pet"), a plural made singular
    ("Customers"); "An entry in the address book", "Something we keep" or no description give nothing, and
    the kind is then the title, with the warning `kind_fallback` (name it with `Many(kind=...)`). "a" and
-   "an" follow how the noun is said ("a user", "an LLM"). Live, "Is Emma a Member?" scored 0.24, Maria 0.189, Jon 0.226 and the
+   "an" follow how the noun is said ("a user", "an LLM"). The title fallback is the class name as
+   words ("PersonModel" is "person", "HTTPRequest" "http request", "Item_v2" "item"), and leading
+   intensifiers are dropped ("Very important customer record" is a "customer"). Live, "Is Emma a Member?" scored 0.24, Maria 0.189, Jon 0.226 and the
    presence question 0.21 (live run 5), against 0.97 for "is Emma a person?", so a terse title made bare
    names unqualifiable; the presence question ("Does `input` mention any {kind}?") names the kind as well.
    The criteria refuse only a clear non-match ("The entity is clearly something else, not a {kind}.").
@@ -450,8 +452,9 @@ schema title: "Person").
 7. **Attribution (default on):** Clef `noul` per non-null value and per list element. A scalar: "Does
    `input` state that {desc} of `entity.label` is '{value}', or does it follow by simple
    arithmetic or date math from figures the input states about `entity.label`?" An ORDERED QUANTITY (a number field named
-   `quantity` or `qty`, or whose description is a number of units, items or copies ordered, wanted or to
-   order; never a price, cost, id, "number of the invoice", a count to date such as "copies sold to date",
+   `quantity` or `qty`, or `units`, `count`, `pieces`, `seats`, `tickets`, `copies`, `boxes`, `num_*` on a line of
+   an order, booking or the like, or whose description is a number of units, items or copies ordered, wanted
+   or to order, or "how many ... to book/order/attend/reserve/buy" (a stated "how many children she has" is not); never a price, cost, id, "number of the invoice", a count to date such as "copies sold to date",
    or a total) is asked as "Does `input` ask for
    {value} of `entity.label` (as the {desc})?": "add two more of the blue mugs" asks for a quantity of 2
    that no sentence states (live 0.34 for the "states" wording; this one 0.78 to 0.86 for 2, 0.02 to 0.04
@@ -534,15 +537,21 @@ schema title: "Person").
      (`match.confirm_accept`, default 0.7, 0 off; call kind `match_confirm`).** Clef's record choice
      answered `__new__` at 0.83 for "Emma" against the record "Emma Thompson" and 0.84 for "Maria" against
      "Maria Costa" while the record-presence check agreed with the records at 0.87, and gave the README's Emma
-     0.506 (a coin flip for the margin). When the choice is `__new__` or not sure, and EXACTLY ONE existing
+     0.506 (a coin flip for the margin). The confirmation settles only an AMBIGUOUS outcome: the choice
+     was not sure (below `accept` or `min_confidence`; "Emma" 0.83 with confidence 0.44 was, "Maria" 0.84
+     with confidence 0.58 was sure and stays new), and its answer must also exceed the choice's p(`__new__`).
+     A sure `__new__` is as final as a sure record ("A new hire, Emma, joined the Oslo office" is never
+     written onto Emma Thompson by a gullible pairwise 0.75). And EXACTLY ONE existing
      record fits the entity's mentions at all (`identity_compatible`) and strongly (`strong_compatible`),
      one Clef `noul` in a request of its own asks "In `input`, is `entity.label` the same {kind} as the
      existing record `record` ({identity})?" over the input windows around the mentions, the entity and the
      record. At the knob the entity is matched to the record (warning `match_confirmed`); otherwise the
      choice's outcome stands. Never with two or more compatible records ("Emma" with Emma Thompson and Emma
-     Watson), never for "Emma Watson" against "Emma Thompson" (not a strong fit), never for a record another
-     entity holds, and the identity-conflict guard still refuses a confirmed match whose extracted name
-     contradicts the record. Else the entity is ambiguous:
+     Watson), never for "Emma Watson" against "Emma Thompson" (not a strong fit), never when a mention of two
+     words or more contradicts the record ("Emma Davis, ... Emma has a cat" for Emma Thompson), never for a
+     record another entity holds. The identity-conflict guard still refuses a confirmed match whose extracted
+     name contradicts the record, and then the entity is treated as NEW (`match_confirmed_reverted`: an
+     insert, or `inserts_disabled` when inserts are off), never dropped. Else the entity is ambiguous:
      `SkippedEntity(reason="ambiguous_match", candidates=((option, p), …))` (the options with p ≥
      0.01, the most likely first; the records it might have been are NOT handled, so they stay
      untouched), or, with `on_ambiguous="insert"`, it is treated as new when its `__new__`
@@ -910,7 +919,9 @@ does not name Alice when extraction gave nothing (the record is skipped, never i
 mention any product line of `parent.label`?" scored 0.1991 for "two more of the blue mugs" next to an
 order, under the 0.2 floor, and the line was never looked at). On an update, before the collection
 concludes that there are no items, the parent's existing items are asked about with the record-presence
-check (only those with a name word in the input), and the items they bring back go on to matching and
+check (only those with TWO name words in the input, or one capitalised word of an input that has case;
+everyday verbs such as "set" are no name word: "set the delivery date" does not revive "Wooden spoon set"),
+and the items they bring back go on to matching and
 the usual per-item update, where the relative-edit refusal can run.
 
 **A name that is a sibling's is refused (`identity_bleed`).** The entity "blue mugs" came back from
@@ -922,9 +933,9 @@ name there ("the blue mugs" gives "blue mugs"); at the top level a descriptive r
 
 **A relative edit is refused (`verify.relative_edit`, default 0.5, 0 off).** "Please add two more of the
 blue mugs" says how a quantity changes; the library does no arithmetic on a record's values, and writing
-the stated 2 over the line's 3 loses data. For every `replace` of an ORDERED QUANTITY field (the fields `requestable` accepts: `quantity`, "number
-of units ordered", "how many tickets", "number of guests"; never a total, price, year or age) by another
-number, one Clef `noul` (kind `relative_edit`, the gate's model and state) asks it about THAT change:
+the stated 2 over the line's 3 loses data. For every `replace` of a whole number by another in a number field that is not only ever STATED (not
+a price, cost, total, id, count to date, year or age, whatever the field is called: `units`, `count`,
+`num_items` carried the data loss too when the check relied on the name), one Clef `noul` (kind `relative_edit`, the gate's model and state) asks it about THAT change:
 "Does `input` only describe how the current value `proposed_change.from` of `proposed_change.field` of
 `entity.label` changes (e.g. 'two more', 'one fewer', 'double it'), instead of giving `proposed_change.to`
 as its new value?" ("two more of the blue mugs and the tea towels at 5" refuses the mugs, 3 to 2, and

@@ -128,7 +128,7 @@ from trustcall_system_one._verify import (
     contest_cross,
     crosscheck,
     reask,
-    requestable,
+    relative_candidate,
     resolve,
     resolve_clef,
     run_ladder,
@@ -1151,6 +1151,14 @@ def _proper_noun(text: str, source: str = "", span: Span | None = None) -> bool:
         and w.casefold() not in _NOT_NAMES
     ]
     if not names:
+        return False
+    # "The Printer Ticket": a determiner and then title-case words is a description
+    # set in capitals, not a name ("The Hague", "The Beatles" are two words)
+    if (
+        len(words) >= 3
+        and words[0].casefold() in {"the", "a", "an"}
+        and all(w[:1].isupper() for w in words[1:])
+    ):
         return False
     only_initial = (
         len(names) == 1
@@ -2335,9 +2343,11 @@ async def _judge_changes(
             )
 
     floor_relative = ctx.run.verify.relative_edit
+    # any number that is not only ever stated (a price, a total, a year, an age) can
+    # be changed relatively, whatever the field is called: "two more" on `units`
     quantities = {
-        spec.pretty for spec in ctx.plan.all_specs() if requestable(spec)
-    }  # only an ordered quantity can be requested relatively: "two more"
+        spec.pretty for spec in ctx.plan.all_specs() if relative_candidate(spec)
+    }
     numbers = [
         v
         for v in verdicts

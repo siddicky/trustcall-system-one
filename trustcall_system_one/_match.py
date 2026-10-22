@@ -133,11 +133,14 @@ class MatchOutcome:
             an entity that is new, by entity key. An ambiguous entity is only here
             (as new) with ``on_ambiguous="insert"``.
         skipped: The ambiguous entities (``ambiguous_match``).
+        confirmed: The keys of the entities matched by the pairwise confirmation
+            (``match_confirm``) rather than by the choice question.
     """
 
     entities: tuple[EntityInfo, ...] = ()
     targets: Mapping[str, str | None] = field(default_factory=dict, hash=False)
     skipped: tuple[SkippedEntity, ...] = ()
+    confirmed: frozenset[str] = frozenset()
 
 
 # --------------------------------------------------------------------------- #
@@ -540,9 +543,10 @@ class _Matcher:
         """The index of the ONE record the entity is a strong name fit for, if any.
 
         ``None`` when no record fits, when two or more fit at all (``Emma`` with
-        Emma Thompson and Emma Watson: a name is no evidence there), or when the
-        one that fits only does so as a prefix, a typo or an initial of a one-word
-        mention (``strong_compatible``).
+        Emma Thompson and Emma Watson: a name is no evidence there), when the one
+        that fits only does so as a prefix, a typo or an initial of a one-word
+        mention (``strong_compatible``), or when a mention of two words or more
+        contradicts the record ("Emma Davis" next to "Emma Thompson").
         """
         mentions = [info.label, *(m.text for m in info.mentions)]
         fits = [
@@ -553,6 +557,13 @@ class _Matcher:
         if len(fits) != 1:
             return None
         (only,) = fits
+        # a full name that contradicts the record is another person ("Emma Davis"
+        # next to "Emma Thompson"), whatever a short form of it would fit
+        for text in mentions:
+            if len(name_tokens(text)) >= 2 and not any(
+                identity_compatible(text, v) for v in self._values[only]
+            ):
+                return None
         strong = any(
             strong_compatible(m, v) for m in mentions for v in self._values[only]
         )
@@ -901,7 +912,7 @@ async def match_entities(
         skipped.append(
             SkippedEntity(plan.name, info, "ambiguous_match", detail, candidates_)
         )
-    return MatchOutcome(tuple(out), targets, tuple(skipped))
+    return MatchOutcome(tuple(out), targets, tuple(skipped), frozenset(confirmed))
 
 
 async def _confirmations(
@@ -938,9 +949,9 @@ async def _confirmations(
         if sure and pick != NEW
     }
     wanted: list[tuple[EntityInfo, int]] = []
-    for info, pick, sure in zip(infos, chosen, sure_ones, strict=True):
-        if sure and pick != NEW:
-            continue
+    for info, sure in zip(infos, sure_ones, strict=True):
+        if sure:
+            continue  # a sure __new__ is as final as a sure record
         index = matcher.sole_fit(info)
         if index is not None and ids[index] not in taken:
             wanted.append((info, index))
@@ -954,7 +965,7 @@ async def _confirmations(
         (
             (p, info, index)
             for (info, index), p in zip(wanted, asked, strict=True)
-            if p is not None and p >= floor
+            if p is not None and p >= floor and p > answers[info.key].p(NEW)
         ),
         key=lambda item: -item[0],
     )
