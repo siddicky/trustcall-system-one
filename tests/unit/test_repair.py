@@ -1381,6 +1381,42 @@ async def test_a_message_that_names_fields_re_asks_only_those() -> None:
     assert record.fields["start"].repaired and not record.fields["guest"].repaired
 
 
+class OrderedStay(BaseModel):
+    guest: str
+    room: Optional[str] = None
+    start: dt.date
+    end: dt.date
+
+    @model_validator(mode="after")
+    def _order(self) -> "OrderedStay":
+        if self.end < self.start:
+            raise ValueError("the end must not be before the start")
+        return self
+
+
+async def test_named_answers_are_kept_as_a_set_never_one_by_one() -> None:
+    # either date alone would make the record valid again (start = end), but the
+    # start's first answer was shown wrong by the validator: both stay
+    world = stay_world()
+    record = only(await run([OrderedStay], world, STAY))
+    stay = value_of(record, OrderedStay)
+    assert (stay.start, stay.end) == (dt.date(2024, 5, 1), dt.date(2024, 5, 10))
+    assert (stay.guest, stay.room) == ("Ann Lee", "12")
+    assert sorted(c[2].field or "" for c in repair_calls(world)) == ["end", "start"]
+    assert record.fields["start"].repaired and record.fields["end"].repaired
+
+
+async def test_named_answers_are_all_taken_back_when_the_error_stays() -> None:
+    world = stay_world(start=ca("date", "2024-05-09"), end=ca("date", "2024-05-02"))
+    record = only(await run([OrderedStay], world, STAY))
+    assert not record.valid
+    assert record.after is not None
+    assert (record.after["start"], record.after["end"]) == (
+        dt.date(2024, 5, 10),
+        dt.date(2024, 5, 1),
+    )  # the originals (a set that does not fix it is not kept)
+
+
 async def test_an_unnamed_model_level_error_keeps_only_the_answers_it_needed() -> None:
     # nothing in the message says which field is wrong: all four are re-asked and
     # installed, then taken back one by one while the record stays valid

@@ -914,8 +914,10 @@ class RepairState:
             candidate in the input, one that was re-asked once already, or one
             whose re-ask was not accepted.
         formatted: Wire names that had their one format re-ask.
-        tentative: Answers to a model-level error that are installed but not yet
-            known to be needed (see ``repair_loop``).
+        tentative: Answers to a model-level error that named no field, installed
+            but not yet known to be needed (see ``repair_loop``).
+        bad: ``(wire name, value)`` pairs that an error implicated by name and
+            that a repair then replaced: never put back.
     """
 
     rounds: int = 0
@@ -923,6 +925,7 @@ class RepairState:
     exhausted: set[str] = field(default_factory=set)
     formatted: set[str] = field(default_factory=set)
     tentative: list["Outcome"] = field(default_factory=list)
+    bad: set[tuple[str, str]] = field(default_factory=set)
 
 
 @dataclass
@@ -941,6 +944,8 @@ class Outcome:
         undo: Put the field's earlier answer back (set by the caller that
             installed this outcome, ``None`` before).
         redo: Install this outcome again after an ``undo``.
+        restores: The value the field held before this outcome was installed
+            (what ``undo`` puts back).
     """
 
     target: Target
@@ -952,6 +957,7 @@ class Outcome:
     failfast: bool = False
     undo: Callable[[], None] | None = None
     redo: Callable[[], None] | None = None
+    restores: Any = None
 
     @property
     def repaired(self) -> bool:
@@ -1216,18 +1222,27 @@ async def repair_loop(
             for o in outcomes
             if o.repaired and o.undo is not None and not o.target.hit.direct
         ]
-        if pending.problems and fresh:
-            # an answer to a model-level error stays only if that error went away
-            cause = _errors(plan, _model_level(fresh), chosen)
-            after = _errors(plan, pending.problems, pending.chosen)
-            if not cause - after:
-                pending = await _revert(fresh, refresh)
-                fresh = []
-        state.tentative.extend(fresh)
+        groups = (
+            [o for o in fresh if o.target.hit.named],  # judged as a set
+            [o for o in fresh if not o.target.hit.named],  # judged one by one later
+        )
+        kept: list[list[Outcome]] = []
+        for group in groups:
+            if group and pending.problems:
+                # answers to a model-level error stay only if that error went away
+                cause = _errors(plan, _model_level(group), chosen)
+                after = _errors(plan, pending.problems, pending.chosen)
+                if not cause - after:
+                    pending = await _revert(group, refresh)
+                    group = []
+            kept.append(group)
+        for outcome in kept[0]:  # what a message named is never reinstated
+            state.bad.add(_pair(outcome))
+        state.tentative.extend(kept[1])
         if not pending.problems and state.tentative:
             pending = await _minimise(state, refresh)
     if pending.problems and state.tentative:  # still invalid: none of it helped
-        pending = await _revert(state.tentative, refresh)
+        pending = await _revert(_free(state, state.tentative), refresh)
         state.tentative.clear()
     return pending
 
@@ -1243,6 +1258,18 @@ def _errors(
             normal = tuple("*" if isinstance(p, int) else p for p in path)
             found.add((pointer(normal), problem.type, problem.msg))
     return found
+
+
+def _pair(outcome: Outcome) -> tuple[str, str]:
+    """The field and the value this outcome replaced."""
+    return outcome.target.wire, json.dumps(
+        _jsonable(outcome.restores), sort_keys=True, default=str
+    )
+
+
+def _free(state: RepairState, outcomes: list[Outcome]) -> list[Outcome]:
+    """The outcomes whose undoing would not bring back a value known to be wrong."""
+    return [o for o in outcomes if _pair(o) not in state.bad]
 
 
 def _model_level(outcomes: list[Outcome]) -> list[Problem]:
@@ -1268,17 +1295,21 @@ async def _revert(
 async def _minimise(
     state: RepairState, refresh: Callable[[], Awaitable[Pending]]
 ) -> Pending:
-    """Once the record validates, keep only the tentative answers it needs.
+    """Once the record validates, keep only the unnamed tentative answers it needs.
 
-    Each answer is taken back in turn and stays back as long as the record still
-    validates without it; this repeats until no single answer can go, so answers
-    that are only needed together (both ends of a date range) are kept.
+    These are the answers to a model-level error that named no field (answers
+    to the fields a message names are a set and are never taken back one by
+    one). An answer that would bring back a value that a message named and a
+    repair replaced is not a candidate. Each answer is taken back in turn and
+    stays back as long as the record still validates without it; this repeats
+    until no single answer can go, so answers that are only needed together are
+    kept.
     """
     kept = list(state.tentative)
     changed = True
     while changed:
         changed = False
-        for outcome in list(kept):
+        for outcome in _free(state, kept):
             assert outcome.undo is not None and outcome.redo is not None
             outcome.undo()
             if (await refresh()).problems:

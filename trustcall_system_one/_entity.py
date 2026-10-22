@@ -1243,6 +1243,7 @@ def _install(leaf: _Leaf, outcome: Outcome) -> bool:
     ``undo`` and ``redo``.
     """
     saved = (leaf.spec, leaf.state, leaf.resolved)
+    outcome.restores = leaf.final()
     if _put(leaf, outcome):
         new = (leaf.spec, leaf.state, leaf.resolved)
 

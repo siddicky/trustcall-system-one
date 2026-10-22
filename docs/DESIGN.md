@@ -493,12 +493,15 @@ max_attempts=5, stop_on_repeat=True, allow_pattern_reask=True)`.
 5. Model-level errors repair minimally. A model-level error implicates every field of the model,
    or only the fields its message names (by name, key, spaced name or title; pydantic's "Value
    error, " / "Assertion failed, " prefix and quoted values are not part of the message for this).
-   Every answer to such an error, named or not, is TENTATIVE: it is kept only if the error that
-   caused it went away (a direct fix of another field does not count), tentative answers carry
-   over to the next round, and when the record validates each is taken back in turn and stays
-   back while the record still validates, until no single one can go (answers that are only
-   needed together, both ends of a date range, stay). If the loop ends with the record invalid,
-   all of them are taken back. On an update, a repair that comes back to the RECORD's value for a
+   Answers to such an error are TENTATIVE: they stay only if the error that caused them went away
+   (a direct fix of another field does not count). The answers to the fields a message NAMES are
+   judged as a SET: all are kept when together they make the error disappear, else all are taken
+   back, and never one by one (each was asked because the validator showed the old value wrong,
+   so a set whose parts happen to validate separately is not split). Answers to an error that
+   names no field are carried over to the next round, and when the record validates each is taken
+   back in turn and stays back while the record still validates, until no single one can go; if
+   the loop ends invalid they are all taken back. A revert never brings back a value that a message
+   named and a repair replaced. On an update, a repair that comes back to the RECORD's value for a
    field whose operation was meant to change it is a failed repair: the field keeps the answer
    the operation came from and the operation is reported `RejectedOp(op, path, "validation")`.
 
