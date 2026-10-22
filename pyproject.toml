@@ -1,13 +1,33 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
 name = "trustcall-system-one"
-version = "0.1.0a0"
+version = "0.1.0a1"
 description = "Validated multi-entity extraction and JSON-Patch updates on Cloudflare System One models (Clairic + Clef)."
 readme = "README.md"
 license = "Unlicense"
+authors = [{ name = "siddicky" }]
+keywords = [
+  "extraction",
+  "json-patch",
+  "cloudflare",
+  "workers-ai",
+  "pydantic",
+  "structured-output",
+  "trustcall",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Typing :: Typed",
+]
 requires-python = ">=3.10,<4.0"
 dependencies = [
   "pydantic>=2.7,<3",
@@ -20,6 +40,11 @@ dependencies = [
 
 [project.optional-dependencies]
 jsonschema = ["dydantic>=0.0.8,<1.0"]
+
+[project.urls]
+Homepage = "https://github.com/siddicky/trustcall-system-one"
+Repository = "https://github.com/siddicky/trustcall-system-one"
+Issues = "https://github.com/siddicky/trustcall-system-one/issues"
 
 [dependency-groups]
 dev = [
@@ -38,6 +63,21 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["trustcall_system_one"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/trustcall_system_one",
+  "/tests",
+  "/examples",
+  "/evals",
+  "/docs",
+  "/README.md",
+  "/LICENSE",
+  "/CONTRIBUTING.md",
+  "/AGENTS.md",
+  "/Makefile",
+  "/uv.lock",
+]
 
 [tool.ruff]
 line-length = 88

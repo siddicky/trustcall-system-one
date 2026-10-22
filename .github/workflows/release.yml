@@ -1,0 +1,96 @@
+# Release to PyPI with trusted publishing: GitHub Actions mints a short-lived
+# OIDC token, so no PyPI API token is stored anywhere. (trustcall-system-one
+# 0.1.0a1 was uploaded by hand with an API token; this workflow is for 0.1.0a2
+# and later.)
+#
+# One-time setup on pypi.org: open the trustcall-system-one project, go to
+# Manage > Publishing, and add a GitHub trusted publisher with:
+#   owner:        siddicky
+#   repository:   trustcall-system-one
+#   workflow:     release.yml
+#   environment:  pypi
+# The GitHub repository also needs an environment named "pypi"
+# (Settings > Environments).
+#
+# To release: set `version` in pyproject.toml and `__version__` in
+# trustcall_system_one/_version.py to the same value, merge to main, then push a
+# tag `v<version>` on that commit (for example `v0.1.0a2`). The build job fails
+# if the tag or either version string differs.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: false
+          python-version: "3.13"
+
+      - name: Check the tag matches both version strings
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          expected="${TAG#v}"
+          pyproject="$(uv run --no-project python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          package="$(uv run --no-project python -c 'import re; print(re.search(r"__version__ = \"([^\"]+)\"", open("trustcall_system_one/_version.py").read()).group(1))')"
+          echo "tag: ${expected}, pyproject.toml: ${pyproject}, _version.py: ${package}"
+          for version in "${pyproject}" "${package}"; do
+            if [ "${version}" != "${expected}" ]; then
+              echo "::error::tag ${TAG} does not match version ${version}"
+              exit 1
+            fi
+          done
+
+      - name: Install dependencies
+        run: uv sync --all-extras --frozen
+
+      - name: Unit tests
+        run: make test
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: pypi
+      url: https://pypi.org/project/trustcall-system-one/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: false
+
+      - name: Publish to PyPI
+        run: uv publish --trusted-publishing always --check-url https://pypi.org/simple/

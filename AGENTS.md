@@ -27,9 +27,9 @@ API schemas for both models are in `docs/schemas/`.
 ## Licensing
 
 This repository is public domain under the Unlicense. The reference
-implementation at `/home/user/trustcall` (upstream
-github.com/hinthornw/trustcall) is MIT-licensed. Reimplement its behaviour
-from the design doc. Never copy its code, and credit it in the README.
+implementation, [trustcall](https://github.com/hinthornw/trustcall) by
+William Fu-Hinthorn (LangChain), is MIT-licensed. Reimplement its behaviour from the design doc.
+Never copy its code, and credit it in the README.
 
 ## Layout
 

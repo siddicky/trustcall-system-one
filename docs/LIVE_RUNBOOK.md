@@ -9,7 +9,7 @@ echoes them).
 ## 0. Set-up
 
 ```bash
-cd /home/user/trustcall-system-one
+cd trustcall-system-one                # your checkout of the repository
 export CLOUDFLARE_ACCOUNT_ID=...      # from the environment only
 export CLOUDFLARE_API_TOKEN=...       # (CLOUDFLARE_AUTH_TOKEN also works)
 git rev-parse --short HEAD            # the commit under test: put it in the report
@@ -21,6 +21,7 @@ uv run python -m evals run --quiet    # offline baseline: 24/24 on the scripted 
 
 Use `UV_SYSTEM_CERTS` instead of the deprecated `UV_NATIVE_TLS` if uv warns. Do not print the
 variables (`env | grep CLOUDFLARE` leaks the token); `test -n "$CLOUDFLARE_ACCOUNT_ID"` is enough.
+To run the live smoke test from GitHub Actions instead, see [CONTRIBUTING.md](https://github.com/siddicky/trustcall-system-one/blob/main/CONTRIBUTING.md#live-smoke-test-in-ci).
 
 ## 1. Smoke
 

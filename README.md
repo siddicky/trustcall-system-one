@@ -1,5 +1,8 @@
 # trustcall-system-one
 
+[![CI](https://github.com/siddicky/trustcall-system-one/actions/workflows/ci.yml/badge.svg)](https://github.com/siddicky/trustcall-system-one/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/trustcall-system-one.svg)](https://pypi.org/project/trustcall-system-one/)
+
 Extract typed data from text, and update the records you already have, on Cloudflare's
 **System One** models. Patch, don't regenerate. Verify, don't generate.
 
@@ -11,7 +14,7 @@ This library turns those probabilities into validated pydantic objects, and turn
 code and checked one by one**, so a field the text never mentions is never touched.
 
 It is a reimplementation of the ideas of [trustcall](https://github.com/hinthornw/trustcall)
-(see [Credits](#credits)) with no LangChain or LangGraph. Status: alpha (`0.1.0a0`),
+(see [Credits](#credits)) with no LangChain or LangGraph. Status: alpha (`0.1.0a1`),
 the API may still move.
 
 On this page: [quickstart](#quickstart) · [raw calls vs the library](#without-the-library-vs-with-the-library) ·
@@ -24,7 +27,7 @@ On this page: [quickstart](#quickstart) · [raw calls vs the library](#without-t
 ## Quickstart
 
 ```bash
-uv add "git+https://github.com/siddicky/trustcall-system-one@feat/system-one-extractor"
+uv add --prerelease=allow trustcall-system-one
 export CLOUDFLARE_ACCOUNT_ID=...   # your Cloudflare account id
 export CLOUDFLARE_API_TOKEN=...    # a token with Workers AI access
 ```
@@ -49,8 +52,8 @@ Full setup, extraction without an existing record, and the details are [below](#
 ## Without the library vs with the library
 
 One task, twice: **update a CRM contact from a short note** (this is
-[`examples/03_update_contact.py`](examples/03_update_contact.py); the raw call of step 1, a naive merge of its values and the library run
-below are [`examples/00_raw_vs_library.py`](examples/00_raw_vs_library.py)).
+[`examples/03_update_contact.py`](https://github.com/siddicky/trustcall-system-one/blob/main/examples/03_update_contact.py); the raw call of step 1, a naive merge of its values and the library run
+below are [`examples/00_raw_vs_library.py`](https://github.com/siddicky/trustcall-system-one/blob/main/examples/00_raw_vs_library.py)).
 
 The note, the record you already hold, and your schema:
 
@@ -283,7 +286,7 @@ pass, request kind `crosscheck`.)
   both existing notes with the five fragments.
 - **No check that a value is about the right person.** A span says where a value was
   read, not whom it describes. This note has one person, so nothing goes wrong here;
-  [`examples/06`](examples/06_attribution_guard.py) injects the case where it does.
+  [`examples/06`](https://github.com/siddicky/trustcall-system-one/blob/main/examples/06_attribution_guard.py) injects the case where it does.
 - **No validation or repair.** Nothing checks the values against your schema, and no
   request is made again when one fails.
 - **No multi-entity matching.** One request answers about one entity. With several
@@ -613,15 +616,20 @@ The library gives Clef the note, the record and the proposed change, and asks on
 
 ## Install
 
-Python 3.10 or newer. The package is a pre-release; install it from the repository with
-[uv](https://docs.astral.sh/uv/):
+Python 3.10 or newer. The package is a pre-release (alpha), so the `--pre` or
+`--prerelease=allow` flag is needed to install it:
 
 ```bash
-uv add "git+https://github.com/siddicky/trustcall-system-one@feat/system-one-extractor"
+pip install --pre trustcall-system-one
+# or, with uv:
+uv add --prerelease=allow trustcall-system-one
 ```
 
-(The code is on the `feat/system-one-extractor` branch for now, because `main` only has the
-initial commit. Drop the `@feat/system-one-extractor` part once it is merged.)
+To install the latest code from the repository instead, use [uv](https://docs.astral.sh/uv/):
+
+```bash
+uv add "git+https://github.com/siddicky/trustcall-system-one"
+```
 
 It depends on `pydantic>=2.7`, `httpx`, `jsonpatch`, `jsonpointer`, `typing-extensions`
 and `annotated-types`. An optional extra, `jsonschema`, installs `dydantic` for JSON
@@ -638,7 +646,8 @@ export CLOUDFLARE_API_TOKEN=...    # a token with Workers AI access
 read on the first request, so building an extractor needs none (tests build them with
 `FakeTransport`). To go through AI Gateway pass `CloudflareTransport(gateway="<id>")`.
 
-For development: `make install`, `make format`, `make lint`, `make test`.
+For development: `make install`, `make format`, `make lint`, `make test` (`make help` lists every
+target). See [`CONTRIBUTING.md`](https://github.com/siddicky/trustcall-system-one/blob/main/CONTRIBUTING.md) for releases.
 
 ## Extract one record
 
@@ -680,8 +689,8 @@ trail for each: `fields[path]` has the `FieldAnswer` (value, `p_null`, `confiden
 `valid` and `errors` say whether it validated. `total` was never written in the text;
 Clairic worked out 4 x 250 + 80 and the attribution check accepted it (0.94), because the
 question allows "simple arithmetic from stated figures". Examples
-[`01`](examples/01_invoice.py), [`02`](examples/02_support_ticket.py) and
-[`04`](examples/04_repair.py) go deeper (spans, nested models, repair).
+[`01`](https://github.com/siddicky/trustcall-system-one/blob/main/examples/01_invoice.py), [`02`](https://github.com/siddicky/trustcall-system-one/blob/main/examples/02_support_ticket.py) and
+[`04`](https://github.com/siddicky/trustcall-system-one/blob/main/examples/04_repair.py) go deeper (spans, nested models, repair).
 
 `invoke` is synchronous (it runs on a private event-loop thread, so it also works inside
 Jupyter or a running loop); `ainvoke`, `batch` and `abatch` are the async and batch forms.
@@ -1014,7 +1023,7 @@ assert tom.role == "finance lead"
 For a single entity, `FakeTransport(route(presence=..., extract=..., clef_fields=...,
 attribution=...))` with the helpers `clairic_answer`, `clairic_response`, `noul`, `choice` and
 `clef_response` is all you need; `transport.calls` records every request so a test can also
-assert what was **not** asked. See [`examples/08_testing_your_extractor.py`](examples/08_testing_your_extractor.py),
+assert what was **not** asked. See [`examples/08_testing_your_extractor.py`](https://github.com/siddicky/trustcall-system-one/blob/main/examples/08_testing_your_extractor.py),
 which is also a runnable pytest module. This repository's own suite is
 `make test` (`pytest --disable-socket`).
 
@@ -1027,17 +1036,17 @@ and **offline** (a banner says so; answers come from a scripted transport) other
 
 | Example | Shows | Live run of 2026-10-22 |
 | --- | --- | --- |
-| [`00_raw_vs_library.py`](examples/00_raw_vs_library.py) | The raw `httpx` call and a naive merge of its values, then the library, on the CRM note | offline only so far; the wire bodies in this README are from the live run of 03 |
-| [`01_invoice.py`](examples/01_invoice.py) | Invoice email to a typed model: spans, a confident null, re-asks, the due date computed in code | correct |
-| [`02_support_ticket.py`](examples/02_support_ticket.py) | Nested models, a union, an optional sub-model skipped by the presence gate, an ordered enum | correct |
-| [`03_update_contact.py`](examples/03_update_contact.py) | A CRM record updated as a JSON Patch; every refusal with its reason | 4 of 5 expected operations; note not appended |
-| [`04_repair.py`](examples/04_repair.py) | Validation failures fixed by narrow re-asks | correct, but the repair loop was not needed |
-| [`05_people_memory.py`](examples/05_people_memory.py) | trustcall's relationships scenario with `Many` | weak (see above) |
-| [`06_attribution_guard.py`](examples/06_attribution_guard.py) | One person's fact landing on another, caught by the attribution check | names correct; Tom's city kept (attributed 0.77 against a keep bar of 0.75) |
-| [`07_order_line_items.py`](examples/07_order_line_items.py) | Edits inside a nested list of an existing order | not in the live runs so far |
-| [`08_testing_your_extractor.py`](examples/08_testing_your_extractor.py) | Unit-testing your extractor with `FakeTransport` and `FakeWorld` | offline only |
+| [`00_raw_vs_library.py`](https://github.com/siddicky/trustcall-system-one/blob/main/examples/00_raw_vs_library.py) | The raw `httpx` call and a naive merge of its values, then the library, on the CRM note | offline only so far; the wire bodies in this README are from the live run of 03 |
+| [`01_invoice.py`](https://github.com/siddicky/trustcall-system-one/blob/main/examples/01_invoice.py) | Invoice email to a typed model: spans, a confident null, re-asks, the due date computed in code | correct |
+| [`02_support_ticket.py`](https://github.com/siddicky/trustcall-system-one/blob/main/examples/02_support_ticket.py) | Nested models, a union, an optional sub-model skipped by the presence gate, an ordered enum | correct |
+| [`03_update_contact.py`](https://github.com/siddicky/trustcall-system-one/blob/main/examples/03_update_contact.py) | A CRM record updated as a JSON Patch; every refusal with its reason | 4 of 5 expected operations; note not appended |
+| [`04_repair.py`](https://github.com/siddicky/trustcall-system-one/blob/main/examples/04_repair.py) | Validation failures fixed by narrow re-asks | correct, but the repair loop was not needed |
+| [`05_people_memory.py`](https://github.com/siddicky/trustcall-system-one/blob/main/examples/05_people_memory.py) | trustcall's relationships scenario with `Many` | weak (see above) |
+| [`06_attribution_guard.py`](https://github.com/siddicky/trustcall-system-one/blob/main/examples/06_attribution_guard.py) | One person's fact landing on another, caught by the attribution check | names correct; Tom's city kept (attributed 0.77 against a keep bar of 0.75) |
+| [`07_order_line_items.py`](https://github.com/siddicky/trustcall-system-one/blob/main/examples/07_order_line_items.py) | Edits inside a nested list of an existing order | not in the live runs so far |
+| [`08_testing_your_extractor.py`](https://github.com/siddicky/trustcall-system-one/blob/main/examples/08_testing_your_extractor.py) | Unit-testing your extractor with `FakeTransport` and `FakeWorld` | offline only |
 
-[`examples/README.md`](examples/README.md) has the details of examples 01 to 08.
+[`examples/README.md`](https://github.com/siddicky/trustcall-system-one/blob/main/examples/README.md) has the details of examples 01 to 08.
 
 ## Limitations
 
@@ -1070,15 +1079,16 @@ Read these before relying on it.
 - **Alpha.** Public names are in `trustcall_system_one/__init__.py`; anything with a leading
   underscore is internal and may change.
 
-The design, with the full pipeline and every rule above, is in [`docs/DESIGN.md`](docs/DESIGN.md);
-the Clairic and Clef request and response schemas it implements are in [`docs/schemas/`](docs/schemas/).
+The design, with the full pipeline and every rule above, is in [`docs/DESIGN.md`](https://github.com/siddicky/trustcall-system-one/blob/main/docs/DESIGN.md);
+the Clairic and Clef request and response schemas it implements are in [`docs/schemas/`](https://github.com/siddicky/trustcall-system-one/tree/main/docs/schemas).
 
 ## Credits
 
 The idea (let the model emit RFC 6902 JSON Patch instead of regenerating records, validate
 every result, narrow the repair) and the `existing` conventions come from
-[trustcall](https://github.com/hinthornw/trustcall) by hinthornw, which is MIT-licensed. This
-is a clean reimplementation of its behaviour on different models, not a port of its code.
+[trustcall](https://github.com/hinthornw/trustcall) by William Fu-Hinthorn (LangChain), which is
+MIT-licensed. This is a clean reimplementation of its behaviour on different models, not a port of
+its code.
 Clairic and Clef are Cloudflare's System One models.
 
-This repository is released into the public domain under the Unlicense; see [`LICENSE`](LICENSE).
+This repository is released into the public domain under the Unlicense; see [`LICENSE`](https://github.com/siddicky/trustcall-system-one/blob/main/LICENSE).

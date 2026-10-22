@@ -1,6 +1,7 @@
 """Tests for the package skeleton and the exception hierarchy."""
 
 import importlib
+from importlib.metadata import version as distribution_version
 
 from trustcall_system_one import (
     AuthError,
@@ -17,7 +18,7 @@ from trustcall_system_one import (
 
 def test_version() -> None:
     package = importlib.import_module("trustcall_system_one")
-    assert package.__version__ == "0.1.0a0"
+    assert package.__version__ == distribution_version("trustcall-system-one")
 
 
 def test_all_names_are_importable() -> None:
