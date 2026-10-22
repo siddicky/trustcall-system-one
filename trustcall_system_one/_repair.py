@@ -290,8 +290,23 @@ def _names_of(entry: Entry) -> set[str]:
     return {n.lower() for n in names if len(n) >= 3}
 
 
+_PREFIX = re.compile(r"^(?:Value error|Assertion failed), ")
+_QUOTED = re.compile(r"'[^']*'|\"[^\"]*\"")
+
+
+def message_text(message: str) -> str:
+    """The part of a model-level message that can name a field.
+
+    pydantic prefixes the message of a validator's error with ``Value error, ``
+    or ``Assertion failed, ``, and a message may quote a value; neither names a
+    field, so both are left out.
+    """
+    return _QUOTED.sub(" ", _PREFIX.sub("", message))
+
+
 def _named(entry: Entry, message: str) -> bool:
     """Whether a message mentions the field (as a whole word)."""
+    message = message_text(message)
     return any(
         re.search(rf"(?<![A-Za-z0-9_]){re.escape(n)}(?![A-Za-z0-9_])", message, re.I)
         for n in _names_of(entry)
@@ -500,12 +515,16 @@ class Target:
         previous: The rejected value (``None`` when there was none).
         type_answer: For a union of primitives, the Clef choice of the member
             type, which a re-ask keeps.
+        show_input: Whether ``<validation_errors>`` may show the input a
+            validator saw. An update never does: that input may be a value of
+            the record (the field's own answer is in ``<previous_attempt>``).
     """
 
     hit: Hit
     spec: FieldSpec
     previous: Any = None
     type_answer: ChoiceAnswer | None = None
+    show_input: bool = True
 
     @property
     def wire(self) -> str:
@@ -740,7 +759,8 @@ def _error_objects(target: Target) -> list[dict[str, Any]]:
         # a leaf. For a model-level or container error pydantic's input is the
         # whole document (on an update: the record).
         if (
-            problem.type != "missing"
+            target.show_input
+            and problem.type != "missing"
             and id(problem) in target.hit.direct_ids
             and (problem.input is None or isinstance(problem.input, (str, int, float)))
         ):
@@ -894,12 +914,15 @@ class RepairState:
             candidate in the input, one that was re-asked once already, or one
             whose re-ask was not accepted.
         formatted: Wire names that had their one format re-ask.
+        tentative: Answers to a model-level error that are installed but not yet
+            known to be needed (see ``repair_loop``).
     """
 
     rounds: int = 0
     seen: set[Signature] = field(default_factory=set)
     exhausted: set[str] = field(default_factory=set)
     formatted: set[str] = field(default_factory=set)
+    tentative: list["Outcome"] = field(default_factory=list)
 
 
 @dataclass
@@ -1186,47 +1209,83 @@ async def repair_loop(
         if not targets:
             break
         state.rounds += 1
+        chosen = pending.chosen
         pending = await refresh()
-        tentative = [
+        fresh = [
             o
             for o in outcomes
-            if o.repaired
-            and o.undo is not None
-            and not o.target.hit.direct
-            and not o.target.hit.named
+            if o.repaired and o.undo is not None and not o.target.hit.direct
         ]
-        if tentative:
-            pending = await _settle(plan, sig, pending, tentative, refresh)
+        if pending.problems and fresh:
+            # an answer to a model-level error stays only if that error went away
+            cause = _errors(plan, _model_level(fresh), chosen)
+            after = _errors(plan, pending.problems, pending.chosen)
+            if not cause - after:
+                pending = await _revert(fresh, refresh)
+                fresh = []
+        state.tentative.extend(fresh)
+        if not pending.problems and state.tentative:
+            pending = await _minimise(state, refresh)
+    if pending.problems and state.tentative:  # still invalid: none of it helped
+        pending = await _revert(state.tentative, refresh)
+        state.tentative.clear()
     return pending
 
 
-async def _settle(
-    plan: SchemaPlan,
-    before: Signature,
-    pending: Pending,
-    tentative: list[Outcome],
-    refresh: Callable[[], Awaitable[Pending]],
-) -> Pending:
-    """Keep only the answers to a model-level error that were needed.
+def _errors(
+    plan: SchemaPlan, problems: Sequence[Problem], chosen: Mapping[str, str]
+) -> set[tuple[str, str, str]]:
+    """Errors with their messages: a new validator's error is not the old one."""
+    found: set[tuple[str, str, str]] = set()
+    for problem in problems:
+        path = document_path(plan, problem.loc, chosen)
+        if path is not None:
+            normal = tuple("*" if isinstance(p, int) else p for p in path)
+            found.add((pointer(normal), problem.type, problem.msg))
+    return found
 
-    A model-level error that names no field does not say which one is wrong, so
-    every field of the model was re-asked and what differs was installed
-    tentatively. If the
-    round removed no error, none of it helped and all of it is taken back. If the
-    record validates now, each tentative answer is taken back in turn and stays
-    back as long as the record still validates without it.
-    """
-    after = signature(plan, pending.problems, pending.chosen)
-    if pending.problems:
-        if before - after:
-            return pending
-        for outcome in tentative:
-            assert outcome.undo is not None
-            outcome.undo()
-        return await refresh()
-    for outcome in tentative:
-        assert outcome.undo is not None and outcome.redo is not None
+
+def _model_level(outcomes: list[Outcome]) -> list[Problem]:
+    """The model-level errors that made the repair of these fields necessary."""
+    return [
+        p
+        for o in outcomes
+        for p in o.target.hit.problems
+        if id(p) not in o.target.hit.direct_ids
+    ]
+
+
+async def _revert(
+    outcomes: list[Outcome], refresh: Callable[[], Awaitable[Pending]]
+) -> Pending:
+    """Take answers back (a repair that did not help)."""
+    for outcome in reversed(outcomes):
+        assert outcome.undo is not None
         outcome.undo()
-        if (await refresh()).problems:
-            outcome.redo()
+    return await refresh()
+
+
+async def _minimise(
+    state: RepairState, refresh: Callable[[], Awaitable[Pending]]
+) -> Pending:
+    """Once the record validates, keep only the tentative answers it needs.
+
+    Each answer is taken back in turn and stays back as long as the record still
+    validates without it; this repeats until no single answer can go, so answers
+    that are only needed together (both ends of a date range) are kept.
+    """
+    kept = list(state.tentative)
+    changed = True
+    while changed:
+        changed = False
+        for outcome in list(kept):
+            assert outcome.undo is not None and outcome.redo is not None
+            outcome.undo()
+            if (await refresh()).problems:
+                outcome.redo()
+            else:
+                kept.remove(outcome)
+                changed = True
+    state.tentative.clear()
+    state.tentative.extend(kept)
     return await refresh()

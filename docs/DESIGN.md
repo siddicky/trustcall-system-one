@@ -465,14 +465,17 @@ max_attempts=5, stop_on_repeat=True, allow_pattern_reask=True)`.
    dropped as absent are repaired too, before the group is given up. An update re-asks only a
    field that one of its own operations touched, or a required value that is missing from the record
    (that one is re-asked input-only, attributed and gated like the rest). Any other error the
-   record already had is not the update's to repair.
+   record already had is not the update's to repair: that includes an error about a list element
+   the record held before the update, which costs no request and does not drop the update's own
+   operations.
 2. ONE narrow request per implicated field, all in parallel (call kind `repair`, `CallMeta.field`
    the wire name): a Clairic request with that one field, whose `state` is the focus header, the
    `<input>` (input only: never the existing record, so a repair cannot echo it) and the blocks
    `<previous_attempt>` (just that field's rejected answer, never the patched document),
-   `<validation_errors>` (pydantic message and type, and the input only where it is the field's own
-   scalar value at a leaf: for a model-level or container error pydantic's input is the whole
-   document, which on an update holds the record, so it is left out) and `<expected_schema>` (the `$defs`-resolved JSON-schema excerpt of
+   `<validation_errors>` (pydantic message and type; on an insert also the input, only where it is
+   the field's own scalar value at a leaf. For a model-level or container error pydantic's input is
+   the whole document, and on an update even a leaf's input may be a value of the record, so an
+   update shows no input at all) and `<expected_schema>` (the `$defs`-resolved JSON-schema excerpt of
    the path), or a Clef question when the field is adapted to Clef (its structured state carries
    the same three things as keys). The instructions are the field's rendered instructions plus
    "Must satisfy: {constraint}. The previous answer {old!r} was rejected because: {message}". An
@@ -487,16 +490,17 @@ max_attempts=5, stop_on_repeat=True, allow_pattern_reask=True)`.
    repairs. `ExtractionResult.attempts` is 1 plus the rounds of the record that needed the most,
    so up to `1 + max_attempts`. The error signature normalises list indexes (`/notes/2` and
    `/notes/3` are `/notes/*`).
-5. Model-level errors repair minimally. When the message names no field, every field of the model
-   is re-asked but what differs is only tentative: if the round removed no error all of it is
-   taken back, and if the record validates, each tentative answer is taken back in turn and stays
-   back while the record still validates. Fields the message names are installed as normal
-   answers. On an update, a repair that comes back to the RECORD's value for a field whose
-   operation was meant to change it is a failed repair: the field keeps the answer the operation
-   came from and the operation is reported `RejectedOp(op, path, "validation")`.
-   The loop stops when the record validates, when `max_attempts` rounds are used (a guard against
-   a loop that never ends, not a cost cap), when the error signature `frozenset((path, error
-   type))` repeats (`stop_on_repeat`), or when every field that is left is out of reach.
+5. Model-level errors repair minimally. A model-level error implicates every field of the model,
+   or only the fields its message names (by name, key, spaced name or title; pydantic's "Value
+   error, " / "Assertion failed, " prefix and quoted values are not part of the message for this).
+   Every answer to such an error, named or not, is TENTATIVE: it is kept only if the error that
+   caused it went away (a direct fix of another field does not count), tentative answers carry
+   over to the next round, and when the record validates each is taken back in turn and stays
+   back while the record still validates, until no single one can go (answers that are only
+   needed together, both ends of a date range, stay). If the loop ends with the record invalid,
+   all of them are taken back. On an update, a repair that comes back to the RECORD's value for a
+   field whose operation was meant to change it is a failed repair: the field keeps the answer
+   the operation came from and the operation is reported `RejectedOp(op, path, "validation")`.
 
 | error type | re-asked as |
 | --- | --- |
@@ -522,7 +526,11 @@ the reason is in the field's warnings, and the other failing fields go on withou
 belong in a `Literal`, where Clef chooses among the allowed values and no error arises.
 
 **Terminal failure.** Updates: the operations on the paths that still fail are dropped
-(`RejectedOp(reason="validation")`) and the record is validated once more (the M5 rule). Inserts:
+(`RejectedOp(reason="validation")`) and the record is validated once more (the M5 rule); a
+model-level error whose message names fields drops the operations on just those fields
+(`detail` is the message). A model-level error that names nothing drops nothing, the record is
+invalid, and every operation of the failing document is reported `RejectedOp(op, path,
+"validation")` next to the error of the record as a whole. Inserts:
 an optional field that still fails goes back to its default (or null) with `RejectedOp(op=None,
 path, reason="validation")` and the record is validated again; if a required field still fails the
 record is `valid=False` (`value=None`, kept out of `responses`; it still appears in `records` as an

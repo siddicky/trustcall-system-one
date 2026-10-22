@@ -4,7 +4,7 @@
 
 import datetime as dt
 import json
-from typing import Any, Literal, Optional, TypeVar, Union
+from typing import Annotated, Any, Literal, Optional, TypeVar, Union
 
 import pytest
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
@@ -25,6 +25,7 @@ from trustcall_system_one._repair import (
     classify,
     excerpt,
     locate,
+    message_text,
     problems_of,
     signature,
 )
@@ -552,8 +553,8 @@ class Booking(BaseModel):
 
     @model_validator(mode="after")
     def _ordered(self) -> "Booking":
-        if self.end < self.start:
-            raise ValueError("the end must not be before the start")
+        if (self.end - self.start).days < 2:
+            raise ValueError("the end must be two days after the start")
         return self
 
 
@@ -571,7 +572,7 @@ async def test_a_model_level_error_re_asks_every_field_of_the_model_once() -> No
     assert result.attempts == 2
     # "anything else": the same type, with the error in hand
     assert request_for(world, "start")["fields"]["start"]["type"] == "date"
-    assert "the end must not be before the start" in instructions(world, "start")
+    assert "the end must be two days after the start" in instructions(world, "start")
     state = request_for(world, "end")["state"]
     assert '"field": "(record)"' in state and '"type": "value_error"' in state
 
@@ -1240,6 +1241,78 @@ async def test_the_previous_attempt_of_a_list_is_the_answer_not_the_patched_list
     assert '<previous_attempt>\n["asked about X"]\n</previous_attempt>' in state
 
 
+class CNotes(BaseModel):
+    name: str
+    notes: list[Annotated[str, Field(max_length=25)]] = Field(default_factory=list)
+
+
+LONG_NEW = "Dana asked for a very long intro to logistics"
+SECRET = "SECRET-NOTE-XYZ is far too long for the limit"
+
+
+def notes_world(answer: Any) -> Script:
+    world = Script()
+    world.clairic = {
+        "name": ca("text", "Dana", find="Dana"),
+        "notes": ca("list", [answer], find_all=[answer]),
+    }
+    return world
+
+
+async def update_notes(world: Script, notes: list[str]) -> ExtractionResult:
+    extractor = make_extractor([One(CNotes)], world, repair=ON)
+    return await extractor.ainvoke(
+        f"Dana asked for {world.clairic['notes']['value'][0]}.",
+        existing={"CNotes": {"name": "Dana", "notes": notes}},
+    )
+
+
+async def test_a_record_list_element_never_reaches_a_repair_request() -> None:
+    world = notes_world(LONG_NEW)
+    world.repair = {"notes": ca("list", ["asked about X"], find_all=[])}
+    world.clairic["notes"] = ca("list", [LONG_NEW], find_all=[LONG_NEW])
+    extractor = make_extractor([One(CNotes)], world, repair=ON)
+    await extractor.ainvoke(
+        f"{LONG_NEW}.", existing={"CNotes": {"name": "Dana", "notes": [SECRET]}}
+    )
+    calls = repair_calls(world)
+    assert [c[2].field for c in calls] == ["notes"]  # the new element is the update's
+    for _, payload, _ in calls:
+        assert "SECRET-NOTE-XYZ" not in json.dumps(payload)
+    state = calls[0][1]["state"]
+    errors = json.loads(
+        state.split("<validation_errors>\n")[1].split("\n</validation_errors>")[0]
+    )
+    assert [e["field"] for e in errors] == ["notes.1"]  # not the record's notes.0
+    assert all("input" not in e for e in errors)  # an update shows no input at all
+
+
+async def test_an_error_the_record_already_had_in_a_list_costs_no_request() -> None:
+    world = notes_world("asked about X")
+    extractor = make_extractor([One(CNotes)], world, repair=ON)
+    record = only(
+        await extractor.ainvoke(
+            "Dana asked about X.",
+            existing={"CNotes": {"name": "Dana", "notes": [SECRET]}},
+        )
+    )
+    assert repair_calls(world) == []
+    assert not record.valid  # the element was invalid before the update
+    # the valid new note is not dropped because of somebody else's error
+    assert [(p.op, p.path) for p in record.patches] == [("add", "/notes/-")]
+    assert not [r for r in record.rejected if r.op == "add"]
+
+
+async def test_a_repair_request_of_an_update_shows_no_validator_input() -> None:
+    world = member_world()
+    await update(world)
+    state = request_for(world, "age")["state"]
+    errors = json.loads(
+        state.split("<validation_errors>\n")[1].split("\n</validation_errors>")[0]
+    )
+    assert errors and all("input" not in e for e in errors)
+
+
 # --------------------------------------------------------------------------- #
 # A model-level error: minimal repairs
 # --------------------------------------------------------------------------- #
@@ -1253,8 +1326,8 @@ class Stay(BaseModel):
 
     @model_validator(mode="after")
     def _order(self) -> "Stay":
-        if self.end < self.start:
-            raise ValueError("the end must not be before the start")
+        if (self.end - self.start).days < 2:
+            raise ValueError("the end must be two days after the start")
         return self
 
 
@@ -1339,6 +1412,144 @@ async def test_unneeded_answers_are_taken_back_when_the_error_stays() -> None:
     assert any("reverted" in n for n in record.fields["room"].warnings)
 
 
+class Mix(BaseModel):
+    age: int = Field(ge=0)
+    guest: str
+    start: dt.date
+    end: dt.date
+
+    @model_validator(mode="after")
+    def _order(self) -> "Mix":
+        if self.end < self.start:
+            raise ValueError("the dates are inconsistent")  # names no field
+        return self
+
+
+def mix_world(**repair: Any) -> Script:
+    world = Script()
+    world.clairic = {
+        "age": ca("number", -1),
+        "guest": ca("text", "Ann Lee", find="Ann Lee"),
+        "start": ca("date", "2024-05-10"),
+        "end": ca("date", "2024-05-01"),
+    }
+    world.repair = {
+        "age": ca("number", 5),
+        "guest": ca("text", "Ann", find="Ann"),
+        "start": ca("date", "2024-05-10"),  # nothing new
+        "end": ca("date", "2024-05-01"),  # nothing new
+        **repair,
+    }
+    return world
+
+
+MIX = "Ann Lee, 5 years, May 2024."
+
+
+async def test_a_direct_fix_does_not_keep_answers_to_an_error_that_stays() -> None:
+    # the age error goes away; the unnamed date error does not: the guest answer
+    # that was only a guess at the date error is taken back
+    world = mix_world()
+    result = await run([Mix], world, MIX)
+    record = only(result)
+    assert not record.valid
+    assert record.after is not None
+    assert record.after["age"] == 5  # the direct fix stays
+    assert record.after["guest"] == "Ann Lee"  # the tentative answer does not
+    assert any("reverted" in n for n in record.fields["guest"].warnings)
+    assert not record.fields["guest"].repaired and record.fields["age"].repaired
+
+
+class Mix2(BaseModel):
+    age: int = Field(ge=0)
+    guest: str
+    start: dt.date
+    end: dt.date
+
+    @model_validator(mode="after")
+    def _order(self) -> "Mix2":
+        if self.end < self.start:
+            raise ValueError("the dates are inconsistent")  # names no field
+        return self
+
+    @model_validator(mode="after")
+    def _five(self) -> "Mix2":
+        assert self.age != 5, "that age is not allowed"  # names no field
+        return self
+
+
+async def test_tentative_answers_are_minimised_over_every_round() -> None:
+    # round 1 fixes the date error (start) and guesses at the guest; a second
+    # validator then fails, and round 2 fixes it (age). The guest answer of
+    # round 1 was never needed: it goes at the end, over all rounds, while the
+    # answers that are needed stay
+    world = mix_world(
+        start=ca("date", "2024-05-01"),
+        age=[ca("number", 5), ca("number", 6)],
+        guest=ca("text", "Ann", find="Ann"),
+    )
+    world.clairic["age"] = ca("number", 5)
+    result = await run([Mix2], world, MIX)
+    record = only(result)
+    mix = value_of(record, Mix2)
+    assert (mix.age, mix.guest) == (6, "Ann Lee")
+    assert (mix.start, mix.end) == (dt.date(2024, 5, 1), dt.date(2024, 5, 1))
+    assert result.attempts == 3
+    assert record.fields["start"].repaired and record.fields["age"].repaired
+    assert not record.fields["guest"].repaired
+
+
+class Span(BaseModel):
+    value: Optional[str] = None
+    label: Optional[str] = None
+    start: int
+    stop: int
+
+    @model_validator(mode="after")
+    def _order(self) -> "Span":
+        if self.stop < self.start:
+            raise ValueError("stop must not be below start")
+        return self
+
+
+def test_pydantics_prefix_and_quoted_values_do_not_name_fields() -> None:
+    assert message_text("Value error, stop must not be below start") == (
+        "stop must not be below start"
+    )
+    assert message_text("Assertion failed, x") == "x"
+    assert "label" not in message_text("Value error, check 'label' and \"value\"")
+    assert "value" not in message_text("Value error, check 'label' and \"value\"")
+
+
+async def test_a_field_called_value_is_not_named_by_every_value_error() -> None:
+    world = Script()
+    world.clairic = {
+        "value": ca("text", "abc", find="abc"),
+        "label": ca("text", "L1", find="L1"),
+        "start": ca("number", 9),
+        "stop": ca("number", 3),
+    }
+    world.repair = {"start": ca("number", 3), "stop": ca("number", 9)}
+    record = only(await run([Span], world, "abc L1 from 3 to 9"))
+    assert sorted(c[2].field or "" for c in repair_calls(world)) == ["start", "stop"]
+    assert record.valid  # both ends were needed: start 9 -> 3 alone leaves 3..3
+
+
+async def test_a_named_answer_is_kept_only_if_it_removes_the_error() -> None:
+    world = Script()
+    world.clairic = {
+        "value": ca("text", None, p_null=0.99),
+        "label": ca("text", None, p_null=0.99),
+        "start": ca("number", 9),
+        "stop": ca("number", 3),
+    }
+    world.repair = {"start": ca("number", 9), "stop": ca("number", 4)}  # still < 9
+    record = only(await run([Span], world, "from 3 to 9"))
+    assert not record.valid
+    assert record.after is not None and record.after["stop"] == 3  # taken back
+    assert not record.fields["stop"].repaired
+
+
 # --------------------------------------------------------------------------- #
 # An update repair never goes back to the record
 # --------------------------------------------------------------------------- #
@@ -1365,6 +1576,52 @@ async def test_a_repair_that_still_changes_the_value_is_used() -> None:
     world = plan_world(tier=pick("silver", ["gold", "silver"]))
     record = only(await update_plan(world))
     assert record.valid and not [r for r in record.rejected if r.op]
+
+
+class SeatPlan(BaseModel):
+    name: str
+    tier: Literal["gold", "silver"]
+    seats: int
+
+    @model_validator(mode="after")
+    def _allowed(self) -> "SeatPlan":
+        if self.tier == "silver" and self.seats > 5:
+            raise ValueError("silver allows at most 5 seats")  # names `seats`
+        return self
+
+
+async def test_a_terminal_model_error_that_names_a_field_drops_just_its_operation() -> (
+    None
+):
+    plan = {"name": "Acme", "tier": "gold", "seats": 3}
+    world = plan_world(seats=ca("number", 8))  # the repair cannot fix it
+    extractor = make_extractor([One(SeatPlan)], world, repair=ON)
+    record = only(await extractor.ainvoke(PLAN_TEXT, existing={"SeatPlan": plan}))
+    assert record.valid
+    assert record.after == {"name": "Acme", "tier": "silver", "seats": 3}
+    assert [(p.op, p.path) for p in record.patches] == [("replace", "/tier")]
+    refused = [r for r in record.rejected if r.op]
+    assert [(r.op, r.path, r.reason) for r in refused] == [
+        ("replace", "/seats", "validation")
+    ]
+    assert refused[0].detail == "Value error, silver allows at most 5 seats"
+    assert record.fields["seats"].rejected_reason == "validation"
+
+
+async def test_a_terminal_model_error_that_names_nothing_reports_every_operation() -> (
+    None
+):
+    world = plan_world(seats=ca("number", 8), tier=pick("silver", ["gold", "silver"]))
+    record = only(await update_plan(world))
+    assert not record.valid
+    reported = [(r.op, r.path, r.reason) for r in record.rejected if r.op]
+    assert sorted(reported) == [
+        ("replace", "/seats", "validation"),
+        ("replace", "/tier", "validation"),
+    ]
+    assert any(r.op is None and r.reason == "validation" for r in record.rejected)
+    # the operations stay in the document that failed: the record is invalid
+    assert {p.path for p in record.patches} == {"/tier", "/seats"}
 
 
 # --------------------------------------------------------------------------- #

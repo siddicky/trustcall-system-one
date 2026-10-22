@@ -1709,6 +1709,27 @@ def _is_new(spec: FieldSpec, value: Any, old: Any, default: Any) -> bool:
     return is_change(spec, value, old, default)
 
 
+def _held_element(record: Mapping[str, Any], path: tuple[str | int, ...]) -> bool:
+    """Whether a path points at a list element the record already held.
+
+    An error about such an element is not the update's: it was there before, and
+    it costs no repair request.
+    """
+    if not any(isinstance(part, int) for part in path):
+        return False
+    held: Any = record
+    for part in path:
+        if isinstance(part, int) and isinstance(held, list):
+            if part >= len(held):
+                return False
+            held = held[part]
+        elif isinstance(held, Mapping) and part in held:
+            held = held[part]
+        else:
+            return False
+    return True
+
+
 def _change_key(change: Change) -> tuple[str, str, str]:
     """What identifies an operation across evaluations (its kind, place, value)."""
     return (
@@ -1835,9 +1856,15 @@ async def _repair_update(
         outcome.state = outcome.resolved = None
         outcome.note = f"{outcome.note.split(':')[0]} failed: {detail}"
 
+    def pre_existing(problem: Problem) -> bool:
+        path = document_path(ctx.plan, problem.loc, ev.chosen)
+        return path is not None and _held_element(before, path)
+
     def pending() -> Pending:
-        problems = problems_of(ev.failure) if ev.failure is not None else []
-        return Pending(problems, ev.chosen)
+        # errors of what the record held before the update are not the update's
+        # to repair: they cost no request
+        found = problems_of(ev.failure) if ev.failure is not None else []
+        return Pending([p for p in found if not pre_existing(p)], ev.chosen)
 
     def target_for(hit: Hit) -> Target | None:
         leaf = leaves.get(hit.entry.spec.wire_name)
@@ -1849,7 +1876,7 @@ async def _repair_update(
         # the answer the operation came from: never the patched document, which
         # holds the record
         kind = leaf.state.type_answer if leaf.state is not None else None
-        return Target(hit, leaf.spec, leaf.final(), kind)
+        return Target(hit, leaf.spec, leaf.final(), kind, show_input=False)
 
     async def apply(outcomes: list[Outcome]) -> None:
         installed: list[_Leaf] = []
@@ -1931,11 +1958,24 @@ async def _finish_update(
         # which error is about which operation
         bad: list[PatchOp] = []
         why: dict[int, str] = {}
+
+        def blame(op: PatchOp, text: str) -> None:
+            if id(op) not in why:
+                bad.append(op)
+                why[id(op)] = text
+
         for path, message in problems:
+            if _held_element(before, path):
+                continue  # the record had that element: not this update's error
             for op in ops_for_errors(applied.applied, [path]):
-                if id(op) not in why:
-                    bad.append(op)
-                    why[id(op)] = f"{_dotted(path)}: {message}"
+                blame(op, f"{_dotted(path)}: {message}")
+        # a model-level error whose message names fields is about those fields
+        for hit in locate(plan, problems_of(failure), chosen):
+            if hit.direct or not hit.named:
+                continue
+            for problem in hit.problems:
+                for op in ops_for_errors(applied.applied, [hit.entry.path]):
+                    blame(op, problem.msg)
         for op in bad:
             rejected.append(RejectedOp(op.op, op.path, "validation", why[id(op)], None))
             owner = _owner(ordered, op)
@@ -1950,6 +1990,24 @@ async def _finish_update(
         rejected.append(
             RejectedOp(None, pointer(path), "validation", f"{_dotted(path)}: {message}")
         )
+    if failure is not None:
+        # a model-level error that names nothing: every operation that was part
+        # of the failing document is reported, not just the record as a whole
+        general = [
+            p
+            for p in problems_of(failure)
+            if not p.loc
+            or (
+                (hits := locate(plan, [p], chosen))
+                and not any(h.direct for h in hits)
+                and not any(h.named for h in hits)
+            )
+        ]
+        if general:
+            for op in applied.applied:
+                rejected.append(
+                    RejectedOp(op.op, op.path, "validation", general[0].msg, None)
+                )
     # the fields: how each answer fared
     answers = dict(out.answers)
     for verdict in verdicts:
