@@ -14,18 +14,43 @@ It is a reimplementation of the ideas of [trustcall](https://github.com/hinthorn
 (see [Credits](#credits)) with no LangChain or LangGraph. Status: alpha (`0.1.0a0`),
 the API may still move.
 
-On this page: [raw calls vs the library](#without-the-library-vs-with-the-library) ·
+On this page: [quickstart](#quickstart) · [raw calls vs the library](#without-the-library-vs-with-the-library) ·
 [install](#install) · [insert](#extract-one-record) · [many people](#extract-and-update-many-records) ·
 [never clobbered](#fields-the-text-does-not-mention-are-never-touched) ·
 [types](#type-mapping) · [cardinality](#cardinality) · [verification](#verification-and-thresholds) ·
 [cost](#requests-latency-and-cost) · [`existing`](#the-five-existing-shapes) ·
 [testing](#testing-your-code) · [examples](#examples) · [limitations](#limitations)
 
+## Quickstart
+
+```bash
+uv add "git+https://github.com/siddicky/trustcall-system-one@feat/system-one-extractor"
+export CLOUDFLARE_ACCOUNT_ID=...   # your Cloudflare account id
+export CLOUDFLARE_API_TOKEN=...    # a token with Workers AI access
+```
+
+Update an existing record from a note (`Contact`, `NOTE` and `RECORD` are defined in the
+[next section](#without-the-library-vs-with-the-library)):
+
+```python
+from trustcall_system_one import One, create_extractor
+
+with create_extractor([One(Contact)]) as extractor:
+    result = extractor.invoke(NOTE, existing=[("crm-4711", "Contact", RECORD)])
+
+record = result.records[0]
+record.patches  # the JSON Patch operations that were applied
+record.rejected  # everything computed and then refused, with a reason
+record.after  # the patched record
+```
+
+Full setup, extraction without an existing record, and the details are [below](#install).
+
 ## Without the library vs with the library
 
 One task, twice: **update a CRM contact from a short note** (this is
-[`examples/03_update_contact.py`](examples/03_update_contact.py); the whole comparison runs
-as [`examples/00_raw_vs_library.py`](examples/00_raw_vs_library.py)).
+[`examples/03_update_contact.py`](examples/03_update_contact.py); the raw call of step 1, a naive merge of its values and the library run
+below are [`examples/00_raw_vs_library.py`](examples/00_raw_vs_library.py)).
 
 The note, the record you already hold, and your schema:
 
@@ -109,8 +134,11 @@ HEADERS = {"Authorization": f"Bearer {os.environ['CLOUDFLARE_API_TOKEN']}"}
 
 
 def text(what: str, null_threshold: float) -> dict:
-    spec = {"type": "text", "instructions": f"the Contact's {what}"}
-    return {**spec, "null_threshold": null_threshold}
+    return {
+        "type": "text",
+        "instructions": f"the Contact's {what}",
+        "null_threshold": null_threshold,
+    }
 
 
 body = {
@@ -141,6 +169,9 @@ the wire. The Python above builds exactly that body: it is the library's own inp
 pass, request kind `crosscheck`.)
 
 **2. The real response** (HTTP 200; `state_text`, an echo of the `state` you sent, trimmed to `…`):
+
+<details>
+<summary>The real Clairic response: typed answers with <code>p_null</code>, <code>confidence</code>, <code>guess</code> and <code>span</code>, and a <code>notes</code> list of fragments</summary>
 
 ```json
 {
@@ -231,7 +262,9 @@ pass, request kind `crosscheck`.)
 }
 ```
 
-**3. What this response does not give you.** All of it is visible above.
+</details>
+
+**3. What this response does not give you.** All of it is visible in the response above (expand it).
 
 - **An envelope.** The answers sit under `result`, next to `success`, `errors` and
   `messages`. Unwrapping it, checking `success`, mapping errors and retrying 429s is yours.
@@ -276,6 +309,9 @@ Quick note after catching up with Dana: she moved to Berlin last month and start
 ```
 
 `phone`, `city` and `company` of the response (the other four answers trimmed to `…`; `state_text` trimmed):
+
+<details>
+<summary>The real response when the record is in <code>state</code>: <code>phone</code> and <code>company</code> are the record's old values, read from inside the <code>&lt;existing&gt;</code> block</summary>
 
 ```json
 {
@@ -328,6 +364,8 @@ Quick note after catching up with Dana: she moved to Berlin last month and start
 }
 ```
 
+</details>
+
 Five of the six text answers are the record's own old values, read from the
 `<existing>` block (it starts at character 402; the spans 525 to 540 and 573 to 581
 lie inside it): the old phone `+1 415 555 0134` at confidence 0.996, `Fabrikam`,
@@ -343,6 +381,9 @@ questions are `noul` (probability of yes), options are `choice` (a `criteria` ma
 option to description), ordered scales are `score`. This is a real Clef request and response
 from the same run (the library's "is there a Contact in this text?" question; `input`
 trimmed to `…`). A `bool` field would be asked in exactly this shape:
+
+<details>
+<summary>A real Clef request and response: the presence question, a <code>noul</code> with its own request shape</summary>
 
 ```json
 {
@@ -384,6 +425,8 @@ trimmed to `…`). A `bool` field would be asked in exactly this shape:
 }
 ```
 
+</details>
+
 **6. Then your code** has to do everything in the table below.
 
 | What you'd have to build | What the library does |
@@ -392,7 +435,7 @@ trimmed to `…`). A `bool` field would be asked in exactly this shape:
 | Pick thresholds for `p_null` and `confidence`; decide what to do with `guess` and a span on a null | Per-field `null_threshold` (0.7 required, 0.3 optional), minimum confidence 0.5, a re-ask of answers under 0.85, a Clef check of borderline `p_null` (0.25 to 0.75); a `guess` is metadata and is never used as a value |
 | Ask booleans and enums on a second model, with its own request shape, and map the answers back | The schema compiler: `bool` becomes a Clef `noul`, `Literal` and `Enum` a Clef `choice` (with an `unstated` option when the field is nullable or defaulted); request and mapping back are generated |
 | Keep the model from echoing the record you gave it | Spans inside the `<existing>` block are rejected (`echo_span`); a second Clairic pass reads the input alone and a changed value it does not reproduce is rejected (`echo_crosscheck`); disagreements go to a Clef adjudication |
-| Turn answers into a JSON Patch | `add` and `replace` computed from the field plan (`remove` only with `GateConfig(allow_null_removals=True)`), list elements by set semantics (`add /notes/-`), a fixed operation order, applied with `jsonpatch` on a copy; `before`, `after` and `patches` on the result |
+| Turn answers into a JSON Patch | `add` and `replace` computed from the field plan (`remove` only when you opt in: `GateConfig(allow_null_removals=True)` for a field, `enable_item_removals` for items of a nested list, `enable_deletes` for whole records), list elements by set semantics (`add /notes/-`), a fixed operation order, applied with `jsonpatch` on a copy; `before`, `after` and `patches` on the result |
 | Know that a change is real and about this person | One Clef question per value ("does the input state this about the entity?"), kept at 0.75 or more, dropped under 0.4, re-asked in between; one Clef change gate per operation (add 0.55, replace 0.6); a short form of an identity value ("Dana" for "Dana Whitfield") is refused as `identity_subset` |
 | Validate the result and fix what fails | The patched record is validated by pydantic; each failing field is re-asked alone with the error in the request (the repair loop), and operations on a failing path are dropped; `strict=True` raises instead |
 | Find several entities, group mentions, match them to records | `Many(Schema)`: discovery, coreference (Clef), qualification ("is Sunny a Person?"), one-to-one matching to existing records or `__new__`, opt-in deletes |
@@ -417,9 +460,9 @@ record.rejected  # everything computed and then refused, each with a reason
 record.after  # the patched record, validated as a Contact
 ```
 
-**Live output** of `uv run python examples/03_update_contact.py` (the run whose wire
-bodies are above; two sections left out: the note with its spans bracketed, and each
-operation printed next to its text):
+**Live output** of `uv run python examples/03_update_contact.py`. It is identical to the
+traced run whose wire bodies are above. Left out: the note with its spans bracketed, the
+`record 'crm-4711': update` line, and each operation printed next to its text:
 
 ```text
 LIVE — requests go to Cloudflare (Clairic and Clef)
@@ -480,13 +523,13 @@ What to read in it:
 
 - The four `replace` operations are the four facts the note states. Each one passed
   attribution, the input-only cross-check and its own Clef change gate.
-- `replace /name` was **refused before any model was asked**: "Dana" is a short form of
-  "Dana Whitfield" (`identity_subset`). `/email` is not mentioned; its answer was the
+- `replace /name` was **refused in code before any change gate was asked**: "Dana" is a
+  short form of "Dana Whitfield" (`identity_subset`). `/email` is not mentioned; its answer was the
   record's own value, so it was rejected as an echo (`echo_span`).
 - **The note is not appended, live.** The open-ended `notes` list is where Clairic fails: it
   returned fragments at confidence 3.2e-11 (with the record) and 1.9e-06 (without it).
-  The library refuses them (`/notes` `low_confidence`, and the fragments that are the
-  record's own notes `echo_span`), so `add /notes/-` never happens and "she asked to be
+  The library refuses them (`/notes` `low_confidence`, and the fragments read from the
+  existing record `echo_span`), so `add /notes/-` never happens and "she asked to be
   introduced to our logistics team" is lost. The offline run of the same example *does*
   append it, because the script is told to; do not read that as live behaviour (see
   [Limitations](#limitations)).
@@ -574,11 +617,11 @@ Python 3.10 or newer. The package is a pre-release; install it from the reposito
 [uv](https://docs.astral.sh/uv/):
 
 ```bash
-uv add git+https://github.com/siddicky/trustcall-system-one
+uv add "git+https://github.com/siddicky/trustcall-system-one@feat/system-one-extractor"
 ```
 
-(Until the work is merged, the code is on the `feat/system-one-extractor` branch: append
-`@feat/system-one-extractor` to the URL.)
+(The code is on the `feat/system-one-extractor` branch for now, because `main` only has the
+initial commit. Drop the `@feat/system-one-extractor` part once it is merged.)
 
 It depends on `pydantic>=2.7`, `httpx`, `jsonpatch`, `jsonpointer`, `typing-extensions`
 and `annotated-types`. An optional extra, `jsonschema`, installs `dydantic` for JSON
@@ -673,13 +716,17 @@ people = [  # (record id, schema name, record)
         {
             "name": "Emma Thompson",
             "relationship": "College friend",
-            "notes": ["Loves hiking"],
+            "notes": ["Loves hiking", "Works in marketing", "Has a dog named Max"],
         },
     ),
     (
         "1",
         "Person",
-        {"name": "Michael Chen", "relationship": "Coworker", "notes": ["Plays guitar"]},
+        {
+            "name": "Michael Chen",
+            "relationship": "Coworker",
+            "notes": ["Great at problem-solving", "Vegetarian", "Plays guitar"],
+        },
     ),
     (
         "2",
@@ -687,7 +734,7 @@ people = [  # (record id, schema name, record)
         {
             "name": "Sarah Johnson",
             "relationship": "Neighbor",
-            "notes": ["Has two kids"],
+            "notes": ["Has two kids", "Loves gardening", "Makes amazing cookies"],
         },
     ),
 ]
@@ -705,7 +752,7 @@ print([(s.entity.label, s.reason) for s in result.skipped], result.untouched)
 one existing record or to none (one-to-one), and runs the full single-entity pipeline per
 person. `enable_inserts=True` lets the unmatched person become a new record; deletes
 (`enable_deletes`) and removal of nested items (`enable_item_removals`) are off unless you
-ask. **Offline, scripted** output of
+ask. **Scripted output (offline)** of
 `uv run python examples/05_people_memory.py --offline` (the answers come from a scripted
 transport; the matching, checks and patching are the real code):
 
@@ -721,7 +768,8 @@ Records
   untouched existing records: none
 ```
 
-Michael Chen's applied operations, then the verification log and the totals of the run:
+Still the scripted run (offline): Michael Chen's applied operations, then the verification
+log and the totals of the run (the token counts are estimates):
 
 ```text
 Each applied operation, next to the text behind it
@@ -749,9 +797,9 @@ Verification
 22,662 input tokens (clairic 5,110 · clef 17,552) · $0.000511 + clef unpriced (estimated offline: no model counted these)
 ```
 
-Rock climbing was Emma's, and sits right before Michael's name; the attribution check
-dropped it (`attribution p=0.05`). "Sarah" would have overwritten "Sarah Johnson" and was
-refused (`identity_subset`).
+In the scripted run, rock climbing was Emma's and sits right before Michael's name; the
+attribution check dropped it (`attribution p=0.05`). "Sarah" would have overwritten "Sarah
+Johnson" and was refused (`identity_subset`).
 
 **Honest status of the live run.** The same scenario on the real models is still weak
 (2026-10-22, commit `05207aa`, 20 requests, 5 s): Michael and Sarah were matched but got no
@@ -775,7 +823,12 @@ for r in result.records[0].rejected:
 In example 03 that is `None /email not_mentioned` offline (live the model echoed the
 record's email, so it shows as `echo_span`; either way, no operation), and
 `replace /name identity_subset`. Removing a value needs `GateConfig(allow_null_removals=True)`
-and a Clef check at 0.85. A record the text does not mention at all is returned in
+and a Clef check at 0.85. Removing a whole record (`enable_deletes`) or a nested item
+(`enable_item_removals`) is a Clef question too, and it applies the same silence rule: a
+matched record or item that the input flags for deletion is removed only when the input
+proposes no change to it. If the text both changes and removes it, nothing is done and it is
+reported as skipped with `conflict_update_delete`, even if the change gate would have
+refused the change. A record the text does not mention at all is returned in
 `result.untouched`. An update that applies nothing is still an `update` record with
 `patches == ()` and `after == before`.
 

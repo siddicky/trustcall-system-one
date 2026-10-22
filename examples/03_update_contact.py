@@ -17,7 +17,7 @@ What to look at in the output:
   interesting one: Clairic returns the verbatim span "Dana", a short form, so a
   naive diff would rename the contact from "Dana Whitfield" to "Dana". The diff
   never replaces an identity value with a token subset of the existing one
-  (``identity_subset``), before any model is asked about it.
+  (``identity_subset``), in code, before any change gate is asked.
 * Each applied operation passed three checks: the value is stated about this record
   (attribution), a second Clairic pass over the note alone, without the record,
   read the same value (the cross-check: it catches a value merely echoed from the

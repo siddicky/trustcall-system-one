@@ -86,20 +86,27 @@ def scripted_clairic(script: OfflineScript) -> httpx.MockTransport:
         meta = CallMeta(kind="extract", schema="Contact")
         sent = json.loads(request.content)
         reply = asyncio.run(script.transport.run(CLAIRIC, sent, meta=meta))
-        envelope = {"success": True, "errors": [], "messages": [], "result": reply.body}
+        result = json.loads(json.dumps(reply.body))
+        for answer in result["answers"].values():
+            if answer["type"] == "list":  # a real list answer has no p_null
+                answer.pop("p_null", None)
+        envelope = {"success": True, "errors": [], "messages": [], "result": result}
         return httpx.Response(200, json=envelope)
 
     return httpx.MockTransport(handler)
 
 
-def raw_call(offline: bool) -> dict[str, Any]:
+def raw_call(offline: bool, script: OfflineScript | None = None) -> dict[str, Any]:
     """POST the request and unwrap ``{success, result}``; return ``result``."""
     if offline:
-        client = httpx.Client(transport=scripted_clairic(contact.offline_script()))
+        script = script or contact.offline_script()
+        client = httpx.Client(transport=scripted_clairic(script))
         account = "scripted"
     else:
         account = os.environ["CLOUDFLARE_ACCOUNT_ID"]
-        token = os.environ["CLOUDFLARE_API_TOKEN"]
+        token = os.environ.get("CLOUDFLARE_API_TOKEN") or os.environ.get(
+            "CLOUDFLARE_AUTH_TOKEN", ""
+        )
         client = httpx.Client(
             headers={"Authorization": f"Bearer {token}"}, timeout=60.0
         )

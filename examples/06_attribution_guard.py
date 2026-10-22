@@ -11,7 +11,7 @@ validates and looks fine, and is wrong.
 
 Every non-null Clairic value is therefore checked by Clef with a yes/no question that
 names the entity: "Does ``input`` state that the role of ``Priya Raman`` is 'finance
-lead'?". At least 0.6 keeps the value, below 0.3 drops it (``attribution``), and in
+lead'?". At least 0.75 keeps the value, below 0.4 drops it (``attribution``), and in
 between the field is re-asked in isolation and checked once more.
 
 What to look at: the "Naive vs guarded" table (what taking every Clairic answer at
