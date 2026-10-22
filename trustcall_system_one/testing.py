@@ -439,6 +439,81 @@ _YES, _NO = 0.96, 0.03
 _ATTR_YES, _ATTR_NO = 0.95, 0.04
 
 
+_FILLER = frozenset(
+    [
+        "the",
+        "and",
+        "for",
+        "with",
+        "from",
+        "into",
+        "onto",
+        "that",
+        "this",
+        "these",
+        "those",
+        "she",
+        "her",
+        "hers",
+        "his",
+        "him",
+        "they",
+        "them",
+        "their",
+        "you",
+        "your",
+        "our",
+        "was",
+        "were",
+        "are",
+        "has",
+        "have",
+        "had",
+        "who",
+        "whom",
+        "what",
+        "when",
+        "where",
+        "which",
+        "will",
+        "would",
+        "can",
+        "could",
+        "not",
+        "but",
+        "now",
+        "new",
+        "also",
+        "just",
+        "today",
+        "then",
+        "than",
+        "there",
+        "here",
+        "its",
+        "said",
+        "says",
+        "called",
+        "calls",
+        "told",
+        "asked",
+        "wants",
+        "wanted",
+        "moved",
+    ]
+)
+"""Words that carry no news by themselves, for ``FakeWorld``'s novelty check."""
+
+
+def _content(text: str) -> set[str]:
+    """The words and numbers of a text that can tell something new."""
+    return {
+        word
+        for word in re.findall(r"\w+", _fold(text))
+        if len(word) >= 3 and word not in _FILLER
+    }
+
+
 def _fold(value: Any) -> str:
     """Compare-ready text: case and spacing folded; dates, bools and numbers plain."""
     if isinstance(value, bool):
@@ -701,6 +776,9 @@ class FakeWorld:
     * ``gate`` (Clef ``gate``): 0.9 if ``proposed_change.to`` is new compared to
       ``record`` (not equal to what the record holds at the path, nor an element
       of the list it is appended to), else 0.05.
+    * ``relative_edit`` (``relative``, one per numeric replacement of an update): 0.95
+      if the words around the entity's mentions state a change relative to the
+      current value ("two more", "one fewer", "double", "another"), else 0.04.
     * ``match`` (Clef choice, question id ``match``): the state is ``{input, entity:
       {label, mentions}}`` (the focused entity is found as for every Clef request)
       and the options are ``rec_<i>``, whose criteria is the existing record as a
@@ -978,7 +1056,10 @@ class FakeWorld:
 
         The ``novelty`` check answers ``p`` (default 0.05) for a sentence that
         contains ``text`` (case and accents ignored): "Her mobile is now ..." when the
-        phone is being written to its own field. Every other sentence is news (0.95).
+        phone is being written to its own field. Without this the check judges the
+        sentence by its words: it is news (0.95) when it has a word or number (of
+        three letters or more, not a filler such as "the" or "she") that the record
+        it is shown does not hold, else it repeats the record (0.05).
         """
         self._redundant.append((_fold(text), p))
         return self
@@ -1270,6 +1351,7 @@ class FakeWorld:
             "novelty": self._novelty,
             "record_presence": self._record_presence,
             "gate": self._gate,
+            "relative_edit": self._relative_edit,
             "match": self._match,
             "delete": self._delete,
         }.get(meta.kind)
@@ -1646,7 +1728,8 @@ class FakeWorld:
         answers = {}
         for qid, question in payload["questions"].items():
             found = re.search(
-                r'(?:\bis|\bbe|:) "(.*)"(?:\?\s*$|, or does it follow\b| one of the\b)',
+                r'(?:\bis|\bbe|:) "(.*)"'
+                r"(?:\?\s*$|, or does it follow\b| (?:one of the|an?)\b)",
                 question["instructions"],
                 re.S,
             )
@@ -1752,10 +1835,14 @@ class FakeWorld:
                 re.S,
             )
             text = _fold(found.group(1)) if found else ""
-            held = _fold(json.dumps(payload["state"].get("record"), ensure_ascii=False))
+            record = payload["state"].get("record")
+            held = _fold(json.dumps(record, ensure_ascii=False))
+            known = _content(held)
             p = 0.95
             if text and f'"{text}"' in held:
                 p = 0.05  # the record holds this very sentence already
+            elif text and not (_content(text) - known):
+                p = 0.05  # every word of it is in the record: nothing new
             for part, odds in self._redundant:
                 if part in text:
                     p = odds
@@ -1801,6 +1888,32 @@ class FakeWorld:
         held = self._held(state.get("record"), state.get("proposed_change", {}))
         return clef_response(
             {qid: noul(0.05 if held else 0.9) for qid in payload["questions"]},
+            model=payload["model"],
+        )
+
+    _RELATIVE = re.compile(
+        r"\b(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|a few|a couple of)"
+        r"\s+(?:more|fewer|less|extra|additional)\b"
+        r"|\b(?:double|triple|halve|half|another)\b",
+        re.IGNORECASE,
+    )
+
+    def _relative_edit(
+        self, model: str, payload: dict[str, Any], meta: CallMeta
+    ) -> Any:
+        element = self._focus(payload, meta)
+        source = str(payload["state"].get("input", ""))
+        if element is not None and element.spans and self.text:
+            # only the words around the entity's own mentions: "two more of the blue
+            # mugs" is about the mugs, not about the tea towels in the next clause
+            windows = [
+                self.text[max(0, a - 40) : b + 25] for a, b in sorted(element.spans)
+            ]
+        else:
+            windows = [source]
+        relative = any(self._RELATIVE.search(w) for w in windows)
+        return clef_response(
+            {qid: noul(0.95 if relative else 0.04) for qid in payload["questions"]},
             model=payload["model"],
         )
 
@@ -2412,7 +2525,10 @@ def trace_to_cassette(
     that was sent, the full REST response and the URL it went to (the model is the
     part after ``/ai/run/``). Such a line has everything a cassette key needs,
     except the call kind, which is left empty (it is informational; a lookup uses
-    the key only). The REST envelope is removed from the response.
+    the key only). The REST envelope is removed from the response. The lines are
+    written as they are: a line whose request or response holds an exact credential
+    (the Cloudflare environment variables) is left out with a ``RuntimeWarning``,
+    never edited, so a recorded answer replays as the model gave it.
 
     Args:
         trace: The JSONL trace file.
@@ -2442,6 +2558,17 @@ def trace_to_cassette(
                 and "result" in response
             ):
                 response = response["result"]
+            bodies = json.dumps([row["request"], response], ensure_ascii=False)
+            if any(secret in bodies for secret in _secrets()):
+                # a cassette is never edited (it replays what was said): a call that
+                # holds a credential is left out, as when recording
+                warnings.warn(
+                    f"trace_to_cassette: line {number} holds a credential in its "
+                    "request or response and was not converted",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                continue
             lines.append(
                 {
                     "key": request_key(model, row["request"]),
@@ -2458,5 +2585,5 @@ def trace_to_cassette(
             )
     with open(cassette, "w", encoding="utf-8") as out:
         for line in lines:
-            out.write(scrub(json.dumps(line, ensure_ascii=False)) + "\n")
+            out.write(json.dumps(line, ensure_ascii=False) + "\n")
     return len(lines)

@@ -104,9 +104,11 @@ REQUEST_LIGHT = (
     "match.accept",
     "match.min_confidence",
     "match.accept_compatible",
+    "match.compatible_margin",
     "match.delete_threshold",
     "coref.merge_threshold",
     "discovery.record_presence",
+    "discovery.qualify_min",
 )
 """Knobs that act on answers already received. A sweep over them replays the
 first-pass requests from the cassette; only the follow-up requests that depend on
@@ -126,6 +128,7 @@ REQUEST_CHANGING = (
     "verify.attribution",
     "verify.reask_low_confidence",
     "verify.isolate_decisions",
+    "verify.relative_edit",
     "verify.borderline_null",
     "passes.split",
     "presence.threshold_absent",

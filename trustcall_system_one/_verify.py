@@ -57,6 +57,7 @@ from trustcall_system_one._render import (
     render_clairic,
 )
 from trustcall_system_one._run import Answer, Question, Run, gather
+from trustcall_system_one._sentences import split_sentences
 from trustcall_system_one._types import CallKind, EntityInfo
 from trustcall_system_one._wire import (
     ChoiceAnswer,
@@ -1916,30 +1917,84 @@ _YES = "Yes."
 _NO = "No."
 
 
-def _plural(description: str) -> str:
-    """The field's description as the name of what a list holds (article dropped)."""
-    text = _ARTICLE.sub("", " ".join(description.split()).strip(" .!?:;"), count=1)
-    return text or "the things the field asks for"
+_LIST_OF = re.compile(
+    r"^(?:(?:a|an|the)\s+)?(?:list|array|set|collection|sequence|group)\s+of\s+"
+    r"(?:all\s+)?(?:the\s+)?",
+    re.IGNORECASE,
+)
+_OWNER = re.compile(r"^(?:(?:a|an|the)\s+)?\w+(?:\s\w+)?['\u2019]s\s+", re.IGNORECASE)
+_HEAD_END = re.compile(
+    r"\s(?:of|for|that|who|which|worth|to|in|about|from|with|on)\s", re.IGNORECASE
+)
+_IRREGULAR_PLURALS = frozenset({"people", "children", "staff", "data", "men", "women"})
+_SCOPE_SUFFIX = re.compile(r"^(.*?)(\s*\([^()]*\))?$", re.DOTALL)
 
 
-_QUANTITY = re.compile(
-    r"\b(?:quantit\w*|units?|how many|pieces?|copies|count|number of)\b", re.IGNORECASE
+def _element_phrase(description: str) -> str:
+    """What a list element is, for "is X ___ of the entity?": a noun phrase.
+
+    The field's description is cleaned of what would double up in the sentence: a
+    leading article, "list of" ("one of the list of tags"), the owner of a
+    possessive ("one of the person's nickname"). A plural ("the contacts") gives
+    "one of the contacts"; a singular ("the person's nickname") gives "a nickname".
+    A parenthesised scope ("tags (owner → child)") is kept at the end.
+    """
+    flat = " ".join(description.split())
+    found = _SCOPE_SUFFIX.match(flat)
+    core, scope = (found.group(1), found.group(2) or "") if found else (flat, "")
+    core = core.strip(" .!?:;")
+    core = _ARTICLE.sub("", core, count=1)
+    core = _LIST_OF.sub("", core, count=1)
+    core = _OWNER.sub("", core, count=1)
+    if not core:
+        return "one of the things the field asks for"
+    head = _HEAD_END.split(f" {core} ", maxsplit=1)[0].split()
+    last = head[-1].casefold() if head else ""
+    plural = last in _IRREGULAR_PLURALS or (
+        last.endswith("s") and not last.endswith(("ss", "us", "is"))
+    )
+    if plural:
+        return f"one of the {core}{scope}"
+    article = "an" if core[:1].lower() in "aeiou" else "a"
+    return f"{article} {core}{scope}"
+
+
+_ORDERED_NAME = re.compile(r"^(?:\w+_)?(?:quantity|qty)(?:_\w+)?$", re.IGNORECASE)
+_NOT_REQUESTED = re.compile(
+    r"\b(?:price|prices|cost|costs|fee|rate|total|totals|sum|subtotal|id|ids|"
+    r"identifier|sku|code|to date|so far|sold|shipped|delivered|received|stock|"
+    r"inventory|available|pages?)\b|\bnumber of the\b",
+    re.IGNORECASE,
+)
+_ORDERED_UNITS = re.compile(
+    r"\b(?:units?|items?|pieces?|copies|pcs|quantity|qty|number|count|how many)\b"
+    r".*\b(?:ordered|wanted|requested|needed|to\s+(?:order|buy|add|purchase))\b"
+    r"|\b(?:ordered|requested|wanted)\s+(?:quantity|units?|items?)\b",
+    re.IGNORECASE,
 )
 
 
 def _requestable(spec: FieldSpec) -> bool:
     """Whether the input may ASK for the field's value instead of stating it.
 
-    A quantity can be requested ("add two more of the blue mugs": a quantity of 2
-    that no sentence states). A total, a price, a name, a place or a date is
-    stated: asking "state or ask for" about a derived total made Clef less sure of
-    it (0.88 became 0.52), so only a number whose description names a quantity is
-    asked this way.
+    An ORDERED quantity can be requested ("add two more of the blue mugs": a
+    quantity of 2 that no sentence states): a number field named ``quantity`` or
+    ``qty``, or whose description is a number of units, items or copies ordered,
+    wanted or to order. A total, a price, a cost, an id, a count to date ("copies
+    sold to date", "total units shipped so far", "page count") or "the number of
+    the invoice" is stated: asking "state or ask for" about a derived total made
+    Clef less sure of it (0.88 became 0.52).
     """
+    if spec.clairic is None or spec.clairic.type != "number":
+        return False
+    name = str(spec.path[-1])
+    if _NOT_REQUESTED.search(name.replace("_", " ")) or _NOT_REQUESTED.search(
+        spec.description
+    ):
+        return False
     return (
-        spec.clairic is not None
-        and spec.clairic.type == "number"
-        and _QUANTITY.search(spec.description) is not None
+        _ORDERED_NAME.match(name) is not None
+        or _ORDERED_UNITS.search(spec.description) is not None
     )
 
 
@@ -1959,7 +2014,7 @@ def _attribution_question(
         return NoulQuestion(
             type="noul",
             instructions=(
-                f'According to `input`, is "{text}" one of the {_plural(description)} '
+                f'According to `input`, is "{text}" {_element_phrase(description)} '
                 "of `entity.label`? Something the input asks to include counts."
             ),
             criteria=NoulCriteria(true=_YES, false=_NO),
@@ -1968,9 +2023,8 @@ def _attribution_question(
         # "Does the input ask for 2 of the entity (as the number of units ordered)?"
         # is the shape that told 2 (0.78 to 0.86) from 3 (0.02 to 0.04) and kept a
         # stated 1 (0.92 to 0.98); the longer "state or ask for X to be V" did not
-        instructions = (
-            f"Does `input` ask for {text} of `entity.label` (as the {description})?"
-        )
+        noun = _ARTICLE.sub("", description.strip(), count=1)
+        instructions = f"Does `input` ask for {text} of `entity.label` (as the {noun})?"
     else:
         instructions = (
             f'Does `input` state that {description} of `entity.label` is "{text}", '
@@ -1981,6 +2035,68 @@ def _attribution_question(
         type="noul",
         instructions=instructions,
         criteria=NoulCriteria(true=_ATTR_TRUE, false=_ATTR_FALSE),
+    )
+
+
+_PASSAGE_MAX = 240
+"""Longest passage a re-check quotes, in characters."""
+
+
+_CLAUSE_BREAK = re.compile(
+    r"(?:[,;:]\s+|\s+(?:and|but|while|whereas|then|so)\s+)", re.IGNORECASE
+)
+
+
+def _passage(text: str, span: Span | None) -> str | None:
+    """The clause of the input a span lies in, as the passage a re-check quotes.
+
+    The sentence the span is in, cut to the clause around it when the sentence has
+    several ("Please add two more of the blue mugs and drop the quantity of the tea
+    towels to 1" gives the first: another clause's number would otherwise pull the
+    answer about the first one down, live 0.4793). A passage longer than
+    ``_PASSAGE_MAX`` is cut to the characters around the span.
+    """
+    if span is None:
+        return None
+    for sentence in split_sentences(text):
+        if sentence.start <= span[0] < sentence.end:
+            start, end = sentence.start, sentence.end
+            cuts = [m for m in _CLAUSE_BREAK.finditer(text, start, end)]
+            low, high = start, end
+            for cut in cuts:
+                if cut.end() <= span[0]:
+                    low = cut.end()
+                elif cut.start() >= span[1] and high == end:
+                    high = cut.start()
+            if len(text[low:high].split()) >= 3:  # a clause with something in it
+                start, end = low, high
+            if end - start > _PASSAGE_MAX:
+                start = max(start, span[0] - _PASSAGE_MAX // 2)
+                end = min(end, max(span[1], start) + _PASSAGE_MAX // 2)
+            return " ".join(text[start:end].split()).replace('"', "'")
+    return None
+
+
+def _recheck_question(
+    question: NoulQuestion, text: str, span: Span | None
+) -> NoulQuestion:
+    """The same attribution question, asked differently: the second look.
+
+    A middle-band answer is checked once more after a re-ask, but on a short input
+    the re-ask changes neither the value nor the state (the input is the same whole
+    text), so the request would be byte-identical and Clef would give the same
+    middle-band answer: the value would always be dropped. The second look quotes
+    the passage the re-ask found the value in (or, with no span, asks to read the
+    input again for the entity only), so it is a different question.
+    """
+    quote = _passage(text, span)
+    lead = (
+        f'Reading the passage "{quote}" of `input`: '
+        if quote
+        else "Reading `input` once more, and only what it says about `entity.label`: "
+    )
+    return question.model_copy(
+        update={"instructions": f"{lead}{question.instructions}"}
     )
 
 
@@ -2141,11 +2257,15 @@ async def _recheck_scalar(ctx: Ctx, st: FieldState) -> None:
     spans = [checked.span] if checked.span else []
     answers = await ctx.run.call_clef(
         {
-            _attr_id(st, None): _attribution_question(
-                st.spec.scoped,
-                checked.value,
-                element=False,
-                ask_for=_requestable(st.spec),
+            _attr_id(st, None): _recheck_question(
+                _attribution_question(
+                    st.spec.scoped,
+                    checked.value,
+                    element=False,
+                    ask_for=_requestable(st.spec),
+                ),
+                ctx.text,
+                checked.span,
             )
         },
         ctx.entity_state(spans or None),
@@ -2202,8 +2322,10 @@ async def _recheck_elements(
     if not candidates:
         return
     questions: dict[str, Question] = {
-        _attr_id(st, index): _attribution_question(st.spec.scoped, value, element=True)
-        for index, (value, _) in candidates.items()
+        _attr_id(st, index): _recheck_question(
+            _attribution_question(st.spec.scoped, value, element=True), ctx.text, span
+        )
+        for index, (value, span) in candidates.items()
     }
     narrowed = [span for _, span in candidates.values() if span is not None]
     answers = await ctx.run.call_clef(

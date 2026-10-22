@@ -77,6 +77,10 @@ _DAYS_MONTHS = _words(
     "january february march april may june july august september october november",
     "december",
 )
+# A modal or a pronoun after a day or month word starts a sentence ("5 p.m. May I
+# suggest ...", "9 a.m. April will be ...") instead of continuing the time.
+_MODALS = _words("will would can could shall should may might must")
+_SUBJECTS = _words("i we you he she it they there this that these those")
 _CLOSERS = "\"')]}\N{RIGHT DOUBLE QUOTATION MARK}\N{RIGHT SINGLE QUOTATION MARK}"
 _CLOSERS += "\N{RIGHT-POINTING DOUBLE ANGLE QUOTATION MARK}"
 _OPENERS = "\"'([{\N{LEFT DOUBLE QUOTATION MARK}\N{LEFT SINGLE QUOTATION MARK}"
@@ -152,8 +156,14 @@ def _is_abbreviation(line: str, dot: int, rest: str) -> bool:
     if word.lower() in ("a.m", "p.m"):
         # "at 5 p.m. Then" ends the sentence; "at 5 p.m. Monday" does not: the
         # time goes on with a day or a month
-        following = re.match(r"[A-Za-z]+", rest)
-        return following is not None and following.group(0).lower() in _DAYS_MONTHS
+        following = re.match(r"([A-Za-z]+)(?:\W+([A-Za-z0-9]+))?", rest)
+        if following is None or following.group(1).lower() not in _DAYS_MONTHS:
+            return False
+        word = following.group(1).lower()
+        after = (following.group(2) or "").lower()
+        if word in _MODALS and after and not after[:1].isdigit():
+            return False  # "May I suggest ...": the modal, not the month
+        return after not in _MODALS and after not in _SUBJECTS
     if len(bare) == 1 and "." not in word:
         return word.isupper() and _is_initial(line, found.start(1), rest)
     if bare in _ABBREVIATIONS or (rest[:1].isdigit() and bare in _BEFORE_NUMBER):
@@ -558,8 +568,9 @@ async def list_kind(ctx: "Ctx", spec: "FieldSpec") -> str:
     """Whether a ``list[str]`` field holds short named values or free-form statements.
 
     One Clef ``choice`` (call kind ``list_kind``), asked once per schema and field
-    in a run however many entities have the field: the answer is kept on the run
-    (concurrent askers share one request). Only statements are worth reading by
+    in a run however many entities have the field (the schema is told apart by its
+    class, not its name): the answer is kept on the run (concurrent askers share one
+    request). Only statements are worth reading by
     sentences; a list of names or languages that Clairic is unsure of is not turned
     into sentences. An unclear or missing answer is ``"items"``.
 
@@ -570,8 +581,7 @@ async def list_kind(ctx: "Ctx", spec: "FieldSpec") -> str:
     Returns:
         ``"items"`` or ``"statements"``.
     """
-    schema = ctx.plan.schema
-    key = (f"{schema.__module__}.{schema.__qualname__}", spec.wire_name)
+    key = (ctx.plan.schema, spec.wire_name)  # the class itself: names can collide
     pending = ctx.run.list_kinds.get(key)
     if pending is None:
         pending = ctx.run.list_kinds[key] = asyncio.ensure_future(_ask_kind(ctx, spec))

@@ -574,7 +574,7 @@ async def test_qualification_skips_what_is_not_a_person() -> None:
     assert sunny["mentions"] == [{"text": "Sunny", "span": [at, at + 5]}]
     assert state["input"] == TEXT
     assert payload["questions"]["qualify.e1"]["instructions"].startswith(
-        "Is `entities.e1.label` a Person"
+        "Is `entities.e1.label` a person?"
     )
 
 
@@ -661,7 +661,7 @@ async def test_the_presence_gate_is_not_asked_again_per_entity() -> None:
     ((_, payload, _),) = of_kind(world, "presence")
     assert list(payload["questions"]) == ["presence"]
     assert payload["questions"]["presence"]["instructions"].startswith(
-        "Does `input` mention any Person (Someone the speaker knows"
+        "Does `input` mention any person?"
     )
 
 

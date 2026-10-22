@@ -22,6 +22,7 @@ Two kinds of cassette live there:
   discovery has a new key.
 """
 
+import collections
 import copy
 import json
 import re
@@ -96,6 +97,19 @@ def mention_texts(state: dict[str, Any]) -> list[str]:
     return [m["text"] for m in state["entity"].get("mentions", [])]
 
 
+def same_entity(old: dict[str, Any], new: dict[str, Any]) -> bool:
+    """Whether a reworded request is about the entity the recording was about.
+
+    The mentions are the same; the label is the same or has grown (a single record's
+    label carries what it is called now: "the Contact" became "the Contact Dana
+    Whitfield").
+    """
+    before, after = old["entity"], new["entity"]
+    return mention_texts(old) == mention_texts(new) and str(after["label"]).startswith(
+        str(before["label"])
+    )
+
+
 def _asks(row: dict[str, Any], prefix: str) -> bool:
     questions = row["request"].get("questions", {})
     return bool(questions) and all(q.startswith(prefix) for q in questions)
@@ -110,7 +124,8 @@ class Reworded:
     question and the label (a single record's carries its identity now) are what
     changed, so they are the things not compared. Qualification: the same entities
     in the same order (the question no longer carries the schema's description).
-    Any other kind of call is a miss that fails the test.
+    Presence: the same input (the question names the kind of thing, "person", and
+    not the schema's title). Any other kind of call is a miss that fails the test.
     """
 
     def __init__(self, path: Path) -> None:
@@ -119,6 +134,7 @@ class Reworded:
         self.attribution = [r for r in rows if _asks(r, "attr.")]
         self.qualify = [r for r in rows if _asks(r, "qualify.")]
         self.gate = [r for r in rows if _asks(r, "gate")]
+        self.presence = [r for r in rows if _asks(r, "presence")]
         self.served: list[tuple[str, ...]] = []
 
     def _answer(self, row: dict[str, Any], qids: list[str]) -> TransportResponse:
@@ -146,6 +162,12 @@ class Reworded:
                     self.served.append(("qualify", *sorted(payload["questions"])))
                     return self._answer(row, list(payload["questions"]))
             raise AssertionError(f"no recorded qualification of {labels}")
+        if meta.kind == "presence":  # it now names the kind of thing, not the title
+            for row in self.presence:
+                if row["request"]["state"]["input"] == payload["state"]["input"]:
+                    self.served.append(("presence",))
+                    return self._answer(row, ["presence"])
+            raise AssertionError("no recorded presence of this input")
         if meta.kind == "gate":  # the label of a single record carries its identity
             state = payload["state"]
             for row in self.gate:
@@ -154,6 +176,7 @@ class Reworded:
                     request["input"] == state["input"]
                     and request["proposed_change"] == state["proposed_change"]
                     and request["record"] == state["record"]
+                    and same_entity(request, state)
                 ):
                     self.served.append(("gate", state["proposed_change"]["path"]))
                     return self._answer(row, ["gate"])
@@ -168,7 +191,7 @@ class Reworded:
                 if (
                     other is not None
                     and request["state"]["input"] == state["input"]
-                    and mention_texts(request["state"]) == mention_texts(state)
+                    and same_entity(request["state"], state)
                     and quoted(other) == quoted(question)
                 ):
                     found[qid] = self._answer(row, [qid])
@@ -211,12 +234,18 @@ def test_the_recorded_update_of_a_contact_gives_the_live_patch() -> None:
     result = extractor.invoke(
         CONTACT_NOTE, existing=[("crm-4711", "Contact", CONTACT_EXISTING)]
     )
-    # the requests that did not change hash to their keys still; the attribution
-    # questions (one per request now) and the gates (a single record's label carries
-    # its identity) are answered with what the model said to the same questions
-    assert cassette.hits >= 4 and len(cassette) == 9
-    assert {m[2].kind for m in cassette.misses} <= {"attribution", "gate"}
-    assert inner.served
+    # the requests that did not change hash to their keys still, and exactly these
+    # do (presence, the reading with the record, the input-only reading and one
+    # re-ask): 4 of the 9 recorded. The attribution questions (one per request now,
+    # five of them) and
+    # the gates (a single record's label carries its identity, four) are answered
+    # with what the model said to the same questions
+    assert cassette.hits == 4 and len(cassette) == 9
+    assert collections.Counter(m[2].kind for m in cassette.misses) == {
+        "attribution": 5,
+        "gate": 4,
+    }
+    assert len(inner.served) == 9
     (record,) = result.records
     assert record.kind == "update" and record.json_doc_id == "crm-4711" and record.valid
     assert [(p.op, p.path, p.value) for p in record.patches] == [
@@ -245,8 +274,12 @@ def test_the_recorded_attribution_guard_gives_the_live_records() -> None:
         PASSAGE,
     )
     result = extractor.invoke(PASSAGE)
-    assert {m[2].kind for m in cassette.misses} == {"attribution", "qualify"}
-    assert cassette.hits >= 5 and inner.served
+    assert collections.Counter(m[2].kind for m in cassette.misses) == {
+        "attribution": 5,
+        "qualify": 1,
+        "presence": 1,
+    }
+    assert cassette.hits == 5 and len(cassette) == 9 and len(inner.served) == 7
     people = {
         r.entity.label: r for r in result.records if r.entity is not None and r.valid
     }
@@ -271,7 +304,7 @@ def test_a_cassette_miss_names_the_request_that_changed() -> None:
     )
     with pytest.raises(CassetteMissError) as caught:
         extractor.invoke(PASSAGE)
-    # qualification is the first request M10c reworded (no schema description)
-    assert caught.value.kind == "qualify"
+    # presence is the first request M10c reworded (it names the kind of thing)
+    assert caught.value.kind == "presence"
     assert caught.value.schema == "Colleague"
     assert "changed since the cassette was recorded" in str(caught.value)

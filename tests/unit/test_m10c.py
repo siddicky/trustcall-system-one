@@ -11,12 +11,13 @@
 
 from typing import Any, Optional
 
+import pytest
 from pydantic import BaseModel, Field
 
 from tests.unit.extract_helpers import Script, ca, kinds, make_extractor
-from trustcall_system_one import Limits, One, VerifyConfig
+from trustcall_system_one import Limits, One, VerifyConfig, s1_field
 from trustcall_system_one._gates import record_after
-from trustcall_system_one.testing import FakeWorld
+from trustcall_system_one.testing import FakeTransport, FakeWorld
 
 
 class Contact(BaseModel):
@@ -474,6 +475,23 @@ def test_a_time_followed_by_a_day_or_month_does_not_split() -> None:
     assert texts("Call me at 9 a.m. March is busy.") == [
         "Call me at 9 a.m. March is busy."
     ]
+    # a month that is a modal, or a day or month followed by a modal or a pronoun,
+    # starts a new sentence
+    assert texts("Dinner is at 5 p.m. May I suggest the fish?") == [
+        "Dinner is at 5 p.m.",
+        "May I suggest the fish?",
+    ]
+    assert texts("Breakfast is at 9 a.m. April will be warm.") == [
+        "Breakfast is at 9 a.m.",
+        "April will be warm.",
+    ]
+    assert texts("We start at 9 a.m. Monday we rest.") == [
+        "We start at 9 a.m.",
+        "Monday we rest.",
+    ]
+    assert texts("Call at 5 p.m. May 3 is the date.") == [
+        "Call at 5 p.m. May 3 is the date."
+    ]
     # a sentence that starts with anything else still ends at the time
     assert texts("We meet at 5 p.m. Then we leave.") == [
         "We meet at 5 p.m.",
@@ -523,12 +541,586 @@ async def test_two_models_with_one_class_name_do_not_share_a_list_kind() -> None
     assert kinds_seen == ["statements", "statements"]
     # the same class name in two modules is two cache entries (the two requests are
     # byte-identical here, so the run's Clef memo sends one of them)
-    assert sorted(key for key, _ in run.list_kinds) == [
-        "pkg_a.models.Item",
-        "pkg_b.models.Item",
+    keys = [schema for schema, _ in run.list_kinds]
+    assert [(k.__module__, k.__name__) for k in keys] == [
+        ("pkg_a.models", "Item"),
+        ("pkg_b.models", "Item"),
     ]
+    assert all(isinstance(k, type) for k in keys)  # keyed by the class itself
     assert len(asked) == 1
     # and the same model asks once, however many entities have the field
     again = Ctx(run=run, plan=plan, text="y", label="the Item")
     await list_kind(again, plan.spec(("notes",)))
     assert len(run.list_kinds) == 2
+
+
+# --------------------------------------------------------------------------- #
+# M10c review: the count is covered by DISTINCT mentions only
+# --------------------------------------------------------------------------- #
+
+
+async def _count_case(
+    text: str, entities: list[tuple[str, list[Any], list[str], dict[str, Any]]], n: int
+) -> tuple[Any, int]:
+    from trustcall_system_one import Many, create_extractor
+
+    world = FakeWorld(text)
+    for label, mentions, descriptive, fields in entities:
+        world.entity(
+            label,
+            schema=Member,
+            mentions=mentions,
+            descriptive=descriptive,
+            fields=fields,
+        )
+    world.count(Member, n)
+    transport = world.transport()
+    extractor = create_extractor(
+        [Many(Member, identity="name")], transport=transport, enable_inserts=True
+    )
+    result = await extractor.ainvoke(text)
+    return result, [m.kind for _, _, m in transport.calls].count("discover")
+
+
+async def test_a_name_said_twice_does_not_hide_a_missed_descriptive_mention() -> None:
+    result, discovers = await _count_case(
+        "Sarah called. Sarah and my cousin went hiking in Oslo.",
+        [
+            ("Sarah", ["Sarah", ("Sarah", 1)], [], {"name": "Sarah"}),
+            ("my cousin", [], ["my cousin"], {"name": "my cousin"}),
+        ],
+        2,
+    )
+    assert discovers == 2  # the broadened discovery ran
+    assert len(result.records) + len(result.skipped) == 2
+
+
+async def test_a_name_said_once_with_a_cousin_still_broadens() -> None:
+    _, discovers = await _count_case(
+        "Sarah and my cousin went hiking in Oslo.",
+        [
+            ("Sarah", ["Sarah"], [], {"name": "Sarah"}),
+            ("my cousin", [], ["my cousin"], {"name": "my cousin"}),
+        ],
+        2,
+    )
+    assert discovers == 2
+
+
+async def test_two_distinct_names_of_one_person_are_still_covered() -> None:
+    result, discovers = await _count_case(
+        "Sarah Johnson got married and is now Sarah Miller.",
+        [("Sarah", ["Sarah Johnson", "Sarah Miller"], [], {"name": "Sarah Miller"})],
+        2,
+    )
+    assert discovers == 1 and not [w for w in result.warnings if "count_" in w]
+
+
+# --------------------------------------------------------------------------- #
+# M10c review B2: the identity fallback only names a proper noun
+# --------------------------------------------------------------------------- #
+
+
+class Subscriber(BaseModel):
+    """A newsletter subscriber."""
+
+    email: str
+    city: Optional[str] = None
+
+
+class Ticket(BaseModel):
+    """A support ticket."""
+
+    id: str
+    summary: Optional[str] = None
+
+
+class Account(BaseModel):
+    """A customer account."""
+
+    login: str = Field(
+        json_schema_extra=s1_field(identity=True), description="The account's name"
+    )
+    city: Optional[str] = None
+
+
+class Machine(BaseModel):
+    """A machine."""
+
+    serial: str = Field(
+        json_schema_extra=s1_field(identity=True), description="Serial number"
+    )
+    city: Optional[str] = None
+
+
+async def _fallback(
+    schema: type[BaseModel],
+    text: str,
+    label: str,
+    mention: str,
+    fields: dict[str, Any],
+) -> Any:
+    from trustcall_system_one import Many, create_extractor
+
+    world = FakeWorld(text)
+    world.entity(label, schema=schema, mentions=[mention], fields=fields)
+    extractor = create_extractor(
+        [Many(schema)], transport=world.transport(), enable_inserts=True
+    )
+    return await extractor.ainvoke(text)
+
+
+@pytest.mark.parametrize(
+    ("schema", "text", "label", "fields"),
+    [
+        (Subscriber, "Dana Ruiz from Lyon signed up.", "Dana Ruiz", {"city": "Lyon"}),
+        (
+            Ticket,
+            "The printer ticket is about a paper jam.",
+            "The printer ticket",
+            {"summary": "paper jam"},
+        ),
+        (
+            Machine,
+            "Dana Ruiz serviced it in Lyon.",
+            "Dana Ruiz",
+            {"city": "Lyon"},
+        ),
+    ],
+)
+async def test_the_fallback_never_invents_an_email_an_id_or_a_serial(
+    schema: type[BaseModel], text: str, label: str, fields: dict[str, Any]
+) -> None:
+    result = await _fallback(schema, text, label, label, fields)
+    assert not any(r.valid for r in result.records)  # nothing invented
+    assert not [w for w in result.warnings if "identity_from_mention" in w]
+    assert [s.reason for s in result.skipped] == ["validation_failed"]
+
+
+@pytest.mark.parametrize("mention", ["my cousin", "the client", "the new hire"])
+async def test_a_descriptive_reference_is_not_a_name(mention: str) -> None:
+    text = f"I met {mention} in Oslo."
+    result = await _fallback(Member, text, mention, mention, {"city": "Oslo"})
+    assert not any(r.valid for r in result.records)
+    assert not [w for w in result.warnings if "identity_from_mention" in w]
+
+
+async def test_a_name_like_marked_identity_takes_a_proper_noun_and_warns() -> None:
+    result = await _fallback(
+        Account,
+        "Dana Ruiz from Lyon opened an account.",
+        "Dana Ruiz",
+        "Dana Ruiz",
+        {"city": "Lyon"},
+    )
+    (record,) = result.records
+    assert record.after == {"login": "Dana Ruiz", "city": "Lyon"}
+    assert any("identity_from_mention" in w for w in result.warnings)
+
+
+async def test_the_fallback_is_a_run_warning_for_a_plain_name_field() -> None:
+    result = await _fallback(
+        Member,
+        "Dana Ruiz from Lyon signed up.",
+        "Dana Ruiz",
+        "Dana Ruiz",
+        {"city": "Lyon"},
+    )
+    (record,) = result.records
+    assert record.after == {"name": "Dana Ruiz", "city": "Lyon"}
+    assert record.fields["name"].warnings == ("identity_from_mention: no value",)
+    assert [w for w in result.warnings if "identity_from_mention: no value" in w]
+
+
+# --------------------------------------------------------------------------- #
+# M10c review S3: novelty is judged against the accepted changes only
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_note_is_judged_against_the_record_without_a_refused_change() -> None:
+    world = script()
+    world.gate = {"/phone": 0.1}  # the phone change is refused by its gate
+    world.novelty = {"mobile": 0.9}  # and the note about it is news: it was not written
+    record = await update(world)
+    assert [r.reason for r in record.rejected if r.path == "/phone"] == ["gate_noul"]
+    assert record.after is not None
+    assert record.after["phone"] == "+1 415 555 0134"
+    assert "Her mobile is now +49 30 5555 0198." in record.after["notes"]
+    for _, payload, _ in world.calls("novelty"):
+        assert payload["state"]["record"]["phone"] == "+1 415 555 0134"
+    gates = {
+        c[1]["state"]["proposed_change"]["path"]: c[1]["state"]["record"]
+        for c in world.calls("gate")
+    }
+    assert gates["/notes/-"]["phone"] == "+1 415 555 0134"
+
+
+async def test_the_other_fields_gates_run_before_the_novelty_check() -> None:
+    world = script()
+    await update(world)
+    order = [m.kind for _, _, m in world.transport.calls]
+    last_other = max(
+        i
+        for i, (_, payload, m) in enumerate(world.transport.calls)
+        if m.kind == "gate" and payload["state"]["proposed_change"]["path"] == "/phone"
+    )
+    assert last_other < order.index("novelty")
+
+
+class Employee(BaseModel):
+    """An employee."""
+
+    name: str
+    city: Optional[str] = None
+    notes: list[str] = Field(
+        default_factory=list, description="things worth remembering"
+    )
+
+
+async def test_a_note_next_to_an_applied_city_keeps_what_the_city_does_not_say() -> (
+    None
+):
+    text = "Dana Ruiz works here. She moved to Berlin to lead the Ops team."
+    world = FakeWorld(text)
+    world.entity(
+        "Dana Ruiz",
+        schema=Employee,
+        mentions=["Dana Ruiz"],
+        fields={
+            "name": "Dana Ruiz",
+            "city": "Berlin",
+            "notes": ["She moved to Berlin to lead the Ops team."],
+        },
+    )
+    from trustcall_system_one import create_extractor
+
+    extractor = create_extractor(
+        [One(Employee)],
+        transport=world.transport(),
+        limits=Limits(list_strategy="sentences"),
+    )
+    result = await extractor.ainvoke(
+        text,
+        existing=[
+            ("e-1", "Employee", {"name": "Dana Ruiz", "city": "Oslo", "notes": []})
+        ],
+    )
+    (record,) = result.records
+    assert record.after is not None
+    assert record.after["city"] == "Berlin"
+    assert record.after["notes"] == ["She moved to Berlin to lead the Ops team."]
+    assert not [r for r in record.rejected if r.reason == "not_novel"]
+
+
+async def test_fakeworld_novelty_depends_on_what_the_record_holds() -> None:
+    from trustcall_system_one import create_extractor
+
+    text = "Dana Ruiz works here. She moved to Berlin."
+    world = FakeWorld(text)
+    world.entity(
+        "Dana Ruiz",
+        schema=Employee,
+        mentions=["Dana Ruiz"],
+        fields={
+            "name": "Dana Ruiz",
+            "city": "Berlin",
+            "notes": ["She moved to Berlin."],
+        },
+    )
+    extractor = create_extractor(
+        [One(Employee)],
+        transport=world.transport(),
+        limits=Limits(list_strategy="sentences"),
+    )
+    result = await extractor.ainvoke(
+        text,
+        existing=[
+            ("e-1", "Employee", {"name": "Dana Ruiz", "city": "Oslo", "notes": []})
+        ],
+    )
+    (record,) = result.records
+    # the city is written, and nothing else is in the sentence: not news
+    assert record.after is not None and record.after["notes"] == []
+    assert [r.reason for r in record.rejected if r.path == "/notes/-"] == ["not_novel"]
+
+
+# --------------------------------------------------------------------------- #
+# M10c review S4: only an ordered or requested quantity may be asked for
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("name", "description", "asked"),
+    [
+        ("quantity", "number of units ordered", True),
+        ("quantity", None, True),
+        ("qty", "how many", True),
+        ("units", "number of units to order", True),
+        ("copies", "number of copies wanted", True),
+        ("items", "number of items requested", True),
+        ("amount", "the number of units the customer wants to buy", True),
+        ("unit_price", "price per unit in EUR", False),
+        ("unit_cost", "Unit cost", False),
+        ("invoice_number", "The number of the invoice", False),
+        ("pages", "page count", False),
+        ("sold", "copies sold to date", False),
+        ("shipped", "total units shipped so far", False),
+        ("quantity", "total units shipped so far", False),
+        ("total", "the amount due", False),
+        ("size", "the number of seats", False),
+    ],
+)
+def test_only_an_ordered_quantity_is_asked_for(
+    name: str, description: str | None, asked: bool
+) -> None:
+    from pydantic import create_model
+
+    from trustcall_system_one._compile import compile_schema
+    from trustcall_system_one._verify import _requestable
+
+    field = (int, Field(description=description) if description else Field())
+    plan = compile_schema(create_model("Line", **{name: field}))  # type: ignore[call-overload]
+    (spec,) = plan.specs
+    assert _requestable(spec) is asked, (name, description)
+
+
+@pytest.mark.parametrize(
+    ("description", "phrase"),
+    [
+        ("the contacts", "one of the contacts"),
+        ("List of tags", "one of the tags"),
+        ("the list of the person's nicknames", "one of the nicknames"),
+        ("the person's nickname", "a nickname"),
+        ("things worth remembering", "one of the things worth remembering"),
+        ("email address", "an email address"),
+        ("contacts (order → items)", "one of the contacts (order → items)"),
+        ("", "one of the things the field asks for"),
+    ],
+)
+def test_the_element_phrase_never_doubles_a_word(description: str, phrase: str) -> None:
+    from trustcall_system_one._verify import _element_phrase
+
+    assert _element_phrase(description) == phrase
+
+
+def test_the_ask_for_wording_does_not_double_the_article() -> None:
+    from trustcall_system_one._verify import _attribution_question
+
+    question = _attribution_question(
+        "the number of units ordered", 2, element=False, ask_for=True
+    )
+    assert question.instructions == (
+        "Does `input` ask for 2 of `entity.label` (as the number of units ordered)?"
+    )
+    element = _attribution_question("List of the tags", "red", element=True)
+    assert "one of the list of" not in element.instructions
+    assert 'is "red" one of the tags of `entity.label`?' in element.instructions
+
+
+async def test_two_classes_with_one_module_and_name_do_not_share_a_list_kind() -> None:
+    from trustcall_system_one import CallMeta, compile_schema
+    from trustcall_system_one._run import Run
+    from trustcall_system_one._sentences import list_kind
+    from trustcall_system_one._verify import Ctx
+    from trustcall_system_one.testing import FakeTransport, choice, clef_response
+
+    def make() -> type[BaseModel]:
+        class Item(BaseModel):
+            notes: list[str] = Field(default_factory=list, description="notes")
+
+        return Item
+
+    def answer(model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
+        return clef_response(
+            {"kind": choice("statements", {"items": 0.1, "statements": 0.9}, 0.9)},
+            model=payload["model"],
+        )
+
+    first, second = make(), make()
+    assert (first.__module__, first.__qualname__) == (
+        second.__module__,
+        second.__qualname__,
+    )
+    run = Run(transport=FakeTransport(answer))
+    for model in (first, second):
+        plan = compile_schema(model)
+        ctx = Ctx(run=run, plan=plan, text="x", label="the Item")
+        await list_kind(ctx, plan.spec(("notes",)))
+    assert {k for k, _ in run.list_kinds} == {first, second}
+
+
+@pytest.mark.parametrize(
+    ("text", "clipped"),
+    [
+        ("Dana Ruiz", "Dana Ruiz"),
+        ("x" * 40, "x" * 40),
+        (
+            "Northwind Logistics and Freight Forwarding GmbH",
+            "Northwind Logistics and Freight…",
+        ),
+        (
+            "aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj",
+            "aaaa bbbb cccc dddd eeee ffff gggg hhhh…",
+        ),
+        (
+            "Alexander the Great of Macedon and Persia, King",
+            "Alexander the Great of Macedon and…",
+        ),
+        ("x" * 60, "x" * 39 + "…"),  # one word longer than the limit: cut inside it
+    ],
+)
+def test_a_record_label_is_cut_at_a_word_boundary(text: str, clipped: str) -> None:
+    from trustcall_system_one._entity import _clip_label
+
+    out = _clip_label(text)
+    assert len(out) <= 40
+    assert out == clipped
+
+
+# --------------------------------------------------------------------------- #
+# M10c round 2 (live 5): qualify and presence name the KIND of thing
+# --------------------------------------------------------------------------- #
+
+PEOPLE = {"Emma", "Maria", "Jon", "Olivia Davis", "Priya Raman", "Bob Roe"}
+ANIMALS = {"Sunny", "Rex"}
+
+
+def _terse_clef(model: str, payload: dict[str, Any], meta: Any) -> Any:
+    """A Clef that, as live, doubts a bare name is a "Member" but not a "person"."""
+    from trustcall_system_one.testing import clef_response, noul
+
+    answers = {}
+    for qid, question in payload["questions"].items():
+        text = question["instructions"]
+        if meta.kind == "presence":
+            answers[qid] = noul(0.9 if "any person" in text else 0.21)
+            continue
+        label = payload["state"]["entities"][qid.split(".", 1)[1]]["label"]
+        if label in ANIMALS:
+            answers[qid] = noul(0.02)
+        elif label in PEOPLE:
+            answers[qid] = noul(0.95 if "a person" in text else 0.2)
+        else:
+            answers[qid] = noul(0.5)
+    return clef_response(answers, model=payload["model"])
+
+
+async def _people(
+    text: str,
+    people: list[tuple[str, dict[str, Any]]],
+    animals: list[str] = (),  # type: ignore[assignment]
+    existing: Any = None,
+    matches: dict[str, str] | None = None,
+) -> Any:
+    from trustcall_system_one import Many, create_extractor
+    from trustcall_system_one.testing import route
+
+    world = FakeWorld(text)
+    for name, fields in people:
+        world.entity(
+            name,
+            schema=Member,
+            mentions=[name],
+            fields={"name": name, **fields},
+            matches=(matches or {}).get(name),
+        )
+    for name in animals:
+        world.non_entity(name, schema=Member, mentions=[name])
+    transport = FakeTransport(
+        route(default=world.handler, qualify=_terse_clef, presence=_terse_clef)
+    )
+    extractor = create_extractor(
+        [Many(Member, identity="name")], transport=transport, enable_inserts=True
+    )
+    return await extractor.ainvoke(text, existing=existing)
+
+
+async def test_a_bare_first_name_is_a_person_for_a_terse_schema_title() -> None:
+    """short_form: "Is Emma a Member?" scored 0.24 live."""
+    result = await _people(
+        "Emma moved to Denver.",
+        [("Emma", {"city": "Denver"})],
+        existing=[("0", "Member", {"name": "Emma Thompson", "city": "Austin"})],
+        matches={"Emma": "Emma Thompson"},
+    )
+    (record,) = result.records
+    assert record.kind == "update" and record.json_doc_id == "0"
+    assert [(p.op, p.path, p.value) for p in record.patches] == [
+        ("replace", "/city", "Denver")
+    ]
+    assert result.skipped == ()
+
+
+async def test_two_bare_first_names_both_qualify() -> None:
+    """bleed_update: Maria 0.189 and Jon 0.226 live, so nothing was processed."""
+    result = await _people(
+        "Maria lives in Lisbon. Jon lives in Oslo.",
+        [("Maria", {"city": "Lisbon"}), ("Jon", {"city": "Oslo"})],
+    )
+    assert sorted(r.entity.label for r in result.records if r.entity) == [
+        "Jon",
+        "Maria",
+    ]
+    assert result.skipped == ()
+
+
+async def test_people_in_a_story_qualify_and_the_dog_does_not() -> None:
+    """notes_people_insert: presence 0.21 and qualify 0.11 and 0.02 live; Sunny
+    (the README's dog) is still refused."""
+    result = await _people(
+        "Olivia Davis is a designer. Priya Raman is her flatmate. They walk Sunny.",
+        [("Olivia Davis", {}), ("Priya Raman", {})],
+        animals=["Sunny"],
+    )
+    assert sorted(r.entity.label for r in result.records if r.entity) == [
+        "Olivia Davis",
+        "Priya Raman",
+    ]
+    assert [(s.reason, s.entity.label) for s in result.skipped] == [
+        ("not_qualified", "Sunny")
+    ]
+
+
+async def test_the_presence_question_names_the_kind_too() -> None:
+    from trustcall_system_one import Many, create_extractor
+    from trustcall_system_one.testing import FakeTransport, route
+
+    text = "Emma moved to Denver."
+    world = FakeWorld(text)
+    world.entity("Emma", schema=Member, mentions=["Emma"], fields={"name": "Emma"})
+    transport = FakeTransport(route(default=world.handler))
+    await create_extractor(
+        [Many(Member, identity="name")], transport=transport, enable_inserts=True
+    ).ainvoke(text)
+    asked = [p for _, p, m in transport.calls if m.kind == "presence"]
+    assert asked[0]["questions"]["presence"]["instructions"] == (
+        "Does `input` mention any person?"
+    )
+
+
+async def test_many_kind_names_the_kind_and_the_knob_moves_the_floor() -> None:
+    from trustcall_system_one import DiscoveryConfig, Many, create_extractor
+    from trustcall_system_one.testing import FakeTransport, clef_response, noul, route
+
+    text = "Emma moved to Denver."
+    world = FakeWorld(text)
+    world.entity("Emma", schema=Member, mentions=["Emma"], fields={"name": "Emma"})
+
+    def seen_kind(model: str, payload: dict[str, Any], meta: Any) -> Any:
+        return clef_response(
+            {qid: noul(0.45) for qid in payload["questions"]}, model=payload["model"]
+        )
+
+    for floor, expected in ((0.4, 1), (0.5, 0)):
+        transport = FakeTransport(route(default=world.handler, qualify=seen_kind))
+        result = await create_extractor(
+            [Many(Member, identity="name", kind="human being")],
+            transport=transport,
+            enable_inserts=True,
+            discovery=DiscoveryConfig(qualify_min=floor),
+        ).ainvoke(text)
+        assert len(result.records) == expected
+        ((_, payload, _),) = [c for c in transport.calls if c[2].kind == "qualify"]
+        assert payload["questions"]["qualify.e0"]["instructions"] == (
+            "Is `entities.e0.label` a human being?"
+        )

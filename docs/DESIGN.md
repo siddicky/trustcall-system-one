@@ -358,30 +358,38 @@ schema title: "Person").
    holding only its own entities) over the state `{"input", "entities": {"e0": {"label",
    "mentions": [{"text", "span", "context"}]}, …}}` (a state whose input was narrowed carries
    `{"text", "context"}` without spans; `context` only for the first 8 and last 2 mentions); the call carries no entity key, since the numbering changes
-   with a broadened discovery or a merge: "Is `entities.e{n}.label` a {Person}?" (a schema description is
-   added in parentheses ONLY when it is a type description, a noun phrase of at most four words without
-   prepositions or relative clauses: "A customer order", not "A person in an address book", which made
-   Clef doubt that a bare "Emma" is in an address book: 0.37 against 0.97 for "is Emma a person?"). `< 0.5` →
-   `SkippedEntity(reason="not_qualified")` ("Sunny", a dog, for `Person`); a missing answer
-   qualifies. Qualification runs BEFORE the count comparison, so "k" is the number of entities
+   with a broadened discovery or a merge: "Is `entities.e{n}.label` a {kind}?" where the KIND is what the schema is, not its
+   title: `Many(kind=...)`, else its `label`, else the leading noun phrase of the schema description up to the
+   first preposition, relative word, participle or punctuation mark (at most four words: "A person in an
+   address book" is a "person", "One product line on an order" a "product line"; "Someone ..." is a
+   "person"), else the title. Live, "Is Emma a Member?" scored 0.24, Maria 0.189, Jon 0.226 and the
+   presence question 0.21 (live run 5), against 0.97 for "is Emma a person?", so a terse title made bare
+   names unqualifiable; the presence question ("Does `input` mention any {kind}?") names the kind as well.
+   The criteria refuse only a clear non-match ("The entity is clearly something else, not a {kind}.").
+   `< discovery.qualify_min` (0.4) → `SkippedEntity(reason="not_qualified")` ("Sunny", a dog, 0.02, for
+   `Person`); a missing answer qualifies. Qualification runs BEFORE the count comparison, so "k" is the number of entities
    that qualify.
    **Record-driven presence (updates, `discovery.record_presence`, default 0.5).** Discovery and
    qualification do not see the existing records. For every existing record that no qualified entity
    already fits (`identity_compatible` with one of its identity values) and whose identity has a word of
    three letters or more in the input, one Clef `noul` of its own (kind `record_presence`, id `record.{k}`,
-   `CallMeta.field` the record id, at most `record_presence_max` = 20 records, else the check is skipped for
-   the collection) asks "Does `input` refer to the same {Person} as `record`? A first name, a former name or
-   a short form counts." over `{input, record (compacted), parent?}`. A yes (≥ the knob) brings the entity
-   back: the group discovery found and qualification refused (its `qualify_p` becomes the answer), else a
-   new group whose mention is where the input names the record (the whole identity, else its first word;
-   none found, none made). A record an entity already fits is never asked about, so no entity is made twice;
+   `CallMeta.field` the record id) asks "Does `input` refer to the same {Person} as `record`?" over
+   `{input, record (compacted), parent?}`. Only a name word counts as "in the input": three letters or
+   more, not a stopword, a proper name (capitalised in the record) in its own case, so "pay the bill" does
+   not ask for "Bill Gates". More than `record_presence_max` = 20 such records skip the check for the
+   collection, with the warning `record_presence_capped`. A yes (≥ the knob) brings the entity back: the
+   group discovery found and qualification refused, only if qualification put it at 0.3 or more (a dog
+   "Sunny" at 0.02 stays refused for the record "Sunny Patel"), keeping its own `qualify_p`; else a new
+   group whose mention is where the input names the record (the whole identity, else its first name word,
+   in its case; none found, none made), unless that overlaps a mention already found. A record an entity already fits is never asked about, so no entity is made twice;
    matching still decides which record each entity is, and a first name that Clef calls a NEW person is not
    forced onto a record (the match's top option decides, see step 8). 0 switches it off.
 5. **Count reconciliation** (count `n` against `k` qualifying entities; acted on only when
    `broaden_on_count_mismatch` and `max(n, k) ≤ count_trust_max`, else the mismatch only warns;
    `count_trust_max` is validated to at most 30, so a merge asks at most 30·29/2 = 435 pair checks):
-   * `n > k`: unless the mentions found already cover `n` (the model counted two NAMES of one person that
-     coreference joined, or an entity was found and refused as a non-{Person}: nothing was missed, no
+   * `n > k`: unless the DISTINCT mentions found (case-folded texts: "Sarah called. Sarah and my cousin went
+     hiking" has two mentions of one text and a count of 2, so the cousin is still missing) already cover `n`
+     (the model counted two NAMES of one person that coreference joined, "Sarah Johnson" and "Sarah Miller", or an entity was found and refused as a non-{Person}: nothing was missed, no
      warning), ONE broadened re-discovery (the same question plus "Also include descriptive
      references such as 'my cousin' when no name is given."), whose mentions are only ADDED to the
      first list where they overlap none of its mentions (a broadened "Emma's brother Tom" never
@@ -434,8 +442,10 @@ schema title: "Person").
    models in the same order.
 7. **Attribution (default on):** Clef `noul` per non-null value and per list element. A scalar: "Does
    `input` state that {desc} of `entity.label` is '{value}', or does it follow by simple
-   arithmetic or date math from figures the input states about `entity.label`?" A QUANTITY (a number
-   whose description names units, a count or a number of something) is asked as "Does `input` ask for
+   arithmetic or date math from figures the input states about `entity.label`?" An ORDERED QUANTITY (a number field named
+   `quantity` or `qty`, or whose description is a number of units, items or copies ordered, wanted or to
+   order; never a price, cost, id, "number of the invoice", a count to date such as "copies sold to date",
+   or a total) is asked as "Does `input` ask for
    {value} of `entity.label` (as the {desc})?": "add two more of the blue mugs" asks for a quantity of 2
    that no sentence states (live 0.34 for the "states" wording; this one 0.78 to 0.86 for 2, 0.02 to 0.04
    for 3, 0.92 to 0.98 for a stated 1). A total is not asked this way: "state or ask for" took a derived
@@ -449,7 +459,15 @@ schema title: "Person").
    `entity.label` of a single record being updated carries what it is called ("the Bill INV-2291": its
    identity values, else its id when short and with a letter): a figure the input gives for another invoice
    is then not attributed to this one (0.88 became 0.015). Clairic's instructions keep the plain label.
-   ≥ 0.75 keep, < 0.4 drop (`attribution`), between → isolated re-ask then one more check. The
+   ≥ 0.75 keep, < 0.4 drop (`attribution`), between → isolated re-ask then one more check. The second
+   check is a DIFFERENT request: on a short input the re-ask changes neither the value nor the state (the
+   whole input fits the window), so a repeat would be byte-identical, the run's memo would return the same
+   middle-band answer and the value would always be dropped. The second look quotes the clause the re-ask
+   found the value in ("Reading the passage "Please add two more of the blue mugs" of `input`: ..."; with
+   no span, "Reading `input` once more, and only what it says about `entity.label`: ..."). Under the
+   defaults (isolated decisions) a middle-band value is therefore kept if the second look says yes at
+   0.75, not dropped by construction. (Live 5: the quantity of "two more of the blue mugs" scored 0.4793
+   next to the clause about the tea towels; the clause quote is the fix, not yet checked live.) The
    0.75/0.4 defaults come from one live observation (a bleed kept at 0.62); they are guesses to be
    tuned by the evals harness (M10a). On updates an op must pass
    **both** attribution (right entity) and the change gate (new vs. record).
@@ -499,10 +517,13 @@ schema title: "Person").
    * **Thresholds.** An assignment stands only if its option (a record or `__new__`) has `p >=
      accept` AND the answer's confidence is `>= min_confidence`, or if the pick is a record that is
      Clef's own top option (above every other option, `__new__` included), the ONLY record any of the
-     entity's mentions fits (`identity_compatible`) and has `p >= accept_compatible` (0.5): Clef's
-     choice `confidence` is not the probability of the chosen option (live: p 0.84 with confidence 0.47,
-     p 0.506 with 0.30 for a record named exactly like the entity). The assignment and the identity-conflict
-     guard are unchanged. Else the entity is ambiguous:
+     entity's mentions fits (`identity_compatible`) and has `p >= accept_compatible` (0.5) and beats every
+     other option (`__new__` and the runner-up) by `compatible_margin` (0.1; 0.51 against 0.49 is a coin
+     flip), and the fit stands on its own (`strong_compatible`: a mention of two words or more, or a single
+     word that is a word or diminutive of the record's identity; "Dan" is only the start of "Daniela Cruz",
+     "Emma Thomson" for "Emma Thompson" is fine). A blank identity value fits nothing. Clef's
+     choice `confidence` is not the probability of the chosen option (live: p 0.84 with confidence 0.47).
+     The assignment and the identity-conflict guard are unchanged. Else the entity is ambiguous:
      `SkippedEntity(reason="ambiguous_match", candidates=((option, p), …))` (the options with p ≥
      0.01, the most likely first; the records it might have been are NOT handled, so they stay
      untouched), or, with `on_ambiguous="insert"`, it is treated as new when its `__new__`
@@ -791,9 +812,12 @@ re-ask; no input-only cross-check, the sentences come from the input alone and t
 near-duplicate of an existing note goes to the `list_dedup` question and is rejected as `duplicate`
 when it is the same fact, then (updates, `verify.note_novelty` = 0.5, 0 off) one Clef `noul` of its own per
 sentence (kind `novelty`): "Does the sentence 'S' say anything about `entity.label` that `record` does not
-already hold?" over the record AFTER the update's other operations (a sentence that only repeats a value
-written to another field, "Her mobile is now ...", is `not_novel`; live 0.04 to 0.22 against 0.90 to 0.97
-for the notes that matter), and each remaining `add /notes/-` passes the change gate, judged against the
+already hold?" (true: the sentence adds information the record does not hold; false: everything it says is
+already held by `record`: nothing else drops a note) over the record AFTER the update's other operations
+that were ACCEPTED, so the other fields' gates run first (a sentence that only repeats a value written to
+another field, "Her mobile is now ...", is `not_novel`; live 0.04 to 0.22 against 0.90 to 0.97 for the
+notes that matter; but with the phone change refused by its gate the sentence is news, and "She moved to
+Berlin to lead the Ops team" next to an applied city survives because "lead the Ops team" is new), and each remaining `add /notes/-` passes the change gate, judged against the
 same record (the gate compared "Bob Roe's new phone number is 555-0199" with the record's OLD phone and
 passed it at 0.97). Only sentences read by the `sentences` strategy are checked: a list Clairic reads holds
 short named values, not sentences copied from the input that can repeat another field. Existing notes
@@ -834,15 +858,32 @@ therefore get a request each (`Run.call_clef(..., decisive=True)`); the other ki
 deterministic for an identical request, so the run keeps the answers of the requests it has sent
 (`Run.clef_memo`, finished requests only: a cancelled call is cancelled) and a re-check that would send
 the same bytes again (a re-ask that returned the same value over the same state) is answered from there.
+The memo is keyed on the SHA-256 of the canonical JSON of the request (keys sorted within objects, the
+questions kept in the order asked: their order is part of the request), not on the request, which holds
+the whole state and the images.
 Clef's answer to "state that X" cannot be checked against arithmetic (live: a wrong total 1100 scored
 0.89 and the right 1080 0.26 on a "follows by arithmetic" question), so there is no second arithmetic
 question; and no value-independent field-level question for derived values (one positive case, and it
 cannot tell a right derived number from a wrong one).
 
-**A new entity's identity falls back to its mention.** When extraction gives the identity field of a
-new entity of a collection nothing usable (a low confidence on the very words discovery quoted: "blue
-mugs" at 0.33 on the first pass and the repair), the field takes the mention text (label and span), with
-the warning `identity_from_mention: <the reason>`; never for an update.
+**A new entity's name falls back to its mention.** When extraction gives the NAME field of a new entity
+of a collection nothing usable (null, or a low confidence on the very words discovery quoted: "blue mugs"
+at 0.33 on the first pass and the repair), the field takes a proper-noun mention (label and span), with
+the warning `identity_from_mention: <the reason>` on the field and in `result.warnings`; never for an
+update. Only a name-like identity field qualifies (named `name`, `full_name`, `title`, `label` or
+`display_name`, or marked `s1_field(identity=True)` with a description about a name, title or label), so a
+Subscriber's `email` or a Ticket's `id` is never made up from "Dana Ruiz" or "printer ticket"; and only a
+capitalised mention that is not a descriptive reference ("my cousin", "the client", "The printer ticket")
+counts as a proper noun.
+
+**A relative edit is refused (`verify.relative_edit`, default 0.5, 0 off).** "Please add two more of the
+blue mugs" says how a quantity changes; the library does no arithmetic on a record's values, and writing
+the stated 2 over the line's 3 loses data. For every `replace` of one number by another, one Clef `noul`
+(kind `relative_edit`, the gate's model and state) asks "Does `input` state a change relative to the
+current value (e.g. 'two more', 'one fewer', 'double it') rather than a new value?"; at the knob or above
+the operation is refused as `relative_edit_unsupported` and nothing is written. It is never asked for an
+`add` (a new line's quantity is attributed as a requested quantity above). The README case expects no
+operation, and an operation that writes the 2 is a `must_not` violation.
 
 ## Update path (`One` schema with an existing record)
 

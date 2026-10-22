@@ -351,9 +351,11 @@ def test_identity_compatible(first: str, second: str, same: bool) -> None:
     assert identity_compatible(second, first) is same
 
 
-def test_an_identity_with_nothing_to_compare_is_compatible() -> None:
-    assert identity_compatible("", "Emma")
-    assert identity_compatible("...", "Emma")
+@pytest.mark.parametrize("blank", ["", "   ", "...", "\t\n"])
+def test_a_blank_identity_fits_nothing(blank: str) -> None:
+    assert not identity_compatible(blank, "Emma")
+    assert not identity_compatible("Emma", blank)
+    assert not identity_compatible(blank, blank)
 
 
 def test_compact_records_keep_identity_scalars_and_list_heads() -> None:
@@ -409,6 +411,14 @@ def entity(key: str, label: str, *texts: str, after: str = "") -> EntityInfo:
         mentions=tuple(mentions),
         first_mention=mentions[0],
         qualify_p=0.97,
+    )
+
+
+def named(key: str, label: str) -> EntityInfo:
+    """An entity whose single mention has no span (its text is not in ``TEXT``)."""
+    mention = Mention(label, None)
+    return EntityInfo(
+        key=key, label=label, mentions=(mention,), first_mention=mention, qualify_p=0.97
     )
 
 
@@ -733,16 +743,17 @@ async def test_a_name_compatible_top_record_is_accepted_without_the_confidence()
 
 
 async def test_a_first_name_fits_its_only_record_at_the_compatible_floor() -> None:
-    # live: Emma, 0.506 for the record against 0.4683 for __new__, confidence 0.30
+    # live: Emma, 0.506 for the record, confidence 0.30; the margin over __new__ now
+    # has to be real (compatible_margin), so the record is at 0.58 against 0.38
     fixed = Fixed(
-        {"Emma": {"Emma Thompson": 0.506, NEW: 0.4683, "Bob Roe": 0.02}},
+        {"Emma": {"Emma Thompson": 0.58, NEW: 0.38, "Bob Roe": 0.04}},
         confidence=0.30,
     )
     outcome, _ = await run_fixed(
         fixed, [entity("e0", "Emma", "Emma")], candidates("Emma Thompson", "Bob Roe")
     )
     assert outcome.targets == {"e0": "0"}
-    below = Fixed({"Emma": {"Emma Thompson": 0.45, NEW: 0.4, "Bob Roe": 0.15}})
+    below = Fixed({"Emma": {"Emma Thompson": 0.45, NEW: 0.3, "Bob Roe": 0.25}})
     outcome, _ = await run_fixed(
         below, [entity("e0", "Emma", "Emma")], candidates("Emma Thompson", "Bob Roe")
     )
@@ -754,6 +765,94 @@ async def test_a_first_name_fits_its_only_record_at_the_compatible_floor() -> No
         MatchConfig(accept_compatible=0.4),
     )
     assert loose.targets == {"e0": "0"}
+
+
+async def test_the_compatible_shortcut_is_no_coin_flip() -> None:
+    # 0.51 against __new__ 0.49 with a low confidence: not a decision
+    flip = Fixed(
+        {"Emma": {"Emma Thompson": 0.51, NEW: 0.49}},
+        confidence=0.02,
+    )
+    pool = candidates("Emma Thompson", "Bob Roe")
+    outcome, _ = await run_fixed(flip, [entity("e0", "Emma", "Emma")], pool)
+    assert outcome.targets == {} and outcome.skipped[0].reason == "ambiguous_match"
+    # the margin is over the runner-up too, not only over __new__
+    runner = Fixed(
+        {"Emma": {"Emma Thompson": 0.52, "Emma Watson": 0.45, NEW: 0.03}},
+        confidence=0.02,
+    )
+    outcome, _ = await run_fixed(
+        runner,
+        [entity("e0", "Emma", "Emma")],
+        candidates("Emma Thompson", "Emma Watson"),
+    )
+    assert outcome.targets == {}
+    # a margin of 0.1 is enough, and the knob moves it
+    clear = Fixed({"Emma": {"Emma Thompson": 0.58, NEW: 0.42}}, confidence=0.02)
+    outcome, _ = await run_fixed(clear, [entity("e0", "Emma", "Emma")], pool)
+    assert outcome.targets == {"e0": "0"}
+    wide = MatchConfig(compatible_margin=0.3)
+    outcome, _ = await run_fixed(clear, [entity("e0", "Emma", "Emma")], pool, wide)
+    assert outcome.targets == {}
+    off = MatchConfig(compatible_margin=0.0)
+    outcome, _ = await run_fixed(flip, [entity("e0", "Emma", "Emma")], pool, off)
+    assert outcome.targets == {"e0": "0"}
+
+
+async def test_a_prefix_alone_does_not_accept_a_longer_name() -> None:
+    # "Dan" is the start of "Daniela", and a nickname of Daniel: not enough
+    fixed = Fixed({"Dan": {"Daniela Cruz": 0.7, NEW: 0.2}}, confidence=0.1)
+    pool = candidates("Daniela Cruz", "Bob Roe")
+    outcome, _ = await run_fixed(fixed, [named("e0", "Dan")], pool)
+    assert outcome.targets == {} and outcome.skipped[0].reason == "ambiguous_match"
+    # a typo of a two-word name is a fit; so is a single word the record has
+    typo = Fixed({"Emma Thomson": {"Emma Thompson": 0.7, NEW: 0.2}}, confidence=0.1)
+    outcome, _ = await run_fixed(
+        typo,
+        [named("e0", "Emma Thomson")],
+        candidates("Emma Thompson", "Bob Roe"),
+    )
+    assert outcome.targets == {"e0": "0"}
+    word = Fixed({"Daniela": {"Daniela Cruz": 0.7, NEW: 0.2}}, confidence=0.1)
+    outcome, _ = await run_fixed(word, [named("e0", "Daniela")], pool)
+    assert outcome.targets == {"e0": "0"}
+    liz = Fixed({"Liz": {"Elizabeth Parker": 0.7, NEW: 0.2}}, confidence=0.1)
+    outcome, _ = await run_fixed(
+        liz,
+        [named("e0", "Liz")],
+        candidates("Elizabeth Parker", "Bob Roe"),
+    )
+    assert outcome.targets == {"e0": "0"}
+
+
+@pytest.mark.parametrize(
+    ("mention", "value", "strong"),
+    [
+        ("Dan", "Daniela Cruz", False),
+        ("Jo", "John Doe", False),
+        ("JS", "John Smith", False),
+        ("Emma Thomson", "Emma Thompson", True),
+        ("Emma", "Emma Thompson", True),
+        ("Liz", "Elizabeth Parker", True),
+        ("J. Smith", "John Smith", True),
+        ("Emma Watson", "Emma Thompson", False),
+        ("", "Emma", False),
+    ],
+)
+def test_strong_compatible(mention: str, value: str, strong: bool) -> None:
+    from trustcall_system_one._coref import strong_compatible
+
+    assert strong_compatible(mention, value) is strong
+
+
+async def test_a_blank_identity_record_is_never_the_compatible_one() -> None:
+    recs = [
+        Candidate("0", {"name": "", "relationship": None, "notes": []}),
+        Candidate("1", {"name": "  ", "relationship": None, "notes": []}),
+    ]
+    fixed = Fixed({"Zara Khan": {"0": 0.7, NEW: 0.2}}, confidence=0.1)
+    outcome, _ = await run_fixed(fixed, [named("e0", "Zara Khan")], recs)
+    assert outcome.targets == {}
 
 
 async def test_the_compatible_shortcut_needs_the_top_and_only_fitting_record() -> None:
@@ -1103,6 +1202,7 @@ def test_the_defaults() -> None:
     config = MatchConfig()
     assert (config.accept, config.min_confidence, config.render_fields) == (0.6, 0.5, 4)
     assert config.accept_compatible == 0.5
+    assert config.compatible_margin == 0.1
     assert (config.collision, config.on_ambiguous, config.delete_threshold) == (
         "warn",
         "skip",
@@ -1119,6 +1219,8 @@ def test_the_defaults() -> None:
         {"accept": 1.5},
         {"min_confidence": -0.1},
         {"accept_compatible": 1.5},
+        {"compatible_margin": -0.1},
+        {"compatible_margin": 1.5},
         {"delete_threshold": float("nan")},
         {"render_fields": -1},
         {"render_fields": True},

@@ -29,7 +29,7 @@ differ from a top-level ``Many``); at the top level ``parent`` is ``None``.
 
 import dataclasses
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -107,8 +107,6 @@ __all__ = [
 
 Span = tuple[int, int]
 
-QUALIFY_MIN = 0.5
-"""Qualification probability below which an entity is not a ``<Schema>``."""
 MERGE_CANDIDATE_MIN = 0.2
 """Best pairwise probability from which two clusters are checked for a merge."""
 
@@ -206,6 +204,16 @@ class Scope:
     def noun(self) -> str:
         """What one entity is called in prompts."""
         return self.cardinality.label or self.plan.title
+
+    @property
+    def kind(self) -> str:
+        """What kind of thing an entity is, for the presence and qualify questions.
+
+        ``Many(kind=...)``, else its ``label``, else the leading noun phrase of the
+        schema's description, else the schema title.
+        """
+        many = self.cardinality
+        return many.kind or many.label or _derive_kind(self.plan)
 
     @property
     def name(self) -> str:
@@ -747,23 +755,46 @@ _CONTEXT_WORDS = frozenset(
 )
 
 
-def _type_description(plan: SchemaPlan) -> str:
-    """The schema's description, if it names a kind of thing and nothing else.
+_KIND_STOP = _CONTEXT_WORDS | frozenset(
+    ["named", "called", "mentioned", "known", "listed", "described", "found", "kept"]
+)
+_KIND_HEADS = {"someone": "person", "somebody": "person", "anyone": "person"}
 
-    "A customer order" is a type description; "A person in an address book" and
-    "Someone the speaker knows or is being introduced to" describe where the thing
-    is or who it is for. Put into the question "is Emma a Member (A person in an
-    address book)?" the second kind made Clef doubt that a bare first name is "in
-    an address book" (0.37; "is Emma a person?" gave 0.97). Only a short noun
-    phrase without prepositions, conjunctions or relative clauses is kept.
+
+def _article(noun: str) -> str:
+    """``a`` or ``an`` in front of a noun phrase."""
+    return "an" if noun[:1].lower() in "aeiou" else "a"
+
+
+def _derive_kind(plan: SchemaPlan) -> str:
+    """The kind of thing a schema is, from the start of its description.
+
+    "A person in an address book" is a "person", "A customer order" a "customer
+    order", "One product line on an order" a "product line", "A colleague named in
+    an announcement" a "colleague": the leading noun phrase, up to the first
+    preposition, relative word, participle or punctuation mark, at most four
+    words. A description with no such phrase ("Someone the speaker knows") falls
+    back to what its first word says ("someone" is a "person"), else the schema
+    title.
     """
+    title = plan.title
     text = _described(plan)
-    words = [w.strip(",;:()").casefold() for w in text.split()]
-    if not text or len(words) > 4 or any(w in _CONTEXT_WORDS for w in words):
-        return ""
-    if any(ch in text for ch in ",;:"):
-        return ""
-    return text
+    words: list[str] = []
+    for raw in text.split(".")[0].split():
+        word = raw.strip(",;:()")
+        if not word or (word.casefold() in _KIND_STOP and words):
+            break
+        words.append(word)
+        if raw[-1] in ",;:":  # the phrase ends with its punctuation mark
+            break
+    while words and words[0].casefold() in ("a", "an", "the", "one"):
+        words.pop(0)
+    if words and words[0].casefold() in _KIND_HEADS:
+        return _KIND_HEADS[words[0].casefold()]
+    if not words or len(words) > 4 or words[0].casefold() in ("something", "anything"):
+        return title
+    first = words[0]
+    return " ".join([first.lower() if first.istitle() else first, *words[1:]])
 
 
 # --------------------------------------------------------------------------- #
@@ -783,22 +814,20 @@ async def _presence(run: Run, scope: Scope) -> tuple[float | None, bool]:
         question has nothing to anchor on, so a cut state is read from the start
         of the input and its answer is not to be trusted).
     """
-    plan = scope.plan
-    described = _described(plan)
+    kind = scope.kind
     nested = scope.parent is not None
     context = run.coref.context_chars
     question = NoulQuestion(
         type="noul",
         instructions=(
-            f"Does `input` mention any {scope.noun}"
-            + (f" ({described})" if described else "")
+            f"Does `input` mention any {kind}"
             + (" belonging to `parent.label`" if nested else "")
             + "?"
         ),
         criteria=NoulCriteria(
-            true=f"The input mentions at least one {scope.noun}"
+            true=f"The input mentions at least one {kind}"
             + (" belonging to the parent." if nested else "."),
-            false=f"The input mentions no {scope.noun}"
+            false=f"The input mentions no {kind}"
             + (" belonging to the parent." if nested else "."),
         ),
     )
@@ -904,6 +933,9 @@ class _Group:
 
     mentions: tuple[Mention, ...]
     qualify_p: float | None = None
+    adopted: bool = False
+    """Brought back by an existing record (``discovery.record_presence``), with
+    ``qualify_p`` left as qualification said it."""
 
     @property
     def label(self) -> str:
@@ -936,8 +968,7 @@ async def _qualify(
     """
     if not items:
         return []
-    plan = scope.plan
-    described = _type_description(plan)
+    kind = scope.kind
     context = run.coref.context_chars
 
     def entity(group: _Group, *, spans: bool) -> dict[str, Any]:
@@ -981,16 +1012,15 @@ async def _qualify(
             f"qualify.{_provisional(n)}": NoulQuestion(
                 type="noul",
                 instructions=(
-                    f"Is `entities.{_provisional(n)}.label` a {scope.noun}"
-                    + (f" ({described})" if described else "")
+                    f"Is `entities.{_provisional(n)}.label` {_article(kind)} {kind}"
                     + belonging
                     + "?"
                 ),
                 criteria=NoulCriteria(
-                    true=f"The entity is a {scope.noun}"
+                    true=f"The entity is {_article(kind)} {kind}"
                     + (" belonging to the parent." if nested else "."),
-                    false="The entity is something else, not a "
-                    + f"{scope.noun}"
+                    false=f"The entity is clearly something else, not {_article(kind)} "
+                    + f"{kind}"
                     + (" of the parent." if nested else "."),
                 ),
             )
@@ -1039,8 +1069,11 @@ async def _group(
     return groups, clustering
 
 
-def _qualified(groups: Sequence[_Group]) -> list[_Group]:
-    return [g for g in groups if g.qualify_p is None or g.qualify_p >= QUALIFY_MIN]
+def _qualified(groups: Sequence[_Group], minimum: float) -> list[_Group]:
+    """The groups that qualify: adopted by a record, unasked, or at ``minimum``."""
+    return [
+        g for g in groups if g.adopted or g.qualify_p is None or g.qualify_p >= minimum
+    ]
 
 
 def _best_pair(a: _Group, b: _Group, cache: PairCache) -> float | None:
@@ -1105,7 +1138,7 @@ async def _merge(
     Returns:
         The clusters after the merges and how many merge checks were asked.
     """
-    live = _qualified(groups)
+    live = _qualified(groups, run.discovery.qualify_min)
     threshold = run.coref.merge_threshold
     checks: dict[tuple[int, int], float | None] = {}
 
@@ -1156,7 +1189,13 @@ async def _merge(
             (m for i in members for m in live[i].mentions),
             key=lambda m: m.span or (0, 0),
         )
-        out.append(_Group(tuple(mentions), live[members[0]].qualify_p))
+        out.append(
+            _Group(
+                tuple(mentions),
+                live[members[0]].qualify_p,
+                adopted=any(live[i].adopted for i in members),
+            )
+        )
     # what did not qualify stays, as it was
     kept_ids = {id(g) for g in live}
     out.extend(g for g in groups if id(g) not in kept_ids)
@@ -1186,27 +1225,137 @@ def _union(
 _WORD_MIN = 3
 """Shortest identity word that makes a record worth asking about."""
 
+REVIVE_MIN = 0.3
+"""Below this a refused entity stays refused, whatever a record shares with it."""
 
-def _words_of(text: str) -> set[str]:
-    return {w for w in re.findall(r"\w+", text.casefold()) if len(w) >= _WORD_MIN}
+_STOPWORDS = frozenset(
+    [
+        "the",
+        "and",
+        "for",
+        "with",
+        "from",
+        "into",
+        "onto",
+        "over",
+        "under",
+        "this",
+        "that",
+        "these",
+        "those",
+        "its",
+        "our",
+        "your",
+        "his",
+        "her",
+        "their",
+        "you",
+        "she",
+        "him",
+        "they",
+        "them",
+        "are",
+        "was",
+        "were",
+        "has",
+        "had",
+        "have",
+        "but",
+        "not",
+        "all",
+        "any",
+        "one",
+        "two",
+        "new",
+        "old",
+        "who",
+        "whom",
+        "whose",
+        "what",
+        "when",
+        "where",
+        "which",
+        "will",
+        "would",
+        "can",
+        "could",
+        "should",
+        "may",
+        "might",
+        "must",
+        "also",
+        "just",
+        "than",
+        "then",
+        "there",
+        "here",
+        "some",
+        "such",
+        "own",
+        "same",
+        "other",
+        "mrs",
+        "miss",
+        "ltd",
+        "inc",
+        "llc",
+        "plc",
+        "corp",
+        "company",
+    ]
+)
+"""Words that never make a record worth asking about, in any case."""
+
+
+def _name_words(text: str) -> list[str]:
+    """The words of an identity value that can be looked for in the input.
+
+    Words shorter than three characters and stopwords ("the", "and", "company") are
+    left out; the case of a word is kept, since a capitalised word is a proper name.
+    """
+    return [
+        w
+        for w in re.findall(r"\w+", text)
+        if len(w) >= _WORD_MIN and w.casefold() not in _STOPWORDS
+    ]
+
+
+def _word_pattern(word: str) -> str:
+    """The pattern that finds ``word`` as a whole word: exactly if it is a name.
+
+    "Bill" does not match "pay the bill": a capitalised word of an identity is a
+    proper name and is looked for in its case. A lower-case word ("blue", in a
+    product line) is looked for in any.
+    """
+    flag = "" if word[:1].isupper() else "(?i:"
+    pattern = rf"(?<!\w){re.escape(word)}(?!\w)"
+    return pattern if not flag else f"{flag}{pattern})"
+
+
+def _present(words: Sequence[str], source: str) -> bool:
+    """Whether any of the words occurs in the input (a name in its own case)."""
+    return any(re.search(_word_pattern(w), source) for w in words)
 
 
 def _locate(source: str, values: Sequence[str]) -> Mention | None:
     """Where the input names a record: its whole identity, else its first word.
 
     The longest identity value that occurs in the input wins; failing that the
-    first word of an identity value that occurs as a word of its own. The mention
-    is the words as the input writes them, with their span.
+    first word (of three letters or more, not a stopword) of an identity value that
+    occurs as a word of its own. A proper name is found in its own case: the record
+    "Bill Gates" is not named by "pay the bill". The mention is the words as the
+    input writes them, with their span.
     """
     for value in sorted(values, key=len, reverse=True):
-        found = re.search(rf"(?<!\w){re.escape(value.strip())}(?!\w)", source, re.I)
-        if found is not None and value.strip():
+        value = value.strip()
+        if not value or not _name_words(value):
+            continue
+        found = re.search(_word_pattern(value), source)
+        if found is not None:
             return Mention(found.group(0), found.span())
     for value in values:
-        for word in re.findall(r"\w+", value):
-            if len(word) < _WORD_MIN:
-                continue
-            found = re.search(rf"(?<!\w){re.escape(word)}(?!\w)", source, re.I)
+        for word in _name_words(value):
+            found = re.search(_word_pattern(word), source)
             if found is not None:
                 return Mention(found.group(0), found.span())
     return None
@@ -1220,7 +1369,7 @@ async def _record_presence(
     Each record gets a request of its own (call kind ``record_presence``): the state
     is the input, the record (cut down to its identity and a few fields) and, for an
     item of a nested list, its parent; the question is "does the input refer to the
-    same <noun> as the record? A first name, a former name or a short form counts".
+    same <noun> as the record?".
     """
     noun = scope.noun
     context = run.coref.context_chars
@@ -1229,10 +1378,7 @@ async def _record_presence(
     for k, (_, data, _) in enumerate(records):
         questions[f"record.{k}"] = NoulQuestion(
             type="noul",
-            instructions=(
-                f"Does `input` refer to the same {noun} as `record`? A first name, a "
-                "former name or a short form counts."
-            ),
+            instructions=f"Does `input` refer to the same {noun} as `record`?",
             criteria=NoulCriteria(
                 true="The input refers to this record.",
                 false="The input does not refer to this record.",
@@ -1268,18 +1414,24 @@ async def _adopt_records(
     names: Sequence[str],
     groups: list[_Group],
     live: list[_Group],
+    warn: Callable[[str], None],
 ) -> list[_Group]:
     """Let the existing records say which entities the input is about.
 
     Discovery and qualification are blind to the records: a first name alone can
     fail the schema question, a multi-word product line can be cut short. For each
     existing record that no qualified entity already fits (``identity_compatible``)
-    and whose identity has a word in the input, Clef is asked whether the input
+    and whose identity has a name word in the input (three letters or more, no
+    stopword, a proper name in its own case), Clef is asked whether the input
     refers to it. A yes (``discovery.record_presence``) brings the entity back: the
-    group discovery found and qualification refused, else a new group whose mention
-    is where the input names the record. A record an entity already fits is not
-    asked about, so no entity is made twice; matching still decides which record
-    each entity is (an adopted entity is no more than a candidate for it).
+    group discovery found and qualification refused (kept as it was qualified, and
+    only when qualification put it at ``REVIVE_MIN`` or more: a dog called "Sunny"
+    stays refused for the record "Sunny Patel"), else a new group whose mention is
+    where the input names the record, unless that overlaps a mention already
+    found. A record an entity already fits is not asked about, so no entity is made
+    twice; matching still decides which record each entity is (an adopted entity is
+    no more than a candidate for it). More records than
+    ``discovery.record_presence_max`` skip the check, with a warning.
 
     Returns:
         The groups, with the adopted ones qualified.
@@ -1288,12 +1440,11 @@ async def _adopt_records(
     if config.record_presence <= 0 or not scope.existing:
         return groups
     keys = identity_keys(scope.plan, names)
-    words = _words_of(scope.source)
     asked: list[tuple[str, dict[str, Any], str]] = []
     wanted: dict[str, list[str]] = {}
     for record in scope.existing:
         data = normalise_record(scope.plan, record.data)
-        values = identity_values(data, keys)
+        values = [v for v in identity_values(data, keys) if v.strip()]
         if not values or any(
             identity_compatible(m.text, v)
             for group in live
@@ -1301,7 +1452,7 @@ async def _adopt_records(
             for v in values
         ):
             continue
-        if not any(_words_of(v) & words for v in values):
+        if not any(_present(_name_words(v), scope.source) for v in values):
             continue
         wanted[record.record_id] = values
         asked.append(
@@ -1311,7 +1462,14 @@ async def _adopt_records(
                 values[0],
             )
         )
-    if not asked or len(asked) > config.record_presence_max:
+    if not asked:
+        return groups
+    if len(asked) > config.record_presence_max:
+        warn(
+            f"record_presence_capped: {len(asked)} existing records might be named "
+            f"in the input, more than discovery.record_presence_max "
+            f"({config.record_presence_max}), so none was checked against it"
+        )
         return groups
     found = await _record_presence(run, scope, asked)
     groups = list(groups)
@@ -1332,16 +1490,22 @@ async def _adopt_records(
             None,
         )
         if refused is not None:
-            refused.qualify_p = p
-            live.append(refused)
+            if refused.qualify_p is None or refused.qualify_p >= REVIVE_MIN:
+                refused.adopted = True
+                live.append(refused)
             continue
         mention = _locate(scope.source, values)
-        if mention is None or any(
-            g.mentions and any(m.span == mention.span for m in g.mentions)
-            for g in groups
+        if (
+            mention is None
+            or mention.span is None
+            or any(
+                m.span is not None and _overlap(m.span, mention.span)
+                for g in groups
+                for m in g.mentions
+            )
         ):
             continue
-        group = _Group((mention,), p)
+        group = _Group((mention,), p, adopted=True)
         groups.append(group)
         live.append(group)
     return groups
@@ -1418,15 +1582,19 @@ async def collect(
     pair_cache: PairCache = {}
     known: dict[frozenset[Mention], float | None] = {}
     groups, _ = await _group(run, scope, mentions, pair_cache, known)
-    live = _qualified(groups)
-    groups = await _adopt_records(run, scope, names, groups, live)
-    live = _qualified(groups)
+    live = _qualified(groups, config.qualify_min)
+    groups = await _adopt_records(run, scope, names, groups, live, warn)
+    live = _qualified(groups, config.qualify_min)
 
     if count is not None and count != len(live):
-        # a count above the entities that qualify is no miss when the mentions
-        # found cover it: the model counted two NAMES of one person (coreference
-        # joined them), or the entity was found and then refused as a non-<noun>
-        explained = count > len(live) and len(mentions) >= count
+        # a count above the entities that qualify is no miss when the DISTINCT
+        # mentions found cover it: the model counted two NAMES of one person
+        # (coreference joined them), or the entity was found and then refused as a
+        # non-<noun>. The same name twice is one name: "Sarah called. Sarah and my
+        # cousin went hiking" has two mentions of one text and a count of 2, so the
+        # cousin is still missing.
+        distinct = len({" ".join(m.text.casefold().split()) for m in mentions})
+        explained = count > len(live) and distinct >= count
         act = (
             config.broaden_on_count_mismatch
             and max(count, len(live)) <= config.count_trust_max
@@ -1438,13 +1606,13 @@ async def collect(
             if merged != mentions:
                 mentions = merged
                 groups, _ = await _group(run, scope, mentions, pair_cache, known)
-                live = _qualified(groups)
-                groups = await _adopt_records(run, scope, names, groups, live)
-                live = _qualified(groups)
+                live = _qualified(groups, config.qualify_min)
+                groups = await _adopt_records(run, scope, names, groups, live, warn)
+                live = _qualified(groups, config.qualify_min)
         checked = 0
         if act and count < len(live):
             groups, checked = await _merge(run, scope, groups, count, pair_cache)
-            live = _qualified(groups)
+            live = _qualified(groups, config.qualify_min)
         why = (
             ""
             if act

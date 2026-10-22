@@ -63,6 +63,7 @@ __all__ = [
     "ordered_pair",
     "plausible",
     "plural",
+    "strong_compatible",
 ]
 
 logger = logging.getLogger(__name__)
@@ -297,7 +298,8 @@ def identity_compatible(first: str, second: str) -> bool:
     a prefix (Ann and Anne), a small typo (Thomson and Thompson), or the initials
     of the whole name ("JS" for John Smith). "Sarah" fits "Sarah Johnson"; "Emma
     Watson" does not fit "Emma Thompson" (a shared first name is not enough), and
-    two ids that differ in a number never fit.
+    two ids that differ in a number never fit. A blank value (empty, whitespace or
+    only punctuation) fits nothing: there is nothing to compare.
 
     Args:
         first: One identity value (a name, a title, an id).
@@ -305,7 +307,7 @@ def identity_compatible(first: str, second: str) -> bool:
     """
     a, b = name_tokens(first), name_tokens(second)
     if not a or not b:
-        return True  # nothing to compare
+        return False  # nothing to compare is no evidence: a blank fits no one
     short, long = (a, b) if len(a) <= len(b) else (b, a)
     if (
         len(short) == 1
@@ -322,6 +324,28 @@ def identity_compatible(first: str, second: str) -> bool:
         else:
             return False
     return True
+
+
+def strong_compatible(mention: str, value: str) -> bool:
+    """Whether a mention fits an identity value well enough to stand on its own.
+
+    ``identity_compatible`` also accepts a one-word mention that is only the start
+    of a word, a typo of it or an initial ("Dan" for "Daniela Cruz", "Jo" for
+    "John Doe"), which is a coin flip between two people. A fit stands on its own
+    when the mention has two words or more ("Emma Thomson" for "Emma Thompson"),
+    or its single word is a word of the value or a diminutive of one ("Liz" for
+    "Elizabeth Parker").
+
+    Args:
+        mention: How the input names the entity.
+        value: An identity value of the record.
+    """
+    if not identity_compatible(mention, value):
+        return False
+    words = name_tokens(mention)
+    if len(words) >= 2:
+        return True
+    return any(words[0] == t or nicknames(words[0], t) for t in name_tokens(value))
 
 
 def near(source: str, first: Mention, second: Mention) -> bool:

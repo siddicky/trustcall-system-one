@@ -36,7 +36,9 @@ __all__ = [
     "dedup_elements",
     "gate_changes",
     "note_novelty",
+    "numeric_replace",
     "record_after",
+    "relative_edits",
     "threshold",
 ]
 
@@ -74,10 +76,17 @@ NOVELTY_QUESTION = (
     "does not already hold?"
 )
 NOVELTY_TRUE = "The sentence adds information that `record` does not hold."
-NOVELTY_FALSE = (
-    "Everything the sentence says is already held by `record`, or it says nothing "
-    "worth recording."
+NOVELTY_FALSE = "Everything the sentence says is already held by `record`."
+
+RELATIVE_QUESTION = (
+    "Does `input` state a change relative to the current value (e.g. 'two more', "
+    "'one fewer', 'double it') rather than a new value?"
 )
+RELATIVE_TRUE = (
+    "The input says how the current value changes (more, fewer, double), not what "
+    "the new value is."
+)
+RELATIVE_FALSE = "The input gives the new value itself."
 
 
 @dataclass(frozen=True)
@@ -254,6 +263,63 @@ async def dedup_elements(
         p = answer.noul if isinstance(answer, NoulAnswer) else None
         verdicts[index] = DedupVerdict(p is not None and p >= DUPLICATE_AT, p, other)
     return verdicts
+
+
+def numeric_replace(change: Change) -> bool:
+    """Whether an operation replaces one number with another.
+
+    Such an operation is a candidate for a relative edit ("two more" read as the
+    stated 2).
+    """
+    return (
+        change.op == "replace"
+        and all(
+            isinstance(v, (int, float)) and not isinstance(v, bool)
+            for v in (change.old, change.value)
+        )
+        and change.old != change.value
+    )
+
+
+async def relative_edits(
+    ctx: Ctx, record: dict[str, Any], changes: Sequence[Change]
+) -> list[float | None]:
+    """Ask Clef, per numeric replacement, whether the input states a RELATIVE change.
+
+    "Please add two more of the blue mugs" says how much to add to the line's
+    quantity (3), not that the quantity is 2; the library does no arithmetic on a
+    record's values, so writing the 2 over the 3 loses data. One request per
+    operation (call kind ``relative_edit``, model ``gate_model``) with the gate's
+    state.
+
+    Args:
+        ctx: The entity context.
+        record: The existing record.
+        changes: The operations to judge (``numeric_replace`` ones).
+
+    Returns:
+        One probability per change, in order; ``None`` for a missing answer.
+    """
+
+    async def one(change: Change) -> float | None:
+        answers = await ctx.run.call_clef(
+            {"relative": _relative_question()},
+            gate_state(ctx, record, change),
+            meta=ctx.meta("relative_edit", field=change.field_path),
+            model=ctx.run.gate_model,
+        )
+        answer = answers.get("relative")
+        return answer.noul if isinstance(answer, NoulAnswer) else None
+
+    return list(await gather(*(one(change) for change in changes)))
+
+
+def _relative_question() -> NoulQuestion:
+    return NoulQuestion(
+        type="noul",
+        instructions=RELATIVE_QUESTION,
+        criteria=NoulCriteria(true=RELATIVE_TRUE, false=RELATIVE_FALSE),
+    )
 
 
 def record_after(record: dict[str, Any], changes: Sequence[Change]) -> dict[str, Any]:

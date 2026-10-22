@@ -143,9 +143,11 @@ def build_extractor(
     if offline:
         if script is None:
             raise ValueError("offline mode needs a script")
-        # The scripted answers are given per question, so the demo's request log reads
-        # the same with the questions of a check batched; live, each decision gets
-        # a request of its own (verify.isolate_decisions, the default).
+        # Offline only, the checks of a request are batched (isolate_decisions=False):
+        # the scripts answer per question id, so the answers are the same either way,
+        # but with the default (one request per decision) the offline request log of
+        # every example, and the call-order assertions of tests/unit/test_examples.py
+        # that pin it, would grow several times over. Live, the default applies.
         options.setdefault("verify", VerifyConfig(isolate_decisions=False))
         return create_extractor(schemas, transport=script.transport, **options)
     # No transport given: the extractor creates a CloudflareTransport() from the

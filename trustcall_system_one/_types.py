@@ -78,6 +78,7 @@ CallKind = Literal[
     "novelty",
     "record_presence",
     "gate",
+    "relative_edit",
     "repair",
     "raw",
 ]

@@ -194,6 +194,10 @@ def readme_people() -> Case:
         ],
         expect_values=[
             Val("Olivia", "/name", "Olivia Davis"),
+            # required, as in the README: a new person without it is not inserted
+            # (live: "cousin" scored 0.75 on attribution and the record was invalid),
+            # so a run that inserts Olivia holds the speaker's own word for it
+            Val("Olivia", "/relationship", contains="cousin"),
             Val("Olivia", "/notes", contains="graphic designer"),
         ],
         must_not=[
@@ -452,6 +456,9 @@ def rename() -> Case:
         schemas=lambda: [Many(Member, identity="name")],
         existing=existing,
         expect_ops=[Op("replace", "/name", "Sarah Miller", who="0")],
+        # live 5: the whole sentence is also appended as a note (attribution 0.97): it
+        # is grounded, so it may happen; the rename must, and nothing may be deleted
+        allow_ops=[Op("add", "/notes/-", contains="got married", who="0")],
         must_not=[MustNot.insert(), MustNot.delete(), MustNot.op("replace", "/city")],
         tags=("people", "update", "identity"),
         world=world,
@@ -619,19 +626,23 @@ def relative_edit() -> Case:
         existing=existing,
         options={"enable_inserts": True},
         # nothing is applied: "two more" is a request to add 2 to what is there, which
-        # the library does not compute. Writing the stated 2 over the 3 is what the
-        # design allows if a model reads it that way, never a computed 5.
+        # the library does not compute, and writing the stated 2 over the 3 loses
+        # data (a replace of the quantity is a violation, not an alternative)
         expect_ops=[],
-        allow_ops=[Op("replace", "/items/0/quantity", 2, who="SO-10442")],
+        expect_rejected=[
+            Rejected("relative_edit_unsupported", "/items/0/quantity", "SO-10442")
+        ],
         must_not=[
-            MustNot.op(value=5),
+            MustNot.op("replace", "/items/0/quantity", who="SO-10442"),
+            MustNot.value_at("SO-10442", "/items/0/quantity", 2),
             MustNot.value_at("SO-10442", "/items/0/quantity", 5),
             MustNot.op("add", "/items/-"),
         ],
         tags=("order", "update", "nested", "relative"),
         world=world,
-        note="'Two more' is read as the stated 2, never computed from the record's 3 "
-        "(5); the library has no arithmetic on old values (docs/DESIGN.md).",
+        note="'Two more' is a change relative to the record's 3: it is neither "
+        "written as 2 (data loss) nor computed as 5; the operation is refused as "
+        "relative_edit_unsupported (docs/DESIGN.md).",
     )
 
 
@@ -787,6 +798,11 @@ def silence_is_not_deletion() -> Case:
         schemas=lambda: [One(Contact)],
         existing=[("crm-1", "Contact", CONTACT_EXISTING)],
         expect_ops=[],
+        # live 5: "called about the invoice" is a stated fact (attribution 0.97) and
+        # may be appended as a note; no field may change or go
+        allow_ops=[
+            Op("add", "/notes/-", contains="called about the invoice", who="crm-1")
+        ],
         must_not=[MustNot.op("remove"), MustNot.op("replace")],
         tags=("contact", "update", "negative"),
         world=world,
@@ -1002,6 +1018,39 @@ def notes_near_duplicate() -> Case:
     )
 
 
+def note_beside_applied_change() -> Case:
+    text = "Dana Whitfield called. She moved to Berlin to lead the Ops team."
+    sentence = "She moved to Berlin to lead the Ops team."
+
+    def world() -> FakeWorld:
+        w = FakeWorld(text)
+        entity = w.entity(
+            "the Contact",
+            schema=Contact,
+            mentions=["Dana Whitfield"],
+            fields={"name": "Dana Whitfield", "city": "Berlin", "notes": [sentence]},
+        )
+        w.low_confidence(entity, "notes", 1e-9, persistent=True)
+        return w
+
+    return Case(
+        id="note_beside_applied_change",
+        text=text,
+        schemas=lambda: [One(Contact)],
+        existing=[("crm-1", "Contact", CONTACT_EXISTING)],
+        expect_ops=[
+            Op("replace", "/city", "Berlin", who="crm-1"),
+            Op("add", "/notes/-", contains="lead the Ops team", who="crm-1"),
+        ],
+        must_not=[MustNot.op("replace", "/name"), MustNot.op("remove")],
+        tags=("contact", "update", "notes"),
+        world=world,
+        note="City=Berlin is applied; the sentence also says she leads the Ops team, "
+        "which the record does not hold, so the note survives the novelty check "
+        "(judged against the record after the ACCEPTED changes only).",
+    )
+
+
 CASES: list[Case] = [
     readme_people(),
     colleague_bleed(),
@@ -1027,6 +1076,7 @@ CASES: list[Case] = [
     notes_insert_contact(),
     notes_people_insert(),
     notes_near_duplicate(),
+    note_beside_applied_change(),
 ]
 """Every case, in the order reports list them."""
 

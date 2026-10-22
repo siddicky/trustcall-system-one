@@ -1074,3 +1074,134 @@ async def test_attribution_accepts_what_the_input_directly_implies() -> None:
     assert "simple arithmetic or date math" in question["criteria"]["true"]
     assert "concerns another entity" in question["criteria"]["false"]
     assert result.records[0].valid
+
+
+# --------------------------------------------------------------------------- #
+# The middle band on a SHORT input, under the defaults (isolated decisions, the
+# default window): the second look is a different question, not the same bytes
+# --------------------------------------------------------------------------- #
+
+DEFAULTS = VerifyConfig(borderline_null=False)  # isolate_decisions=True, window 600
+
+
+async def test_the_middle_band_on_a_short_input_is_checked_by_a_different_request() -> (
+    None
+):
+    script = person_script()
+    script.attribution = {"attr.city": [0.55, 0.9]}
+    script.reask = {"city": ca("text", "London", find="London")}
+    record = await run_person(script, verify=DEFAULTS)
+    assert person(record).city == "London"  # the second look decided, not a memo
+    assert record.fields["city"].attribution_p == 0.9
+    first, second = [
+        c[1] for c in script.calls("attribution") if "attr.city" in c[1]["questions"]
+    ]
+    one = first["questions"]["attr.city"]["instructions"]
+    two = second["questions"]["attr.city"]["instructions"]
+    assert one != two
+    assert two.endswith(one)
+    # the clause around the value, not the whole sentence
+    assert two.startswith('Reading the passage "Ada Lovelace lives in London" of ')
+
+
+async def test_a_second_look_that_stays_in_the_band_still_drops_the_value() -> None:
+    script = person_script()
+    script.attribution = {"attr.city": [0.55, 0.5]}
+    script.reask = {"city": ca("text", "London", find="London")}
+    record = await run_person(script, verify=DEFAULTS)
+    assert record.fields["city"].rejected_reason == "attribution"
+    assert record.fields["city"].attribution_p == 0.5
+
+
+async def test_the_second_look_without_a_span_rereads_the_input() -> None:
+    script = person_script()
+    script.attribution = {"attr.city": [0.55, 0.9]}
+    script.reask = {"city": ca("text", "London")}  # no span: nothing to quote
+    record = await run_person(script, verify=DEFAULTS)
+    assert person(record).city == "London"
+    second = script.calls("attribution")[-1][1]["questions"]["attr.city"]
+    assert second["instructions"].startswith("Reading `input` once more")
+
+
+async def test_list_elements_in_the_band_get_a_second_look_that_quotes_them() -> None:
+    class Notes(BaseModel):
+        contacts: list[str]
+
+    text = "Contacts: Dana Ruiz, Priya Shah."
+    script = Script()
+    script.clairic = {
+        "contacts": ca(
+            "list", ["Dana Ruiz", "Priya Shah"], find_all=["Dana Ruiz", "Priya Shah"]
+        )
+    }
+    script.attribution = {"attr.contacts.0": [0.95], "attr.contacts.1": [0.55, 0.9]}
+    script.reask = {
+        "contacts": ca(
+            "list", ["Dana Ruiz", "Priya Shah"], find_all=["Dana Ruiz", "Priya Shah"]
+        )
+    }
+    extractor = make_extractor([Notes], script, verify=DEFAULTS)
+    result = await extractor.ainvoke(text)
+    (record,) = result.records
+    assert record.value is not None
+    assert record.value.contacts == ["Dana Ruiz", "Priya Shah"]  # type: ignore[attr-defined]
+    last = script.calls("attribution")[-1][1]["questions"]["attr.contacts.1"]
+    assert last["instructions"].startswith(f'Reading the passage "{text}" of `input`: ')
+
+
+def test_the_second_look_quotes_the_clause_of_the_value_not_the_whole_sentence() -> (
+    None
+):
+    from trustcall_system_one._verify import _passage
+
+    text = (
+        "Hi Sam, it's Ines about order SO-10442. Please add two more of the blue "
+        "mugs and drop the quantity of the tea towels to 1. Thanks!"
+    )
+    two = text.index("two")
+    one = text.index(" 1.") + 1
+    assert _passage(text, (two, two + 3)) == "Please add two more of the blue mugs"
+    assert _passage(text, (one, one + 1)) == "drop the quantity of the tea towels to 1."
+    assert _passage(text, None) is None
+    short = "Yes. Ok."
+    assert _passage(short, (0, 3)) == "Yes."  # a clause without substance is not cut
+
+
+async def test_a_new_line_whose_quantity_is_asked_for_gets_a_second_look() -> None:
+    """order_line_items (live 5): "add two more of the blue mugs", a line that is not
+    there yet; the quantity scored 0.4793 and was dropped after an identical re-check.
+    The ask-for question applies (an add, not a replace) and the second look quotes
+    the clause about the mugs."""
+
+    class Line(BaseModel):
+        name: str
+        quantity: int = Field(description="number of units ordered")
+
+    text = (
+        "Please add two more of the blue mugs and drop the quantity of the tea "
+        "towels to 1."
+    )
+    script = Script()
+    script.clairic = {
+        "name": ca("text", "blue mugs", find="blue mugs"),
+        "quantity": ca("number", 2, find="two"),
+    }
+    script.attribution = {"attr.quantity": [0.4793, 0.9]}
+    script.reask = {"quantity": ca("number", 2, find="two")}
+    extractor = make_extractor([Line], script, verify=DEFAULTS)
+    result = await extractor.ainvoke(text)
+    (record,) = result.records
+    assert record.valid and record.after == {"name": "blue mugs", "quantity": 2}
+    first, second = [
+        c[1]["questions"]["attr.quantity"]["instructions"]
+        for c in script.calls("attribution")
+        if "attr.quantity" in c[1]["questions"]
+    ]
+    assert first == (
+        "Does `input` ask for 2 of `entity.label` (as the number of units ordered)?"
+    )
+    assert second == (
+        'Reading the passage "Please add two more of the blue mugs" of `input`: '
+        + first
+    )
+    assert "relative_edit" not in kinds(script.transport)  # an add, never a replace

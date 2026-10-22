@@ -20,6 +20,7 @@ from trustcall_system_one import (
     One,
     RepairConfig,
     ResultRecord,
+    VerifyConfig,
     create_extractor,
 )
 from trustcall_system_one.testing import FakeTransport, FakeWorld, route
@@ -963,8 +964,8 @@ async def test_the_identity_guard_refuses_one_items_update_only() -> None:
     assert record.after["items"][1] == ORDER["items"][1]  # the tea towels: untouched
 
 
-async def test_two_more_of_an_existing_line_is_read_as_the_stated_value() -> None:
-    """Relative edits are not supported: nothing is computed from the old value."""
+async def test_two_more_of_an_existing_line_is_refused_not_written_as_two() -> None:
+    """A relative edit loses data when written as a value: 4 + 2 is not 2."""
     text = "Order SO-10442: Ines wants two more of the tea towels."
     world = FakeWorld(text)
     world.entity(
@@ -973,11 +974,46 @@ async def test_two_more_of_an_existing_line_is_read_as_the_stated_value() -> Non
         mentions=["SO-10442"],
         fields={"order_id": "SO-10442"},
     )
-    add_line(world, "tea towels", "Tea towels", quantity=2)  # what the text states
+    add_line(world, "tea towels", "Tea towels", quantity=2)  # the model reads "two"
     result = await update_order(world)
     (record,) = result.records
-    # 4 + 2 = 6 is NOT computed: the extraction reads "two", and the gate decides
+    assert ops(record) == []  # neither 6 (computed) nor 2 (the stated number)
+    assert record.after is not None
+    assert record.after["items"][1]["quantity"] == ORDER["items"][1]["quantity"]
+    (refused,) = [r for r in record.rejected if r.reason == "relative_edit_unsupported"]
+    assert refused.path == "/items/1/quantity" and refused.op == "replace"
+    assert "relative" in refused.detail and refused.p is not None
+
+
+async def test_a_stated_quantity_is_written_even_if_the_line_has_one() -> None:
+    text = "Order SO-10442: Ines wants the tea towels at 2, not more."
+    world = FakeWorld(text)
+    world.entity(
+        "the Order",
+        schema=Order,
+        mentions=["SO-10442"],
+        fields={"order_id": "SO-10442"},
+    )
+    add_line(world, "tea towels", "Tea towels", quantity=2)
+    result = await update_order(world)
+    (record,) = result.records
     assert ops(record) == [("replace", "/items/1/quantity", 2)]
+
+
+async def test_the_relative_edit_check_can_be_switched_off() -> None:
+    text = "Order SO-10442: Ines wants two more of the tea towels."
+    world = FakeWorld(text)
+    world.entity(
+        "the Order",
+        schema=Order,
+        mentions=["SO-10442"],
+        fields={"order_id": "SO-10442"},
+    )
+    add_line(world, "tea towels", "Tea towels", quantity=2)
+    result = await update_order(world, verify=VerifyConfig(relative_edit=0))
+    (record,) = result.records
+    assert ops(record) == [("replace", "/items/1/quantity", 2)]
+    assert "relative_edit" not in [c[2].kind for c in world.transport().calls]
 
 
 async def test_an_error_the_record_already_had_is_not_the_updates_to_repair() -> None:

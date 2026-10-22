@@ -40,6 +40,7 @@ from trustcall_system_one._coref import (
     identity_compatible,
     name_tokens,
     nicknames,
+    strong_compatible,
 )
 from trustcall_system_one._errors import AmbiguousMatchError
 from trustcall_system_one._render import estimate_tokens
@@ -672,23 +673,27 @@ def _compatible_top(
     answer: MatchAnswer,
     pick: str,
 ) -> bool:
-    """Whether a name-compatible record that is Clef's top choice is enough.
+    """Whether a name-compatible record that is Clef's clear top choice is enough.
 
     Clef's choice ``confidence`` is not the probability of the chosen option (live:
     p 0.84 with confidence 0.47), and a record whose identity is a form of the
     entity's own name (``identity_compatible``) is the strongest evidence there is
-    that it is the one. So when the pick is a record, it is Clef's own top option,
-    it is the ONLY record any of the entity's mentions fits, and its probability is
-    at least ``match.accept_compatible``, the entity is matched without the
-    ``match.min_confidence`` floor. Everything else (the assignment, the identity
-    conflict guard) is unchanged.
+    that it is the one. So when the pick is a record, its probability is at least
+    ``match.accept_compatible`` and beats every other option (``__new__`` and the
+    runner-up) by ``match.compatible_margin``, it is the ONLY record any of the
+    entity's mentions fits, and the fit stands on its own (``strong_compatible``: a
+    mention of two words or more, or one that is a word or diminutive of the
+    record's identity; "Dan" is no more than the start of "Daniela"), the entity is
+    matched without the ``match.min_confidence`` floor. Everything else (the
+    assignment, the identity conflict guard) is unchanged.
     """
     if pick == NEW or not answer.probs or pick not in ids:
         return False
     here = answer.p(pick)
     rivals = [p for option, p in answer.probs.items() if option != pick]
-    if here < config.accept_compatible or any(p >= here for p in rivals):
-        return False  # not above every other option: not Clef's top choice
+    rivals.append(answer.p(NEW))
+    if here < config.accept_compatible or here - max(rivals) < config.compatible_margin:
+        return False  # not clearly above every other option
     mentions = [info.label, *(m.text for m in info.mentions)]
     fits = [
         index
@@ -699,7 +704,13 @@ def _compatible_top(
             for value in values
         )
     ]
-    return len(fits) == 1 and ids[fits[0]] == pick
+    if len(fits) != 1 or ids[fits[0]] != pick:
+        return False
+    return any(
+        strong_compatible(mention, value)
+        for mention in mentions
+        for value in matcher._values[fits[0]]
+    )
 
 
 async def match_entities(
