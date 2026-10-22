@@ -569,6 +569,10 @@ class CorefConfig:
             clusters) at or above which two mentions or clusters are one entity.
         max_pairwise_mentions: Largest number of mentions ``"auto"`` clusters
             pairwise.
+        all_pairs_below: Up to this many mentions EVERY pair is asked about. Above
+            it only plausible pairs are (a shared name token, a short form, a
+            diminutive such as Bob and Robert, mentions close to each other, a
+            description); an unasked pair is "not asked", never a "no".
         context_chars: Characters of the input kept on each side of a mention in
             the state of a coreference question.
     """
@@ -577,6 +581,7 @@ class CorefConfig:
     merge_threshold: float = 0.5
     max_pairwise_mentions: int = 60
     context_chars: int = 120
+    all_pairs_below: int = 24
 
     def __post_init__(self) -> None:
         """Validate every setting."""
@@ -588,3 +593,4 @@ class CorefConfig:
         _check_unit("merge_threshold", self.merge_threshold)
         _check_int("max_pairwise_mentions", self.max_pairwise_mentions, 2)
         _check_int("context_chars", self.context_chars, 0)
+        _check_int("all_pairs_below", self.all_pairs_below, 0)

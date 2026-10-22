@@ -259,7 +259,8 @@ every entity: a `Many(S)` WITH existing records of S raises `NotImplementedError
 does too); an `"__any__"` record is never claimed by a `Many` (it stays in `untouched`, with a
 warning). Settings: `DiscoveryConfig(presence_absent=0.2, presence_present=0.5,
 count_trust_max=10, broaden_on_count_mismatch=True)` and `CorefConfig(strategy="auto",
-merge_threshold=0.5, max_pairwise_mentions=60, context_chars=120)`, passed to
+merge_threshold=0.5, max_pairwise_mentions=60, context_chars=120,
+all_pairs_below=24)`, passed to
 `create_extractor(discovery=, coref=)`. `Many.label` is what prompts call an entity (default the
 schema title: "Person").
 
@@ -273,7 +274,9 @@ schema title: "Person").
    only):
    * presence, Clef `noul` (kind `presence`, id `presence`): "Does `input` mention any {Person}
      ({description})?"; `p < presence_absent` → zero entities and no further call (the other two
-     requests are already in flight); `presence_absent ≤ p < presence_present` → proceed only if
+     requests are already in flight), unless the question had to be cut to the Clef budget (it then
+     reads only the start of the input) and discovery found mentions: the answer is ignored with a
+     `presence_unreliable` warning; `presence_absent ≤ p < presence_present` → proceed only if
      discovery found mentions;
    * discovery, Clairic `list` of `text` (kind `discover`, field `mentions`; state
      `<focus schema="Person" task="discover">…</focus><input>…</input>`): "Every mention of a
@@ -290,20 +293,26 @@ schema title: "Person").
      demonstrative (the/a/an/this/that/these/those), or a capitalised one when what follows is a
      common phrase ("The cousin"): before a capitalised name it is part of it ("The Hague", "An
      Nguyen", "This Is Us"); a descriptive "my cousin" stays. Of two overlapping mentions the
-     longer wins only if it contains exactly one of them: a span that bridges two mentions ("Emma's
-     brother Tom" over "Emma" and "Tom") replaces neither. Result: `Mention(text, span)` in input
+     longer wins when it contains exactly one of them, or when it is ONE name that several of them
+     quote (only whitespace, punctuation, initials or capitalised words between the parts: "Emma
+     Thompson" over "Emma" and "Thompson", "Mary Ann Smith" over "Mary" and "Smith"); a span that
+     bridges separate mentions through lower-case or possessive words ("Emma's brother Tom" over
+     "Emma" and "Tom") replaces neither. Result: `Mention(text, span)` in input
      order;
    * count, Clairic `number` with `integer: true` (kind `count`, field `count`, same state): "How
      many distinct {Person}s does the input mention?". A truncated or null answer means "no
      count" (`count_unreliable` warning when truncated).
 3. **Coreference (`_coref.py`):** unit is the mention, not the surface form. Strategy
-   `pairwise`: one Clef `noul` per PLAUSIBLE mention pair (kind `coref`, id `pair.m{i}.m{j}`,
-   i < j, "Do `mentions.m{i}` and `mentions.m{j}` refer to the same {Person}?", criteria
-   true/false). A pair is plausible when the mentions share a name token, one token starts another
-   ("Ann", "Anne"), one is the initials of the other ("JS", "J. Smith"), or either side is a
-   description with no name ("my cousin"); every other pair ("Emma Thompson", "Michael Chen") is
-   taken as 0 without asking (a debug log counts them), which is also why a nickname that shares
-   nothing with the name ("Bob" for "Robert Smith") is never joined by coreference. At most 64
+   `pairwise`: one Clef `noul` per mention pair (kind `coref`, id `pair.m{i}.m{j}`, i < j,
+   "Do `mentions.m{i}` and `mentions.m{j}` refer to the same {Person}?", criteria true/false). Up to
+   `all_pairs_below` (24) mentions EVERY pair is asked (at most 276 pairs, 5 requests). Above that
+   only plausible pairs are: the mentions share a name token, one token starts another ("Ann",
+   "Anne"), two tokens are forms of one given name (a small built-in table: Bob/Robert,
+   Liz/Elizabeth, Bill/William, Peggy/Margaret, Tom/Thomas …), one is the initials of the other
+   ("JS", "J. Smith"), a single name stands within ~200 characters (or the same sentence) of a
+   longer one, or either side is a description with no name ("my cousin"). A pair that is not asked
+   is "not asked", never a "no": it stays out of the pair cache (a debug log counts them), the
+   clustering treats it as 0, and a count-driven merge can still check it (step 5). At most 64
    questions per request, the requests concurrent, each with its own structured state
    `{"input", "mentions": {"m0": {"text", "span", "context"}, …}}` that holds only the mentions its
    questions name (context = ±`context_chars` of the input; the input is narrowed to windows
@@ -311,12 +320,15 @@ schema title: "Person").
    the two clusters with the highest average pairwise probability merge first, ties go to the
    lowest first-mention index, so A~B 0.9, B~C 0.9, A~C 0.05 gives {A, B}, {C}. Strategy
    `incremental`: the mentions after the first are walked in order in batches of 16; a batch is ONE
-   request of Clef `choice` questions (id `assign.m{k}`, state `{"input", "mentions": {"m{k}": …}}`
-   with the batch's mentions) over the clusters as they were when the batch started (`c{n}`:
-   "Emma Thompson: mentioned as "Emma Thompson" (0-13), …") plus `__new__`, all questions with the same
-   options; a mention joins a cluster only if its option has probability ≥ `merge_threshold`, else it
-   starts one, and the mentions of one batch that started clusters are then compared with each other
-   pairwise (the same plausible-pair questions). More than 254 clusters show the 254 most recently
+   request of Clef `choice` questions (id `assign.m{k}`, state `{"input", "mentions": {"m{k}": …},
+   "clusters": {"c{n}": {"label", "mentions": [up to 3 with spans]}, …}}`: each earlier entity is
+   described once, in `clusters`, and the options are only `c{n}: <label>` plus `__new__`), over the
+   clusters as they were when the batch started, all questions with the same options; a mention joins
+   a cluster only if its option has probability >= `merge_threshold`, else it starts one, and the
+   mentions of one batch that started clusters are then compared with each other pairwise (the same
+   rules for which pairs are asked; only these intra-batch pairs reach the pair cache, mentions of
+   different batches are never compared, so a count-driven merge check may ask about them). More
+   than 254 clusters show the 254 most recently
    MENTIONED (`coref_options_capped` warning). `strategy="auto"` is pairwise up to
    `max_pairwise_mentions` (60) mentions and incremental above; `"pairwise"` and `"incremental"`
    force it. Canonical label: a name beats a description (`name_part`: a capitalised start; a
@@ -325,9 +337,10 @@ schema title: "Person").
    framing, the stored identity value is extracted like any field. Pair probabilities are cached, so
    the broadened re-discovery asks only about pairs that involve a new mention.
 4. **Qualification:** one Clef `noul` per entity (kind `qualify`, id `qualify.e{n}`), all entities in
-   ONE request per schema (at most 64 questions per request) over the shared state `{"input",
-   "entities": {"e0": {"label", "mentions": [{"text", "span"}]}, …}}` (the spans are left out of a
-   state whose input was narrowed); the call carries no entity key, since the numbering changes
+   ONE request per schema up to 64 questions (beyond that one request per 64 entities, each state
+   holding only its own entities) over the state `{"input", "entities": {"e0": {"label",
+   "mentions": [{"text", "span", "context"}]}, …}}` (a state whose input was narrowed carries
+   `{"text", "context"}` without spans; `context` only for the first 8 and last 2 mentions); the call carries no entity key, since the numbering changes
    with a broadened discovery or a merge: "Is `entities.e{n}.label` a {Person} ({description})?". `< 0.5` →
    `SkippedEntity(reason="not_qualified")` ("Sunny", a dog, for `Person`); a missing answer
    qualifies. Qualification runs BEFORE the count comparison, so "k" is the number of entities
@@ -341,7 +354,8 @@ schema title: "Person").
      for the new clusters; if `n > k` still, warning `count_exceeds_discovered` (an entity is never
      invented);
    * `n < k`: cluster-level merge checks for every pair of qualifying clusters whose best
-     pairwise probability is ≥ 0.2 (needs the pairwise strategy): one Clef `noul` each (kind
+     ASKED pairwise probability is ≥ 0.2 or that were never asked about (an unasked pair is not a
+     "no"; needs the pairwise or incremental strategy): one Clef `noul` each (kind
      `coref`, id `merge`, state `{"input", "a": {"label", "mentions"}, "b": {…}}`, "Do `a` and
      `b` refer to the same {Person}?"), run together; pairs at ≥ `merge_threshold` are approved, and
      the highest probability first two sets of clusters are joined, until `k == n`, only if EVERY

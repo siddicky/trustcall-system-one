@@ -355,6 +355,7 @@ def test_coref_defaults_and_value_semantics() -> None:
     config = CorefConfig()
     assert config.strategy == "auto" and config.merge_threshold == 0.5
     assert config.max_pairwise_mentions == 60 and config.context_chars == 120
+    assert config.all_pairs_below == 24
     with pytest.raises(dataclasses.FrozenInstanceError):
         config.strategy = "pairwise"  # type: ignore[misc]
     assert hash(config) == hash(CorefConfig())
@@ -372,6 +373,9 @@ def test_coref_defaults_and_value_semantics() -> None:
         {"max_pairwise_mentions": "150"},
         {"context_chars": -1},
         {"context_chars": 1.5},
+        {"all_pairs_below": -1},
+        {"all_pairs_below": 2.5},
+        {"all_pairs_below": True},
     ],
 )
 def test_coref_settings_are_validated(kwargs: dict[str, Any]) -> None:
@@ -382,4 +386,4 @@ def test_coref_settings_are_validated(kwargs: dict[str, Any]) -> None:
 def test_coref_accepts_every_strategy_and_a_zero_context() -> None:
     for strategy in ("pairwise", "incremental", "auto"):
         CorefConfig(strategy=strategy)
-    CorefConfig(context_chars=0, merge_threshold=1.0)
+    CorefConfig(context_chars=0, merge_threshold=1.0, all_pairs_below=0)

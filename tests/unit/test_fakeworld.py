@@ -276,17 +276,33 @@ async def test_a_coref_fault_changes_one_pair_in_either_order() -> None:
 
 async def test_an_assignment_picks_the_cluster_of_the_same_entity() -> None:
     world = people()
-    first = mention_entry("Emma Thompson")
-    options = {
-        "c0": f'Emma Thompson: mentioned as "Emma Thompson" ({first["span"][0]}-'
-        f"{first['span'][1]})",
-        "c1": 'Michael Chen: mentioned as "Michael Chen" (58-70)',
-        "__new__": "none of them",
-    }
-    # one request assigns a batch of mentions, which share one state
+    options = {"c0": "Emma Thompson", "c1": "Michael Chen", "__new__": "none of them"}
+    # one request assigns a batch of mentions; the clusters are described once
     state = {
         "input": TEXT,
         "mentions": {"m2": mention_entry("Emma"), "m3": mention_entry("Sunny")},
+        "clusters": {
+            "c0": {
+                "label": "Emma Thompson",
+                "mentions": [
+                    {
+                        k: v
+                        for k, v in mention_entry("Emma Thompson").items()
+                        if k != "context"
+                    }
+                ],
+            },
+            "c1": {
+                "label": "Michael Chen",
+                "mentions": [
+                    {
+                        k: v
+                        for k, v in mention_entry("Michael Chen").items()
+                        if k != "context"
+                    }
+                ],
+            },
+        },
     }
     answers = await ask(
         world,

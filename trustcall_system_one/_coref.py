@@ -6,20 +6,25 @@ same text and may be two entities.
 
 Two strategies, picked by ``CorefConfig.strategy``:
 
-* ``pairwise``: one Clef ``noul`` per PLAUSIBLE pair of mentions (they share a
-  name token, one is a short form or the initials of the other, or one side is a
-  descriptive reference such as "my cousin"; every other pair is taken as 0
-  without asking). The questions go out in requests of at most 64, each with a
-  structured state ``{"input", "mentions": {"m0": {"text", "span", "context"}}}``
+* ``pairwise``: one Clef ``noul`` per pair of mentions; above
+  ``CorefConfig.all_pairs_below`` mentions only per PLAUSIBLE pair (they share a
+  name token, one is a short form, a nickname or the initials of the other, a
+  single name stands near a longer one, or one side is a descriptive reference
+  such as "my cousin"). A pair that is not asked is "not asked", never a "no": it
+  stays out of the pair cache, and a count-driven merge can still check it. The
+  questions go out in requests of at most 64, each with a structured state
+  ``{"input", "mentions": {"m0": {"text", "span", "context"}}}``
   that holds only the mentions its questions name; the requests run
   concurrently. The answers are clustered with average linkage, which settles
   inconsistent triangles (A~B 0.9, B~C 0.9, A~C 0.05 stays two entities because
   the average over ``{A, B}`` and ``{C}`` is below the threshold).
 * ``incremental``: the mentions are walked in order, in batches of 16: each batch
   is one request of Clef choices over the clusters that existed when it started
-  (plus ``__new__``), and the mentions of one batch that start new clusters are
-  then compared with each other pairwise. It needs about a request per 16
-  mentions, so ``auto`` switches to it for long lists.
+  (plus ``__new__``; each cluster is described once, in ``state.clusters``), and
+  the mentions of one batch that start new clusters are then compared with each
+  other pairwise. It needs about a request per 16 mentions, so ``auto`` switches
+  to it for long lists. Pairs of mentions from different batches are never
+  compared, so only the pairs inside a batch land in the pair cache.
 """
 
 import logging
@@ -46,8 +51,11 @@ __all__ = [
     "agglomerate",
     "canonical_label",
     "cluster_mentions",
+    "has_context",
     "mention_entry",
     "name_part",
+    "near",
+    "nicknames",
     "normalise",
     "ordered_pair",
     "plausible",
@@ -76,7 +84,9 @@ class Clustering:
         clusters: The clusters as tuples of indexes into the mention list, each
             in increasing order, the clusters ordered by their first mention.
         pairs: Probability that two mentions are the same entity, by the pair of
-            their indexes (smaller first); empty for the incremental strategy.
+            their indexes (smaller first), for the pairs that were asked; a pair
+            that is not here was not asked (not "no"). Empty for the incremental
+            strategy, apart from the pairs compared inside a batch.
         strategy: The strategy that ran.
     """
 
@@ -187,18 +197,97 @@ def _initials(tokens: Sequence[str]) -> str:
     return "".join(t[0] for t in tokens)
 
 
-def plausible(first: str, second: str) -> bool:
-    """Whether two mentions are worth asking about at all.
+_NICKNAMES = tuple(
+    frozenset(group.split())
+    for group in (
+        "robert rob bob bobby robbie",
+        "william will bill billy willy liam",
+        "elizabeth liz beth betty eliza lizzie liza",
+        "margaret maggie peggy meg marge margie",
+        "michael mike mickey mick",
+        "james jim jimmy jamie",
+        "katherine catherine kate katie kathy cathy kat",
+        "richard dick rick rich richie ricky",
+        "anthony tony",
+        "susan sue susie suzy",
+        "jennifer jen jenny",
+        "christopher chris",
+        "christine christina chris tina",
+        "alexander alex",
+        "alexandra alex",
+        "samuel sam",
+        "samantha sam",
+        "daniel dan danny",
+        "thomas tom tommy",
+        "joseph joe joey",
+        "nicholas nick",
+        "benjamin ben",
+        "matthew matt",
+        "edward ed eddie ted teddy",
+        "theodore ted theo",
+        "john jack johnny jon",
+        "jonathan jon",
+        "henry harry hank",
+        "charles charlie chuck",
+        "patricia pat patty trish",
+        "deborah debbie deb",
+        "rebecca becky becca",
+        "stephen steven steve",
+        "andrew andy drew",
+        "david dave",
+        "timothy tim",
+        "frederick fred freddie",
+        "gregory greg",
+        "joshua josh",
+        "kenneth ken kenny",
+        "lawrence larry",
+        "victoria vicky",
+        "abigail abby",
+        "dorothy dot dottie",
+        "eleanor ellie nell",
+        "nathaniel nate nat",
+        "peter pete",
+        "philip phil",
+        "ronald ron ronnie",
+        "walter walt wally",
+        "zachary zack zach",
+    )
+)
+"""Groups of English given names that are short forms of one another."""
+_NEAR_CHARS = 200
+_SENTENCE_END = re.compile(r"[.!?](?:\s|$)")
+
+
+def nicknames(first: str, second: str) -> bool:
+    """Whether two given names are forms of one name (``Bob`` and ``Robert``)."""
+    return any(first in group and second in group for group in _NICKNAMES)
+
+
+def near(source: str, first: Mention, second: Mention) -> bool:
+    """Whether two mentions stand in one sentence or within about 200 characters."""
+    if first.span is None or second.span is None:
+        return False
+    (_, a1), (b0, _) = sorted([first.span, second.span])
+    if b0 - a1 <= _NEAR_CHARS:
+        return True
+    return _SENTENCE_END.search(source, a1, b0) is None
+
+
+def plausible(first: str, second: str, *, near: bool = False) -> bool:
+    """Whether two mentions are worth asking about when not every pair is.
 
     They are when they share a name token ("Emma" and "Emma Thompson"), when one
-    token is the start of another ("Ann" and "Anne", "Em" and "Emma"), when one is
-    the initials of the other ("JS", "J. Smith" and "John Smith"), or when either
-    side only describes its entity ("my cousin" could be anyone). Everything else,
-    "Emma Thompson" and "Michael Chen", is not asked: the answer is no.
+    token is the start of another ("Ann" and "Anne", "Em" and "Emma"), when two
+    tokens are forms of one given name ("Bob" and "Robert"), when one is the
+    initials of the other ("JS", "J. Smith" and "John Smith"), when a single name
+    stands near a longer one (``near``: "Bob" in the sentence after "Robert
+    Smith"), or when either side only describes its entity ("my cousin" could be
+    anyone). Everything else, "Emma Thompson" and "Michael Chen", is not asked.
 
     Args:
         first: One mention as written.
         second: The other.
+        near: Whether the two stand in one sentence or within about 200 characters.
     """
     if name_part(first) is None or name_part(second) is None:
         return True
@@ -209,6 +298,10 @@ def plausible(first: str, second: str) -> bool:
         for y in b:
             if len(x) >= 2 and len(y) >= 2 and (x.startswith(y) or y.startswith(x)):
                 return True
+            if nicknames(x, y):
+                return True
+    if near and (len(a) == 1) != (len(b) == 1):
+        return True
     for short, full in ((a, b), (b, a)):
         letters = "".join(short)
         if len(short) == 1 and len(letters) >= 2 and letters == _initials(full):
@@ -273,6 +366,15 @@ def agglomerate(
 # --------------------------------------------------------------------------- #
 
 
+def has_context(index: int, total: int) -> bool:
+    """Whether the ``index``-th of ``total`` mentions of an entity shows its context.
+
+    Only the first 8 and the last 2 do: an entity mentioned dozens of times needs
+    no more to be told apart, and the state stays small.
+    """
+    return index < 8 or index >= total - 2
+
+
 def mention_entry(
     source: str, mention: Mention, context_chars: int
 ) -> dict[str, object]:
@@ -306,19 +408,25 @@ def ordered_pair(first: Mention, second: Mention) -> tuple[Mention, Mention]:
 
 
 def _state(
-    run: Run, source: str, shown: Mapping[int, Mention], key: str = "mentions"
+    run: Run,
+    source: str,
+    shown: Mapping[int, Mention],
+    clusters: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """A coreference state holding only the mentions ``shown`` (by index)."""
-    return run.clef_state(
-        source,
-        spans=_spans(list(shown.values())),
-        extra={
-            key: {
-                f"m{i}": mention_entry(source, m, run.coref.context_chars)
-                for i, m in shown.items()
-            }
-        },
-    )
+    """A coreference state holding only the mentions ``shown`` (by index).
+
+    ``clusters`` (incremental assignment) are the earlier entities the mentions are
+    matched with, each described once.
+    """
+    extra: dict[str, object] = {
+        "mentions": {
+            f"m{i}": mention_entry(source, m, run.coref.context_chars)
+            for i, m in shown.items()
+        }
+    }
+    if clusters is not None:
+        extra["clusters"] = dict(clusters)
+    return run.clef_state(source, spans=_spans(list(shown.values())), extra=extra)
 
 
 async def _pairwise(
@@ -330,24 +438,32 @@ async def _pairwise(
     schema: str,
     cache: PairCache,
 ) -> dict[tuple[int, int], float]:
-    """Ask about every plausible pair of mentions that the cache does not know."""
+    """Ask about the pairs of mentions that the cache does not know yet.
+
+    Up to ``coref.all_pairs_below`` mentions every pair is asked; above it only the
+    plausible ones. A pair that is not asked is left OUT of the cache and of the
+    result: it is "not asked", which is not a confident no.
+    """
     n = len(mentions)
+    everything = n <= run.coref.all_pairs_below
     missing: dict[str, tuple[int, int]] = {}
     unasked = 0
     for i in range(n):
         for j in range(i + 1, n):
-            key = ordered_pair(mentions[i], mentions[j])
-            if key in cache:
+            if ordered_pair(mentions[i], mentions[j]) in cache:
                 continue
-            if plausible(mentions[i].text, mentions[j].text):
+            if everything or plausible(
+                mentions[i].text,
+                mentions[j].text,
+                near=near(source, mentions[i], mentions[j]),
+            ):
                 missing[_pair_id(i, j)] = (i, j)
             else:
-                cache[key] = 0.0
                 unasked += 1
     if unasked:
         logger.debug(
-            "coref: %d of %d pairs of %s mentions share no name token, short form "
-            "or description and are taken as different entities without asking",
+            "coref: %d of %d pairs of %s mentions share no name token, short form, "
+            "nickname or neighbourhood and were not asked about",
             unasked,
             n * (n - 1) // 2,
             schema,
@@ -383,30 +499,27 @@ async def _pairwise(
         answers = {qid: answer for part in parts for qid, answer in part.items()}
         for qid, (i, j) in missing.items():
             answer = answers.get(qid)
-            # a question that came back unanswered does not merge anything
-            cache[ordered_pair(mentions[i], mentions[j])] = (
-                answer.noul if isinstance(answer, NoulAnswer) else 0.0
-            )
+            # a question that came back unanswered stays unknown
+            if isinstance(answer, NoulAnswer):
+                cache[ordered_pair(mentions[i], mentions[j])] = answer.noul
     return {
-        (i, j): cache[ordered_pair(mentions[i], mentions[j])]
+        (i, j): cache[key]
         for i in range(n)
         for j in range(i + 1, n)
+        if (key := ordered_pair(mentions[i], mentions[j])) in cache
     }
 
 
-def _describe(members: Sequence[Mention]) -> str:
-    shown = list(members)
-    gap = False
-    if len(shown) > 8:
-        shown, gap = [*shown[:4], *shown[-4:]], True
-    parts = [
-        f'"{m.text}"' + (f" ({m.span[0]}-{m.span[1]})" if m.span else "") for m in shown
-    ]
-    if gap:
-        parts.insert(4, "...")
-    return f"{canonical_label([m.text for m in members])}: mentioned as " + ", ".join(
-        parts
-    )
+def _cluster_entry(members: Sequence[Mention]) -> dict[str, object]:
+    """A cluster as the incremental state shows it: its label and up to 3 mentions."""
+    shown = list(members) if len(members) <= 3 else [*members[:2], members[-1]]
+    return {
+        "label": canonical_label([m.text for m in members]),
+        "mentions": [
+            {"text": m.text, "span": list(m.span)} if m.span else {"text": m.text}
+            for m in shown
+        ],
+    }
 
 
 def _decide(
@@ -422,7 +535,7 @@ def _decide(
 
 
 def _lookup_in(pairs: Mapping[tuple[int, int], float]) -> Callable[[int, int], float]:
-    return lambda i, j: pairs[(i, j)]
+    return lambda i, j: pairs.get((i, j), 0.0)
 
 
 async def _incremental(
@@ -446,18 +559,20 @@ async def _incremental(
             shown = sorted(shown, key=lambda c: max(clusters[c]))[-(_MAX_OPTIONS - 1) :]
             shown.sort()
             capped = True
-        criteria: dict[str, str | None] = {
-            f"c{c}": _describe([mentions[i] for i in clusters[c]]) for c in shown
+        described = {
+            f"c{c}": _cluster_entry([mentions[i] for i in clusters[c]]) for c in shown
         }
-        criteria[NEW] = (
-            f"A {noun} that none of the others is, one not mentioned before."
-        )
+        criteria: dict[str, str | None] = {
+            option: str(entry["label"]) for option, entry in described.items()
+        }
+        criteria[NEW] = f"A {noun} that none of the others is."
         questions = {
             f"assign.m{k}": ChoiceQuestion(
                 type="choice",
                 instructions=(
                     f"Which {noun} does `mentions.m{k}` refer to? Pick the earlier "
-                    f"{noun} it names, or {NEW} if it is a different {noun}."
+                    f"{noun} it names (see `clusters`), or {NEW} if it is a different "
+                    f"{noun}."
                 ),
                 criteria=criteria,
             )
@@ -465,7 +580,7 @@ async def _incremental(
         }
         answers = await run.call_clef(
             questions,
-            _state(run, source, {k: mentions[k] for k in batch}),
+            _state(run, source, {k: mentions[k] for k in batch}, described),
             meta=CallMeta(
                 kind="coref", schema=schema, field=f"m{batch[0]}-m{batch[-1]}"
             ),
@@ -523,7 +638,7 @@ async def cluster_mentions(
             not asked again, and new answers are added.
 
     Returns:
-        The clusters and, for the pairwise strategy, every pair probability.
+        The clusters and the probabilities of the pairs that were asked.
     """
     n = len(mentions)
     if n == 0:
@@ -553,5 +668,5 @@ async def cluster_mentions(
         schema=schema,
         cache=shared,
     )
-    groups = agglomerate(n, lambda i, j: pairs[(i, j)], config.merge_threshold)
+    groups = agglomerate(n, lambda i, j: pairs.get((i, j), 0.0), config.merge_threshold)
     return Clustering(tuple(tuple(g) for g in groups), pairs, "pairwise")

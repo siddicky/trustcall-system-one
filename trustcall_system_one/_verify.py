@@ -43,6 +43,7 @@ from trustcall_system_one._compile import (
     UnionGroup,
     render_instructions,
 )
+from trustcall_system_one._coref import has_context
 from trustcall_system_one._errors import StateTruncatedError
 from trustcall_system_one._render import (
     Focus,
@@ -312,15 +313,17 @@ class Ctx:
         if self.info is not None and self.info.mentions:
             context = self.run.coref.context_chars
             mentions = []
-            for m in self.info.mentions:
+            total = len(self.info.mentions)
+            for index, m in enumerate(self.info.mentions):
                 entry: dict[str, Any] = {"text": m.text}
                 if m.span is not None:
                     if spans:
                         entry["span"] = list(m.span)
-                    start, end = m.span
-                    entry["context"] = self.text[
-                        max(0, start - context) : end + context
-                    ]
+                    if has_context(index, total):  # the first 8 and the last 2
+                        start, end = m.span
+                        entry["context"] = self.text[
+                            max(0, start - context) : end + context
+                        ]
                 mentions.append(entry)
         return {"label": self.label, "mentions": mentions}
 
@@ -349,7 +352,9 @@ class Ctx:
             proposed_change: A change under review (updates).
         """
         shown = self.text if text is None else text
-        anchors = [*(spans or ()), *self.mention_spans()]
+        # spans are offsets in the whole input: there is nothing to anchor on in a
+        # text that was narrowed already
+        anchors = [*(spans or ()), *self.mention_spans()] if shown == self.text else []
         state = self.run.clef_state(
             shown,
             entity=self.entity_dict() if entity else None,
@@ -374,6 +379,18 @@ class Ctx:
         """
         return self.fitted(spans=spans, entity=self.info is not None)
 
+    def _nearest_mentions(self, spans: Sequence[Span]) -> list[Span]:
+        """For each span, the entity's mention closest to it."""
+        mentions = self.mention_spans()
+        if not mentions:
+            return []
+        return list(
+            dict.fromkeys(
+                min(mentions, key=lambda m: max(m[0] - span[1], span[0] - m[1], 0))
+                for span in spans
+            )
+        )
+
     def entity_state(
         self,
         narrow_to: list[Span] | None = None,
@@ -384,12 +401,12 @@ class Ctx:
 
         Args:
             narrow_to: Cut ``input`` to windows around these spans (an isolated
-                check; the entity's own mentions keep their windows too).
+                check; the entity's mention nearest to each keeps a window too).
             anchors: Spans to keep if the full input is over the Clef budget.
         """
         if not narrow_to:
             return self.fitted(spans=anchors)
-        keep = [*narrow_to, *self.mention_spans()]
+        keep = [*narrow_to, *self._nearest_mentions(narrow_to)]
         windows = mention_windows(len(self.text), keep, self.run.verify.window_chars)
         return self.fitted(narrow_text(self.text, windows))
 

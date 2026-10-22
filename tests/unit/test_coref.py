@@ -13,7 +13,10 @@ from trustcall_system_one._coref import (
     agglomerate,
     canonical_label,
     cluster_mentions,
+    has_context,
     name_part,
+    near,
+    nicknames,
     normalise,
     ordered_pair,
     plausible,
@@ -195,12 +198,14 @@ def by_span(
 
 
 async def test_a_request_holds_only_the_mentions_its_questions_name() -> None:
-    text = "Ann Lee met Ann. Anne Lee saw Bob Roe."
+    far = " ".join(["and so it went"] * 30)  # Bob Roe is nowhere near the Anns
+    text = f"Ann Lee met Ann. Anne Lee came. {far} Bob Roe waved."
     mentions = mentions_of(text, "Ann Lee", "Ann", "Anne Lee", "Bob Roe")
     truth = {0: "a", 1: "a", 2: "a", 3: "b"}
     index = {m.span: i for i, m in enumerate(mentions)}
     run = run_with(
-        by_span(lambda x, y: 0.96 if truth[index[x]] == truth[index[y]] else 0.03)
+        by_span(lambda x, y: 0.96 if truth[index[x]] == truth[index[y]] else 0.03),
+        all_pairs_below=0,  # only the plausible pairs
     )
     clustering = await cluster_mentions(
         run, source=text, mentions=mentions, noun="Person", schema="Person"
@@ -226,12 +231,12 @@ async def test_a_request_holds_only_the_mentions_its_questions_name() -> None:
     )
     assert set(first["criteria"]) == {"true", "false"}
     assert clustering.pairs[(0, 1)] == 0.96
-    assert clustering.pairs[(0, 3)] == 0.0  # not asked: nothing in common
+    assert (0, 3) not in clustering.pairs  # not asked: nothing in common
 
 
 async def test_pairs_that_cannot_be_the_same_entity_are_not_asked() -> None:
     mentions = mentions_of(SOURCE, "Ann", "Bob", "Ann", "Cy", "Bob")
-    run = run_with(by_span(lambda a, b: 0.96))
+    run = run_with(by_span(lambda a, b: 0.96), all_pairs_below=0)
     clustering = await cluster_mentions(
         run, source=SOURCE, mentions=mentions, noun="Person", schema="Person"
     )
@@ -322,7 +327,7 @@ async def test_more_than_64_questions_are_split_and_run_concurrently() -> None:
 
 async def test_pairs_already_asked_are_not_asked_again() -> None:
     mentions = mentions_of(SOURCE, "Ann", "Bob", "Ann", "Cy", "Bob")
-    run = run_with(by_span(lambda a, b: 0.03))
+    run = run_with(by_span(lambda a, b: 0.03), all_pairs_below=0)
     cache: dict[tuple[Mention, Mention], float] = {}
     await cluster_mentions(
         run,
@@ -332,7 +337,7 @@ async def test_pairs_already_asked_are_not_asked_again() -> None:
         schema="Person",
         cache=cache,
     )
-    assert len(cache) == 3
+    assert len(cache) == 1  # only the pair that was asked is known
     await cluster_mentions(
         run,
         source=SOURCE,
@@ -394,13 +399,11 @@ def assigner(
             who = truth[tuple(mentions[qid.removeprefix("assign.")]["span"])]
             options = list(question["criteria"])
             picked = NEW
-            for option, text in question["criteria"].items():
+            for option in question["criteria"]:
                 if option == NEW:
                     continue
-                spans = [
-                    (int(a), int(b)) for a, b in re.findall(r"\((\d+)-(\d+)\)", text)
-                ]
-                if any(truth[s] == who for s in spans):
+                held = payload["state"]["clusters"][option]["mentions"]
+                if any(truth[tuple(m["span"])] == who for m in held):
                     picked = option
             rest = (1 - p) / (len(options) - 1)
             answers[qid] = choice(
@@ -418,7 +421,9 @@ async def test_above_the_threshold_the_mentions_are_assigned_in_batches() -> Non
         for m, who in zip(mentions, ["ann", "bob", "ann", "cy", "bob"], strict=True)
         if m.span
     }
-    run = run_with(assigner(truth), max_pairwise_mentions=4)  # 5 mentions > 4
+    run = run_with(
+        assigner(truth), max_pairwise_mentions=4, all_pairs_below=0
+    )  # 5 mentions > 4
     clustering = await cluster_mentions(
         run, source=SOURCE, mentions=mentions, noun="Person", schema="Person"
     )
@@ -450,7 +455,7 @@ async def test_each_batch_sees_the_clusters_the_earlier_ones_made() -> None:
     text = " ".join(names)
     mentions = mentions_of(text, *names)
     truth = {m.span: m.text for m in mentions if m.span}
-    run = run_with(assigner(truth), strategy="incremental")
+    run = run_with(assigner(truth), strategy="incremental", all_pairs_below=0)
     result = await cluster_mentions(
         run, source=text, mentions=mentions, noun="Person", schema="Person"
     )
@@ -513,7 +518,7 @@ async def test_the_options_are_capped_at_255_with_the_latest_mentioned() -> None
             answers[qid] = choice(NEW, {o: (1.0 if o == NEW else 0.0) for o in options})
         return clef_response(answers, model=payload["model"])
 
-    run = run_with(handler, strategy="incremental")
+    run = run_with(handler, strategy="incremental", all_pairs_below=0)
     result = await cluster_mentions(
         run, source=text, mentions=mentions, noun="Person", schema="Person"
     )
@@ -522,3 +527,124 @@ async def test_the_options_are_capped_at_255_with_the_latest_mentioned() -> None
     last = seen[-1]
     assert "c256" in last and "c0" not in last  # the oldest mention dropped out
     assert any("coref_options_capped" in w for w in run.warnings)
+
+
+# --------------------------------------------------------------------------- #
+# Which pairs are asked
+# --------------------------------------------------------------------------- #
+
+
+def test_nicknames_are_forms_of_one_name() -> None:
+    assert nicknames("bob", "robert") and nicknames("robert", "rob")
+    assert nicknames("liz", "elizabeth") and nicknames("peggy", "margaret")
+    assert nicknames("tom", "thomas") and nicknames("chris", "christine")
+    assert not nicknames("bob", "william") and not nicknames("emma", "emma")
+
+
+def test_a_nickname_makes_a_pair_plausible_however_far_apart() -> None:
+    assert plausible("Bob", "Robert Smith") and plausible("Robert Smith", "Bob")
+    assert plausible("Liz", "Elizabeth Warren")
+    assert plausible("Bill", "William")  # two single names
+    assert not plausible("Bob", "Michael Chen")
+    assert not plausible("Zed", "Robert Smith")
+
+
+def test_a_single_name_near_a_longer_one_is_plausible() -> None:
+    assert not plausible("Zed", "Robert Smith")
+    assert plausible("Zed", "Robert Smith", near=True)
+    assert not plausible("Zed Roe", "Robert Smith", near=True)  # both long
+    assert not plausible("Zed", "Ann", near=True)  # both single
+
+
+def test_near_is_one_sentence_or_about_200_characters() -> None:
+    far = "x " * 150
+    text = f"Robert Smith is my uncle. {far}. Bob loves sailing. Zed Roe came."
+    smith = Mention("Robert Smith", (0, 12))
+    bob = Mention("Bob", (text.index("Bob"), text.index("Bob") + 3))
+    assert not near(text, smith, bob)  # a sentence break and over 200 characters
+    assert near("Robert Smith spoke. Bob listened.", smith, Mention("Bob", (20, 23)))
+    same_sentence = "Robert Smith, " + "x " * 150 + "and Bob came."
+    at = same_sentence.index("Bob")
+    assert near(same_sentence, smith, Mention("Bob", (at, at + 3)))  # no break
+    assert not near(text, smith, Mention("Bob"))  # no span, no answer
+
+
+async def test_up_to_the_threshold_every_pair_is_asked() -> None:
+    names = [f"Ab{chr(97 + i // 26)}{chr(97 + i % 26)}" for i in range(24)]
+    text = " ".join(names)
+    mentions = mentions_of(text, *names)
+    run = run_with(by_span(lambda a, b: 0.03))  # all_pairs_below defaults to 24
+    result = await cluster_mentions(
+        run, source=text, mentions=mentions, noun="Person", schema="Person"
+    )
+    transport = run.transport
+    assert isinstance(transport, FakeTransport)
+    sizes = sorted(len(p["questions"]) for _, p, _ in transport.calls)
+    assert sum(sizes) == 276 and sizes == [20, 64, 64, 64, 64]  # 5 requests
+    assert len(result.pairs) == 276 and len(result.clusters) == 24
+
+
+async def test_above_the_threshold_only_plausible_pairs_are_asked() -> None:
+    names = [f"Ab{chr(97 + i // 26)}{chr(97 + i % 26)}" for i in range(25)]
+    text = " ".join(names)
+    mentions = mentions_of(text, *names)
+    run = run_with(by_span(lambda a, b: 0.03))
+    result = await cluster_mentions(
+        run, source=text, mentions=mentions, noun="Person", schema="Person"
+    )
+    transport = run.transport
+    assert isinstance(transport, FakeTransport)
+    assert transport.calls == []  # no two share anything
+    assert result.pairs == {} and len(result.clusters) == 25
+
+
+async def test_the_threshold_is_configurable() -> None:
+    mentions = mentions_of(SOURCE, "Ann", "Bob", "Cy")
+    run = run_with(by_span(lambda a, b: 0.03), all_pairs_below=2)  # 3 mentions
+    await cluster_mentions(
+        run, source=SOURCE, mentions=mentions, noun="Person", schema="Person"
+    )
+    transport = run.transport
+    assert isinstance(transport, FakeTransport)
+    assert transport.calls == []
+
+
+async def test_a_nickname_is_asked_about_far_above_the_threshold() -> None:
+    far = " ".join(["and so it went"] * 40)
+    text = f"Elizabeth Warren spoke. {far} Later Liz left. {far} Zed Roe came."
+    mentions = mentions_of(text, "Elizabeth Warren", "Liz", "Zed Roe")
+    asked: list[str] = []
+
+    def handler(model: str, payload: Body, meta: CallMeta) -> Any:
+        asked.extend(payload["questions"])
+        return by_span(lambda a, b: 0.96 if a == mentions[0].span else 0.03)(
+            model, payload, meta
+        )
+
+    run = run_with(handler, all_pairs_below=0)
+    result = await cluster_mentions(
+        run, source=text, mentions=mentions, noun="Person", schema="Person"
+    )
+    assert asked == ["pair.m0.m1"]  # Liz and Elizabeth; Zed Roe is far from both
+    assert result.clusters == ((0, 1), (2,))
+
+
+async def test_a_pair_that_was_not_asked_is_not_in_the_cache() -> None:
+    mentions = mentions_of(SOURCE, "Ann", "Bob", "Ann")
+    run = run_with(by_span(lambda a, b: 0.96), all_pairs_below=0)
+    cache: dict[tuple[Mention, Mention], float] = {}
+    await cluster_mentions(
+        run,
+        source=SOURCE,
+        mentions=mentions,
+        noun="Person",
+        schema="Person",
+        cache=cache,
+    )
+    assert list(cache.values()) == [0.96]  # Ann~Ann; nothing stands for Ann~Bob
+
+
+def test_only_the_first_eight_and_the_last_two_mentions_show_a_context() -> None:
+    shown = [i for i in range(12) if has_context(i, 12)]
+    assert shown == [0, 1, 2, 3, 4, 5, 6, 7, 10, 11]
+    assert all(has_context(i, 5) for i in range(5))

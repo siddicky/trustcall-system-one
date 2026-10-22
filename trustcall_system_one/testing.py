@@ -594,8 +594,8 @@ class FakeWorld:
       the schema, or the ``count()`` override.
     * ``coref`` (Clef): ``pair.m{i}.m{j}`` over ``state.mentions`` (each with a
       ``span``) is 0.96 if both mentions belong to one world entity, else 0.03;
-      ``assign.m{k}`` (choice over ``c{n}`` clusters described with
-      ``(start-end)`` spans, plus ``__new__``; the mention is
+      ``assign.m{k}`` (choice over ``c{n}`` clusters, each described once in
+      ``state.clusters.c{n}.mentions`` with spans, plus ``__new__``; the mention is
       ``state.mentions.m{k}``, a request holds a batch of them) picks the cluster of
       the same entity or ``__new__``; ``merge`` over ``state.a`` and ``state.b`` is
       0.96 only if EVERY mention on both sides belongs to one entity, else 0.03.
@@ -1170,14 +1170,12 @@ class FakeWorld:
                 )
                 options = dict(question["criteria"])
                 chosen = "__new__"
-                for option, text in options.items():
+                for option in options:
                     if option == "__new__":
                         continue
-                    for a, b in re.findall(r"\((\d+)-(\d+)\)", str(text)):
-                        if self._owner((int(a), int(b))) is owner:
-                            chosen = option
-                            break
-                    if chosen != "__new__":
+                    held = state["clusters"][option]["mentions"]
+                    if any(self._owner_of_entry(m) is owner for m in held):
+                        chosen = option
                         break
                 answers[qid] = _pick(chosen, list(options), 0.95)
             elif qid == "merge":

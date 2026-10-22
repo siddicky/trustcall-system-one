@@ -3,7 +3,6 @@
 # ruff: noqa: UP045 - the schemas deliberately spell Optional
 
 import asyncio
-import json
 from collections import Counter
 from typing import Any, Optional
 
@@ -392,7 +391,7 @@ async def test_the_call_sequence_of_the_readme_people() -> None:
         "presence": 1,
         "discover": 1,
         "count": 1,
-        "coref": 1,  # 7 mentions: only the two plausible pairs are asked
+        "coref": 1,  # 7 mentions: every pair, 21 questions, in one request
         "qualify": 1,  # every entity, Sunny included, in one request
         "extract": 4,  # one per qualifying entity
         "attribution": 4,
@@ -401,7 +400,8 @@ async def test_the_call_sequence_of_the_readme_people() -> None:
     assert sorted(first) == ["count", "discover", "presence"]  # the parallel step
     assert kinds(result)[3:5] == ["coref", "qualify"]
     ((_, coref, _),) = of_kind(world, "coref")
-    assert sorted(coref["questions"]) == ["pair.m0.m2", "pair.m4.m5"]  # Emma, Sarah
+    # 7 mentions: up to 24 EVERY pair is asked (21), in one request
+    assert len(coref["questions"]) == 21
     assert len(result.calls) == 13
 
 
@@ -814,10 +814,15 @@ async def test_the_incremental_strategy_finds_the_same_entities() -> None:
     assert labels(result) == ["Emma Thompson", "Michael Chen", "Sarah", "Olivia Davis"]
     coref = of_kind(world, "coref")
     # one request assigns mentions 1 to 6; the mentions that start new clusters
-    # are then compared with each other (the two Sarahs)
+    # (five of them) are then compared with each other, all 10 pairs, because
+    # there are few; the two Sarahs are among them
     assert [c[2].field for c in coref] == ["m1-m6", None]
     assert sorted(coref[0][1]["questions"]) == [f"assign.m{k}" for k in range(1, 7)]
-    assert sorted(coref[1][1]["questions"]) == ["pair.m2.m3"]
+    assert len(coref[1][1]["questions"]) == 10
+    assert "pair.m2.m3" in coref[1][1]["questions"]
+    # the clusters are described once, in the state, and the options are labels
+    assert coref[0][1]["state"]["clusters"]["c0"]["label"] == "Emma Thompson"
+    assert coref[0][1]["questions"]["assign.m1"]["criteria"]["c0"] == "Emma Thompson"
 
 
 async def test_auto_switches_to_incremental_above_the_threshold() -> None:
@@ -1350,10 +1355,11 @@ def test_a_broadened_mention_only_adds_what_overlaps_nothing() -> None:
         Mention("Emma Thompson", (0, 13)),  # contains one, still overlaps it
         Mention("My neighbour", (31, 43)),
     ]
-    merged = _union(first, wide)
+    text = "Emma's brother Tom visited us. My neighbour waved."
+    merged = _union(first, wide, text)
     assert [m.text for m in merged] == ["Emma", "Tom", "My neighbour"]
-    assert _union(first, []) == first
-    assert _union([], wide[:1]) == wide[:1]
+    assert _union(first, [], text) == first
+    assert _union([], wide[:1], text) == wide[:1]
 
 
 def test_among_the_additions_a_bridging_span_still_replaces_neither() -> None:
@@ -1362,7 +1368,7 @@ def test_among_the_additions_a_bridging_span_still_replaces_neither() -> None:
         Mention("Ann Lee", (0, 7)),
         Mention("Bob", (12, 15)),
     ]
-    assert [m.text for m in _union([], wide)] == ["Ann Lee", "Bob"]
+    assert [m.text for m in _union([], wide, "Ann Lee and Bob")] == ["Ann Lee", "Bob"]
 
 
 def test_one_discovery_list_with_a_bridging_item_keeps_the_two_it_bridges() -> None:
@@ -1786,9 +1792,345 @@ async def test_qualification_is_split_at_64_entities_per_request() -> None:
     assert len(result.records) == 70
     sizes = sorted(len(p["questions"]) for _, p, _ in of_kind(world, "qualify"))
     assert sizes == [6, 64]
-    # one shared state: every entity, whichever request asks about it
-    states = {
-        json.dumps(p["state"], sort_keys=True) for _, p, _ in of_kind(world, "qualify")
-    }
-    assert len(states) == 1
-    assert len(next(iter(of_kind(world, "qualify")))[1]["state"]["entities"]) == 70
+    # each request carries only the entities it asks about
+    for _, payload, _ in of_kind(world, "qualify"):
+        asked = {q.removeprefix("qualify.") for q in payload["questions"]}
+        assert set(payload["state"]["entities"]) == asked
+    assert (
+        sum(len(p["state"]["entities"]) for _, p, _ in of_kind(world, "qualify")) == 70
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Review fixes: nicknames, name parts, a truncated presence question
+# --------------------------------------------------------------------------- #
+
+UNCLE = "Robert Smith is my uncle. Bob loves sailing."
+
+
+def uncle_world() -> FakeWorld:
+    world = FakeWorld(UNCLE)
+    world.entity(
+        "Robert Smith",
+        schema=Person,
+        mentions=["Robert Smith", "Bob"],
+        fields={"name": "Robert Smith", "notes": ["loves sailing"]},
+    )
+    return world
+
+
+async def test_a_nickname_is_asked_about_and_joined_when_the_model_says_yes() -> None:
+    world = uncle_world()
+    result = await invoke(world)
+    assert labels(result) == ["Robert Smith"]
+    assert [m.text for m in result.records[0].entity.mentions] == [  # type: ignore[union-attr]
+        "Robert Smith",
+        "Bob",
+    ]
+    ((_, coref, _),) = of_kind(world, "coref")  # asked: few mentions, every pair
+    assert list(coref["questions"]) == ["pair.m0.m1"]
+    assert result.warnings == ()
+
+
+async def test_a_nickname_the_model_refuses_stays_two_with_a_truthful_warning() -> None:
+    world = uncle_world().coref("Bob", "Robert Smith", 0.1)  # asked, answered: no
+    result = await invoke(world)
+    assert labels(result) == ["Robert Smith", "Bob"]
+    (warning,) = [w for w in result.warnings if "count_below_discovered" in w]
+    assert "pairwise coreference found them different" in warning
+    assert "could not be merged" not in warning
+    assert not [c for c in of_kind(world, "coref") if "merge" in c[1]["questions"]]
+
+
+async def test_an_unasked_pair_is_still_a_merge_check_candidate() -> None:
+    far = " ".join(["and so it went"] * 40)
+    text = f"Ann Lee is my aunt. {far} Sue Kim called. {far} Zed Roe came."
+    world = FakeWorld(text)
+    world.entity(
+        "Ann Lee",
+        schema=Person,
+        mentions=["Ann Lee", "Sue Kim"],  # the model counted one person
+        fields={"name": "Ann Lee"},
+    )
+    world.entity("Zed Roe", schema=Person, mentions=["Zed Roe"], fields={"name": "Zed"})
+    # above the all-pairs threshold nothing links Ann Lee, Sue Kim and Zed Roe, so no
+    # pair is asked; the count (2 against 3 found) is all there is to go on
+    result = await invoke(
+        world, text, Many(Person), coref=CorefConfig(all_pairs_below=0)
+    )
+    assert not [c for c in of_kind(world, "coref") if "pair.m0.m1" in c[1]["questions"]]
+    merges = [c for c in of_kind(world, "coref") if "merge" in c[1]["questions"]]
+    assert merges  # the pairs nobody asked about were checked now
+    assert labels(result) == ["Ann Lee", "Zed Roe"]  # Ann Lee and Sue Kim are one
+    assert len(result.records[0].entity.mentions) == 2  # type: ignore[union-attr]
+
+
+async def test_a_nickname_far_above_the_threshold_is_found_by_the_table() -> None:
+    far = " ".join(["and so it went"] * 40)
+    text = f"Elizabeth Warren spoke. {far} Later Liz left. {far} Zed Roe came."
+    world = FakeWorld(text)
+    world.entity(
+        "Elizabeth Warren",
+        schema=Person,
+        mentions=["Elizabeth Warren", "Liz"],
+        fields={"name": "Elizabeth Warren"},
+    )
+    world.entity("Zed Roe", schema=Person, mentions=["Zed Roe"], fields={"name": "Zed"})
+    result = await invoke(
+        world, text, Many(Person), coref=CorefConfig(all_pairs_below=0)
+    )
+    assert labels(result) == ["Elizabeth Warren", "Zed Roe"]
+    ((_, coref, _),) = of_kind(world, "coref")
+    assert list(coref["questions"]) == ["pair.m0.m1"]  # Liz~Elizabeth, nothing else
+    assert result.warnings == ()
+
+
+NAME_TEXT = "Dr. Emma Thompson arrived. Later Emma left."
+
+
+def test_a_full_name_listed_with_its_parts_is_one_name() -> None:
+    answer = ClairicAnswer(
+        type="list", value=["Emma Thompson", "Emma", "Thompson", "Emma"], spans=None
+    )
+    mentions = parse_mentions(NAME_TEXT, answer, None)
+    assert [(m.text, m.span) for m in mentions] == [
+        ("Emma Thompson", (4, 17)),
+        ("Emma", (33, 37)),
+    ]
+
+
+def test_a_full_name_with_a_middle_name_or_initial_is_one_name() -> None:
+    text = "Mary Ann Smith arrived. John R. Smith left."
+    answer = ClairicAnswer(
+        type="list",
+        value=[
+            "Mary Ann Smith",
+            "Mary Ann",
+            "Ann Smith",
+            "John R. Smith",
+            "John",
+            "Smith",
+        ],
+    )
+    assert [m.text for m in parse_mentions(text, answer, None)] == [
+        "Mary Ann Smith",
+        "John R. Smith",
+    ]
+    parts = ClairicAnswer(type="list", value=["Mary", "Smith", "Mary Ann Smith"])
+    assert [m.text for m in parse_mentions("Mary Ann Smith arrived.", parts, None)] == [
+        "Mary Ann Smith"
+    ]
+
+
+def test_words_between_the_parts_make_a_bridge_not_a_name() -> None:
+    text = "Emma's brother Tom visited. Ann and Bob left. Smith, Jones & Co came."
+    answer = ClairicAnswer(
+        type="list",
+        value=["Emma's brother Tom", "Emma", "Tom", "Ann and Bob", "Ann", "Bob"],
+    )
+    assert [m.text for m in parse_mentions(text, answer, None)] == [
+        "Emma",
+        "Tom",
+        "Ann",
+        "Bob",
+    ]
+
+
+async def test_a_discovery_that_lists_a_name_with_its_parts_gives_one_record() -> None:
+    text = "Emma Thompson arrived. Bob Roe waved."
+    world = FakeWorld(text)
+    world.entity(
+        "Emma Thompson",
+        schema=Person,
+        mentions=["Emma Thompson"],
+        fields={"name": "Emma Thompson"},
+    )
+    world.entity(
+        "Bob Roe", schema=Person, mentions=["Bob Roe"], fields={"name": "Bob Roe"}
+    )
+    inner = world.handler
+
+    def discover(model: str, payload: Body, meta: CallMeta) -> Any:
+        state = payload["state"]
+        base = state.index("<input>")
+        items = [("Emma Thompson", 0), ("Emma", 0), ("Thompson", 5), ("Bob Roe", 23)]
+        start = state.index("Emma Thompson", base)
+        spans = [[start + at, start + at + len(t)] for t, at in items]
+        answer = clairic_answer("list", [t for t, _ in items], spans=spans)
+        return clairic_response(
+            {n: answer for n in payload["fields"]}, state_text=state
+        )
+
+    extractor = create_extractor(
+        [Many(Person)], transport=FakeTransport(route(default=inner, discover=discover))
+    )
+    result = await extractor.ainvoke(text)
+    assert labels(result) == ["Emma Thompson", "Bob Roe"]
+    assert [
+        [m.text for m in r.entity.mentions] for r in result.records if r.entity
+    ] == [
+        ["Emma Thompson"],
+        ["Bob Roe"],
+    ]
+
+
+TRUNCATED = (
+    "The weather was unremarkable that day. " * 400 + "Michael Chen is vegan now."
+)
+
+
+def michael_world() -> FakeWorld:
+    world = FakeWorld(TRUNCATED)
+    world.entity(
+        "Michael Chen",
+        schema=Person,
+        mentions=["Michael Chen"],
+        fields={"name": "Michael Chen"},
+    )
+    return world
+
+
+def faithful_presence(world: FakeWorld) -> FakeTransport:
+    def presence(model: str, payload: Body, meta: CallMeta) -> Any:
+        seen = "Michael Chen" in payload["state"]["input"]  # answers from what it got
+        return clef_response(
+            {q: noul(0.97 if seen else 0.03) for q in payload["questions"]},
+            model=payload["model"],
+        )
+
+    return FakeTransport(route(default=world.handler, presence=presence))
+
+
+async def test_a_presence_answer_from_a_cut_state_does_not_veto_discovery() -> None:
+    world = michael_world()
+    extractor = create_extractor(
+        [Many(Person)],
+        transport=faithful_presence(world),
+        limits=Limits(clef_state_token_budget=2000),
+    )
+    result = await extractor.ainvoke(TRUNCATED)
+    assert labels(result) == ["Michael Chen"]
+    (warning,) = [w for w in result.warnings if "presence_unreliable" in w]
+    assert "did not fit one Clef request" in warning and "0.03" in warning
+
+
+async def test_an_uncut_low_presence_still_vetoes_and_a_cut_one_needs_mentions() -> (
+    None
+):
+    # not cut: the answer stands (the weather text has no mention to keep anyway)
+    world = FakeWorld("The weather is nice.")
+    result = await invoke(world)
+    assert result.records == ()
+    # cut and nothing discovered: nothing to keep
+    nothing = FakeWorld("The weather was unremarkable that day. " * 400)
+    extractor = create_extractor(
+        [Many(Person)],
+        transport=faithful_presence(nothing),
+        limits=Limits(clef_state_token_budget=2000),
+    )
+    assert (await extractor.ainvoke(nothing.text)).records == ()
+
+
+# --------------------------------------------------------------------------- #
+# Review fixes: smaller, anchored states
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_narrowed_qualification_names_mentions_by_context() -> None:
+    world = long_world()
+    await invoke(
+        world,
+        None,
+        Many(Vegan, identity="name"),
+        limits=Limits(clef_state_token_budget=2000),
+    )
+    ((_, payload, _),) = of_kind(world, "qualify")
+    state = payload["state"]
+    assert len(state["input"]) < len(world.text) // 4  # it was narrowed
+    for entity in state["entities"].values():
+        for mention in entity["mentions"]:
+            assert "span" not in mention  # they would point at nothing
+            assert mention["text"] in mention["context"]
+    # and in the whole input the spans are there, without a context
+    full = readme_world()
+    await invoke(full)
+    ((_, whole, _),) = of_kind(full, "qualify")
+    first = whole["state"]["entities"]["e0"]["mentions"][0]
+    assert "span" in first and "context" not in first
+
+
+async def test_many_mentions_give_a_context_to_the_first_eight_and_last_two() -> None:
+    names = " ".join(f"Ann Lee did thing {i}." for i in range(12))
+    world = FakeWorld(names)
+    world.entity(
+        "Ann Lee", schema=Person, mentions=["Ann Lee"], fields={"name": "Ann Lee"}
+    )
+    await invoke(world, names, Many(Person))
+    attribution = next(c for c in of_kind(world, "attribution"))[1]
+    mentions = attribution["state"]["entity"]["mentions"]
+    assert len(mentions) == 12
+    assert [i for i, m in enumerate(mentions) if "context" in m] == [
+        0, 1, 2, 3, 4, 5, 6, 7, 10, 11,
+    ]  # fmt: skip
+    assert all("span" in m for m in mentions)
+
+
+def test_a_state_given_as_narrowed_text_is_not_anchored_on_whole_input_spans() -> None:
+    from trustcall_system_one import compile_schema
+    from trustcall_system_one._types import EntityInfo
+    from trustcall_system_one._verify import Ctx
+
+    text = "Emma Thompson came. " + "x " * 3000 + "Emma left."
+    info = EntityInfo(
+        key="e0",
+        label="Emma Thompson",
+        mentions=(Mention("Emma Thompson", (0, 13)), Mention("Emma", (6014, 6018))),
+    )
+    run = Run(
+        transport=FakeTransport(lambda *a: None),
+        limits=Limits(clef_state_token_budget=1000),
+    )
+    ctx = Ctx(run=run, plan=compile_schema(Person), text=text, label="Emma", info=info)
+    narrowed = "…\nEmma left."
+    state = ctx.fitted(narrowed)
+    assert state["input"] == narrowed  # taken as given, not re-cut around offsets
+    assert "span" not in state["entity"]["mentions"][0]
+    # the whole input is cut around the mentions instead
+    cut = ctx.fitted()
+    assert "Emma Thompson came." in cut["input"] and "Emma left." in cut["input"]
+
+
+def test_an_isolated_recheck_keeps_only_the_mention_nearest_the_value() -> None:
+    from trustcall_system_one import compile_schema
+    from trustcall_system_one._types import EntityInfo
+    from trustcall_system_one._verify import Ctx
+
+    filler = "x " * 2000
+    text = f"Emma met Bob. {filler} Emma is vegan. {filler} Emma left. {filler}"
+    first, middle = text.index("Emma"), text.index("Emma is")
+    last = text.index("Emma left")
+    info = EntityInfo(
+        key="e0",
+        label="Emma",
+        mentions=tuple(Mention("Emma", (a, a + 4)) for a in (first, middle, last)),
+    )
+    run = Run(transport=FakeTransport(lambda *a: None))
+    ctx = Ctx(run=run, plan=compile_schema(Person), text=text, label="Emma", info=info)
+    value = (text.index("vegan"), text.index("vegan") + 5)
+    state = ctx.entity_state(narrow_to=[value])
+    assert "Emma is vegan" in state["input"]
+    assert "Emma met Bob" not in state["input"]  # the far mentions are left out
+    assert "Emma left" not in state["input"]
+
+
+def test_a_warning_about_an_entity_names_it() -> None:
+    from trustcall_system_one import compile_schema
+    from trustcall_system_one._types import EntityInfo
+    from trustcall_system_one._verify import Ctx
+
+    run = Run(transport=FakeTransport(lambda *a: None))
+    plan = compile_schema(Person)
+    Ctx(run=run, plan=plan, text="x", label="the Person").warn("plain")
+    info = EntityInfo(key="e3", label="Ann Lee")
+    Ctx(run=run, plan=plan, text="x", label="Ann Lee", info=info).warn("odd")
+    assert run.warnings == ["plain", "Ann Lee (e3): odd"]

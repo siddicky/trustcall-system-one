@@ -375,12 +375,12 @@ def test_06_calls_follow_the_collection_pipeline(
     result = run("06_attribution_guard", capsys, keep_output=True)
     kinds = [call.kind for call in result.calls]
     assert sorted(kinds[:3]) == ["count", "discover", "presence"]  # in parallel
-    # the two names share nothing, so no coreference question is asked; both
-    # entities are qualified in one request
-    assert kinds[3:] == ["qualify", "extract", "extract"] + ["attribution"] * 2
+    # the one pair of mentions is asked about (every pair is, up to 24 mentions);
+    # both entities are qualified in one request
+    assert kinds[3:] == ["coref", "qualify", "extract", "extract"] + ["attribution"] * 2
     # the call log the example prints
     out = capsys.readouterr().out
-    assert "8 requests" in out
+    assert "9 requests" in out
     assert "attribution 2" in out and "qualify 1" in out
     colleague = result.records[0].entity
     assert colleague is not None and colleague.label == "Priya Raman"
