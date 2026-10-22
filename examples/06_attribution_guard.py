@@ -36,8 +36,10 @@ from _common import (
     cli,
     fmt,
     heading,
+    only_record,
     print_banner,
     resolve_offline,
+    show_call_log,
     show_overview,
     show_record,
     show_source,
@@ -73,6 +75,7 @@ class Colleague(BaseModel):
 def offline_script() -> OfflineScript:
     """Clairic bleeds each person's fact onto the other; Clef refuses it."""
     script = OfflineScript(
+        source=PASSAGE,
         presence=0.99,
         clairic={
             "Priya::name": says("text", "Priya Raman", find="Priya Raman"),
@@ -137,12 +140,16 @@ def main(offline: bool = False) -> ExtractionResult:
         result = extractor.invoke(PASSAGE)
 
     show_source("The passage", PASSAGE)
+    if not result.records:
+        only_record(result, "colleague")
+        show_call_log(result, script)
+        return result
     show_overview(result)
     for record in result.records:
         show_record(record, PASSAGE, snippets=True)
     show_naive_vs_guarded(result)
     show_verification(result)
-    show_summary(result)
+    show_summary(result, offline=offline)
     return result
 
 

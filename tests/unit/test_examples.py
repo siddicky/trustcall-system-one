@@ -57,12 +57,20 @@ def load(name: str) -> ModuleType:
     return module
 
 
-def run(name: str, capsys: pytest.CaptureFixture[str]) -> Any:
-    """Run an example offline; check the banner and that it printed something."""
+def run(
+    name: str, capsys: pytest.CaptureFixture[str], *, keep_output: bool = False
+) -> Any:
+    """Run an example offline; check the banner and that it printed something.
+
+    With ``keep_output`` the output is printed again so the caller can read it
+    from ``capsys`` too.
+    """
     result = load(name).main(offline=True)
     out = capsys.readouterr().out
     assert BANNER in out
     assert len(out.splitlines()) > 10
+    if keep_output:
+        print(out, end="")
     return result
 
 
@@ -124,9 +132,15 @@ def test_01_invoice(capsys: pytest.CaptureFixture[str]) -> None:
     po = record.fields["po_number"]
     assert po.value is None and po.p_null is not None and po.p_null > 0.9
     assert po.guess == "INV-2024-0412"
-    # a verification event: the low-confidence vendor was re-asked
+    # verification events: the low-confidence vendor was re-asked and agreed; the
+    # terms were re-asked, the second answer disagreed, and Clef adjudicated
     assert record.fields["vendor"].reask is True
-    assert [c.field for c in result.calls if c.kind == "reask"] == ["vendor"]
+    assert record.fields["terms_days"].reask is True
+    assert sorted(c.field or "" for c in result.calls if c.kind == "reask") == [
+        "terms_days",
+        "vendor",
+    ]
+    assert [c.field for c in result.calls if c.kind == "adjudicate"] == ["terms_days"]
     # a value the checks reject: a name that is not the approver
     assert invoice.approved_by is None
     assert {r.path: r.reason for r in record.rejected} == {
@@ -138,7 +152,7 @@ def test_01_invoice(capsys: pytest.CaptureFixture[str]) -> None:
         answer = record.fields[field]
         assert answer.span is not None
         assert text[answer.span[0] : answer.span[1]] == answer.value
-    assert result.usage.requests == len(result.calls) == 5
+    assert result.usage.requests == len(result.calls) == 7
 
 
 # --------------------------------------------------------------------------- #
@@ -146,28 +160,38 @@ def test_01_invoice(capsys: pytest.CaptureFixture[str]) -> None:
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.xfail(strict=True, reason="needs M4")
 def test_02_support_ticket(capsys: pytest.CaptureFixture[str]) -> None:
-    module = load("02_support_ticket")
-    result = run("02_support_ticket", capsys)
+    result = run("02_support_ticket", capsys, keep_output=True)
     (record,) = result.records
     assert record.valid, record.errors
     ticket = record.value
     assert ticket.customer.name == "Tomás Herrera"
     assert ticket.customer.email == "tomas.herrera@lumenlabs.example"
     assert ticket.customer.plan == "pro"
-    assert isinstance(ticket.issue, module.BillingIssue)
+    assert type(ticket.issue).__name__ == "BillingIssue"
     assert ticket.issue.kind == "billing"
     assert ticket.issue.invoice_number == "LL-88213"
     assert ticket.issue.amount_disputed == Decimal("249.00")
-    assert ticket.urgency is module.Urgency.HIGH
+    assert ticket.urgency.name == "HIGH"
     assert ticket.refund_requested is True
     # never mentioned: the presence gate skips the sub-model entirely
     assert ticket.shipping_address is None
-    assert not [path for path in record.fields if path.startswith("shipping_address")]
+    gate = record.fields["shipping_address"]
+    assert (gate.engine, gate.rejected_reason) == ("clef", "absent")
+    assert not [path for path in record.fields if path.startswith("shipping_address.")]
+    # one presence request for it, and no extraction request about it at all
+    assert [c.field for c in result.calls if c.kind == "presence"] == [
+        None,
+        "shipping_address",
+    ]
+    assert not [
+        c for c in result.calls if c.kind == "extract" and c.field == "shipping_address"
+    ]
+    out = capsys.readouterr().out
+    assert "requests that mention 'shipping_address': presence" in out
 
 
-@pytest.mark.xfail(strict=True, reason="needs M5")
+@pytest.mark.xfail(raises=NotImplementedError, strict=True, reason="needs M5")
 def test_03_update_contact(capsys: pytest.CaptureFixture[str]) -> None:
     module = load("03_update_contact")
     result = run("03_update_contact", capsys)
@@ -197,22 +221,30 @@ def test_03_update_contact(capsys: pytest.CaptureFixture[str]) -> None:
     }
 
 
-@pytest.mark.xfail(strict=True, reason="needs M6")
-def test_04_repair(capsys: pytest.CaptureFixture[str]) -> None:
+def test_04_repair_has_no_repair_loop_yet(capsys: pytest.CaptureFixture[str]) -> None:
+    """Pins the M6 gap. M6 (the repair loop) must replace this test.
+
+    Today the first extraction fails validation and nothing repairs it: one round,
+    no ``repair`` call, an invalid record. When M6 lands this fails; replace it with:
+
+    * ``record.valid`` and ``(name, postcode, age) == ("Katarina Vogel", "10115", 34)``
+    * ``result.attempts == 2``
+    * the ``repair`` calls' fields sorted are ``["age", "postcode"]``
+    """
     result = run("04_repair", capsys)
     (record,) = result.records
-    assert record.valid, record.errors
-    assert (record.value.name, record.value.country, record.value.age) == (
-        "Katarina Vogel",
-        "DE",
-        34,
-    )
-    assert result.attempts == 2  # the extraction, then one repair round
-    repairs = [call for call in result.calls if call.kind == "repair"]
-    assert sorted(call.field or "" for call in repairs) == ["age", "country"]
+    assert not record.valid
+    assert sorted(record.errors) == [
+        "age: Input should be a valid integer",
+        "postcode: String should match pattern '^\\d{5}$'",
+    ]
+    assert result.attempts == 1
+    assert not [call for call in result.calls if call.kind == "repair"]
+    # the age was dropped by the attribution check, not by validation
+    assert [(r.path, r.reason) for r in record.rejected] == [("/age", "attribution")]
 
 
-@pytest.mark.xfail(strict=True, reason="needs M8")
+@pytest.mark.xfail(raises=NotImplementedError, strict=True, reason="needs M8")
 def test_05_people_memory(capsys: pytest.CaptureFixture[str]) -> None:
     module = load("05_people_memory")
     result = run("05_people_memory", capsys)
@@ -261,7 +293,7 @@ def test_05_people_memory(capsys: pytest.CaptureFixture[str]) -> None:
             assert text[mention.span[0] : mention.span[1]] == mention.text
 
 
-@pytest.mark.xfail(strict=True, reason="needs M7")
+@pytest.mark.xfail(raises=NotImplementedError, strict=True, reason="needs M7")
 def test_06_attribution_guard(capsys: pytest.CaptureFixture[str]) -> None:
     result = run("06_attribution_guard", capsys)
     priya, tom = result.responses
@@ -276,7 +308,7 @@ def test_06_attribution_guard(capsys: pytest.CaptureFixture[str]) -> None:
     }
 
 
-@pytest.mark.xfail(strict=True, reason="needs M9")
+@pytest.mark.xfail(raises=NotImplementedError, strict=True, reason="needs M9")
 def test_07_order_line_items(capsys: pytest.CaptureFixture[str]) -> None:
     module = load("07_order_line_items")
     result = run("07_order_line_items", capsys)

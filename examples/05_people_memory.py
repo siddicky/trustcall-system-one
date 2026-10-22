@@ -35,14 +35,18 @@ answers. Either way ``Many`` plus ``existing`` is the whole interface.
 
 import sys
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _common import (
     build_extractor,
     cli,
+    only_record,
     print_banner,
     resolve_offline,
+    show_call_log,
+    show_clusters,
     show_mentions,
     show_overview,
     show_patch_lines,
@@ -129,12 +133,13 @@ def offline_script() -> OfflineScript:
         "Sunny": "sunny",
     }
 
-    def notes(*found: str, confidence: float = 0.9) -> dict[str, object]:
+    def notes(*found: str | tuple[str, int], confidence: float = 0.9) -> dict[str, Any]:
         return says(
             "list", None, find_all=list(found), p_null=0.03, confidence=confidence
         )
 
     script = OfflineScript(
+        source=CONVERSATION,
         presence=0.99,
         clairic={
             "Emma::name": says("text", "Emma Thompson", find="Emma Thompson"),
@@ -205,14 +210,23 @@ def main(offline: bool = False) -> ExtractionResult:
         result = extractor.invoke(CONVERSATION, existing=existing)
 
     show_source("The conversation", CONVERSATION)
+    if not result.records:
+        only_record(result, "person")
+        show_call_log(result, script)
+        return result
     show_overview(result)
+    show_clusters(result)
     for record in result.records:
         show_record(record, CONVERSATION, snippets=True)
         if record.kind == "update":
-            show_patch_lines(record)
+            show_patch_lines(
+                record,
+                "Each applied operation, next to the text behind it",
+                CONVERSATION,
+            )
         show_mentions(record, CONVERSATION)
     show_verification(result)
-    show_summary(result)
+    show_summary(result, offline=offline)
     return result
 
 

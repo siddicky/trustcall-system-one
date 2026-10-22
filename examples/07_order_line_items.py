@@ -40,9 +40,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (
     build_extractor,
     cli,
+    only_record,
     print_banner,
     resolve_offline,
     show_before_after,
+    show_call_log,
     show_patch_lines,
     show_rejected,
     show_source,
@@ -101,6 +103,7 @@ EXISTING = Order(
 def offline_script() -> OfflineScript:
     """What Clairic and Clef would plausibly answer for ``EMAIL``."""
     script = OfflineScript(
+        source=EMAIL,
         presence=0.98,
         clairic={
             # The order itself: the id is restated, the customer is not mentioned.
@@ -141,13 +144,16 @@ def main(offline: bool = False) -> ExtractionResult:
     with extractor:
         result = extractor.invoke(EMAIL, existing=existing)
 
-    (record,) = result.records
+    record = only_record(result, "order")
+    if record is None:
+        show_call_log(result, script)
+        return result
     show_source("The email, with the spans the model pointed at", EMAIL, record)
     show_before_after(record)
-    show_patch_lines(record, "Patch (inside the order)")
+    show_patch_lines(record, "Patch (inside the order)", EMAIL)
     show_rejected(record, "Not applied (and why)")
     show_verification(result)
-    show_summary(result)
+    show_summary(result, offline=offline)
     return result
 
 

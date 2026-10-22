@@ -61,7 +61,8 @@ python_version = "3.10"
 strict = true
 plugins = ["pydantic.mypy"]
 warn_unused_ignores = true
-files = ["trustcall_system_one", "tests"]
+files = ["trustcall_system_one", "tests", "examples"]
+mypy_path = "examples"
 
 [[tool.mypy.overrides]]
 module = ["jsonpatch.*", "jsonpointer.*", "dydantic.*", "hypothesis_jsonschema.*"]

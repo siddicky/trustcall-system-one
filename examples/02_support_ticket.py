@@ -1,8 +1,6 @@
 """A support email in, a nested ``Ticket`` out: sub-models, a union, an optional gate.
 
-Needs milestone M4 (nested sub-models and unions); until it lands this example
-raises or returns an incomplete ticket (``tests/unit/test_examples.py`` expects the
-failure and flips when M4 does). ``uv run python examples/02_support_ticket.py``.
+Runs today (M4). ``uv run python examples/02_support_ticket.py [--offline]``
 
 What it demonstrates:
 
@@ -21,9 +19,11 @@ What it demonstrates:
   member, instead of Clairic extracting a word that is not in the text.
 * ``refund_requested: bool`` is a Clef yes/no.
 
-Look at the output for: the resolved union member, the absence of any
-``shipping_address.*`` line, and the call counts (no Clairic request mentions the
-address). Live mode runs on the real models; offline mode scripts the answers.
+Look at the output for: the resolved union member, the one ``shipping_address``
+line that says it is absent, and "Every request that was made", which ends by listing
+the requests that mention ``shipping_address``: only the presence question. No
+Clairic request ever asks for a street or a postcode. Live mode runs on the real
+models; offline mode scripts the answers.
 """
 
 import enum
@@ -38,17 +38,19 @@ from _common import (
     build_extractor,
     cli,
     heading,
+    only_record,
     print_banner,
     resolve_offline,
+    show_call_log,
     show_record,
     show_source,
     show_summary,
     show_verification,
 )
-from _offline import OfflineScript, choose, pick, says, scale
+from _offline import OfflineScript, pick, says, scale
 from pydantic import BaseModel, Field
 
-from trustcall_system_one import ExtractionResult, s1_field
+from trustcall_system_one import ExtractionResult, ResultRecord, s1_field
 
 EMAIL = """\
 Subject: Charged twice for March, please refund
@@ -131,26 +133,57 @@ class Ticket(BaseModel):
 def offline_script() -> OfflineScript:
     """What Clairic and Clef would plausibly answer for ``EMAIL``."""
     return OfflineScript(
+        source=EMAIL,
         presence=0.99,
-        absent=("address",),  # the optional sub-model's presence gate says no
+        # The optional sub-model's gate is a Clef noul with id "<path>.__presence".
+        absent=("shipping_address.__presence",),
         clairic={
-            "name": says("text", "Tomás Herrera", find="Tomás Herrera", p_null=0.01),
-            "email": says(
+            "customer.name": says(
+                "text", "Tomás Herrera", find="Tomás Herrera", p_null=0.01
+            ),
+            "customer.email": says(
                 "text",
                 "tomas.herrera@lumenlabs.example",
                 find="tomas.herrera@lumenlabs.example",
                 p_null=0.01,
             ),
+            # Only the chosen union member is asked (its wire names carry the
+            # member label); keys match by wire-name suffix, not by wording.
             "invoice_number": says("text", "LL-88213", find="LL-88213", p_null=0.02),
-            "amount_disputed": says("number", 249.0, p_null=0.03, confidence=0.93),
+            "amount_disputed": says("number", 249, p_null=0.03, confidence=0.93),
         },
         clef={
-            "plan": pick("pro", ["free", "pro", "enterprise"], 0.97),
-            "issue": choose("billing"),  # which member of the union
+            "customer.plan": pick("pro", ["free", "pro", "enterprise"], 0.97),
+            # The union: the options are the discriminator's values.
+            "issue": pick("billing", ["billing", "outage"], 0.96),
             "urgency": scale(2),  # "pressing" = HIGH
             "refund_requested": 0.98,
         },
     )
+
+
+def show_shape(record: ResultRecord, ticket: Ticket) -> None:
+    """Print what the schema's shape did, from the record's own field log."""
+    heading("What the schema's shape did")
+    union = record.fields.get("issue")
+    chosen = ""
+    if union is not None and isinstance(union.raw, dict):
+        pick = union.raw.get("choice")
+        chosen = f"  (Clef choice {pick!r}, confidence {union.confidence})"
+    print(f"  issue             {type(ticket.issue).__name__}{chosen}")
+    print(
+        f"                    kind={ticket.issue.kind!r} was filled in code, not asked"
+    )
+    gate = record.fields.get("shipping_address")
+    leaves = [p for p in record.fields if p.startswith("shipping_address.")]
+    if ticket.shipping_address is None and gate is not None:
+        yes = gate.raw.get("noul") if isinstance(gate.raw, dict) else None
+        print(f"  shipping_address  None  (presence gate: P(yes) {yes})")
+        print(f"                    fields asked about it: {len(leaves)}")
+    else:
+        print(f"  shipping_address  {ticket.shipping_address!r}")
+    print(f"  urgency           {ticket.urgency} (a Clef score on the described scale)")
+    print()
 
 
 def main(offline: bool = False) -> ExtractionResult:
@@ -161,32 +194,18 @@ def main(offline: bool = False) -> ExtractionResult:
     with build_extractor([Ticket], offline=offline, script=script) as extractor:
         result = extractor.invoke(EMAIL)
 
-    (record,) = result.records
+    record = only_record(result, "ticket")
+    if record is None:
+        show_call_log(result, script)
+        return result
     show_source("The email, with the spans the model pointed at", EMAIL, record)
     show_record(record)
     ticket = record.value
     if isinstance(ticket, Ticket):
-        heading("What the schema's shape did")
-        issue = type(ticket.issue).__name__
-        print(
-            f"  issue             {issue} (union member chosen by Clef, "
-            f"kind={ticket.issue.kind!r})"
-        )
-        asked = [path for path in record.fields if path.startswith("shipping_address")]
-        print(
-            "  shipping_address  "
-            + (
-                "None; the presence gate found no address, no field of it was asked"
-                if ticket.shipping_address is None and not asked
-                else repr(ticket.shipping_address)
-            )
-        )
-        print(
-            f"  urgency           {ticket.urgency} (a Clef score on a described scale)"
-        )
-        print()
+        show_shape(record, ticket)
+    show_call_log(result, script, mentioning="shipping_address")
     show_verification(result)
-    show_summary(result)
+    show_summary(result, offline=offline)
     return result
 
 

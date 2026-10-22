@@ -24,11 +24,13 @@ from enum import Enum
 from typing import Any
 
 from _offline import OFFLINE_BANNER, OfflineScript
+from pydantic import BaseModel
 
 from trustcall_system_one import (
     ExtractionResult,
     Extractor,
     FieldAnswer,
+    PatchOp,
     ResultRecord,
     create_extractor,
 )
@@ -40,11 +42,14 @@ __all__ = [
     "fmt",
     "heading",
     "live_available",
+    "only_record",
     "paint",
     "patch_json",
     "print_banner",
     "resolve_offline",
     "show_before_after",
+    "show_call_log",
+    "show_clusters",
     "show_mentions",
     "show_overview",
     "show_patch_lines",
@@ -78,22 +83,31 @@ def resolve_offline(offline: bool, environ: Mapping[str, str] | None = None) -> 
     return offline or not live_available(environ)
 
 
-def print_banner(offline: bool) -> None:
-    """Say loudly which mode the example runs in."""
+def print_banner(offline: bool, *, live_hint: bool = True) -> None:
+    """Say loudly which mode the example runs in.
+
+    Args:
+        offline: Resolved mode.
+        live_hint: Whether the example has a live mode to point to.
+    """
     if offline:
         bar = "=" * len(OFFLINE_BANNER)
         print(paint(bar, "yellow"))
         print(paint(OFFLINE_BANNER, "yellow", "bold"))
         print(paint(bar, "yellow"))
-        print(
-            paint(
-                "Spans, confidences and verification events below were scripted to be "
-                "plausible;\nthe library's checks, patches and validation are real. "
-                "Set CLOUDFLARE_ACCOUNT_ID and\nCLOUDFLARE_API_TOKEN and drop "
-                "--offline to run on Clairic and Clef.",
-                "dim",
-            )
+        text = (
+            "Spans, confidences, verification events, token counts and cost below "
+            "were scripted\nor estimated to be plausible; the library's checks, "
+            "patches and validation are real."
         )
+        if live_hint:
+            text += (
+                "\nSet CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN and drop "
+                "--offline to run on\nClairic and Clef."
+            )
+        else:
+            text += "\nThis example has no live mode: tests never need one."
+        print(paint(text, "dim"))
     else:
         print(
             paint(
@@ -183,6 +197,8 @@ def fmt(value: Any) -> str:
     """A short display form of a field value."""
     if value is None:
         return "null"
+    if isinstance(value, BaseModel):
+        return f"{type(value).__name__}(...)"
     if isinstance(value, Enum):
         return f"{type(value).__name__}.{value.name}"
     if isinstance(value, (date, datetime, time)):
@@ -270,6 +286,8 @@ def _status(answer: FieldAnswer) -> str:
     raw = answer.raw
     if isinstance(raw, Mapping) and isinstance(raw.get("noul"), float):
         parts.append(f"P(yes) {_num(raw['noul'])}")
+    elif answer.rejected_reason:
+        parts.append(f"rejected ({answer.rejected_reason})")
     elif answer.value is None and answer.p_null is not None:
         parts.append(f"p_null {_num(answer.p_null)}")
     elif answer.confidence is not None:
@@ -309,8 +327,12 @@ def show_record(
         shown = fmt(answer.value)
         status = paint(_status(answer), "dim")
         print(f"  {answer.pretty:<{name_w}}  {shown:<{value_w}}  {status}")
-        if answer.rejected_reason:
-            was = f" {fmt(answer.raw)}" if isinstance(answer.raw, str) else ""
+        if answer.rejected_reason == "absent":
+            note = "absent: the presence gate says the text does not state it"
+            print(pad + paint("- " + note, "dim"))
+        elif answer.rejected_reason:
+            shown_raw = answer.raw is not None and not isinstance(answer.raw, Mapping)
+            was = f" {fmt(answer.raw)}" if shown_raw else ""
             reason = f"rejected{was}: {answer.rejected_reason}"
             print(pad + paint("- " + reason, "red"))
         if answer.value is None and answer.guess is not None:
@@ -340,8 +362,35 @@ def show_rejected(record: ResultRecord, title: str = "Rejected") -> None:
     print()
 
 
-def show_patch_lines(record: ResultRecord, title: str = "Applied operations") -> None:
-    """Print the applied operations one per line (``op path value``)."""
+def _span_of_op(record: ResultRecord, op: PatchOp) -> Span | None:
+    """The span in the text behind an applied operation, when the answer has one."""
+    parts = [p for p in op.path.split("/") if p and p != "-" and not p.isdigit()]
+    for size in range(len(parts), 0, -1):
+        answer = record.fields.get(".".join(parts[:size]))
+        if answer is None:
+            continue
+        if answer.spans and isinstance(answer.value, (list, tuple)):
+            for index, item in enumerate(answer.value):
+                if item == op.value and index < len(answer.spans):
+                    return (answer.spans[index][0], answer.spans[index][1])
+        if answer.span is not None:
+            return (answer.span[0], answer.span[1])
+        return None
+    return None
+
+
+def show_patch_lines(
+    record: ResultRecord,
+    title: str = "Applied operations",
+    text: str | None = None,
+) -> None:
+    """Print the applied operations one per line, each next to its source span.
+
+    Args:
+        record: The updated record.
+        title: Section heading.
+        text: The original input; with it each operation shows the span it came from.
+    """
     heading(title)
     if not record.patches:
         print("  (none)")
@@ -352,6 +401,9 @@ def show_patch_lines(record: ResultRecord, title: str = "Applied operations") ->
             else "  " + json.dumps(op.value, default=str, ensure_ascii=False)
         )
         print(f"  {paint(op.op, 'green'):<9} {op.path}{value}")
+        span = _span_of_op(record, op) if text is not None else None
+        if span is not None and text is not None:
+            print(paint("      from the text: ", "dim") + snippet(text, span))
     print()
 
 
@@ -364,6 +416,22 @@ def show_mentions(record: ResultRecord, text: str) -> None:
     for mention in entity.mentions:
         if mention.span is not None:
             print("  " + snippet(text, mention.span))
+    print()
+
+
+def show_clusters(result: ExtractionResult) -> None:
+    """Print which mentions were merged into each entity (named mentions only)."""
+    heading("Mention clusters (pronouns are never mentions)")
+    entities = [(r.entity, "") for r in result.records if r.entity]
+    entities += [
+        (item.entity, f"  (skipped: {item.reason})") for item in result.skipped
+    ]
+    for entity, note in entities:
+        counts: dict[str, int] = {}
+        for mention in entity.mentions:
+            counts[mention.text] = counts.get(mention.text, 0) + 1
+        forms = ", ".join(f'"{text}" x{n}' for text, n in counts.items())
+        print(f"  {entity.label}  <-  {forms or '(none recorded)'}{note}")
     print()
 
 
@@ -474,23 +542,87 @@ _GLOSS = {
 def show_verification(
     result: ExtractionResult, kinds: Sequence[str] | None = None
 ) -> None:
-    """Print the verification calls (re-asks, adjudications...) and every rejection."""
+    """Print the verification calls (re-asks, adjudications...), rejections, errors."""
     wanted = tuple(kinds) if kinds is not None else tuple(_GLOSS)
     events = [c for c in result.calls if c.kind in wanted]
     rejected = [(r.schema_name, item) for r in result.records for item in r.rejected]
+    invalid = [r for r in result.records if not r.valid]
     heading("Verification")
-    if not events and not rejected:
-        print("  every answer passed on the first try")
+    if not events and not rejected and not invalid:
+        print("  every answer passed the checks on the first try")
     for call in events:
         where = f" {call.field}" if call.field else ""
         who = f" [{call.entity}]" if call.entity and call.entity != "e0" else ""
-        print(f"  {call.kind:<8}{where}{who}  " + paint(_GLOSS[call.kind], "dim"))
+        print(f"  {call.kind:<10}{where}{who}  " + paint(_GLOSS[call.kind], "dim"))
     for _, item in rejected:
         p = f" p={item.p:.2f}" if item.p is not None else ""
-        print(f"  {paint('rejected', 'red')}   {item.path}  {item.reason}{p}")
+        print(f"  {paint('rejected', 'red'):<10} {item.path}  {item.reason}{p}")
         if item.detail:
             print(paint(f"             {item.detail}", "dim"))
+    for record in invalid:
+        print(paint(f"  {record.schema_name} is INVALID:", "red"))
+        for error in record.errors:
+            print(paint(f"    {error}", "red"))
     print()
+
+
+def show_call_log(
+    result: ExtractionResult,
+    script: OfflineScript | None = None,
+    *,
+    mentioning: str | None = None,
+) -> None:
+    """Print every request that was made, so what was NOT asked is visible too.
+
+    Args:
+        result: The result (its ``calls`` are the log).
+        script: The scripted models; offline it also gives the field and question
+            ids each request carried. Live only the kind and group are known.
+        mentioning: A path prefix to account for: the log ends by counting the
+            requests that asked about it.
+    """
+    heading("Every request that was made")
+    asked: list[tuple[str, str, list[str]]] = []
+    if script is not None:
+        for model, payload, meta in script.calls:
+            ids = list(payload.get("fields") or payload.get("questions") or {})
+            asked.append((meta.kind, model.rsplit("/", 1)[-1], ids))
+    for index, call in enumerate(result.calls):
+        kind, model, ids = (
+            asked[index]
+            if index < len(asked)
+            else (call.kind, call.model.rsplit("/", 1)[-1], [])
+        )
+        group = f"[{call.field}] " if call.field else ""
+        listed = ", ".join(ids) if ids else f"{call.n_items or '?'} item(s)"
+        if len(listed) > 78:
+            listed = f"{listed[:76]}... ({len(ids)} ids)"
+        print(f"  {index + 1:>2}  {kind:<11} {model:<7} {group}{listed}")
+    if mentioning is not None:
+        hits = [
+            kind
+            for kind, _, ids in asked
+            if any(i.removeprefix("attr.").startswith(mentioning) for i in ids)
+        ]
+        text = ", ".join(hits) if hits else "none"
+        print(paint(f"  requests that mention {mentioning!r}: {text}", "bold"))
+    print()
+
+
+def only_record(result: ExtractionResult, what: str = "record") -> ResultRecord | None:
+    """The single record of ``result``, or ``None`` after saying why there is none."""
+    if result.records:
+        return result.records[0]
+    print(paint(f"No {what} came back.", "yellow"))
+    print(
+        "The presence gate found nothing to extract in the text (or inserts and "
+        "updates were\nboth off). Nothing was written; the request log shows what "
+        "was asked."
+    )
+    for warning in result.warnings:
+        print(paint(f"warning: {warning}", "yellow"))
+    print()
+    return None
 
 
 def show_skipped(result: ExtractionResult) -> None:
@@ -508,8 +640,8 @@ def show_skipped(result: ExtractionResult) -> None:
     print()
 
 
-def show_summary(result: ExtractionResult) -> None:
-    """One line: requests by kind, input tokens, priced cost."""
+def show_summary(result: ExtractionResult, *, offline: bool = False) -> None:
+    """Requests by kind, input tokens and priced cost (estimated when offline)."""
     usage = result.usage
     kinds = " · ".join(
         f"{kind} {used.requests}" for kind, used in sorted(usage.by_kind.items())
@@ -522,7 +654,13 @@ def show_summary(result: ExtractionResult) -> None:
     if not result.cost.complete:
         unpriced = ", ".join(m.rsplit("/", 1)[-1] for m in result.cost.unpriced_models)
         cost += f" + {unpriced} unpriced"
+    note = " (estimated offline: no model counted these)" if offline else ""
     print(paint(f"{usage.requests} requests ({kinds})", "dim"))
-    print(paint(f"{usage.input_tokens:,} input tokens ({models}) · {cost}", "dim"))
+    print(
+        paint(
+            f"{usage.input_tokens:,} input tokens ({models}) · {cost}{note}",
+            "dim",
+        )
+    )
     for warning in result.warnings:
         print(paint(f"warning: {warning}", "yellow"))

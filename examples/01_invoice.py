@@ -13,8 +13,11 @@ What it demonstrates, in the order you will see it:
 * A confident null. Nothing in the email is a purchase order number, so
   ``po_number`` is ``None`` with a high ``p_null``; Clairic's ``guess`` is shown for
   transparency and is never used as a value.
-* The verification ladder at work. Look at the "Verification" section: a vendor
-  answer below 0.85 confidence is re-asked in isolation, and ``approved_by`` was
+* The verification ladder at work. Look at the "Verification" section. A vendor
+  answer below 0.85 confidence is re-asked in isolation and the second answer
+  agrees. The payment terms are re-asked too, but the second answer disagrees
+  (the early-payment discount window, 10 days, against the net terms, 30), so
+  Clef adjudicates between the two and keeps the first. And ``approved_by`` was
   answered with a name that the attribution check (Clef) refused to attribute to
   this field, so it was rejected rather than guessed.
 * "Do the maths in code." Clairic is not a calculator, so the due date is not
@@ -36,8 +39,10 @@ from _common import (
     build_extractor,
     cli,
     heading,
+    only_record,
     print_banner,
     resolve_offline,
+    show_call_log,
     show_record,
     show_source,
     show_summary,
@@ -61,7 +66,7 @@ Subtotal: $1,000.00
 Sales tax (8%): $80.00
 Total due: $1,080.00 USD
 
-Payment terms are net 30 days. Your previous invoice, INV-2024-0412, was settled on 2 March, thank you. Please send any questions to Dana Whitlock on our accounts team.
+Payment terms are net 30 days (2% off if paid within 10 days). Your previous invoice, INV-2024-0412, was settled on 2 March, thank you. Please send any questions to Dana Whitlock on our accounts team.
 
 Kind regards,
 Brightwave Supplies Accounts"""  # noqa: E501
@@ -93,6 +98,7 @@ def offline_script() -> OfflineScript:
     """What Clairic and Clef would plausibly answer for ``EMAIL``."""
     currency = ["USD", "EUR", "GBP"]
     return OfflineScript(
+        source=EMAIL,
         presence=0.99,
         clairic={
             "invoice_number": says(
@@ -112,8 +118,9 @@ def offline_script() -> OfflineScript:
                 confidence=0.74,
             ),
             "issue_date": says("date", "2024-03-14", p_null=0.01, confidence=0.96),
-            "terms_days": says("number", 30, p_null=0.01, confidence=0.95),
-            "total": says("number", 1080.0, p_null=0.01, confidence=0.97),
+            # Net 30 or the 10-day discount window? Below 0.85: re-asked.
+            "terms_days": says("number", 30, p_null=0.01, confidence=0.8),
+            "total": says("number", 1080, p_null=0.01, confidence=0.97),
             # Not in the email. Clairic's best guess is the *other* invoice number.
             "po_number": nothing("text", p_null=0.97, guess="INV-2024-0412"),
             # A person's name is the only candidate; she is the vendor's contact.
@@ -130,6 +137,8 @@ def offline_script() -> OfflineScript:
             "paid": 0.03,
         },
         reask={
+            # The second reading disagrees: it picks up the discount window.
+            "terms_days": says("number", 10, p_null=0.04, confidence=0.7),
             "vendor": says(
                 "text",
                 "Brightwave Supplies Ltd",
@@ -137,8 +146,11 @@ def offline_script() -> OfflineScript:
                 occurrence=1,
                 p_null=0.02,
                 confidence=0.97,
-            )
+            ),
         },
+        # Clef settles the disagreement: the net terms (a) are what the email
+        # states as the payment terms.
+        adjudicate={"terms_days": pick("a", ["a", "b", "neither"], 0.91)},
         attribution={
             "attr.invoice_number": 0.99,
             "attr.vendor": 0.97,
@@ -158,7 +170,10 @@ def main(offline: bool = False) -> ExtractionResult:
     with build_extractor([Invoice], offline=offline, script=script) as extractor:
         result = extractor.invoke(EMAIL)
 
-    (record,) = result.records
+    record = only_record(result, "invoice")
+    if record is None:
+        show_call_log(result, script)
+        return result
     show_source("The email, with the spans the model pointed at", EMAIL, record)
     show_record(record)
     invoice = record.value
@@ -171,7 +186,7 @@ def main(offline: bool = False) -> ExtractionResult:
         )
         print()
     show_verification(result)
-    show_summary(result)
+    show_summary(result, offline=offline)
     return result
 
 

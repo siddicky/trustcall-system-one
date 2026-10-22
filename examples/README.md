@@ -20,7 +20,8 @@ uv run python examples/01_invoice.py --offline  # force the scripted transport
   The answers are scripted to be what the models would plausibly return, with spans
   computed against the text the library really sends and at least one answer that the
   checks reject; the library code that checks, patches and validates is the real thing.
-  Offline output shows the behaviour, never the models' accuracy.
+  Token counts and cost are estimates and are labelled as such. Offline output shows
+  the behaviour, never the models' accuracy.
 
 Every example is a module with `main(offline: bool)` returning its result, so
 `tests/unit/test_examples.py` runs them all offline. Examples that need a milestone that
@@ -30,11 +31,11 @@ is not built yet are `xfail(strict=True)` there, and flip when it lands.
 
 | example | shows | runs | needs |
 | --- | --- | --- | --- |
-| [`01_invoice.py`](01_invoice.py) | An invoice email into a typed `Invoice`: spans, a confident null that a `guess` never fills, a low-confidence answer re-asked, a value refused by the attribution check, the due date computed in code. | live or offline | M3 (works now) |
-| [`02_support_ticket.py`](02_support_ticket.py) | Nested sub-models, a discriminated union of models, an optional sub-model skipped by the presence gate, an ordered enum scored by Clef. | live or offline | M4 |
-| [`03_update_contact.py`](03_update_contact.py) | Updating a CRM record as a JSON Patch: four `replace` ops and an `add /notes/-`; every other field rejected with its reason (`p_null`, `gate_noul`, `unchanged`). | live or offline | M5 |
-| [`04_repair.py`](04_repair.py) | Validation failures (`"Germany"` for an ISO code, a birth year for an age) fixed by narrow re-asks that carry the error. | offline (live only repairs if the models slip) | M6 |
-| [`05_people_memory.py`](05_people_memory.py) | trustcall's relationships scenario: three records updated, one inserted, a dog skipped, notes as verbatim quotes. | live or offline | M7-M8 |
+| [`01_invoice.py`](01_invoice.py) | An invoice email into a typed `Invoice`: spans, a confident null that a `guess` never fills, a low-confidence answer re-asked, a disagreeing re-ask settled by Clef adjudication, a value refused by the attribution check, the due date computed in code. | live or offline | M3 (works now) |
+| [`02_support_ticket.py`](02_support_ticket.py) | Nested sub-models, a discriminated union of models, an optional sub-model skipped by the presence gate (the request log shows nothing asked about it), an ordered enum scored by Clef. | live or offline | M4 (works now) |
+| [`03_update_contact.py`](03_update_contact.py) | Updating a CRM record as a JSON Patch: four `replace` ops and an `add /notes/-`, each printed next to the text it came from; every other field rejected with its reason (`p_null`, `gate_noul`, `unchanged`). | live or offline | M5 |
+| [`04_repair.py`](04_repair.py) | Validation failures (`"Berlin 10115"` for a five-digit postcode, a dropped birth year for an age) fixed by narrow re-asks that carry the error. Repair fixes extraction mistakes; vocabularies belong in a `Literal`. | offline (live only repairs if the models slip) | M6 (until then the record is invalid and the output says so) |
+| [`05_people_memory.py`](05_people_memory.py) | trustcall's relationships scenario: three records updated, one inserted, a dog skipped, the mention clusters, notes as verbatim quotes. | live or offline | M7-M8 |
 | [`06_attribution_guard.py`](06_attribution_guard.py) | One person's fact bleeding onto another, caught by the attribution check. | live or offline (bleed injected offline) | M7 |
 | [`07_order_line_items.py`](07_order_line_items.py) | Edits inside a nested list of an existing order: `replace /items/1/quantity` and `add /items/-`, other lines untouched. | live or offline | M9 |
 | [`08_testing_your_extractor.py`](08_testing_your_extractor.py) | A miniature pytest module: unit-testing your own extractor with `FakeTransport` and `route`, no network. Also runs under `pytest`. | offline only | M1-M3 (works now; `FakeWorld` arrives with M7) |

@@ -28,7 +28,7 @@ import json
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from trustcall_system_one import CLAIRIC, CLEF_FLASH, CallMeta
 from trustcall_system_one.testing import (
@@ -148,9 +148,32 @@ def input_bounds(state: str) -> tuple[int, int]:
     return start, len(state) if end < 0 else end
 
 
-def locate(state: str, needle: str, occurrence: int = 0) -> list[int] | None:
-    """``[start, end]`` of ``needle`` inside the input block of ``state``."""
+def locate(
+    state: str, needle: str, occurrence: int = 0, source: str | None = None
+) -> list[int] | None:
+    """``[start, end]`` of ``needle`` inside the input block of ``state``.
+
+    With ``source`` (the original text) ``occurrence`` counts matches in the
+    ORIGINAL text and the match is mapped into the state by its surrounding text,
+    so it still means the same place when the state was narrowed to windows. A
+    needle that is not in ``source`` at all is a script error.
+    """
     start, end = input_bounds(state)
+    if source is not None:
+        at = -1
+        for _ in range(occurrence + 1):
+            at = source.find(needle, at + 1)
+            if at < 0:
+                raise ScriptError(
+                    f"{needle!r} (occurrence {occurrence}) is not in the text"
+                )
+        for margin in (24, 12, 6, 0):
+            lo, hi = max(0, at - margin), min(len(source), at + len(needle) + margin)
+            found = state.find(source[lo:hi], start, end)
+            if found >= 0:
+                begin = found + (at - lo)
+                return [begin, begin + len(needle)]
+        return None  # the state was narrowed to windows that miss it
     at = start - 1
     for _ in range(occurrence + 1):
         at = state.find(needle, at + 1, end)
@@ -174,14 +197,16 @@ def all_mentions(state: str, names: Sequence[str]) -> list[tuple[str, list[int]]
     ]
 
 
-def build_clairic(spec: Mapping[str, Any], state: str) -> dict[str, Any]:
+def build_clairic(
+    spec: Mapping[str, Any], state: str, source: str | None = None
+) -> dict[str, Any]:
     """Turn a ``says(...)`` description into a schema-valid Clairic answer."""
     data = dict(spec)
     kind = data.pop("type")
     find = data.pop("_find", None)
     find_all = data.pop("_find_all", None)
     if find is not None:
-        span = locate(state, *find)
+        span = locate(state, find[0], find[1], source)
         if span is None:  # the text is not in this (narrowed) state: no answer
             return clairic_answer(kind, None, p_null=0.99, confidence=0.95)
         data["span"] = span
@@ -189,7 +214,7 @@ def build_clairic(spec: Mapping[str, Any], state: str) -> dict[str, Any]:
         found = []
         for item in find_all:
             text, nth = item if isinstance(item, tuple) else (item, 0)
-            found.append((text, locate(state, text, nth)))
+            found.append((text, locate(state, text, nth, source)))
         present = [(text, span) for text, span in found if span is not None]
         if not present:
             return clairic_answer(kind, None, p_null=0.99, confidence=0.95)
@@ -349,6 +374,7 @@ class OfflineScript:
         adjudicate: Mapping[str, Mapping[str, Any]] | None = None,
         absent: Sequence[str] = (),
         repair: Mapping[str, Any] | None = None,
+        source: str | None = None,
     ) -> None:
         """Declare the models' answers.
 
@@ -368,12 +394,19 @@ class OfflineScript:
                 consumed one call at a time).
             null_check: P(yes) by ``nullcheck.<wire>`` question id.
             adjudicate: Choice answers by field wire name for ``adjudicate`` calls.
-            absent: Words that mark a presence question as about something the
-                text never mentions (``("address",)``); those questions get 0.03.
+            absent: Question-id parts (``("shipping_address.__presence",)``) that
+                mark a presence question as about something the text never
+                mentions; those questions get 0.03. Matched on the id, never on
+                the instruction wording, and every question of a request is
+                answered (sibling gates may share one request).
             repair: Clairic answers by wire name for ``repair`` calls (the narrow
                 re-asks that follow a validation error); a list is consumed one
                 call at a time.
+            source: The original text. With it, ``says(find=..., occurrence=n)``
+                means the n-th match in that text, wherever the library cut the
+                state down to windows.
         """
+        self.source = source
         self.presence = presence
         self.absent = tuple(absent)
         self.clairic = dict(clairic or {})
@@ -430,11 +463,13 @@ class OfflineScript:
             built = {
                 ident: spec
                 if isinstance(spec, _Prebuilt)
-                else build_clairic(spec, state)
+                else build_clairic(spec, state, self.source)
                 for ident, spec in answers.items()
             }
             return clairic_response(built, state_text=state, input_tokens=tokens)
-        flavour = "clef-flash" if model == CLEF_FLASH else "clef"
+        flavour: Literal["clef", "clef-flash"] = (
+            "clef-flash" if model == CLEF_FLASH else "clef"
+        )
         return clef_response(
             {ident: _clef_answer(a) for ident, a in answers.items()},
             input_tokens=tokens,
@@ -448,11 +483,7 @@ class OfflineScript:
         if isinstance(p, Mapping):
             p = p[call.meta.schema]
         return {
-            qid: 0.03
-            if any(
-                word.lower() in call.instructions(qid).lower() for word in self.absent
-            )
-            else p
+            qid: 0.03 if any(word.lower() in qid.lower() for word in self.absent) else p
             for qid in call.ids
         }
 

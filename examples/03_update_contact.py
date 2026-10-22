@@ -34,9 +34,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (
     build_extractor,
     cli,
+    only_record,
     print_banner,
     resolve_offline,
     show_before_after,
+    show_call_log,
+    show_patch_lines,
     show_patches,
     show_rejected,
     show_source,
@@ -82,6 +85,7 @@ EXISTING = Contact(
 def offline_script() -> OfflineScript:
     """What Clairic and Clef would plausibly answer for ``NOTE`` and the record."""
     script = OfflineScript(
+        source=NOTE,
         presence=0.97,
         clairic={
             # A short form: a verbatim span of the text, but not a new name.
@@ -114,13 +118,17 @@ def main(offline: bool = False) -> ExtractionResult:
     with build_extractor([One(Contact)], offline=offline, script=script) as extractor:
         result = extractor.invoke(NOTE, existing=existing)
 
-    (record,) = result.records
+    record = only_record(result, "contact")
+    if record is None:
+        show_call_log(result, script)
+        return result
     show_source("The note, with the spans the model pointed at", NOTE, record)
     print(f"record {record.json_doc_id!r}: {record.kind}\n")
     show_before_after(record)
+    show_patch_lines(record, "Each applied operation, next to the text behind it", NOTE)
     show_patches(record)
     show_rejected(record, "Not applied (and why)")
-    show_summary(result)
+    show_summary(result, offline=offline)
     return result
 
 
