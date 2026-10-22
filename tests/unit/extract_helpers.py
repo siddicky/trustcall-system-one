@@ -37,19 +37,32 @@ def ca(
     return spec
 
 
-def _locate(state: str, needle: str) -> list[int]:
-    start = state.index(needle, state.index("<input>"))
-    return [start, start + len(needle)]
+def _locate(state: str, needle: str) -> list[int] | None:
+    start = state.find(needle, max(0, state.find("<input>")))
+    return None if start < 0 else [start, start + len(needle)]
 
 
 def _build(spec: Mapping[str, Any], state: str) -> dict[str, Any]:
+    """Build the answer a model would give for ``state``.
+
+    An answer whose ``find`` text is not in the state (a chunk of a long input
+    that does not contain it) is null, like a real model's.
+    """
     data = dict(spec)
     find = data.pop("_find", None)
     find_all = data.pop("_find_all", None)
     if find is not None:
-        data["span"] = _locate(state, find)
+        span = _locate(state, find)
+        if span is None:
+            return clairic_answer(data["type"], None, p_null=0.99)
+        data["span"] = span
     if find_all is not None:
-        data["spans"] = [_locate(state, needle) for needle in find_all]
+        found = [(needle, _locate(state, needle)) for needle in find_all]
+        present = [(n, sp) for n, sp in found if sp is not None]
+        if not present:
+            return clairic_answer(data["type"], None, p_null=0.99)
+        data["spans"] = [sp for _, sp in present]
+        data["value"] = [n for n, _ in present]
     return clairic_answer(data.pop("type"), data.pop("value"), **data)
 
 
@@ -75,6 +88,10 @@ class Script:
         null_check: Probability by question id for ``null_check`` calls.
         adjudicate: Choice answers by field wire name for ``adjudicate`` calls.
         truncated: Number of ``extract`` calls to flag as truncated.
+        state_text: Rewrites the state Clairic says it read.
+        limit: ``limit(state, n)`` gives how many characters of a state Clairic
+            reads on its ``n``-th Clairic call (``None`` for all of it). A longer
+            state is cut, flagged ``truncated`` and answered from the cut text.
     """
 
     presence: float | None = 0.95
@@ -89,6 +106,8 @@ class Script:
     adjudicate: dict[str, dict[str, Any]] = field(default_factory=dict)
     truncated: int = 0
     state_text: Callable[[str], str] | None = None
+    limit: Callable[[str, int], int | None] | None = None
+    _asks: int = field(default=0, init=False)
     clef_input_tokens: int = 100
     transport: FakeTransport = field(init=False)
 
@@ -111,15 +130,24 @@ class Script:
         assert self.presence is not None
         return clef_response({"presence": noul(self.presence)})
 
+    def _read(self, state: str) -> tuple[str, bool]:
+        """The state Clairic reads and whether it had to cut it short."""
+        asks, self._asks = self._asks, self._asks + 1
+        if self.limit is not None:
+            limit = self.limit(state, asks)
+            if limit is not None and len(state) > limit:
+                return state[:limit], True
+        return state, False
+
     def _extract(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
         assert model == CLAIRIC
-        state = payload["state"]
+        state, cut = self._read(payload["state"])
         if self.state_text is not None:
             state = self.state_text(state)  # what Clairic says it read
         answers = {
             name: _build(self.clairic[name], state) for name in payload["fields"]
         }
-        truncated = self.truncated > 0
+        truncated = cut or self.truncated > 0
         self.truncated -= 1
         return clairic_response(answers, truncated=truncated, state_text=state)
 
@@ -144,7 +172,7 @@ class Script:
         return clef_response(answers)
 
     def _reask(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
-        state = payload["state"]
+        state, cut = self._read(payload["state"])
         answers = {}
         for name in payload["fields"]:
             spec = self.reask[name]
@@ -155,7 +183,7 @@ class Script:
             else:
                 chosen = spec
             answers[name] = _build(chosen, state)
-        return clairic_response(answers, state_text=state)
+        return clairic_response(answers, truncated=cut, state_text=state)
 
     def _null_check(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
         return clef_response(

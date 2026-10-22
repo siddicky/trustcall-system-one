@@ -107,6 +107,10 @@ class Coerced:
             the value.
         score: P(yes) for a noul answer, the probability of the chosen option
             for a choice, the probability-weighted level for a score.
+        kept: For a list answer, the position in the answer's own list of each
+            element in ``value`` (``spans`` follow the same elements).
+        failed: For a list answer, ``(position, message)`` of each element that
+            could not be converted and was dropped.
     """
 
     value: Any
@@ -118,6 +122,8 @@ class Coerced:
     confidence: float | None = None
     guess: Any = None
     score: float | None = None
+    kept: tuple[int, ...] | None = None
+    failed: tuple[tuple[int, str], ...] = ()
 
 
 def _is_int(value: Any) -> bool:
@@ -320,28 +326,35 @@ def _element(kind: str | None, value: Any) -> Any:
 # --------------------------------------------------------------------------- #
 
 
-def _list_value(spec: FieldSpec, value: Any) -> tuple[list[Any], str | None, list[int]]:
-    """Parse list elements, returning the values, a note and their source indexes."""
+def _list_value(
+    spec: FieldSpec, value: Any
+) -> tuple[list[Any], str | None, list[int], list[tuple[int, str]]]:
+    """Parse list elements.
+
+    Returns:
+        The values, a note, the source index of each kept value and the
+        ``(source index, message)`` of every element that did not parse.
+    """
     if not isinstance(value, list):
         raise ValueError("a list answer must be an array")
     kept: list[Any] = []
     indexes: list[int] = []
-    dropped: list[str] = []
+    failed: list[tuple[int, str]] = []
     is_set = spec.post.startswith(("set", "frozenset"))
     for index, item in enumerate(value):
         try:
             parsed = _element(spec.item_kind, item)
         except ValueError as exc:
-            dropped.append(str(exc))
+            failed.append((index, str(exc)))
             continue
         if is_set and parsed in kept:
             continue
         kept.append(parsed)
         indexes.append(index)
     reason = None
-    if dropped:
-        reason = f"dropped {len(dropped)} element(s): {dropped[0]}"
-    return kept, reason, indexes
+    if failed:
+        reason = f"dropped {len(failed)} element(s): {failed[0][1]}"
+    return kept, reason, indexes, failed
 
 
 def _clairic_value(spec: FieldSpec, answer: ClairicAnswer) -> tuple[Any, str | None]:
@@ -349,7 +362,7 @@ def _clairic_value(spec: FieldSpec, answer: ClairicAnswer) -> tuple[Any, str | N
     value = answer.value
     kind = spec.clairic.type
     if kind == "list":
-        kept, note, _ = _list_value(spec, value)
+        kept, note, _, _ = _list_value(spec, value)
         return kept, note
     if kind == "duration":
         unit = _unit_of(spec.post, spec.clairic.unit or "seconds")
@@ -390,7 +403,9 @@ def _clairic(spec: FieldSpec, answer: ClairicAnswer) -> Coerced:
         return Coerced(None, True, None, **meta)
     try:
         if spec.clairic.type == "list":
-            value, note, indexes = _list_value(spec, answer.value)
+            value, note, indexes, failed = _list_value(spec, answer.value)
+            meta["kept"] = tuple(indexes)
+            meta["failed"] = tuple(failed)
             # Spans stay aligned with the values: they follow the elements that
             # survived, and are dropped when the model's counts already differ.
             if spans is not None and len(spans) == len(answer.value):

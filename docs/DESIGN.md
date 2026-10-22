@@ -243,7 +243,7 @@ elements only. Order: replace → remove (highest index first) → add. Apply wi
 `jsonpatch.apply_patch` on a deep copy; on conflict try `_fix_string_concat` then
 `_fix_missing_parents`, recording `repaired_from`. Clairic requests always send
 `options.return_state_text=true` so span offsets are re-anchored on sentinel markers;
-`truncated: true` → retry on mention windows, then warn/raise `StateTruncatedError`.
+`truncated: true` → re-ask the same fields on overlapping chunks that cover the whole input (size from the returned `state_text`, overlap ≥ `verify.window_chars`), concurrently, and merge per field (non-null, then confidence; lists united in input order with span dedup); a chunk that is still truncated is split smaller once, then warn/raise `StateTruncatedError`. Any part of the input that is not sent always produces a warning.
 
 ## Repair loop (`_repair.py`)
 

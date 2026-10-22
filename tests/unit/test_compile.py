@@ -1829,3 +1829,50 @@ def test_estimate_override_takes_min_and_max_from_the_bounds() -> None:
     )
     payload = clairic_dict(compile_schema(model).specs[0])
     assert (payload["type"], payload["min"], payload["max"]) == ("forecast", 0.0, 1.0)
+
+
+# --------------------------------------------------------------------------- #
+# Instruction parts
+# --------------------------------------------------------------------------- #
+
+
+def test_render_instructions_builds_every_role() -> None:
+    from trustcall_system_one._compile import render_instructions
+
+    assert render_instructions("clairic", "the age") == "the age"
+    assert (
+        render_instructions("clairic", "the age", prefix="P", hints=["At least 0."])
+        == "P: the age. At least 0."
+    )
+    assert render_instructions("noul", "x") == "Does the input say this is true: x?"
+    assert render_instructions("choice", "x") == "Pick the option that best fits: x"
+    assert render_instructions("score", "x").startswith("Rate on the scale")
+    assert render_instructions("union_type", "x") == "What kind of value is this: x?"
+    clipped = render_instructions("choice", "word " * 50, limit=40)
+    assert len(clipped) <= 40 and clipped.endswith("...")
+
+
+def test_specs_keep_the_parts_the_instructions_were_built_from() -> None:
+    from trustcall_system_one._compile import render_instructions
+
+    spec = spec_for(int, ge=3)
+    assert spec.hints == ("Must be at least 3.",)
+    assert spec.context == "" and spec.clef_context == ""
+    assert (
+        render_instructions(
+            "clairic", spec.description, prefix=spec.context, hints=spec.hints
+        )
+        == spec.instructions
+    )
+    assert spec_for(bool).hints == ()
+    union = spec_for(Union[int, str])
+    assert union.hints == () and union.clef_context == ""
+
+
+def test_shortened_names_record_their_context() -> None:
+    long_name = "a_really_long_field_name_" * 4
+    fields: dict[str, Any] = {long_name: (Optional[int], None)}
+    model = create_model("Ctx", **fields)
+    spec = compile_schema(model).specs[0]
+    assert spec.context == "Ctx"
+    assert spec.instructions.startswith("Ctx: ")

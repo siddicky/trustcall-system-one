@@ -16,14 +16,28 @@ Clef-engine answers are not verified further; they are decisions already.
 
 import dataclasses
 import enum
+import math
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from decimal import Decimal
 from difflib import SequenceMatcher
 from typing import Any
 
+from trustcall_system_one._chunk import (
+    chunk_size,
+    identity_state,
+    merge_parts,
+    part_of,
+    split_ranges,
+)
 from trustcall_system_one._coerce import coerce, coerce_union
-from trustcall_system_one._compile import FieldSpec, SchemaPlan
+from trustcall_system_one._compile import (
+    FieldSpec,
+    Role,
+    SchemaPlan,
+    render_instructions,
+)
+from trustcall_system_one._errors import StateTruncatedError
 from trustcall_system_one._render import (
     RenderedState,
     mention_windows,
@@ -37,6 +51,7 @@ from trustcall_system_one._wire import (
     ChoiceQuestion,
     ClairicAnswer,
     ClairicField,
+    ClairicResponse,
     NoulAnswer,
     NoulCriteria,
     NoulQuestion,
@@ -44,11 +59,13 @@ from trustcall_system_one._wire import (
 from trustcall_system_one.transport import CallMeta
 
 __all__ = [
+    "Asked",
     "Ctx",
     "FieldState",
     "Resolved",
     "accept",
     "agree",
+    "ask_clairic",
     "display",
     "resolve",
     "resolve_clef",
@@ -106,15 +123,21 @@ class Ctx:
         suffix: str = "",
         null_threshold: float | None = None,
     ) -> ClairicField:
-        """Return a copy of the spec's Clairic field, instructions templated.
+        """Return a copy of the spec's Clairic field about this entity.
 
-        The compiled instructions play the part of ``{desc}``. The plan itself
-        is never changed.
+        The instructions are rebuilt from the field's parts: the parent-context
+        prefix is kept as it is, the description is put through
+        ``verify.instruction_template`` and the type and constraint hints follow.
+        The plan itself is never changed.
         """
         assert spec.clairic is not None
         update: dict[str, Any] = {
-            "instructions": self.run.verify.instruction_template.format(
-                label=self.label, desc=spec.clairic.instructions
+            "instructions": render_instructions(
+                "clairic",
+                self.desc(spec),
+                prefix=spec.context,
+                hints=spec.hints,
+                limit=self.run.limits.max_instruction_chars,
             )
             + suffix
         }
@@ -125,19 +148,18 @@ class Ctx:
     def clef_question(self, spec: FieldSpec) -> Question:
         """Return a copy of the spec's Clef question about this entity.
 
-        The field's description inside the compiled question is replaced by the
-        templated description, so the question names the entity.
+        Rebuilt from the field's parts (so a question the compiler clipped is not
+        a problem) with the templated description.
         """
         assert spec.clef is not None
-        question = spec.clef
-        text = question.instructions
-        # The description sits at the end of the compiled question, after any
-        # context prefix, so the last occurrence is the one to replace.
-        if isinstance(text, str) and spec.description:
-            at = text.rfind(spec.description)
-            if at >= 0:
-                text = text[:at] + self.desc(spec) + text[at + len(spec.description) :]
-        return question.model_copy(update={"instructions": text})
+        role: Role = "union_type" if spec.clairic is not None else spec.clef.type
+        text = render_instructions(
+            role,
+            self.desc(spec),
+            prefix=spec.clef_context,
+            limit=self.run.limits.max_instruction_chars,
+        )
+        return spec.clef.model_copy(update={"instructions": text})
 
     def rendered(
         self,
@@ -189,6 +211,130 @@ class Ctx:
             entity={"label": self.label, "mentions": list(self.mentions)},
             spans=None if narrow_to else anchors,
         )
+
+
+# --------------------------------------------------------------------------- #
+# Asking Clairic, in chunks when the state is too long
+# --------------------------------------------------------------------------- #
+
+Asked = dict[str, tuple[ClairicAnswer | None, RenderedState | None]]
+"""Per field: the answer and the state to map its spans with."""
+
+
+async def ask_clairic(
+    ctx: Ctx,
+    fields: dict[str, ClairicField],
+    *,
+    meta: CallMeta,
+    windows: list[Span] | None = None,
+) -> Asked:
+    """Ask Clairic for ``fields`` on the input (or on ``windows`` of it).
+
+    When Clairic reports ``truncated``, the same fields are asked again on
+    consecutive overlapping chunks that together cover everything that was
+    asked, concurrently, and the answers are merged per field (see
+    ``_chunk.merge_parts``). The chunk size comes from how much of the input the
+    truncated response was seen to read. If a chunk is itself truncated the
+    input is split smaller, once; if that is still truncated a warning is
+    recorded, or ``StateTruncatedError`` raised in strict mode. A warning is
+    always recorded when the input is chunked.
+
+    Args:
+        ctx: The entity context.
+        fields: Clairic fields keyed by wire name.
+        meta: Routing context (the call kind).
+        windows: Ranges of the input to ask about; ``None`` for all of it.
+
+    Returns:
+        Each field's answer and the state to map its spans with. For a chunked
+        ask the spans are already in original-input offsets.
+    """
+    run = ctx.run
+    rendered = ctx.rendered(windows=windows)
+    response = await run.call_clairic(fields, rendered, meta=meta)
+    anchored = run.anchor(rendered, response)
+    if not response.truncated:
+        return {name: (response.answers.get(name), anchored) for name in fields}
+
+    ranges = windows or [(0, len(ctx.text))]
+    overlap = run.verify.window_chars
+    covered = sum(end - start for start, end in ranges)
+    size = chunk_size(_chars_read(rendered, response, anchored), covered, overlap)
+    responses: list[tuple[Span, ClairicResponse, RenderedState | None]] = []
+    attempts = 0
+    still_truncated = True
+    while attempts < 2:
+        attempts += 1
+        chunks = split_ranges(ranges, size, overlap)
+        if len(chunks) == 1 and chunks[0] == ranges[0] and len(ranges) == 1:
+            break  # nothing to split: it is one range no longer than a chunk
+        responses = await _ask_chunks(ctx, fields, chunks, meta)
+        truncated = [item for item in responses if item[1].truncated]
+        if not truncated:
+            still_truncated = False
+            break
+        read = [
+            _chars_read(ctx.rendered(windows=[chunk]), resp, anch)
+            for chunk, resp, anch in truncated
+        ]
+        smaller = min(
+            (r for r in read if r is not None),
+            default=None,
+        )
+        shrunk = chunk_size(smaller, size, overlap)
+        if attempts == 2 or shrunk >= size:
+            break
+        size = shrunk
+    if responses:
+        run.warn(
+            f"clairic_chunked: the input of {ctx.plan.name} did not fit one "
+            f"Clairic request and was split into {len(responses)} overlapping "
+            "chunks whose answers were merged"
+        )
+    if still_truncated:
+        message = (
+            f"Clairic still reported a truncated state for {ctx.plan.name} after "
+            "the input was split into chunks, so part of the input was not read"
+        )
+        if run.strict:
+            raise StateTruncatedError(message)
+        run.warn(f"clairic_truncated: {message}")
+    if not responses:  # could not split: use what the full request returned
+        return {name: (response.answers.get(name), anchored) for name in fields}
+    merged: Asked = {}
+    identity = identity_state(ctx.text)
+    for name in fields:
+        parts = [
+            part_of(resp.answers[name], anch, chunk[0])
+            for chunk, resp, anch in responses
+            if name in resp.answers
+        ]
+        merged[name] = (merge_parts(parts), identity)
+    return merged
+
+
+def _chars_read(
+    sent: RenderedState, response: ClairicResponse, anchored: RenderedState | None
+) -> int | None:
+    """How many input characters Clairic was seen to read, if it said."""
+    if response.state_text is None or response.state_text == sent.text:
+        return None
+    if anchored is not None:
+        return anchored.input_chars
+    return len(response.state_text)
+
+
+async def _ask_chunks(
+    ctx: Ctx, fields: dict[str, ClairicField], chunks: list[Span], meta: CallMeta
+) -> list[tuple[Span, ClairicResponse, RenderedState | None]]:
+    async def one(
+        chunk: Span,
+    ) -> tuple[Span, ClairicResponse, RenderedState | None]:
+        rendered = ctx.rendered(windows=[chunk])
+        response = await ctx.run.call_clairic(fields, rendered, meta=meta)
+        return chunk, response, ctx.run.anchor(rendered, response)
+
+    return await gather(*(one(chunk) for chunk in chunks))
 
 
 # --------------------------------------------------------------------------- #
@@ -252,7 +398,11 @@ class Resolved:
     """A model answer turned into a value, with the metadata that came with it.
 
     ``ok`` is false when the answer could not be used (``reason`` is a short
-    code, ``detail`` the explanation). Spans are in the ORIGINAL input.
+    code, ``detail`` the explanation). Spans are in the ORIGINAL input. For a
+    list, ``origin`` gives the position in the model's own answer list of each
+    element of ``value`` and ``lost`` the ``(position, reason, detail)`` of every
+    element dropped while converting it (the one index space of rejected
+    elements).
     """
 
     value: Any = None
@@ -266,6 +416,8 @@ class Resolved:
     confidence: float | None = None
     guess: Any = None
     notes: tuple[str, ...] = ()
+    origin: tuple[int, ...] | None = None
+    lost: tuple[tuple[int, str, str], ...] = ()
 
 
 @dataclass
@@ -281,8 +433,8 @@ class FieldState:
         reject_p: The probability behind ``reject``.
         attribution_p: Attribution probability, or one per element for a list.
         reask: Whether a re-ask contributed to the value.
-        dropped: List elements that were thrown away, as
-            ``(position, reason, detail, p)``.
+        dropped: List elements thrown away by the attribution check, as
+            ``(position in the model's answer list, reason, detail, p)``.
         notes: Short notes for ``FieldAnswer.warnings``.
     """
 
@@ -408,9 +560,16 @@ async def resolve(
     if coerced.reason:
         notes.append(coerced.reason)
     value = coerced.value
+    origin = coerced.kept
+    lost = [(index, "unparseable", message) for index, message in coerced.failed]
     if spec.item_kind == "choice" and isinstance(value, list) and value:
-        value, spans, element_notes = await _choose_elements(ctx, spec, value, spans)
+        before = origin if origin is not None else tuple(range(len(value)))
+        value, spans, element_notes, positions, drops = await _choose_elements(
+            ctx, spec, value, spans
+        )
         notes.extend(element_notes)
+        lost.extend((before[pos], reason, detail) for pos, reason, detail in drops)
+        origin = tuple(before[pos] for pos in positions) if value is not None else None
     return Resolved(
         value=value,
         raw=raw,
@@ -420,6 +579,8 @@ async def resolve(
         confidence=coerced.confidence,
         guess=coerced.guess,
         notes=tuple(notes),
+        origin=origin,
+        lost=tuple(lost),
     )
 
 
@@ -428,12 +589,23 @@ async def _choose_elements(
     spec: FieldSpec,
     elements: list[Any],
     spans: tuple[Span, ...] | None,
-) -> tuple[list[Any] | None, tuple[Span, ...] | None, list[str]]:
+) -> tuple[
+    list[Any] | None,
+    tuple[Span, ...] | None,
+    list[str],
+    list[int],
+    list[tuple[int, str, str]],
+]:
     """Map each text element of a ``list[Literal | Enum]`` to an allowed value.
 
     One Clef ``choice`` per element offers every allowed value plus a
     ``none_of_these`` option; an element that picks it, or whose pick is too
     uncertain, is dropped.
+
+    Returns:
+        The kept values (``None`` if none is left), their spans, notes, the
+        position in ``elements`` of each kept value and ``(position, reason,
+        detail)`` for every element that was dropped.
     """
     assert spec.element_choices is not None
     options = {option: str(value) for option, value in spec.element_choices.items()}
@@ -461,30 +633,37 @@ async def _choose_elements(
     gates = ctx.run.gates
     kept: list[Any] = []
     kept_spans: list[Span] = []
+    positions: list[int] = []
+    drops: list[tuple[int, str, str]] = []
     notes: list[str] = []
     for index, element in enumerate(elements):
         answer = answers.get(f"{spec.wire_name}.el{index}")
         if not isinstance(answer, ChoiceAnswer):
             notes.append(f"element_dropped: {element!r} got no answer")
+            drops.append((index, "missing_answer", f"{element!r} got no answer"))
             continue
         chosen = answer.probabilities.get(answer.choice, 0.0)
         if answer.choice == none_id or answer.choice not in spec.element_choices:
             notes.append(f"element_dropped: {element!r} matches none of the options")
+            drops.append((index, "none_of_these", f"{element!r} matches no option"))
             continue
         if chosen < gates.min_choice_prob or (
             answer.confidence < gates.min_choice_confidence
         ):
             notes.append(f"element_dropped: {element!r} is too uncertain")
+            drops.append((index, "low_choice_prob", f"{element!r} is too uncertain"))
             continue
         value = spec.element_choices[answer.choice]
         if spec.post.startswith(("set", "frozenset")) and value in kept:
             continue
         kept.append(value)
+        positions.append(index)
         if spans is not None:
             kept_spans.append(spans[index])
     if elements and not kept:
-        return None, None, [*notes, "all elements dropped"]
-    return kept, (tuple(kept_spans) if spans is not None else None), notes
+        return None, None, [*notes, "all elements dropped"], [], drops
+    spans_out = tuple(kept_spans) if spans is not None else None
+    return kept, spans_out, notes, positions, drops
 
 
 def resolve_clef(spec: FieldSpec, answer: Answer | None, ctx: Ctx) -> Resolved:
@@ -589,22 +768,23 @@ async def _reask(
 ) -> Resolved:
     """Ask one field again, alone, on windows around ``spans`` (or all the input)."""
     spec = st.spec
-    rendered = ctx.rendered(spans)
-    response = await ctx.run.call_clairic(
+    windows = (
+        mention_windows(len(ctx.text), spans, ctx.run.verify.window_chars)
+        if spans
+        else None
+    )
+    asked = await ask_clairic(
+        ctx,
         {
             spec.wire_name: ctx.clairic_field(
                 spec, suffix=REASK_SUFFIX, null_threshold=null_threshold
             )
         },
-        rendered,
         meta=ctx.meta("reask", field=spec.wire_name),
+        windows=windows,
     )
-    if response.truncated:
-        ctx.run.warn(f"clairic_truncated: the re-ask of {spec.pretty} was truncated")
-    anchored = ctx.run.anchor(rendered, response)
-    return await resolve(
-        ctx, spec, response.answers.get(spec.wire_name), anchored, st.type_answer
-    )
+    answer, anchored = asked[spec.wire_name]
+    return await resolve(ctx, spec, answer, anchored, st.type_answer)
 
 
 def _effective(
@@ -807,6 +987,22 @@ def _p(answers: dict[str, Answer], key: str) -> float | None:
     return answer.noul if isinstance(answer, NoulAnswer) else None
 
 
+def _origin(st: FieldState, position: int) -> int:
+    """Position, in the model's own answer list, of the element at ``position``."""
+    origin = st.resolved.origin
+    return (
+        origin[position] if origin is not None and position < len(origin) else position
+    )
+
+
+def _drop(
+    st: FieldState, position: int, value: Any, p: float | None, *, missing: bool
+) -> None:
+    """Record that a list element was dropped for lack of attribution."""
+    reason = "attribution_missing" if missing else "attribution"
+    st.dropped.append((_origin(st, position), reason, display(value), p))
+
+
 async def _attribution(ctx: Ctx, targets: list[FieldState]) -> None:
     """Check that each value, and each list element, is stated about the entity."""
     if not targets:
@@ -827,9 +1023,10 @@ async def _judge(ctx: Ctx, st: FieldState, answers: dict[str, Answer]) -> None:
     verify = ctx.run.verify
     if not _is_list(st):
         p = _p(answers, _attr_id(st, None))
-        if p is None:
-            return
         st.attribution_p = p
+        if p is None:  # no answer is not a pass: check again, in isolation
+            await _recheck_scalar(ctx, st)
+            return
         if p >= verify.attribution_keep:
             return
         if p < verify.attribution_drop:
@@ -845,15 +1042,15 @@ async def _judge(ctx: Ctx, st: FieldState, answers: dict[str, Answer]) -> None:
     keep: list[bool] = []
     pending: list[int] = []
     for index in range(len(elements)):
-        p = _p(answers, _attr_id(st, index))
-        p = 1.0 if p is None else p
+        answered = _p(answers, _attr_id(st, index))
+        p = math.nan if answered is None else answered
         probabilities.append(p)
-        if p >= verify.attribution_keep:
+        if answered is not None and p >= verify.attribution_keep:
             keep.append(True)
-        elif p < verify.attribution_drop:
+        elif answered is not None and p < verify.attribution_drop:
             keep.append(False)
-            st.dropped.append((index, "attribution", display(elements[index]), p))
-        else:
+            _drop(st, index, elements[index], p, missing=False)
+        else:  # in the middle band, or unanswered (which is not a pass)
             keep.append(False)
             pending.append(index)
     st.attribution_p = tuple(probabilities)
@@ -861,7 +1058,14 @@ async def _judge(ctx: Ctx, st: FieldState, answers: dict[str, Answer]) -> None:
         await _recheck_elements(ctx, st, elements, spans, pending, keep, probabilities)
     survivors = [i for i, flag in enumerate(keep) if flag]
     if not survivors:
-        st.set_reject("attribution", "no element is stated about the entity", None)
+        reasons = {reason for _, reason, _, _ in st.dropped}
+        st.set_reject(
+            "attribution_missing"
+            if reasons == {"attribution_missing"}
+            else "attribution",
+            "no element is stated about the entity",
+            None,
+        )
         return
     st.resolved = dataclasses.replace(
         st.resolved,
@@ -895,7 +1099,13 @@ async def _recheck_scalar(ctx: Ctx, st: FieldState) -> None:
     )
     p = _p(answers, _attr_id(st, None))
     st.attribution_p = p
-    if p is not None and p >= verify.attribution_keep:
+    if p is None:
+        st.set_reject(
+            "attribution_missing",
+            "no attribution answer came back, even after a re-ask",
+            None,
+        )
+    elif p >= verify.attribution_keep:
         _adopt(st, checked)
     else:
         st.set_reject(
@@ -932,8 +1142,13 @@ async def _recheck_elements(
                     break
     for index in pending:
         if index not in candidates:
-            st.dropped.append(
-                (index, "attribution", display(elements[index]), probabilities[index])
+            was = probabilities[index]
+            _drop(
+                st,
+                index,
+                elements[index],
+                None if math.isnan(was) else was,
+                missing=math.isnan(was),
             )
     if not candidates:
         return
@@ -955,7 +1170,7 @@ async def _recheck_elements(
             keep[index] = True
             elements[index] = value
         else:
-            st.dropped.append((index, "attribution", display(value), p))
+            _drop(st, index, value, p, missing=p is None)
     st.attribution_p = tuple(probabilities)
 
 

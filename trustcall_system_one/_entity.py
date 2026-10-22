@@ -18,7 +18,7 @@ from typing import Any
 from pydantic import BaseModel, ValidationError
 
 from trustcall_system_one._compile import FieldSpec, SchemaPlan
-from trustcall_system_one._errors import ExtractionValidationError, StateTruncatedError
+from trustcall_system_one._errors import ExtractionValidationError
 from trustcall_system_one._flatten import prune_nulls, unflatten
 from trustcall_system_one._names import Path
 from trustcall_system_one._render import RenderedState
@@ -35,6 +35,7 @@ from trustcall_system_one._verify import (
     FieldState,
     Resolved,
     accept,
+    ask_clairic,
     resolve,
     resolve_clef,
     run_ladder,
@@ -57,7 +58,6 @@ _MILESTONE = {
     "collection": "M9",
     "mapping": "M9",
 }
-_HEAD_WINDOWS = 4  # a truncated state with no spans is retried on this many windows
 
 
 @dataclass(frozen=True)
@@ -116,53 +116,13 @@ async def _presence(ctx: Ctx) -> float:
     return answer.noul
 
 
-def _spans_in(
-    answers: dict[str, ClairicAnswer], anchored: RenderedState | None
-) -> list[Span]:
-    """Collect the answers' spans, mapped to the original input."""
-    if anchored is None:
-        return []
-    found: list[Span] = []
-    for answer in answers.values():
-        pairs = [answer.span] if answer.span else []
-        pairs += answer.spans or []
-        for pair in pairs:
-            if len(pair) == 2:
-                mapped = anchored.to_original((pair[0], pair[1]))
-                if mapped is not None:
-                    found.append(mapped)
-    return found
-
-
 async def _clairic_pass(
     ctx: Ctx, specs: list[FieldSpec]
 ) -> dict[str, tuple[ClairicAnswer | None, RenderedState | None]]:
-    """One Clairic request for ``specs``; a truncated state is retried narrowed."""
-    run = ctx.run
+    """One Clairic request for ``specs`` (chunked if the input is too long)."""
     fields = {spec.wire_name: ctx.clairic_field(spec) for spec in specs}
     single = specs[0].wire_name if len(specs) == 1 else None
-    meta = ctx.meta("extract", field=single)
-    rendered = ctx.rendered()
-    response = await run.call_clairic(fields, rendered, meta=meta)
-    anchored = run.anchor(rendered, response)
-    if response.truncated:
-        spans = _spans_in(response.answers, anchored)
-        window = run.verify.window_chars
-        windows = None
-        if not spans:  # nothing to anchor on: Clairic reads the head, so keep it
-            windows = [(0, min(len(ctx.text), _HEAD_WINDOWS * window))]
-        narrowed = ctx.rendered(spans or None, windows=windows)
-        response = await run.call_clairic(fields, narrowed, meta=meta)
-        anchored = run.anchor(narrowed, response)
-        if response.truncated:
-            message = (
-                f"Clairic reported a truncated state for {ctx.plan.name} even "
-                "after narrowing it to windows around the mentions"
-            )
-            if run.strict:
-                raise StateTruncatedError(message)
-            run.warn(f"clairic_truncated: {message}")
-    return {name: (response.answers.get(name), anchored) for name in fields}
+    return await ask_clairic(ctx, fields, meta=ctx.meta("extract", field=single))
 
 
 async def _extract(
@@ -231,6 +191,8 @@ def _clairic_answer(state: FieldState) -> tuple[FieldAnswer, list[RejectedOp]]:
         rejected.append(
             RejectedOp(None, pointer, state.reject, state.reject_detail, state.reject_p)
         )
+    for position, reason, detail in resolved.lost:
+        rejected.append(RejectedOp(None, f"{pointer}/{position}", reason, detail, None))
     for position, reason, detail, p in state.dropped:
         rejected.append(RejectedOp(None, f"{pointer}/{position}", reason, detail, p))
     answer = FieldAnswer(

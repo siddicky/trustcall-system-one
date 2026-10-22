@@ -6,7 +6,7 @@ import datetime as dt
 from typing import Any, Literal, Optional
 
 import pytest
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, create_model
 
 from tests.unit.extract_helpers import Script, ca, kinds, make_extractor, pick
 from trustcall_system_one import (
@@ -707,3 +707,226 @@ async def test_clef_questions_name_the_entity_at_the_description() -> None:
         "Pick the option that best fits: the Review's rating"
     )
     assert plan.spec(("best",)).clef == before
+
+
+# --------------------------------------------------------------------------- #
+# A missing attribution answer is not a pass
+# --------------------------------------------------------------------------- #
+
+
+class Lossy:
+    """Wraps a script's transport and leaves some Clef answers out.
+
+    ``drop`` maps a question id to how many of its answers to leave out, counting
+    calls that carried that question.
+    """
+
+    def __init__(self, script: Script, drop: dict[str, int]) -> None:
+        self.script = script
+        self.drop = dict(drop)
+
+    async def run(
+        self, model: str, payload: Any, *, meta: Any, timeout: float | None = None
+    ) -> Any:
+        import dataclasses
+
+        response = await self.script.transport.run(model, payload, meta=meta)
+        if meta.kind != "attribution":
+            return response
+        body = dict(response.body)
+        answers = dict(body["answers"])
+        for qid in list(answers):
+            if self.drop.get(qid, 0) > 0:
+                self.drop[qid] -= 1
+                del answers[qid]
+        body["answers"] = answers
+        return dataclasses.replace(response, body=body)
+
+
+async def run_lossy(
+    script: Script, drop: dict[str, int], **kwargs: Any
+) -> tuple[ResultRecord, Script]:
+    from trustcall_system_one import create_extractor
+
+    extractor = create_extractor(
+        [Person],
+        transport=Lossy(script, drop),
+        verify=VerifyConfig(borderline_null=False),
+        **kwargs,
+    )
+    return (await extractor.ainvoke(TEXT)).records[0], script
+
+
+async def test_a_missing_scalar_attribution_is_rechecked_not_passed() -> None:
+    script = person_script()
+    script.reask = {"city": ca("text", "London", find="London")}
+    record, _ = await run_lossy(script, {"attr.city": 1})
+    assert person(record).city == "London"  # the recheck answered and passed
+    assert record.fields["city"].reask is True
+    assert record.fields["city"].attribution_p == 0.95
+    assert len(script.calls("attribution")) == 2
+
+
+async def test_a_scalar_attribution_that_stays_missing_is_dropped() -> None:
+    script = person_script()
+    script.reask = {"city": ca("text", "London", find="London")}
+    record, _ = await run_lossy(script, {"attr.city": 2})
+    assert person(record).city is None
+    assert record.fields["city"].rejected_reason == "attribution_missing"
+    assert [(r.path, r.reason) for r in record.rejected] == [
+        ("/city", "attribution_missing")
+    ]
+
+
+async def test_a_missing_attribution_with_a_reask_that_finds_nothing_is_dropped() -> (
+    None
+):
+    script = person_script()
+    script.reask = {"city": ca("text", None, p_null=0.99)}
+    record, _ = await run_lossy(script, {"attr.city": 1})
+    assert record.fields["city"].rejected_reason == "attribution"
+
+
+async def test_a_missing_element_attribution_drops_the_element_as_missing() -> None:
+    class Notes(BaseModel):
+        notes: list[str]
+
+    from trustcall_system_one import create_extractor
+
+    script = Script()
+    script.clairic = {"notes": ca("list", ["red", "green"], find_all=["red", "green"])}
+    script.reask = {"notes": ca("list", ["red", "green"], find_all=["red", "green"])}
+    extractor = create_extractor(
+        [Notes],
+        transport=Lossy(script, {"attr.notes.1": 2}),
+        verify=VerifyConfig(borderline_null=False),
+    )
+    record = (await extractor.ainvoke("red green")).records[0]
+    assert record.value == Notes(notes=["red"])
+    assert [(r.path, r.reason) for r in record.rejected] == [
+        ("/notes/1", "attribution_missing")
+    ]
+    assert record.fields["notes"].attribution_p is not None
+
+
+async def test_every_element_missing_rejects_the_field_as_missing() -> None:
+    class Notes(BaseModel):
+        notes: Optional[list[str]] = None
+
+    from trustcall_system_one import create_extractor
+
+    script = Script()
+    script.clairic = {"notes": ca("list", ["red"], find_all=["red"])}
+    script.reask = {"notes": ca("list", ["red"], find_all=["red"])}
+    extractor = create_extractor(
+        [Notes],
+        transport=Lossy(script, {"attr.notes.0": 2}),
+        verify=VerifyConfig(borderline_null=False),
+    )
+    record = (await extractor.ainvoke("red")).records[0]
+    assert record.fields["notes"].rejected_reason == "attribution_missing"
+
+
+# --------------------------------------------------------------------------- #
+# Dropped elements: one index space
+# --------------------------------------------------------------------------- #
+
+
+async def test_every_dropped_list_element_is_rejected_at_its_original_position() -> (
+    None
+):
+    class Numbers(BaseModel):
+        nums: list[int]
+
+    script = Script()
+    script.clairic = {
+        "nums": ca("list", ["1", "x", "3", "4"], find_all=["1", "x", "3", "4"])
+    }
+    script.attribution = {"attr.nums.1": 0.0}  # the element "3" (kept index 1)
+    extractor = make_extractor([Numbers], script)
+    record = (await extractor.ainvoke("1 x 3 4")).records[0]
+    assert record.value == Numbers(nums=[1, 4])
+    by_path = {r.path: r for r in record.rejected}
+    assert set(by_path) == {"/nums/1", "/nums/2"}
+    # "x" failed to parse (position 1 of the model's list); "3" is position 2 of
+    # it, although it was the second element left after parsing
+    assert by_path["/nums/1"].reason == "unparseable"
+    assert by_path["/nums/2"].reason == "attribution"
+    assert by_path["/nums/2"].detail == "3"
+
+
+async def test_enum_list_drops_share_the_index_space() -> None:
+    class Kinds(BaseModel):
+        kinds: list[Literal["bug", "feature", "docs"]]
+
+    script = Script()
+    script.clairic = {
+        "kinds": ca(
+            "list",
+            ["bug", "wish", "feature", "docs"],
+            find_all=["bug", "wish", "feature", "docs"],
+        )
+    }
+    options = ["bug", "feature", "docs", "none_of_these"]
+    script.clef = {
+        "kinds.el0": pick("bug", options),
+        "kinds.el1": pick("none_of_these", options),
+        "kinds.el2": pick("feature", options),
+        "kinds.el3": pick("docs", options),
+    }
+    script.attribution = {"attr.kinds.2": 0.0}  # "docs": third element left
+    extractor = make_extractor([Kinds], script)
+    record = (await extractor.ainvoke("bug wish feature docs")).records[0]
+    assert record.value == Kinds(kinds=["bug", "feature"])
+    by_path = {r.path: r.reason for r in record.rejected}
+    assert by_path == {"/kinds/1": "none_of_these", "/kinds/3": "attribution"}
+
+
+# --------------------------------------------------------------------------- #
+# Templating rebuilds questions from their parts
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_clipped_clef_question_is_rebuilt_not_patched() -> None:
+    from trustcall_system_one import Limits
+
+    long_description = "whether the review " + "really " * 12 + "praises the product"
+
+    class Review(BaseModel):
+        praises: bool = Field(False, description=long_description)
+
+    script = Script()
+    script.clef = {"praises": {"type": "noul", "noul": 0.9}}
+    extractor = make_extractor(
+        [Review], script, limits=Limits(max_instruction_chars=60)
+    )
+    compiled = extractor.plan_for(Review).spec(("praises",)).clef
+    assert compiled is not None
+    assert long_description not in str(compiled.instructions)  # clipped by the compiler
+    await extractor.ainvoke("It praises.")
+    (call,) = script.calls("clef_fields")
+    text = call[1]["questions"]["praises"]["instructions"]
+    assert len(text) <= 60
+    assert text.startswith("Does the input say this is true: the Review's whether")
+    assert text.endswith("...")
+
+
+async def test_the_template_wraps_the_description_not_the_context_or_hints() -> None:
+    from trustcall_system_one import Limits
+
+    # a name over 64 characters is shortened, which adds parent context
+    definitions: dict[str, Any] = {
+        "f" * 70: (Optional[int], Field(None, ge=0, description="the count"))
+    }
+    Wide = create_model("Wide", **definitions)
+    plan = compile_schema(Wide)
+    spec = plan.specs[0]
+    assert spec.context == "Wide" and spec.hints == ("Must be at least 0.",)
+    script = Script()
+    script.clairic = {spec.wire_name: ca("number", 3)}
+    extractor = make_extractor([Wide], script, limits=Limits())
+    await extractor.ainvoke("The count is 3.")
+    (call,) = script.calls("extract")
+    assert call[1]["fields"][spec.wire_name]["instructions"] == (
+        "Wide: the Wide's the count. Must be at least 0."
+    )

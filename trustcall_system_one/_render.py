@@ -86,6 +86,11 @@ class RenderedState:
                 return (start - seg_start + original, end - seg_start + original)
         return None
 
+    @property
+    def input_chars(self) -> int:
+        """How many characters of the original input this state contains."""
+        return sum(end - start for start, end, _ in self.segments)
+
     def in_existing(self, span: Span) -> bool:
         """Whether a span in ``text`` lies inside the ``<existing>`` block."""
         if self.existing_span is None:
@@ -199,12 +204,31 @@ def render_clairic(
     )
 
 
+def _input_start(state_text: str, cursor: int) -> int:
+    """Where the input content begins in a returned ``state_text``."""
+    marker = state_text.find(_INPUT_OPEN, cursor)
+    return cursor if marker < 0 else marker + len(_INPUT_OPEN)
+
+
+def _common_prefix(piece: str, state_text: str, start: int) -> tuple[int, int] | None:
+    """Return ``(start, length)`` of the longest prefix of ``piece`` at ``start``."""
+    limit = min(len(piece), len(state_text) - start)
+    length = 0
+    while length < limit and piece[length] == state_text[start + length]:
+        length += 1
+    # A few characters in common can be chance; a real prefix has more.
+    return (start, length) if length >= min(8, len(piece)) and length else None
+
+
 def reanchor(sent: RenderedState, state_text: str | None) -> RenderedState | None:
     """Re-locate the input in the ``state_text`` Clairic says it read.
 
     Clairic returns the state it actually used. When that is exactly what was
     sent nothing changes. Otherwise each verbatim piece of the input is searched
-    for after the ``<input>`` sentinel.
+    for after the ``<input>`` sentinel. If Clairic read only the beginning of the
+    input (a truncated state), ``state_text`` holds a prefix of the input block:
+    that prefix is anchored, so spans inside it still map, while spans beyond it
+    do not (``RenderedState.to_original`` returns ``None`` for them).
 
     Args:
         sent: The state that was sent.
@@ -219,19 +243,31 @@ def reanchor(sent: RenderedState, state_text: str | None) -> RenderedState | Non
         return sent
     cursor = max(0, state_text.find("<input>"))
     segments: list[Segment] = []
+    previous_end = sent.input_span[0]
     for start, end, original in sent.segments:
         piece = sent.text[start:end]
         found = state_text.find(piece, cursor)
         if found < 0:
-            return None
+            # Clairic may have read only the beginning of a long input: keep the
+            # part of this piece that is there, and nothing after it. It starts
+            # right after whatever stood between it and the previous piece (the
+            # input block's opening, or a separator).
+            between = sent.text[previous_end:start]
+            where = cursor if segments else _input_start(state_text, cursor)
+            if state_text.startswith(between, where):
+                prefix = _common_prefix(piece, state_text, where + len(between))
+                if prefix is not None:
+                    segments.append((prefix[0], prefix[0] + prefix[1], original))
+            break
         segments.append((found, found + len(piece), original))
         cursor = found + len(piece)
+        previous_end = end
     if not segments:
         return None
     existing_span: Span | None = None
     if sent.existing_span is not None:
         existing = sent.text[slice(*sent.existing_span)]
-        found = state_text.find(existing, cursor)
+        found = state_text.find(existing, segments[-1][1])
         if found >= 0:
             existing_span = (found, found + len(existing))
     return RenderedState(

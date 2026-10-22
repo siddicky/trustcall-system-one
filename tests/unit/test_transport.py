@@ -1240,7 +1240,9 @@ async def test_no_deadline_means_unbounded_retries_in_time() -> None:
     assert clock.delays == [50.0] * 10
 
 
-async def test_time_spent_waiting_for_a_slot_counts_against_the_deadline() -> None:
+async def test_time_spent_queueing_for_a_slot_does_not_count_against_the_deadline() -> (
+    None
+):
     transport, rec, clock = make_clocked(
         ok(), call_deadline=5.0, concurrency=ConcurrencyConfig(per_model={CLAIRIC: 1})
     )
@@ -1257,13 +1259,97 @@ async def test_time_spent_waiting_for_a_slot_counts_against_the_deadline() -> No
     call = asyncio.create_task(run(transport))
     for _ in range(5):
         await asyncio.sleep(0)  # let the call queue behind the holder
-    clock.now += 10.0
+    clock.now += 10.0  # longer than the whole deadline
     release.set()
-    with pytest.raises(TransportError, match="deadline"):
+    assert (await call).body == BODY  # the request was sent and succeeded
+    await holder
+    assert len(rec.requests) == 1
+    assert transport.limiter.in_flight == 0
+
+
+async def test_the_deadline_starts_when_the_first_slot_is_acquired() -> None:
+    transport, _, clock = make_clocked(
+        err(503, headers={"Retry-After": "2"}),
+        max_retries=10,
+        call_deadline=5.0,
+        concurrency=ConcurrencyConfig(per_model={CLAIRIC: 1}),
+    )
+    release = asyncio.Event()
+    acquired = asyncio.Event()
+
+    async def hold() -> None:
+        async with transport.limiter.slot(CLAIRIC):
+            acquired.set()
+            await release.wait()
+
+    holder = asyncio.create_task(hold())
+    await acquired.wait()
+    call = asyncio.create_task(run(transport))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    clock.now += 100.0
+    release.set()
+    with pytest.raises(TransportError, match="deadline") as info:
         await call
     await holder
+    assert clock.delays == [2.0, 2.0]  # budget counted from the first attempt
+    assert info.value.retries == 2
+
+
+async def test_many_queued_calls_all_succeed_under_a_short_deadline() -> None:
+    delay = 0.05
+
+    async def slow(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(delay)
+        return ok()
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(slow))
+    transport = CloudflareTransport(
+        account_id="a",
+        api_token="t",
+        client=client,
+        concurrency=ConcurrencyConfig(per_model={CLAIRIC: 1}),
+        call_deadline=delay * 3,  # far less than 8 queued requests take in total
+    )
+    results = await asyncio.gather(*(run(transport) for _ in range(8)))
+    assert [r.body for r in results] == [BODY] * 8
+
+
+async def test_queue_timeout_fails_a_call_that_never_got_a_slot() -> None:
+    transport, rec, _ = make_clocked(
+        ok(),
+        queue_timeout=0.05,
+        concurrency=ConcurrencyConfig(per_model={CLAIRIC: 1}),
+    )
+    release = asyncio.Event()
+    acquired = asyncio.Event()
+
+    async def hold() -> None:
+        async with transport.limiter.slot(CLAIRIC):
+            acquired.set()
+            await release.wait()
+
+    holder = asyncio.create_task(hold())
+    await acquired.wait()
+    with pytest.raises(TransportError, match="waiting for a request slot") as info:
+        await run(transport)
+    assert info.value.retries == 0
     assert rec.requests == []
+    release.set()
+    await holder
     assert transport.limiter.in_flight == 0
+    assert (await run(transport)).body == BODY  # the transport still works
+
+
+async def test_queue_timeout_defaults_to_waiting_indefinitely() -> None:
+    transport, _, _ = make_clocked(ok())
+    assert transport._queue_timeout is None
+
+
+@pytest.mark.parametrize("bad", [0, -1.0, float("nan"), float("inf")])
+def test_invalid_queue_timeout_is_rejected(bad: float) -> None:
+    with pytest.raises(ValueError, match="queue_timeout"):
+        CloudflareTransport(queue_timeout=bad)
 
 
 @pytest.mark.parametrize("bad", [0, -1.0, float("nan"), float("inf")])

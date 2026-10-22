@@ -16,7 +16,21 @@ __all__ = [
 
 
 class TrustcallSystemOneError(Exception):
-    """Base class for all trustcall-system-one errors."""
+    """Base class for all trustcall-system-one errors.
+
+    An error that escapes ``Extractor.ainvoke`` or ``invoke`` carries what the
+    failed invoke had spent before it failed, so the cost of a failure is not
+    lost.
+
+    Attributes:
+        calls: The ``CallRecord`` log up to the failure, the failed call included.
+        usage: The ``Usage`` totals up to the failure (``None`` outside an invoke).
+        cost: The ``CostReport`` for ``usage`` (``None`` outside an invoke).
+    """
+
+    calls: tuple[Any, ...] = ()
+    usage: Any = None
+    cost: Any = None
 
 
 class TransportError(TrustcallSystemOneError):

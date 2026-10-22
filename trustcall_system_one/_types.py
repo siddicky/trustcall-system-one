@@ -298,7 +298,10 @@ class RejectedOp:
     Attributes:
         op: The operation, or ``None`` for an answer that never became one
             (every rejection of an insert).
-        path: JSON Pointer of the field.
+        path: JSON Pointer of the field. For an element dropped from a list
+            answer the last segment is the element's position in the model's
+            own answer list (one index space for every cause: conversion
+            failure, no matching option, attribution), not in the final value.
         reason: Short machine-readable reason, such as ``attribution``.
         detail: A longer explanation.
         p: The probability or confidence behind the decision, when there is one.

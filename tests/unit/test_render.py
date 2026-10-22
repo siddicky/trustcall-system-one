@@ -236,3 +236,73 @@ def test_an_oversized_state_without_spans_keeps_the_beginning() -> None:
     assert warning is not None and "clef_state_truncated" in warning
     assert estimate_tokens(narrowed) <= 2000
     assert text.startswith(narrowed["input"])
+
+
+# --------------------------------------------------------------------------- #
+# A state_text that holds only a prefix of the input
+# --------------------------------------------------------------------------- #
+
+
+def test_reanchor_accepts_a_state_text_cut_inside_the_input() -> None:
+    text = "Ada Lovelace met Charles Babbage in London. " * 5
+    rendered = render_clairic(text, label="the Person")
+    cut = rendered.text[: rendered.input_offset + 60]  # Clairic read 60 characters
+    anchored = reanchor(rendered, cut)
+    assert anchored is not None
+    assert anchored.text == cut
+    assert anchored.input_chars == 60
+    inside = anchored.to_original(
+        (anchored.input_offset + 4, anchored.input_offset + 12)
+    )
+    assert inside == (4, 12)
+    assert text[4:12] == "Lovelace"
+    beyond = (anchored.input_offset + 70, anchored.input_offset + 75)
+    assert anchored.to_original(beyond) is None
+    straddling = (anchored.input_offset + 55, anchored.input_offset + 65)
+    assert anchored.to_original(straddling) is None
+
+
+def test_reanchor_of_a_prefix_works_when_the_head_also_changed() -> None:
+    text = "x" * 20 + " Ada " + "y" * 200
+    rendered = render_clairic(text, label="the Person")
+    changed = rendered.text.replace("Answer only", "Reply only")
+    cut = changed[: changed.index("<input>") + len("<input>\n") + 40]
+    anchored = reanchor(rendered, cut)
+    assert anchored is not None and anchored.input_chars == 40
+    at = cut.index("Ada")
+    assert anchored.to_original((at, at + 3)) == (21, 24)
+
+
+def test_reanchor_of_a_narrowed_state_cut_inside_a_window() -> None:
+    text = "".join(f"w{i} " for i in range(400))
+    windows = [(0, 300), (800, 1100)]
+    rendered = render_clairic(text, label="x", windows=windows)
+    second_piece = rendered.segments[1][0]
+    cut = rendered.text[: second_piece + 50]
+    anchored = reanchor(rendered, cut)
+    assert anchored is not None
+    assert [end - start for start, end, _ in anchored.segments] == [300, 50]
+    assert anchored.input_chars == 350
+    at = anchored.segments[1][0] + 10
+    assert anchored.to_original((at, at + 5)) == (810, 815)
+
+
+def test_reanchor_needs_more_than_a_chance_match_for_a_prefix() -> None:
+    rendered = render_clairic("Ada Lovelace met Babbage.", label="x")
+    assert reanchor(rendered, "<input>\nAda L") is None  # 5 characters in common
+    assert reanchor(rendered, "<input>\nAda Lovelace met") is not None
+
+
+def test_a_prefix_state_keeps_the_existing_block_unknown_when_it_was_cut_off() -> None:
+    rendered = render_clairic("abcdefghij" * 10, label="x", existing="REC")
+    cut = rendered.text[: rendered.input_offset + 30]
+    anchored = reanchor(rendered, cut)
+    assert anchored is not None and anchored.existing_span is None
+
+
+def test_input_chars_counts_every_piece() -> None:
+    assert render_clairic("hello", label="x").input_chars == 5
+    windows = [(0, 3), (10, 14)]
+    assert (
+        render_clairic("0123456789abcdef", label="x", windows=windows).input_chars == 7
+    )

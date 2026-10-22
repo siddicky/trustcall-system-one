@@ -1,0 +1,185 @@
+"""Tests for chunk splitting and the per-field merge."""
+
+import itertools
+
+from trustcall_system_one._chunk import (
+    DEFAULT_CHUNK_CHARS,
+    Part,
+    chunk_size,
+    identity_state,
+    merge_parts,
+    part_of,
+    split_ranges,
+)
+from trustcall_system_one._render import render_clairic
+from trustcall_system_one._wire import ClairicAnswer
+
+
+def answer(value: object, **extra: object) -> ClairicAnswer:
+    return ClairicAnswer(type="text", value=value, **extra)
+
+
+def part(
+    value: object,
+    start: int = 0,
+    *,
+    span: list[int] | None = None,
+    spans: list[list[int]] | None = None,
+    **extra: object,
+) -> Part:
+    """A part whose chunk starts at ``start`` (spans given in original offsets)."""
+    raw = answer(value, span=span, spans=spans, **extra)
+    return part_of(raw, identity_state("x" * 10_000), start)
+
+
+# --------------------------------------------------------------------------- #
+# split_ranges
+# --------------------------------------------------------------------------- #
+
+
+def test_a_range_no_longer_than_a_chunk_is_one_chunk() -> None:
+    assert split_ranges([(0, 100)], 100, 10) == [(0, 100)]
+    assert split_ranges([(5, 50)], 100, 10) == [(5, 50)]
+
+
+def test_chunks_are_consecutive_and_overlap() -> None:
+    chunks = split_ranges([(0, 1000)], 300, 50)
+    assert chunks[0] == (0, 300)
+    assert chunks[-1][1] == 1000
+    for (_, end), (start, _) in itertools.pairwise(chunks):
+        assert end - start == 50
+    assert all(end - start <= 300 for start, end in chunks)
+    covered: set[int] = set()
+    for start, end in chunks:
+        covered.update(range(start, end))
+    assert covered == set(range(1000))
+
+
+def test_every_range_is_split_on_its_own() -> None:
+    chunks = split_ranges([(0, 250), (1000, 1100)], 100, 20)
+    assert chunks[-1] == (1000, 1100)
+    assert all(not (a < 1000 < b) for a, b in chunks)
+    assert [c for c in chunks if c[0] < 1000][-1][1] == 250
+
+
+def test_overlap_at_least_the_size_still_makes_progress() -> None:
+    chunks = split_ranges([(0, 10)], 3, 3)
+    assert chunks[-1][1] == 10 and len(chunks) <= 11
+
+
+# --------------------------------------------------------------------------- #
+# chunk_size
+# --------------------------------------------------------------------------- #
+
+
+def test_chunk_size_comes_from_what_was_read() -> None:
+    assert chunk_size(5000, 26_000, 100) == 4000
+    assert chunk_size(None, 26_000, 100) == DEFAULT_CHUNK_CHARS
+
+
+def test_chunk_size_always_splits_and_never_drops_below_the_floor() -> None:
+    assert chunk_size(None, 1000, 20) == 600  # below the range: at least two chunks
+    assert chunk_size(10, 1000, 100) == 201  # 2 * overlap + 1
+    assert chunk_size(50_000, 26_000, 100) == int(26_000 * 0.6)
+
+
+# --------------------------------------------------------------------------- #
+# part_of
+# --------------------------------------------------------------------------- #
+
+
+def test_part_of_maps_spans_through_the_chunk_state() -> None:
+    text = "0123456789" * 30
+    rendered = render_clairic(text, label="x", windows=[(100, 200)])
+    offset = rendered.segments[0][0]
+    raw = answer("890", span=[offset + 8, offset + 11])
+    mapped = part_of(raw, rendered, 100)
+    assert mapped.span == (108, 111)
+    assert text[108:111] == "890"
+    listed = answer(["a", "b"], spans=[[offset, offset + 2], [0, 3]])  # 2nd: in focus
+    assert part_of(listed, rendered, 100).spans == ((100, 102), None)
+    assert part_of(answer("v"), rendered, 100).span is None
+    assert part_of(answer("v"), None, 100).span is None
+
+
+# --------------------------------------------------------------------------- #
+# merge_parts
+# --------------------------------------------------------------------------- #
+
+
+def test_nothing_merges_to_nothing() -> None:
+    assert merge_parts([]) is None
+
+
+def test_all_null_gives_the_most_certain_null() -> None:
+    merged = merge_parts([part(None, p_null=0.7), part(None, p_null=0.99)])
+    assert merged is not None and merged.value is None and merged.p_null == 0.99
+
+
+def test_non_null_beats_null() -> None:
+    merged = merge_parts(
+        [part(None, p_null=0.99), part("Paris", span=[5, 10], confidence=0.6)]
+    )
+    assert merged is not None
+    assert merged.value == "Paris" and merged.span == [5, 10]
+
+
+def test_higher_confidence_wins_and_ties_go_to_the_earlier_chunk() -> None:
+    low = part("low", span=[1, 4], confidence=0.6)
+    high = part("high", 1000, span=[1001, 1005], confidence=0.9)
+    merged = merge_parts([low, high])
+    assert merged is not None and merged.value == "high" and merged.span == [1001, 1005]
+    tie_a = part("a", span=[1, 2], confidence=0.8)
+    tie_b = part("b", 1000, span=[1001, 1002], confidence=0.8)
+    first = merge_parts([tie_a, tie_b])
+    assert first is not None and first.value == "a"
+
+
+def test_scalars_without_a_confidence_still_merge() -> None:
+    merged = merge_parts([part("a"), part("b", 1000)])
+    assert merged is not None and merged.value == "a"
+
+
+def test_lists_are_united_in_input_order_with_span_dedup() -> None:
+    first = part(["beta", "alpha"], 0, spans=[[500, 504], [10, 15]], confidence=0.9)
+    second = part(
+        ["beta", "gamma"], 400, spans=[[500, 504], [900, 905]], confidence=0.8
+    )
+    merged = merge_parts([first, second])
+    assert merged is not None
+    assert merged.value == ["alpha", "beta", "gamma"]
+    assert merged.spans == [[10, 15], [500, 504], [900, 905]]
+    assert merged.confidence == 0.8  # the least certain chunk
+    assert merged.span is None
+
+
+def test_overlapping_spans_are_duplicates_even_if_the_text_differs() -> None:
+    merged = merge_parts(
+        [
+            part(["Ada Lovelace"], 0, spans=[[10, 22]]),
+            part(["Ada"], 5, spans=[[10, 13]]),
+        ]
+    )
+    assert merged is not None and merged.value == ["Ada Lovelace"]
+
+
+def test_the_same_text_at_two_places_is_two_elements() -> None:
+    merged = merge_parts(
+        [
+            part(["red"], 0, spans=[[10, 13]]),
+            part(["red"], 900, spans=[[950, 953]]),
+        ]
+    )
+    assert merged is not None and merged.value == ["red", "red"]
+
+
+def test_lists_without_spans_dedupe_by_text_and_follow_chunk_order() -> None:
+    merged = merge_parts([part(["B", "a"], 0), part(["b", "c"], 500), part(["z"], 100)])
+    assert merged is not None
+    assert merged.value == ["B", "a", "z", "c"]  # ordered by chunk start
+    assert merged.spans is None
+
+
+def test_a_null_chunk_does_not_hide_the_others_list() -> None:
+    merged = merge_parts([part(None, p_null=0.99), part(["x"], 10, spans=[[12, 13]])])
+    assert merged is not None and merged.value == ["x"]

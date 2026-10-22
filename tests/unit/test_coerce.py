@@ -799,3 +799,31 @@ def test_unconstrained_decimals_keep_their_precision() -> None:
     assert spec.clairic is not None and spec.clairic.decimals is None
     assert coerce(spec, answer("number", 0.000123)).value == Decimal("0.000123")
     assert coerce(spec, answer("number", "0.000123")).value == Decimal("0.000123")
+
+
+# --------------------------------------------------------------------------- #
+# List positions
+# --------------------------------------------------------------------------- #
+
+
+def test_list_answers_report_kept_positions_and_failures() -> None:
+    result = coerce(
+        spec_for(list[int]),
+        answer("list", ["1", "x", "3", None], spans=[[0, 1], [2, 3], [4, 5], [6, 7]]),
+    )
+    assert result.value == [1, 3]
+    assert result.kept == (0, 2)
+    assert [index for index, _ in result.failed] == [1, 3]
+    assert result.spans == ((0, 1), (4, 5))  # aligned with the kept elements
+
+
+def test_set_duplicates_are_not_failures() -> None:
+    result = coerce(spec_for(set[str]), answer("list", ["a", "b", "a"]))
+    assert result.value == ["a", "b"]
+    assert result.kept == (0, 1)
+    assert result.failed == ()
+
+
+def test_scalars_have_no_positions() -> None:
+    result = coerce(spec_for(int), answer("number", 3))
+    assert result.kept is None and result.failed == ()

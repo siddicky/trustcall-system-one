@@ -3,9 +3,11 @@
 # ruff: noqa: UP007, UP045 - tests deliberately spell Optional and Union
 
 import asyncio
+import contextlib
 import dataclasses
 import datetime as dt
 import enum
+import itertools
 import threading
 from decimal import Decimal
 from typing import Any, Literal, Optional, Union
@@ -32,6 +34,7 @@ from trustcall_system_one import (
     ServerError,
     StateTruncatedError,
     TransportResponse,
+    TrustcallSystemOneError,
     VerifyConfig,
     create_extractor,
     s1_field,
@@ -468,57 +471,327 @@ async def test_empty_input_extracts_nothing() -> None:
 # --------------------------------------------------------------------------- #
 
 
-LONG = "q" * 800 + " Ada Lovelace is 36 years old. " + "r" * 800
+def filler(count: int, tag: str) -> str:
+    """Filler text with no repeated stretch, so a chunk has one place in it."""
+    return " ".join(f"{tag}{i}" for i in range(count)) + " "
 
 
-async def test_truncated_state_is_retried_once_on_a_narrowed_state() -> None:
+LONG = filler(150, "q") + "Ada Lovelace is 36 years old. " + filler(150, "r")
+BIG = (
+    "Ada Lovelace lives here. "
+    + filler(2500, "filler")
+    + "She moved to Paris. "
+    + filler(2500, "more")
+)
+
+
+class Located(BaseModel):
+    name: str
+    city: Optional[str] = None
+
+
+def located_script() -> Script:
+    script = Script()
+    script.clairic = {
+        "name": ca("text", "Ada Lovelace", find="Ada Lovelace"),
+        "city": ca("text", "Paris", find="Paris"),
+    }
+    return script
+
+
+def input_ranges(
+    script: Script, text: str, kind: str = "extract"
+) -> list[tuple[int, int]]:
+    """The ranges of ``text`` that the calls of one kind carried."""
+    ranges = []
+    for _, payload, _ in script.calls(kind):
+        state = payload["state"]
+        body = state[state.index("<input>\n") + 8 : state.index("\n</input>")]
+        body = body.removeprefix("…\n").removesuffix("\n…")
+        start = text.index(body)
+        ranges.append((start, start + len(body)))
+    return ranges
+
+
+def covers(ranges: list[tuple[int, int]], length: int) -> bool:
+    reach = 0
+    for start, end in sorted(ranges):
+        if start > reach:
+            return False
+        reach = max(reach, end)
+    return reach >= length
+
+
+async def test_a_truncated_state_is_chunked_over_the_whole_input() -> None:
+    script = located_script()
+    script.limit = lambda state, n: 5000 if n == 0 else None
+    extractor = make_extractor([Located], script, verify=VerifyConfig(window_chars=100))
+    result = await extractor.ainvoke(BIG)
+    record = result.records[0]
+    assert record.valid
+    assert record.value == Located(name="Ada Lovelace", city="Paris")
+    span = record.fields["city"].span
+    assert span is not None and BIG[span[0] : span[1]] == "Paris"
+    name_span = record.fields["name"].span
+    assert name_span is not None and BIG[name_span[0] : name_span[1]] == "Ada Lovelace"
+    # the first request was cut at 5000 characters; the chunks that follow cover
+    # everything, overlapping by at least window_chars
+    ranges = input_ranges(script, BIG)
+    full, chunks = ranges[0], sorted(ranges[1:])
+    assert full == (0, len(BIG))
+    assert len(chunks) >= 3
+    assert covers(chunks, len(BIG))
+    assert chunks[0][0] == 0 and chunks[-1][1] == len(BIG)
+    for (_, end), (start, _) in itertools.pairwise(chunks):
+        assert end - start >= 100
+    assert max(end - start for start, end in chunks) < 5000
+    assert any("clairic_chunked" in w for w in result.warnings)
+    assert not any("clairic_truncated" in w for w in result.warnings)
+    assert {c.kind for c in result.calls if c.kind == "extract"} == {"extract"}
+
+
+async def test_chunking_merges_scalars_preferring_non_null_then_confidence() -> None:
+    script = Script()
+    script.clairic = {
+        "name": ca("text", "Ada Lovelace", find="Ada Lovelace", confidence=0.9),
+        "city": ca("text", "Paris", find="Paris", confidence=0.95),
+    }
+    # a second, better-attested name and a conflicting city later in the text
+    text = (
+        "Ada Lovelace "
+        + filler(2000, "x")
+        + "Ada Lovelace "
+        + filler(2000, "y")
+        + "Paris"
+    )
+    script.limit = lambda state, n: 4000 if n == 0 else None
+    extractor = make_extractor(
+        [Located],
+        script,
+        verify=VerifyConfig(window_chars=50, reask_low_confidence=False),
+    )
+    record = (await extractor.ainvoke(text)).records[0]
+    assert record.value == Located(name="Ada Lovelace", city="Paris")
+    city = record.fields["city"].span
+    assert city is not None and text[city[0] : city[1]] == "Paris"
+
+
+async def test_chunk_answers_for_a_scalar_pick_the_most_confident() -> None:
+    script = Script()
+    texts = {"first": 0.6, "second": 0.9}
+
+    def extract(model: str, payload: dict[str, Any], meta: Any) -> Any:
+        from trustcall_system_one.testing import clairic_answer, clairic_response
+
+        state = payload["state"]
+        cut = state[:4000] if meta.kind == "extract" and len(state) > 6000 else state
+        truncated = cut is not state
+        answers = {}
+        for name in payload["fields"]:
+            if name == "name":
+                at = cut.find("Ada")
+                answers[name] = (
+                    clairic_answer("text", "Ada", span=[at, at + 3])
+                    if at >= 0
+                    else clairic_answer("text", None, p_null=0.99)
+                )
+            else:
+                if "second" in cut:
+                    answers[name] = clairic_answer(
+                        "text",
+                        "second",
+                        confidence=texts["second"],
+                        span=[cut.index("second"), cut.index("second") + 6],
+                    )
+                elif "first" in cut:
+                    answers[name] = clairic_answer(
+                        "text",
+                        "first",
+                        confidence=texts["first"],
+                        span=[cut.index("first"), cut.index("first") + 5],
+                    )
+                else:
+                    answers[name] = clairic_answer("text", None, p_null=0.99)
+        return clairic_response(answers, truncated=truncated, state_text=cut)
+
+    script.transport = FakeTransport(
+        route(
+            presence=script._presence,
+            extract=extract,
+            attribution=script._attribution,
+        )
+    )
+    text = "Ada. first " + filler(3000, "w") + " second " + filler(3000, "z")
+    extractor = make_extractor(
+        [Located],
+        script,
+        verify=VerifyConfig(window_chars=50, reask_low_confidence=False),
+    )
+    record = (await extractor.ainvoke(text)).records[0]
+    assert isinstance(record.value, Located) and record.value.city == "second"
+    span = record.fields["city"].span
+    assert span is not None and text[span[0] : span[1]] == "second"
+
+
+class Notes(BaseModel):
+    notes: list[str]
+
+
+async def test_chunking_unions_list_elements_in_input_order_without_duplicates() -> (
+    None
+):
+    text = (
+        "alpha "
+        + filler(1000, "a")
+        + "beta "
+        + filler(1000, "b")
+        + "gamma "
+        + filler(1000, "c")
+        + "delta"
+    )
+    script = Script()
+    script.clairic = {
+        "notes": ca(
+            "list", [], find_all=["delta", "alpha", "gamma", "beta"], confidence=0.95
+        )
+    }
+    script.limit = lambda state, n: 4000 if n == 0 else None
+    # the chunk answers come back in the model's own order, with the ones in the
+    # overlaps reported by two chunks
+    extractor = make_extractor(
+        [Notes], script, verify=VerifyConfig(window_chars=3500, attribution=False)
+    )
+    result = await extractor.ainvoke(text)
+    record = result.records[0]
+    assert record.value is not None
+    assert record.value == Notes(notes=["alpha", "beta", "gamma", "delta"])
+    answer = record.fields["notes"]
+    assert answer.spans is not None
+    assert [text[a:b] for a, b in answer.spans] == ["alpha", "beta", "gamma", "delta"]
+    chunks = input_ranges(script, text)[1:]
+    assert any(
+        text[a:b].count("beta") and text[c:d].count("beta")
+        for (a, b), (c, d) in itertools.pairwise(chunks)
+    ), "a list element should have sat in two chunks"
+
+
+async def test_a_chunk_that_is_still_too_long_is_split_smaller_once() -> None:
+    script = located_script()
+
+    def limit(state: str, n: int) -> int | None:
+        if n == 0:
+            return 5000
+        return 1000 if len(state) > 2000 else None
+
+    script.limit = limit
+    extractor = make_extractor([Located], script, verify=VerifyConfig(window_chars=20))
+    result = await extractor.ainvoke(BIG)
+    record = result.records[0]
+    assert record.value == Located(name="Ada Lovelace", city="Paris")
+    ranges = input_ranges(script, BIG)[1:]
+    sizes = sorted({end - start for start, end in ranges})
+    assert sizes[-1] > 2000 - 200  # the first round's chunks, which were too long
+    assert sizes[0] < 1000  # the second round's
+    assert covers([r for r in ranges if r[1] - r[0] < 1000], len(BIG))
+    assert not any("clairic_truncated" in w for w in result.warnings)
+    assert any("clairic_chunked" in w for w in result.warnings)
+
+
+SMALL = filler(150, "s") + "Ada Lovelace moved to Paris."
+
+
+async def test_chunks_that_stay_truncated_warn_that_input_was_not_read() -> None:
+    script = located_script()
+    script.limit = lambda state, n: 60  # shorter than the focus block: never fits
+    extractor = make_extractor([Located], script, verify=VerifyConfig(window_chars=20))
+    result = await extractor.ainvoke(SMALL)
+    assert any("clairic_truncated" in w and "not read" in w for w in result.warnings)
+    assert any("clairic_chunked" in w for w in result.warnings)
+    # the full request, a first round of chunks and one smaller round: no third
+    sizes = [end - start for start, end in input_ranges(script, SMALL)]
+    assert sizes[0] == len(SMALL)
+    assert 48 in sizes and 41 in sizes  # the first round, then smaller, down to
+    assert max(sizes[-3:]) == 41  # the floor of 2 * window_chars + 1
+
+
+async def test_strict_raises_when_chunks_stay_truncated() -> None:
+    script = located_script()
+    script.limit = lambda state, n: 60
+    extractor = make_extractor(
+        [Located], script, strict=True, verify=VerifyConfig(window_chars=20)
+    )
+    with pytest.raises(StateTruncatedError, match="not read"):
+        await extractor.ainvoke(SMALL)
+
+
+async def test_strict_does_not_raise_when_the_chunks_succeed() -> None:
+    script = located_script()
+    script.limit = lambda state, n: 5000 if n == 0 else None
+    extractor = make_extractor([Located], script, strict=True)
+    record = (await extractor.ainvoke(BIG)).records[0]
+    assert record.value == Located(name="Ada Lovelace", city="Paris")
+
+
+async def test_without_a_state_text_the_chunk_size_is_a_conservative_default() -> None:
+    from trustcall_system_one._chunk import DEFAULT_CHUNK_CHARS
+
+    script = located_script()
+    script.truncated = 1  # flagged truncated, but state_text says nothing was cut
+    extractor = make_extractor([Located], script)
+    text = "Ada Lovelace. " + filler(3500, "x") + " Paris"
+    record = (await extractor.ainvoke(text)).records[0]
+    assert record.value == Located(name="Ada Lovelace", city="Paris")
+    chunks = input_ranges(script, text)[1:]
+    assert max(end - start for start, end in chunks) <= DEFAULT_CHUNK_CHARS
+    assert covers(chunks, len(text))
+
+
+async def test_a_truncated_short_input_is_still_split_in_two() -> None:
     script = person_script(truncated=1)
     extractor = make_extractor([Person], script, verify=VerifyConfig(window_chars=20))
     result = await extractor.ainvoke(LONG)
-    extracts = script.calls("extract")
-    assert len(extracts) == 2
-    first, second = extracts[0][1]["state"], extracts[1][1]["state"]
-    assert "q" * 800 in first
-    assert "q" * 800 not in second and "…" in second
-    assert result.warnings == ()
+    ranges = input_ranges(script, LONG)
+    assert len(ranges) == 3  # the full request and two chunks
+    assert covers(ranges[1:], len(LONG))
     record = result.records[0]
     span = record.fields["name"].span
     assert span is not None and LONG[span[0] : span[1]] == "Ada Lovelace"
 
 
-async def test_still_truncated_after_the_retry_warns() -> None:
-    script = person_script(truncated=2)
-    extractor = make_extractor([Person], script, verify=VerifyConfig(window_chars=20))
-    result = await extractor.ainvoke(LONG)
-    assert len(script.calls("extract")) == 2
+async def test_an_input_too_short_to_split_warns_instead_of_retrying() -> None:
+    script = person_script(truncated=3)
+    extractor = make_extractor([Person], script)  # window 600: nothing to split
+    result = await extractor.ainvoke(PERSON_TEXT)
+    assert len(script.calls("extract")) == 1
     assert any("clairic_truncated" in w for w in result.warnings)
-    assert result.records[0].valid
-
-
-async def test_strict_raises_when_truncation_survives_the_retry() -> None:
-    script = person_script(truncated=5)
-    extractor = make_extractor([Person], script, strict=True)
+    strict = make_extractor([Person], person_script(truncated=3), strict=True)
     with pytest.raises(StateTruncatedError):
-        await extractor.ainvoke(LONG)
-    assert len(script.calls("extract")) == 2
+        await strict.ainvoke(PERSON_TEXT)
 
 
-async def test_strict_does_not_raise_when_the_retry_succeeds() -> None:
-    script = person_script(truncated=1)
-    extractor = make_extractor([Person], script, strict=True)
-    assert (await extractor.ainvoke(LONG)).records[0].valid
+async def test_a_truncated_reask_is_chunked_too() -> None:
+    class Aged(BaseModel):
+        name: str
+        age: Optional[int] = None
 
-
-async def test_truncated_answer_without_spans_retries_on_the_head() -> None:
+    text = "Ada Lovelace is 36. " + filler(2000, "pad")
     script = Script()
-    script.clairic = {"name": ca("text", "Ada"), "age": ca("number", 36)}
-    script.truncated = 1
-    extractor = make_extractor([Person], script, verify=VerifyConfig(window_chars=20))
-    await extractor.ainvoke("Ada is 36. " + "z" * 500)
-    first, second = (c[1]["state"] for c in script.calls("extract"))
-    assert "z" * 500 in first
-    assert "z" * 500 not in second
-    assert "Ada is 36." in second
+    script.clairic = {
+        "name": ca("text", "Ada Lovelace", find="Ada Lovelace"),
+        "age": ca("number", 36, confidence=0.7),
+    }
+    script.reask = {"age": ca("number", 36, confidence=0.99)}
+    script.limit = lambda state, n: 3000 if len(state) > 3500 else None
+    extractor = make_extractor(
+        [Aged], script, verify=VerifyConfig(window_chars=50, attribution=False)
+    )
+    result = await extractor.ainvoke(text)
+    record = result.records[0]
+    assert record.value == Aged(name="Ada Lovelace", age=36)
+    assert record.fields["age"].reask is True
+    assert record.fields["age"].confidence == 0.99
+    assert len(script.calls("reask")) > 1  # the full re-ask was cut, then chunks
+    assert any("clairic_chunked" in w for w in result.warnings)
 
 
 # --------------------------------------------------------------------------- #
@@ -1185,3 +1458,289 @@ async def test_more_than_64_clef_questions_are_split_and_merged() -> None:
     assert len(record.fields) == 70
     assert [c.kind for c in result.calls].count("clef_fields") == 2
     assert "extract" not in kinds(script.transport)  # nothing for Clairic to do
+
+
+# --------------------------------------------------------------------------- #
+# Shutdown of the sync bridge
+# --------------------------------------------------------------------------- #
+
+
+class Hanging:
+    """A transport whose calls never finish until cancelled."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.cancelled = threading.Event()
+
+    async def run(
+        self, model: str, payload: Any, *, meta: Any, timeout: float | None = None
+    ) -> TransportResponse:
+        self.started.set()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+        raise AssertionError("unreachable")
+
+
+def test_close_during_a_sync_invoke_returns_promptly_and_frees_the_caller() -> None:
+    import time
+
+    hanging = Hanging()
+    extractor = create_extractor([Person], transport=hanging)
+    outcome: dict[str, Any] = {}
+
+    def worker() -> None:
+        started = time.monotonic()
+        try:
+            extractor.invoke(PERSON_TEXT)
+            outcome["result"] = "returned"
+        except BaseException as exc:
+            outcome["result"] = exc
+        outcome["elapsed"] = time.monotonic() - started
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    assert hanging.started.wait(5)
+    bridge = extractor.core._thread
+    started = time.monotonic()
+    extractor.close()
+    assert time.monotonic() - started < 3
+    thread.join(5)
+    assert not thread.is_alive()  # the invoking thread did not hang
+    assert isinstance(outcome["result"], TrustcallSystemOneError)
+    assert "closed" in str(outcome["result"])
+    assert outcome["elapsed"] < 5
+    assert hanging.cancelled.wait(5)  # the call on the loop was cancelled too
+    assert bridge is not None and not bridge.is_alive()
+
+
+def test_close_during_a_sync_batch_frees_every_caller() -> None:
+    hanging = Hanging()
+    extractor = create_extractor([Person], transport=hanging)
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            extractor.batch([PERSON_TEXT, PERSON_TEXT])
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    assert hanging.started.wait(5)
+    extractor.close()
+    for thread in threads:
+        thread.join(5)
+        assert not thread.is_alive()
+    assert len(errors) == 2
+    assert all(isinstance(e, TrustcallSystemOneError) for e in errors)
+
+
+def test_the_extractor_restarts_lazily_after_a_close_that_cancelled_a_call() -> None:
+    script = person_script()
+    hanging = Hanging()
+
+    class Switch:
+        use_hanging = True
+
+        async def run(
+            self, model: str, payload: Any, *, meta: Any, timeout: float | None = None
+        ) -> TransportResponse:
+            if self.use_hanging:
+                return await hanging.run(model, payload, meta=meta)
+            return await script.transport.run(model, payload, meta=meta)
+
+    switch = Switch()
+    extractor = create_extractor([Person], transport=switch)
+    thread = threading.Thread(
+        target=lambda: _swallow(extractor.invoke, PERSON_TEXT), daemon=True
+    )
+    thread.start()
+    assert hanging.started.wait(5)
+    first_bridge = extractor.core._thread
+    extractor.close()
+    thread.join(5)
+    switch.use_hanging = False
+    assert extractor.invoke(PERSON_TEXT).records[0].valid
+    assert extractor.core._thread is not first_bridge
+    extractor.close()
+
+
+def _swallow(function: Any, *args: Any) -> None:
+    with contextlib.suppress(BaseException):
+        function(*args)
+
+
+def test_close_from_the_bridge_thread_closes_the_owned_transport_on_the_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = person_script()
+    created: list[RecordingTransport] = []
+
+    def factory(*, concurrency: Any = None) -> RecordingTransport:
+        created.append(RecordingTransport(script.transport))
+        return created[-1]
+
+    monkeypatch.setattr("trustcall_system_one._extractor.CloudflareTransport", factory)
+    extractor = create_extractor([Person])
+    extractor.invoke(PERSON_TEXT)
+    (owned,) = created
+    loop = extractor.core._loop
+    thread = extractor.core._thread
+    assert thread is not None
+
+    async def close_myself() -> None:
+        extractor.close()  # called on the bridge thread
+
+    with pytest.raises(TrustcallSystemOneError, match="closed"):
+        extractor.core.run_sync(close_myself())
+    thread.join(5)
+    assert not thread.is_alive()
+    assert owned.aclosed_on is loop  # closed on the loop, not leaked
+    assert extractor.invoke(PERSON_TEXT).records[0].valid  # and it restarts
+    assert len(created) == 2
+    extractor.close()
+
+
+def test_the_loop_thread_lets_cancelled_tasks_finish_before_it_closes() -> None:
+    finished = threading.Event()
+
+    class Slow:
+        async def run(
+            self, model: str, payload: Any, *, meta: Any, timeout: float | None = None
+        ) -> TransportResponse:
+            try:
+                await asyncio.sleep(60)
+            finally:
+                await asyncio.sleep(0.05)  # cleanup that needs the loop to run
+                finished.set()
+            raise AssertionError("unreachable")
+
+    extractor = create_extractor([Person], transport=Slow())
+    thread = threading.Thread(
+        target=lambda: _swallow(extractor.invoke, PERSON_TEXT), daemon=True
+    )
+    thread.start()
+    for _ in range(100):
+        if extractor.core._loop is not None and extractor.core._pending:
+            break
+        threading.Event().wait(0.02)
+    extractor.close()
+    thread.join(5)
+    assert finished.wait(5)
+
+
+# --------------------------------------------------------------------------- #
+# Failed invokes keep their accounting
+# --------------------------------------------------------------------------- #
+
+
+class FailsOn:
+    """Delegates to a script, but raises on the first call of one kind."""
+
+    def __init__(self, script: Script, kind: str, error: Exception) -> None:
+        self.script, self.kind, self.error = script, kind, error
+
+    async def run(
+        self, model: str, payload: Any, *, meta: Any, timeout: float | None = None
+    ) -> TransportResponse:
+        if meta.kind == self.kind:
+            raise self.error
+        return await self.script.transport.run(model, payload, meta=meta)
+
+
+async def test_a_library_error_carries_the_calls_usage_and_cost() -> None:
+    error = ServerError("down", status_code=503)
+    error.retries = 4
+    extractor = create_extractor(
+        [Person], transport=FailsOn(person_script(), "extract", error)
+    )
+    with pytest.raises(ServerError) as info:
+        await extractor.ainvoke(PERSON_TEXT)
+    raised = info.value
+    assert raised is error
+    assert [c.kind for c in raised.calls].count("presence") == 1
+    failed = [c for c in raised.calls if c.error is not None]
+    assert [(c.kind, c.retries, c.status_code) for c in failed] == [("extract", 4, 503)]
+    assert raised.usage is not None and raised.usage.requests == 1  # the presence
+    assert raised.cost is not None and raised.cost.complete is False
+    assert raised.cost.unpriced_models == ("@cf/cloudflare/clef",)
+
+
+async def test_errors_outside_a_call_have_empty_defaults() -> None:
+    plain = TrustcallSystemOneError("plain")
+    assert plain.calls == () and plain.usage is None and plain.cost is None
+
+
+async def test_a_strict_validation_error_has_the_full_call_log() -> None:
+    extractor = make_extractor([Adult], adult_script(12), strict=True)
+    with pytest.raises(ExtractionValidationError) as info:
+        await extractor.ainvoke("Ada is 12.")
+    assert len(info.value.calls) == 3
+    assert info.value.usage is not None and info.value.usage.requests == 3
+    assert info.value.cost is not None
+
+
+async def test_a_foreign_error_is_reraised_unchanged_with_a_note() -> None:
+    import sys
+
+    error = TypeError("not a library error")
+    extractor = create_extractor(
+        [Person], transport=FailsOn(person_script(), "extract", error)
+    )
+    with pytest.raises(TypeError) as info:
+        await extractor.ainvoke(PERSON_TEXT)
+    assert info.value is error
+    assert not hasattr(info.value, "calls")
+    if sys.version_info >= (3, 11):
+        (note,) = info.value.__notes__
+        assert "2 call(s)" in note and "presence" in note
+    else:
+        assert not hasattr(info.value, "__notes__")
+
+
+# --------------------------------------------------------------------------- #
+# Batch with return_exceptions
+# --------------------------------------------------------------------------- #
+
+
+async def test_abatch_return_exceptions_keeps_the_others() -> None:
+    script = adult_script(12)
+    ages = iter([12, 40])
+    original = script._extract
+
+    def extract(model: str, payload: dict[str, Any], meta: Any) -> Any:
+        script.clairic["age"] = ca("number", next(ages))
+        return original(model, payload, meta)
+
+    script.transport = FakeTransport(
+        route(
+            presence=script._presence,
+            extract=extract,
+            attribution=script._attribution,
+        )
+    )
+    extractor = make_extractor([Adult], script, strict=True)
+    outcomes = await extractor.abatch(
+        ["Ada is 12.", "Ada is 40."], return_exceptions=True
+    )
+    assert isinstance(outcomes[0], ExtractionValidationError)
+    assert isinstance(outcomes[1], ExtractionResult)
+    assert outcomes[1].records[0].valid
+    assert outcomes[0].calls  # the failed input kept its call log
+
+
+def test_batch_return_exceptions_through_the_bridge() -> None:
+    extractor = make_extractor([Adult], adult_script(12), strict=True)
+    try:
+        outcomes = extractor.batch(
+            ["Ada is 12.", "Ada is 12 too."], return_exceptions=True
+        )
+        assert all(isinstance(o, ExtractionValidationError) for o in outcomes)
+        with pytest.raises(ExtractionValidationError):
+            extractor.batch(["Ada is 12."])
+    finally:
+        extractor.close()

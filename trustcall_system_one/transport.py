@@ -231,11 +231,18 @@ class AdaptiveLimiter:
         task.add_done_callback(state.wake_tasks.discard)
 
     @asynccontextmanager
-    async def slot(self, model: str) -> AsyncIterator[int]:
+    async def slot(
+        self, model: str, timeout: float | None = None
+    ) -> AsyncIterator[int]:
         """Hold one global slot and one slot of the model's limit.
 
         Args:
             model: Model id the call goes to.
+            timeout: Longest time to wait for a slot, in seconds; ``None`` waits
+                indefinitely.
+
+        Raises:
+            asyncio.TimeoutError: If no slot became free within ``timeout``.
 
         Yields:
             The model's generation at acquisition, to pass back to
@@ -245,11 +252,14 @@ class AdaptiveLimiter:
         state = self._state()
         cond = state.cond
         async with cond:
-            await cond.wait_for(
-                lambda: (
-                    state.in_flight < self.max_in_flight
-                    and state.active.get(model, 0) < self.limit(model)
-                )
+            await asyncio.wait_for(
+                cond.wait_for(
+                    lambda: (
+                        state.in_flight < self.max_in_flight
+                        and state.active.get(model, 0) < self.limit(model)
+                    )
+                ),
+                timeout,
             )
             state.in_flight += 1
             state.active[model] = state.active.get(model, 0) + 1
@@ -385,6 +395,7 @@ class CloudflareTransport:
         backoff_max: float = 8.0,
         max_retry_after: float = 60.0,
         call_deadline: float | None = 300.0,
+        queue_timeout: float | None = None,
         concurrency: ConcurrencyConfig | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         clock: Callable[[], float] = time.monotonic,
@@ -412,11 +423,16 @@ class CloudflareTransport:
             max_retry_after: Longest server-requested wait to honour; a longer
                 ``Retry-After`` fails the call immediately.
             call_deadline: Total wall-clock budget in seconds for one ``run()``
-                across every attempt, backoff sleep and wait for a limiter slot;
-                ``None`` for no budget. When the next sleep or attempt would not
-                fit, the call fails with a ``TransportError`` that says the
-                deadline was exceeded. Each attempt's timeout is capped by the
-                budget that is left.
+                across every attempt and backoff sleep; ``None`` for no budget.
+                The budget starts when the first limiter slot is acquired, so
+                time spent queueing for the first attempt does not count and a
+                request that has not been sent never fails on the deadline. When
+                the next sleep or attempt would not fit, the call fails with a
+                ``TransportError`` that says the deadline was exceeded. Each
+                attempt's timeout is capped by the budget that is left.
+            queue_timeout: Longest wait for a limiter slot, per attempt, in
+                seconds; ``None`` (the default) waits indefinitely. On expiry
+                the call fails with a ``TransportError``.
             concurrency: Concurrency limits for the adaptive limiter.
             sleep: Awaitable sleep, injectable for tests.
             clock: Monotonic clock in seconds used for ``call_deadline``,
@@ -442,6 +458,10 @@ class CloudflareTransport:
             math.isfinite(call_deadline) and call_deadline > 0
         ):
             raise ValueError("call_deadline must be positive and finite, or None")
+        if queue_timeout is not None and not (
+            math.isfinite(queue_timeout) and queue_timeout > 0
+        ):
+            raise ValueError("queue_timeout must be positive and finite, or None")
         self._account_id = account_id
         self._api_token = api_token
         self._base_url = base_url
@@ -454,6 +474,7 @@ class CloudflareTransport:
         self._backoff_max = backoff_max
         self._max_retry_after = max_retry_after
         self._call_deadline = call_deadline
+        self._queue_timeout = queue_timeout
         self._sleep = sleep
         self._clock = clock
         self._extra_headers = dict(extra_headers or {})
@@ -606,54 +627,64 @@ class CloudflareTransport:
         headers = self._headers(token, meta)
         client = self._get_client()
         started = time.perf_counter()
-        begun = self._clock()
-        deadline = None if self._call_deadline is None else begun + self._call_deadline
+        deadline: float | None = None  # set when the first slot is acquired
         retries = 0
         previous_delay = self._backoff_base
+        last_failure: TransportError | None = None
         while True:
             retry_after: float | None = None
             failure: TransportError
-            async with self.limiter.slot(model) as generation:
-                post_kwargs = self._post_kwargs(client, timeout, deadline)
-                if post_kwargs is None:
-                    raise self._deadline_error(retries, None)
-                try:
-                    response = await client.post(
-                        url, json=payload, headers=headers, **post_kwargs
-                    )
-                except _RETRYABLE_ERRORS as exc:
-                    failure = TransportError(f"Request to {url} failed: {exc!r}")
-                    failure.__cause__ = exc
-                except httpx.HTTPError as exc:
-                    error = TransportError(f"Request to {url} failed: {exc!r}")
-                    error.retries = retries
-                    raise error from exc
-                else:
-                    status = response.status_code
-                    if response.is_success:
-                        try:
-                            body = self._unwrap(response)
-                        except TransportError as exc:
-                            exc.retries = retries
-                            raise
-                        self.limiter.on_success(model)
-                        return TransportResponse(
-                            body=body,
-                            retries=retries,
-                            duration_ms=(time.perf_counter() - started) * 1000,
-                            status_code=status,
+            try:
+                async with self.limiter.slot(model, self._queue_timeout) as generation:
+                    if deadline is None and self._call_deadline is not None:
+                        deadline = self._clock() + self._call_deadline
+                    post_kwargs = self._post_kwargs(client, timeout, deadline)
+                    if post_kwargs is None:
+                        raise self._deadline_error(retries, last_failure)
+                    try:
+                        response = await client.post(
+                            url, json=payload, headers=headers, **post_kwargs
                         )
-                    retry_after = _parse_retry_after(
-                        response.headers.get("Retry-After")
-                    )
-                    if status == 429:
-                        self.limiter.on_rate_limited(model, generation)
-                    failure = _error_for_status(response, retry_after=retry_after)
-                    if status not in _RETRYABLE_STATUS and status < 500:
-                        failure.retries = retries
-                        raise failure
+                    except _RETRYABLE_ERRORS as exc:
+                        failure = TransportError(f"Request to {url} failed: {exc!r}")
+                        failure.__cause__ = exc
+                    except httpx.HTTPError as exc:
+                        error = TransportError(f"Request to {url} failed: {exc!r}")
+                        error.retries = retries
+                        raise error from exc
+                    else:
+                        status = response.status_code
+                        if response.is_success:
+                            try:
+                                body = self._unwrap(response)
+                            except TransportError as exc:
+                                exc.retries = retries
+                                raise
+                            self.limiter.on_success(model)
+                            return TransportResponse(
+                                body=body,
+                                retries=retries,
+                                duration_ms=(time.perf_counter() - started) * 1000,
+                                status_code=status,
+                            )
+                        retry_after = _parse_retry_after(
+                            response.headers.get("Retry-After")
+                        )
+                        if status == 429:
+                            self.limiter.on_rate_limited(model, generation)
+                        failure = _error_for_status(response, retry_after=retry_after)
+                        if status not in _RETRYABLE_STATUS and status < 500:
+                            failure.retries = retries
+                            raise failure
+            except asyncio.TimeoutError:
+                timed_out = TransportError(
+                    f"timed out after {self._queue_timeout}s waiting for a request slot"
+                )
+                timed_out.retries = retries
+                raise timed_out from None
             # The slot is released; decide whether and how long to wait.
             failure.retries = retries
+            last_failure = failure
             if retries >= self._max_retries:
                 raise failure
             if retry_after is not None and retry_after > self._max_retry_after:

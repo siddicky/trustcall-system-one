@@ -10,6 +10,7 @@ every sync call.
 
 import asyncio
 import atexit
+import concurrent.futures
 import contextlib
 import dataclasses
 import functools
@@ -18,7 +19,7 @@ import weakref
 from collections.abc import Coroutine, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import Any, Literal, TypeVar
+from typing import Any, Literal, TypeVar, overload
 
 from typing_extensions import Required, TypedDict
 
@@ -34,6 +35,7 @@ from trustcall_system_one._config import (
     VerifyConfig,
 )
 from trustcall_system_one._entity import insert_one
+from trustcall_system_one._errors import TrustcallSystemOneError
 from trustcall_system_one._run import Run, gather
 from trustcall_system_one._schemas import SchemaLike, coerce_schema
 from trustcall_system_one._types import ExtractionResult, ResultRecord, Usage
@@ -78,7 +80,10 @@ class _Core:
     """Shared by an extractor and its ``with_options`` copies.
 
     Holds the transport (created lazily when none was given, and then owned),
-    and the private event loop thread behind the sync bridge.
+    and the private event loop thread behind the sync bridge. Calls that are in
+    flight on the bridge are tracked so that closing cancels them: their callers
+    get a ``TrustcallSystemOneError`` at once instead of waiting for a loop that
+    is going away.
     """
 
     def __init__(
@@ -87,10 +92,12 @@ class _Core:
         self._given = transport
         self._concurrency = concurrency
         self._owned: CloudflareTransport | None = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._exit_hook: functools.partial[None] | None = None
+        self._pending: set[concurrent.futures.Future[Any]] = set()
+        self._closed_futures: set[concurrent.futures.Future[Any]] = set()
 
     # -- transport -------------------------------------------------------- #
 
@@ -105,58 +112,93 @@ class _Core:
 
     # -- the bridge loop --------------------------------------------------- #
 
-    def _ensure_loop(self) -> asyncio.AbstractEventLoop:
-        with self._lock:
-            if self._loop is not None and not self._loop.is_closed():
-                return self._loop
-            loop = asyncio.new_event_loop()
-            ready = threading.Event()
+    def _start_loop(self) -> asyncio.AbstractEventLoop:
+        """Start the bridge thread. The caller holds the lock."""
+        loop = asyncio.new_event_loop()
+        ready = threading.Event()
 
-            def target() -> None:
-                asyncio.set_event_loop(loop)
-                loop.call_soon(ready.set)
-                try:
-                    loop.run_forever()
-                finally:
-                    with contextlib.suppress(Exception):
-                        for task in asyncio.all_tasks(loop):
-                            task.cancel()
-                        loop.run_until_complete(loop.shutdown_asyncgens())
-                    loop.close()
+        def target() -> None:
+            asyncio.set_event_loop(loop)
+            loop.call_soon(ready.set)
+            try:
+                loop.run_forever()
+            finally:
+                with contextlib.suppress(Exception):
+                    # Cancel what is left and let it finish, so that nothing
+                    # is destroyed pending and every future gets resolved.
+                    tasks = list(asyncio.all_tasks(loop))
+                    for task in tasks:
+                        task.cancel()
+                    if tasks:
+                        loop.run_until_complete(
+                            asyncio.gather(*tasks, return_exceptions=True)
+                        )
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                loop.close()
 
-            thread = threading.Thread(
-                target=target, name="trustcall-system-one-loop", daemon=True
-            )
-            thread.start()
-            ready.wait()
-            self._loop, self._thread = loop, thread
-            self._exit_hook = functools.partial(_close_at_exit, weakref.ref(self))
-            atexit.register(self._exit_hook)
-            return loop
+        thread = threading.Thread(
+            target=target, name="trustcall-system-one-loop", daemon=True
+        )
+        thread.start()
+        ready.wait()
+        self._loop, self._thread = loop, thread
+        self._exit_hook = functools.partial(_close_at_exit, weakref.ref(self))
+        atexit.register(self._exit_hook)
+        return loop
 
     def run_sync(self, coroutine: Coroutine[Any, Any, T]) -> T:
-        """Run a coroutine on the bridge loop and wait for its result."""
-        loop = self._ensure_loop()
-        if threading.current_thread() is self._thread:
-            coroutine.close()
-            raise RuntimeError(
-                "invoke() was called from the extractor's own event loop thread, "
-                "which would deadlock; await ainvoke() instead"
-            )
-        future = asyncio.run_coroutine_threadsafe(coroutine, loop)
+        """Run a coroutine on the bridge loop and wait for its result.
+
+        Raises:
+            RuntimeError: If called from the bridge thread itself.
+            TrustcallSystemOneError: If the extractor was closed while the
+                coroutine was running.
+        """
+        with self._lock:
+            if self._thread is threading.current_thread():
+                coroutine.close()
+                raise RuntimeError(
+                    "invoke() was called from the extractor's own event loop "
+                    "thread, which would deadlock; await ainvoke() instead"
+                )
+            loop = self._loop
+            if loop is None or loop.is_closed():
+                loop = self._start_loop()
+            # Submitted under the lock, so a concurrent close() either sees this
+            # future and cancels it or has already replaced the loop.
+            future = asyncio.run_coroutine_threadsafe(coroutine, loop)
+            self._pending.add(future)
+        future.add_done_callback(self._forget)
         try:
             return future.result()
+        except concurrent.futures.CancelledError:
+            if future in self._closed_futures:
+                raise TrustcallSystemOneError(
+                    "the extractor was closed while the call was running"
+                ) from None
+            raise
         except BaseException:
             future.cancel()
             raise
+        finally:
+            self._closed_futures.discard(future)
+
+    def _forget(self, future: "concurrent.futures.Future[Any]") -> None:
+        with self._lock:
+            self._pending.discard(future)
 
     def _take_loop(
         self,
     ) -> tuple[asyncio.AbstractEventLoop | None, threading.Thread | None]:
+        """Detach the bridge and cancel the calls running on it."""
         with self._lock:
             loop, thread = self._loop, self._thread
             self._loop = self._thread = None
             hook, self._exit_hook = self._exit_hook, None
+            pending = list(self._pending)
+            self._closed_futures.update(pending)
+        for future in pending:
+            future.cancel()
         if hook is not None:
             atexit.unregister(hook)
         return loop, thread
@@ -164,12 +206,22 @@ class _Core:
     # -- closing ----------------------------------------------------------- #
 
     def close(self) -> None:
-        """Close an owned transport and stop the bridge thread (idempotent)."""
+        """Close an owned transport and stop the bridge thread (idempotent).
+
+        Calls running on the bridge are cancelled. Called from the bridge thread
+        itself, the transport is closed on the loop and the loop stops once that
+        is done.
+        """
         loop, thread = self._take_loop()
-        owned, self._owned = self._owned, None
+        with self._lock:
+            owned, self._owned = self._owned, None
         if loop is not None and thread is not None and not loop.is_closed():
             if threading.current_thread() is thread:
-                loop.call_soon(loop.stop)  # cannot wait for ourselves
+                if owned is None:
+                    loop.call_soon(loop.stop)
+                else:
+                    closing = loop.create_task(owned.aclose())
+                    closing.add_done_callback(lambda _: loop.stop())
                 return
             if owned is not None:
                 with contextlib.suppress(Exception):
@@ -186,7 +238,8 @@ class _Core:
         """Close an owned transport and stop the bridge thread (idempotent)."""
         running = asyncio.get_running_loop()
         loop, thread = self._take_loop()
-        owned, self._owned = self._owned, None
+        with self._lock:
+            owned, self._owned = self._owned, None
         if owned is not None:
             with contextlib.suppress(Exception):
                 await owned.aclose()
@@ -225,6 +278,18 @@ def _iso_date(value: date | str | None) -> str | None:
         raise ValueError(
             f"reference_date must be a date or an ISO date string, got {value!r}"
         ) from None
+
+
+def _note_failure(exc: Exception, run: Run) -> None:
+    """Add a one-line summary of the spent calls to a foreign exception."""
+    add_note = getattr(exc, "add_note", None)  # Python 3.11+
+    if add_note is None:
+        return
+    kinds = ", ".join(call.kind for call in run.calls) or "none"
+    add_note(
+        f"trustcall-system-one: {len(run.calls)} call(s) were made before this "
+        f"failure ({kinds}); {run.usage.input_tokens} input tokens"
+    )
 
 
 def _inner(item: Any) -> SchemaLike:
@@ -348,8 +413,11 @@ class Extractor:
     def with_options(self, **overrides: Any) -> "Extractor":
         """Return a copy with some settings changed.
 
-        The copy shares the transport and the sync bridge. Passing ``transport``
-        or ``concurrency`` gives it a transport of its own.
+        The copy shares the transport and the sync bridge with the original, so
+        closing either (``close``, ``aclose`` or a ``with`` block) closes the
+        shared owned transport and stops the bridge thread for both; each starts
+        again lazily on its next use. Passing ``transport`` or ``concurrency``
+        gives the copy a transport and bridge of its own.
 
         Args:
             **overrides: Any ``create_extractor`` setting.
@@ -457,7 +525,16 @@ class Extractor:
                     run, plan, text, label=label, skip_presence=schema is not None
                 )
             )
-        outcomes = await gather(*jobs)
+        try:
+            outcomes = await gather(*jobs)
+        except TrustcallSystemOneError as exc:
+            exc.calls = tuple(run.calls)
+            exc.usage = run.usage
+            exc.cost = self.prices.cost(run.usage)
+            raise
+        except Exception as exc:
+            _note_failure(exc, run)
+            raise
         records: list[ResultRecord] = [
             o.record for o in outcomes if o.record is not None
         ]
@@ -473,6 +550,30 @@ class Extractor:
             warnings=tuple(run.warnings),
         )
 
+    @overload
+    async def abatch(
+        self,
+        inputs: Sequence[str | ExtractionInput],
+        *,
+        existing: Any = ...,
+        schema: Any = ...,
+        images: Sequence[Any] | None = ...,
+        reference_date: date | str | None = ...,
+        return_exceptions: Literal[False] = ...,
+    ) -> list[ExtractionResult]: ...
+
+    @overload
+    async def abatch(
+        self,
+        inputs: Sequence[str | ExtractionInput],
+        *,
+        existing: Any = ...,
+        schema: Any = ...,
+        images: Sequence[Any] | None = ...,
+        reference_date: date | str | None = ...,
+        return_exceptions: bool,
+    ) -> list[ExtractionResult | BaseException]: ...
+
     async def abatch(
         self,
         inputs: Sequence[str | ExtractionInput],
@@ -481,28 +582,42 @@ class Extractor:
         schema: Any = None,
         images: Sequence[Any] | None = None,
         reference_date: date | str | None = None,
-    ) -> list[ExtractionResult]:
+        return_exceptions: bool = False,
+    ) -> list[ExtractionResult] | list[ExtractionResult | BaseException]:
         """Run ``ainvoke`` on every input concurrently.
 
         The keyword arguments apply to every input (an ``ExtractionInput``'s own
-        keys are used when the argument is ``None``). If one input fails the
-        others are cancelled and the error propagates.
+        keys are used when the argument is ``None``).
+
+        Args:
+            inputs: The inputs.
+            existing: See ``ainvoke``.
+            schema: See ``ainvoke``.
+            images: See ``ainvoke``.
+            reference_date: See ``ainvoke``.
+            return_exceptions: If false (the default) the first failure cancels
+                the other inputs and propagates. If true a failing input yields
+                its exception at its position and the others still complete.
 
         Returns:
             One result per input, in order.
         """
-        return await gather(
-            *(
-                self.ainvoke(
-                    item,
-                    existing=existing,
-                    schema=schema,
-                    images=images,
-                    reference_date=reference_date,
-                )
-                for item in inputs
+        calls = [
+            self.ainvoke(
+                item,
+                existing=existing,
+                schema=schema,
+                images=images,
+                reference_date=reference_date,
             )
-        )
+            for item in inputs
+        ]
+        if return_exceptions:
+            outcomes: list[ExtractionResult | BaseException] = list(
+                await asyncio.gather(*calls, return_exceptions=True)
+            )
+            return outcomes
+        return await gather(*calls)
 
     # -- sync API ----------------------------------------------------------- #
 
@@ -531,6 +646,30 @@ class Extractor:
             )
         )
 
+    @overload
+    def batch(
+        self,
+        inputs: Sequence[str | ExtractionInput],
+        *,
+        existing: Any = ...,
+        schema: Any = ...,
+        images: Sequence[Any] | None = ...,
+        reference_date: date | str | None = ...,
+        return_exceptions: Literal[False] = ...,
+    ) -> list[ExtractionResult]: ...
+
+    @overload
+    def batch(
+        self,
+        inputs: Sequence[str | ExtractionInput],
+        *,
+        existing: Any = ...,
+        schema: Any = ...,
+        images: Sequence[Any] | None = ...,
+        reference_date: date | str | None = ...,
+        return_exceptions: bool,
+    ) -> list[ExtractionResult | BaseException]: ...
+
     def batch(
         self,
         inputs: Sequence[str | ExtractionInput],
@@ -539,7 +678,8 @@ class Extractor:
         schema: Any = None,
         images: Sequence[Any] | None = None,
         reference_date: date | str | None = None,
-    ) -> list[ExtractionResult]:
+        return_exceptions: bool = False,
+    ) -> list[ExtractionResult] | list[ExtractionResult | BaseException]:
         """Run ``abatch`` on the extractor's private event loop thread."""
         return self.core.run_sync(
             self.abatch(
@@ -548,6 +688,7 @@ class Extractor:
                 schema=schema,
                 images=images,
                 reference_date=reference_date,
+                return_exceptions=return_exceptions,
             )
         )
 

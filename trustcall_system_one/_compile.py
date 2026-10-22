@@ -54,8 +54,10 @@ __all__ = [
     "FieldSpec",
     "FrozenMap",
     "Question",
+    "Role",
     "SchemaPlan",
     "compile_schema",
+    "render_instructions",
     "s1_field",
 ]
 
@@ -421,6 +423,11 @@ class FieldSpec:
         alias: The key ``model_validate`` expects for this field when it is not
             the field name (from ``alias`` or a plain-string
             ``validation_alias``); ``None`` when the name itself is the key.
+        context: Parent context put in front of the Clairic instructions of a
+            field whose name was shortened (empty otherwise).
+        clef_context: The same for the Clef question.
+        hints: Type and constraint sentences that follow the description in the
+            Clairic instructions.
         models: For ``submodel``, ``collection`` and ``union_models`` fields, the
             resolved model classes (a single one except for a union of models).
             Forward references are resolved once, here, so expanders never
@@ -451,6 +458,9 @@ class FieldSpec:
     nullable: bool = False
     alias: str | None = None
     models: tuple[type[BaseModel], ...] = field(default=(), hash=False)
+    context: str = ""
+    clef_context: str = ""
+    hints: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, eq=False)
@@ -1265,19 +1275,40 @@ def _validation_key(name: str, info: FieldInfo) -> tuple[str | None, str | None]
     return None, "alias_path"
 
 
-def _synthesise(
-    kind: _Kind,
-    *,
+Role = Literal["clairic", "noul", "choice", "score", "union_type"]
+
+
+def render_instructions(
+    role: Role,
     description: str,
-    prefix: str,
-    limit: int,
-    role: Literal["clairic", "noul", "choice", "score", "union_type"],
+    *,
+    prefix: str = "",
+    hints: Iterable[str] = (),
+    limit: int = 600,
 ) -> str:
-    """Build the instruction string for one question."""
+    """Build the instruction string of one Clairic field or Clef question.
+
+    The compiler uses this for the plan; the engine calls it again with a
+    templated description, so a question is rebuilt from its parts rather than
+    patched (the compiled text may have been clipped).
+
+    Args:
+        role: ``"clairic"`` for a Clairic field, ``"noul"``, ``"choice"`` or
+            ``"score"`` for a Clef question, ``"union_type"`` for the type
+            question of a union of primitives.
+        description: What is asked for (it is the part that gets templated).
+        prefix: Parent context (``FieldSpec.context``), kept as is in front.
+        hints: Type and constraint sentences, for a Clairic field.
+        limit: Longest result in characters; longer text is clipped.
+
+    Returns:
+        The instruction text.
+    """
     if role == "clairic":
         parts = [description]
-        if kind.hints:
-            parts = [_end_sentence(description), *kind.hints]
+        extra = list(hints)
+        if extra:
+            parts = [_end_sentence(description), *extra]
         body = " ".join(parts)
     elif role == "noul":
         body = f"Does the input say this is true: {description}?"
@@ -1288,6 +1319,20 @@ def _synthesise(
     else:
         body = f"What kind of value is this: {description}?"
     return _clip(f"{prefix}: {body}" if prefix else body, limit)
+
+
+def _synthesise(
+    kind: _Kind,
+    *,
+    description: str,
+    prefix: str,
+    limit: int,
+    role: Role,
+) -> str:
+    """Build the instruction string for one question."""
+    return render_instructions(
+        role, description, prefix=prefix, hints=kind.hints, limit=limit
+    )
 
 
 def _choice_criteria(kind: _Kind, override: Any) -> Any:
@@ -1553,6 +1598,9 @@ def _build_spec(
         nullable=draft.nullable,
         alias=draft.alias,
         models=kind.models,
+        context=_context(title, path) if shortened_clairic and kind.clairic else "",
+        clef_context=_context(title, path) if shortened_clef and kind.clef else "",
+        hints=tuple(kind.hints) if kind.clairic is not None else (),
     )
 
 
