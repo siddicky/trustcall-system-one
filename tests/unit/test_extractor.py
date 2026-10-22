@@ -9,6 +9,7 @@ import datetime as dt
 import enum
 import itertools
 import threading
+import time
 from decimal import Decimal
 from typing import Any, Literal, Optional, Union
 
@@ -1686,10 +1687,21 @@ class Hanging:
     def __init__(self) -> None:
         self.started = threading.Event()
         self.cancelled = threading.Event()
+        self.payloads: list[str] = []  # appended on the loop, read by the test
+
+    def saw(self, marker: str, timeout: float = 10) -> bool:
+        """Whether a call with ``marker`` in its payload starts within ``timeout``."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if any(marker in text for text in list(self.payloads)):
+                return True
+            time.sleep(0.01)
+        return False
 
     async def run(
         self, model: str, payload: Any, *, meta: Any, timeout: float | None = None
     ) -> TransportResponse:
+        self.payloads.append(str(payload))
         self.started.set()
         try:
             await asyncio.sleep(60)
@@ -1700,8 +1712,6 @@ class Hanging:
 
 
 def test_close_during_a_sync_invoke_returns_promptly_and_frees_the_caller() -> None:
-    import time
-
     hanging = Hanging()
     extractor = create_extractor([Person], transport=hanging)
     outcome: dict[str, Any] = {}
@@ -1736,16 +1746,21 @@ def test_close_during_a_sync_batch_frees_every_caller() -> None:
     extractor = create_extractor([Person], transport=hanging)
     errors: list[BaseException] = []
 
-    def worker() -> None:
+    def worker(marker: str) -> None:
         try:
-            extractor.batch([PERSON_TEXT, PERSON_TEXT])
+            extractor.batch([f"{PERSON_TEXT} {marker}", f"{PERSON_TEXT} {marker}"])
         except BaseException as exc:
             errors.append(exc)
 
-    threads = [threading.Thread(target=worker, daemon=True) for _ in range(2)]
+    markers = ["[caller-a]", "[caller-b]"]
+    threads = [threading.Thread(target=worker, args=(m,), daemon=True) for m in markers]
     for thread in threads:
         thread.start()
-    assert hanging.started.wait(5)
+    # close only once BOTH callers have a call in flight: an extractor restarts
+    # lazily, so a caller that reaches it after the close would simply run (and
+    # hang) on a fresh bridge instead of being freed
+    for marker in markers:
+        assert hanging.saw(marker)
     extractor.close()
     for thread in threads:
         thread.join(5)

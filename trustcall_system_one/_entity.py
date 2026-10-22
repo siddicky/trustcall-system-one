@@ -2613,10 +2613,13 @@ async def update_one(
             "identity_conflict")``, nothing is gated or applied) and the outcome
             carries an ``ambiguous_match`` skip next to the no-change record.
         placement: For an item of a nested list, whom it belongs to.
-        propose_only: Extract and verify, but stop before the nested items, the
-            change gate and the patch: the outcome has no record and only
-            ``proposed`` says what the input asks for (the removal rule asks this
-            of a record flagged for deletion when updates are off).
+        propose_only: Extract and verify, and run the nested items too, but stop
+            before the record's own change gate and the patch: the outcome has no
+            record and only ``proposed`` says what the input asks for (the
+            record's own changes and its items'; a repeat of an existing list
+            element is dropped by the same near-duplicate check as an update).
+            The removal rule asks this of a record flagged for deletion when
+            updates are off.
 
     Returns:
         The outcome.
@@ -2769,6 +2772,8 @@ async def update_one(
             and short_form(value, old)
         ):
             continue
+        if not is_change(leaf.spec, value, old, leaf.default):
+            continue  # a refused answer that only repeats the record proposes nothing
         refused_answers.append(f"{leaf.spec.pretty} ({asked.reject})")
     if propose_only:
         found = diff_group(
@@ -2776,8 +2781,32 @@ async def update_one(
             before,
             allow_null_removals=run.gates.allow_null_removals,
         )
-        proposed = [f"{c.op} {c.path}" for c in found.changes] + refused_answers
-        return UpdateOutcome(None, None, handle, True, 1, proposed=tuple(proposed))
+        # the items are looked at too: a parent flagged for deletion whose items
+        # the input changes is not a record the input merely asks to remove
+        nested_found = await _update_nested(plain, root, before, info)
+        changes = [*found.changes, *nested_found.changes]
+        dedups = await dedup_elements(plain, before, changes)
+        kept = [
+            c
+            for i, c in enumerate(changes)
+            if not (i in dedups and dedups[i].duplicate)
+        ]
+        proposed = [f"{c.op} {c.path}" for c in kept] + refused_answers
+        proposed += [
+            f"{r.op} {r.path} ({r.reason})"
+            for r in nested_found.rejected
+            if r.op is not None
+            and r.reason not in ("identity_subset", "duplicate", "identity_conflict")
+        ]
+        return UpdateOutcome(
+            None,
+            None,
+            handle,
+            True,
+            max(1, nested_found.attempts),
+            tuple(nested_found.skipped),
+            tuple(proposed),
+        )
     conflict = (
         _identity_conflict(
             plan,

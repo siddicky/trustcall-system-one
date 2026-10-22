@@ -531,7 +531,14 @@ schema title: "Person").
      changes and removes it: `SkippedEntity(reason="conflict_update_delete", candidates=((id,
      match p),))`, neither an update nor a delete, with the proposed changes listed in its
      `detail`. The rule does not depend on `enable_updates`: with updates off the extraction and
-     verification still run, to see what is proposed, but nothing is gated or applied. An
+     verification still run, to see what is proposed, but the record's own changes are not gated
+     or applied. The record's ITEMS are looked at either way (M10a, S1): the nested pipelines run
+     as for an update and what they would change or add counts as proposed, so a flagged parent
+     whose items the input changes ("Emma Thompson's dog Rex is now 5", Emma flagged) is a
+     `conflict_update_delete` whatever `enable_updates` says, not a deletion. Propose-only runs
+     the same near-duplicate check as an update before it counts a list element as proposed (a
+     repeat of an element the record holds is not a change), and an answer the ladder refused
+     counts only when it differs from the record's value. An
      identity-conflict refusal (a wrong match) is reported as such and holds the delete. Cost: every
      flagged and matched entity costs one extraction (Clairic per group plus the cross-check and
      the ladder; with updates on also the gate for its changes), and, if it holds collections, their
