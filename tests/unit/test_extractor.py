@@ -702,7 +702,7 @@ async def test_disagreeing_chunks_are_adjudicated_over_every_candidate() -> None
     span = record.fields["city"].span
     assert span is not None and CITY_TEXT[span[0] : span[1]] == "Paris"
     (call,) = script.calls("adjudicate")
-    question = call[1]["questions"]["adjudicate"]
+    question = call[1]["questions"]["adjudicate.city"]
     assert question["criteria"] == {
         "a": "London",
         "b": "Paris",
@@ -719,7 +719,7 @@ async def test_disagreeing_chunks_are_adjudicated_over_every_candidate() -> None
 
 async def test_an_indecisive_adjudication_falls_back_to_attribution() -> None:
     script = conflict_script()
-    script.adjudicate = {"city": pick("neither", ["a", "b", "neither"])}
+    script.adjudicate = {"city": pick("neither", ["a", "b", "neither"], p=0.5)}
     # London is the more confident chunk answer but is another person's
     script.attribution = {"attr.city.0": 0.1, "attr.city.1": 0.95}
     result = await conflict_extractor(script).ainvoke(CITY_TEXT)
@@ -740,7 +740,7 @@ async def test_low_probability_adjudication_is_not_decisive_either() -> None:
 
 async def test_when_no_check_settles_it_the_ladder_judges_the_top_candidate() -> None:
     script = conflict_script()
-    script.adjudicate = {"city": pick("neither", ["a", "b", "neither"])}
+    script.adjudicate = {"city": pick("neither", ["a", "b", "neither"], p=0.5)}
     script.attribution = {
         "attr.city.0": 0.1,
         "attr.city.1": 0.2,
@@ -754,9 +754,102 @@ async def test_when_no_check_settles_it_the_ladder_judges_the_top_candidate() ->
     assert any("no check settled it" in w for w in result.warnings)
 
 
+async def test_a_decisive_neither_makes_the_field_null() -> None:
+    script = conflict_script()
+    script.adjudicate = {"city": pick("neither", ["a", "b", "neither"], p=0.9)}
+    result = await conflict_extractor(script).ainvoke(CITY_TEXT)
+    record = result.records[0]
+    assert isinstance(record.value, Located) and record.value.city is None
+    assert any("states none of them" in w for w in result.warnings)
+    # the fallback attribution is not asked, nor the ladder's for a null
+    asked = [q for c in script.calls("attribution") for q in c[1]["questions"]]
+    assert asked == ["attr.name"]
+
+
+async def test_conflicting_fields_share_one_adjudication_and_one_attribution() -> None:
+    from trustcall_system_one.testing import clairic_answer, clairic_response
+
+    class Both(BaseModel):
+        name: str
+        city: Optional[str] = None
+        country: Optional[str] = None
+
+    script = Script()
+    script.adjudicate = {
+        "city": pick("neither", ["a", "b", "neither"], p=0.5),
+        "country": pick("b", ["a", "b", "neither"]),
+    }
+    script.attribution = {"attr.city.0": 0.1, "attr.city.1": 0.95}
+
+    def extract(model: str, payload: dict[str, Any], meta: Any) -> Any:
+        state = payload["state"]
+        cut = state[:4000] if len(state) > 6000 else state
+        answers: dict[str, Any] = {}
+        for name in payload["fields"]:
+            options = {
+                "name": [("Ada Lovelace", 0.99)],
+                "city": [("London", 0.97), ("Paris", 0.90)],
+                "country": [("England", 0.97), ("France", 0.90)],
+            }[name]
+            for value, conf in options:
+                at = cut.find(value)
+                if at >= 0:
+                    answers[name] = clairic_answer(
+                        "text", value, confidence=conf, span=[at, at + len(value)]
+                    )
+                    break
+            else:
+                answers[name] = clairic_answer("text", None, p_null=0.99)
+        return clairic_response(answers, truncated=cut is not state, state_text=cut)
+
+    script.transport = FakeTransport(
+        route(
+            presence=script._presence,
+            extract=extract,
+            attribution=script._attribution,
+            adjudicate=script._adjudicate,
+        )
+    )
+    text = (
+        "Ada Lovelace. Grace lives in London, England. "
+        + filler(2000, "w")
+        + "Ada moved to Paris, France. "
+        + filler(2000, "z")
+    )
+    result = await make_extractor(
+        [Both],
+        script,
+        verify=VerifyConfig(window_chars=50, reask_low_confidence=False),
+    ).ainvoke(text)
+    record = result.records[0]
+    assert isinstance(record.value, Both)
+    assert (record.value.city, record.value.country) == ("Paris", "France")
+    (adjudication,) = script.calls("adjudicate")
+    assert sorted(adjudication[1]["questions"]) == [
+        "adjudicate.city",
+        "adjudicate.country",
+    ]
+    assert adjudication[2].field == "city,country"
+    # only city was left open: its candidates share the one fallback request
+    fallbacks = [
+        c for c in script.calls("attribution") if "attr.city.0" in c[1]["questions"]
+    ]
+    assert len(fallbacks) == 1
+
+
+async def test_the_attribution_the_fallback_measured_is_not_asked_again() -> None:
+    script = conflict_script()
+    script.adjudicate = {"city": pick("neither", ["a", "b", "neither"], p=0.5)}
+    script.attribution = {"attr.city.0": 0.1, "attr.city.1": 0.95}
+    await conflict_extractor(script).ainvoke(CITY_TEXT)
+    asked = [q for c in script.calls("attribution") for q in c[1]["questions"]]
+    assert "attr.city" not in asked  # the ladder reused the fallback's answer
+    assert asked.count("attr.city.1") == 1
+
+
 async def test_without_attribution_the_most_confident_candidate_stands() -> None:
     script = conflict_script()
-    script.adjudicate = {"city": pick("neither", ["a", "b", "neither"])}
+    script.adjudicate = {"city": pick("neither", ["a", "b", "neither"], p=0.5)}
     result = await conflict_extractor(script, attribution=False).ainvoke(CITY_TEXT)
     record = result.records[0]
     assert isinstance(record.value, Located) and record.value.city == "London"

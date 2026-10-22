@@ -232,8 +232,15 @@ class Limits:
     The instance is immutable and hashable.
 
     Attributes:
-        max_depth: Deepest nesting of sub-models that is expanded; deeper or
-            recursive fields are skipped with a warning.
+        max_depth: Longest leaf path that is expanded; a sub-model whose leaves
+            would be deeper is skipped with a warning.
+        max_recursion: How many times a model may reappear on its own ancestor
+            chain (a ``Node`` with ``parent: Optional[Node]`` unrolls this many
+            levels below the root); beyond that the field is skipped with one
+            warning. ``0`` forbids any reappearance.
+        max_groups: Most field groups (the root, sub-models and every union
+            member, nested ones included) a schema may compile to. Exceeding it
+            raises ``ValueError`` at compile time instead of truncating.
         any_policy: What to do with ``Any`` and untyped mappings: ``"skip"``
             them (pydantic supplies the default) or ask for ``"text"``.
         estimate_for_bounded_numbers: Emit a Clairic ``estimate`` field for a
@@ -245,6 +252,8 @@ class Limits:
     """
 
     max_depth: int = 8
+    max_recursion: int = 2
+    max_groups: int = 128
     any_policy: Literal["skip", "text"] = "skip"
     estimate_for_bounded_numbers: bool = False
     max_instruction_chars: int = 600
@@ -256,6 +265,12 @@ class Limits:
             raise ValueError("max_depth must be an int")
         if self.max_depth < 1:
             raise ValueError("max_depth must be at least 1")
+        for name, floor in (("max_recursion", 0), ("max_groups", 1)):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be an int")
+            if value < floor:
+                raise ValueError(f"{name} must be at least {floor}")
         if self.any_policy not in ("skip", "text"):
             raise ValueError(
                 f"any_policy must be 'skip' or 'text', got {self.any_policy!r}"

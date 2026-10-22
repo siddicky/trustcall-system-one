@@ -309,24 +309,208 @@ def test_max_depth_caps_nested_expansion_with_a_warning() -> None:
     assert [g.pretty for g in shallow.groups] == [""]
 
 
-def test_a_self_recursive_optional_model_expands_to_the_limit() -> None:
+def test_a_self_recursive_optional_model_unrolls_max_recursion_levels() -> None:
     class Node(BaseModel):
         name: str
         parent: Optional["Node"] = None
 
     Node.model_rebuild()
-    plan = compile_schema(Node)
-    # leaves are at most 8 deep: name, parent.name, ..., parent x7 . name
+    plan = compile_schema(Node)  # max_recursion=2: the root and two parents
     names = [spec.pretty for spec in plan.specs if spec.engine == "clairic"]
-    assert len(names) == 8
-    assert names[-1] == ".".join(["parent"] * 7 + ["name"])
-    deepest = plan.spec(tuple(["parent"] * 8))
-    assert deepest.engine == "skip" and deepest.warnings == ("max_depth",)
-    assert len(plan.groups) == 8  # the root and seven parents
+    assert names == ["name", "parent.name", "parent.parent.name"]
+    deepest = plan.spec(("parent", "parent", "parent"))
+    assert deepest.engine == "skip" and deepest.warnings == ("max_recursion",)
+    assert [g.pretty for g in plan.groups] == ["", "parent", "parent.parent"]
     assert all(g.optional for g in plan.groups[1:])
-    assert len(plan.clef_questions()) == 7  # one presence question per parent
-    small = compile_schema(Node, limits=Limits(max_depth=3))
+    assert len(plan.clef_questions()) == 2  # one presence question per parent
+    # one warning for the recursion, not one per skipped instance
+    assert [w for w in plan.warnings if "max_recursion" in w] == [
+        "parent.parent.parent: max_recursion: Node reappears on its own ancestor "
+        "chain more than limits.max_recursion=2 times; the field is skipped"
+    ]
+    assert len(plan.warnings) == 1
+
+
+def test_max_recursion_and_max_depth_both_bound_the_unrolling() -> None:
+    class Node(BaseModel):
+        name: str
+        parent: Optional["Node"] = None
+
+    Node.model_rebuild()
+    flat = compile_schema(Node, limits=Limits(max_recursion=0))
+    assert [g.pretty for g in flat.groups] == [""]
+    assert flat.spec(("parent",)).warnings == ("max_recursion",)
+    deep = compile_schema(Node, limits=Limits(max_recursion=20))
+    names = [spec.pretty for spec in deep.specs if spec.engine == "clairic"]
+    assert len(names) == 8  # leaves at most 8 deep: max_depth wins
+    assert deep.spec(tuple(["parent"] * 8)).warnings == ("max_depth",)
+    small = compile_schema(Node, limits=Limits(max_depth=3, max_recursion=20))
     assert [g.pretty for g in small.groups] == ["", "parent", "parent.parent"]
+    assert sum("max_depth" in w for w in deep.warnings) == 1
+
+
+def test_recursive_collections_are_named_once_in_the_warnings() -> None:
+    class Tree(BaseModel):
+        label: str
+        parent: Optional["Tree"] = None
+        children: list["Tree"] = []
+
+    Tree.model_rebuild()
+    plan = compile_schema(Tree)
+    assert [spec.pretty for spec in plan.deferred()] == [
+        "parent.parent.children",
+        "parent.children",
+        "children",
+    ]
+    # the compile warnings name each (model, field) once
+    assert len(plan.warnings) == 1 and "max_recursion" in plan.warnings[0]
+
+
+def test_max_groups_is_a_compile_error_not_a_silent_truncation() -> None:
+    class Tri(BaseModel):
+        v: str
+        a: Optional["Tri"] = None
+        b: Optional["Tri"] = None
+        c: Optional["Tri"] = None
+
+    Tri.model_rebuild()
+    with pytest.raises(ValueError, match="max_groups") as info:
+        compile_schema(Tri, limits=Limits(max_recursion=8, max_groups=64))
+    message = str(info.value)
+    assert "Tri" in message and "max_recursion" in message
+    assert "max_depth" in message and "s1_field(skip=True)" in message
+    assert len(compile_schema(Tri).groups) == 13  # 1 + 3 + 9 with the default
+    with pytest.raises(ValueError, match="max_groups"):
+        compile_schema(Book, limits=Limits(max_groups=2))
+    assert len(compile_schema(Book, limits=Limits(max_groups=3)).groups) == 3
+
+
+def test_union_members_count_towards_max_groups() -> None:
+    class Home(BaseModel):
+        pet: Union[Cat, Dog]
+
+    with pytest.raises(ValueError, match="max_groups"):
+        compile_schema(Home, limits=Limits(max_groups=2))
+    plan = compile_schema(Home, limits=Limits(max_groups=3))
+    assert len(plan.groups) + len(plan.member_groups) == 3
+
+
+def test_a_recursive_union_leaves_out_the_member_past_the_limit() -> None:
+    class Num(BaseModel):
+        kind: Literal["num"]
+        n: float
+
+    class BinOp(BaseModel):
+        kind: Literal["op"]
+        op: str
+        left: Union[Num, "BinOp"]
+
+    BinOp.model_rebuild()
+
+    class Calc(BaseModel):
+        expr: Union[Num, BinOp]
+
+    plan = compile_schema(Calc)
+    # BinOp may reappear on its own chain twice (three BinOps deep); past that
+    # the member is simply not offered and the union is left with Num
+    level = plan.unions[0]
+    for _ in range(3):
+        level = level.members[1].group.unions[0]
+    deepest = level
+    assert [m.label for m in level.members] == ["Num"]
+    assert [m.label for m in deepest.members] == ["Num"]
+    assert deepest.spec.warnings == ("max_recursion",)
+    assert len(deepest.members) == 1 and deepest.spec.clef is None
+    assert len([w for w in plan.warnings if "max_recursion" in w]) == 1
+    # every union field up the chain still offers both members
+    top = plan.unions[0]
+    assert [m.label for m in top.members] == ["Num", "BinOp"]
+
+
+def test_a_member_whose_required_recursive_field_was_skipped_is_left_out() -> None:
+    class Leaf(BaseModel):
+        kind: Literal["leaf"]
+        size: int
+
+    class Branch(BaseModel):
+        kind: Literal["branch"]
+        up: "Branch"  # required and recursive: it can never be filled in
+
+    Branch.model_rebuild()
+
+    class Tree(BaseModel):
+        root: Union[Leaf, Branch]
+
+    plan = compile_schema(Tree)
+    (union,) = plan.unions
+    assert [m.label for m in union.members] == ["Leaf"]
+    assert union.spec.clef is None  # one option left: nothing to ask
+    assert dict(union.spec.key_map or {}) == {"leaf": "Leaf"}
+    assert any("Branch" in w and "left out of the union" in w for w in plan.warnings)
+    # the wire names of the survivors are untouched
+    assert list(plan.clairic_fields()) == ["root.Leaf.size"]
+    assert plan.clef_questions() == {}
+
+
+def test_a_union_with_no_viable_member_is_skipped() -> None:
+    class A(BaseModel):
+        kind: Literal["a"]
+        up: "A"
+
+    class B(BaseModel):
+        kind: Literal["b"]
+        up: "B"
+
+    A.model_rebuild()
+    B.model_rebuild()
+
+    class Holder(BaseModel):
+        x: Union[A, B]
+        y: int
+
+    plan = compile_schema(Holder)
+    assert plan.spec(("x",)).engine == "skip"
+    assert plan.spec(("x",)).warnings[-1] == "no_viable_member"
+    assert plan.unions == ()
+    assert any("no_viable_member" in w for w in plan.warnings)
+
+
+def test_a_required_sub_model_made_unviable_removes_the_member_that_holds_it() -> None:
+    class Loop(BaseModel):
+        again: "Loop"
+
+    Loop.model_rebuild()
+
+    class WithLoop(BaseModel):
+        kind: Literal["loop"]
+        inner: Loop
+
+    class Plain(BaseModel):
+        kind: Literal["plain"]
+        x: int
+
+    class Holder(BaseModel):
+        item: Union[WithLoop, Plain]
+
+    plan = compile_schema(Holder)
+    assert [m.label for m in plan.unions[0].members] == ["Plain"]
+
+
+def test_an_optional_recursive_field_does_not_remove_a_member() -> None:
+    class Rec(BaseModel):
+        kind: Literal["rec"]
+        up: Optional["Rec"] = None
+
+    Rec.model_rebuild()
+
+    class Plain(BaseModel):
+        kind: Literal["plain"]
+
+    class Holder(BaseModel):
+        item: Union[Rec, Plain]
+
+    plan = compile_schema(Holder)
+    assert [m.label for m in plan.unions[0].members] == ["Rec", "Plain"]
 
 
 def test_long_nested_names_are_shortened_with_the_context() -> None:
@@ -830,10 +1014,20 @@ def test_member_wire_names_are_unique_even_when_members_share_field_names() -> N
     assert cat_name.path == dog_name.path == ("pet", "name")
     assert cat_name.wire_name != dog_name.wire_name
     assert cat_name.wire_path == ("pet", "Cat", "name")
-    assert cat_name.instructions == "Home → pet: name"
+    assert cat_name.instructions == "Home → pet (Cat: A house cat): name"
+    assert dog_name.instructions == "Home → pet (Dog): name"
     assert plan.clairic_names.name_to_path["pet.Dog.name"] == ("pet", "Dog", "name")
-    # the first spec with a shared path wins a lookup
-    assert plan.spec(("pet", "name")) is cat_name
+    # a shared path is ambiguous: say which member, or use the exact wire path
+    with pytest.raises(ValueError, match=r"several union members.*Cat, Dog"):
+        plan.spec(("pet", "name"))
+    assert plan.spec(("pet", "name"), member="Cat") is cat_name
+    assert plan.spec(("pet", "name"), member="Dog") is dog_name
+    assert plan.spec_by_wire_path(("pet", "Dog", "name")) is dog_name
+    assert plan.spec(("pet", "lives")).member_labels == ("Cat",)
+    with pytest.raises(KeyError):
+        plan.spec(("pet", "name"), member="Fish")
+    with pytest.raises(KeyError):
+        plan.spec_by_wire_path(("pet", "Cat", "tricks"))
     assert list(plan.clef_questions()) == ["pet"]
 
 
@@ -959,3 +1153,101 @@ def test_collections_of_unions_stay_collections() -> None:
 def test_group_types_are_exported() -> None:
     plan = compile_schema(Book)
     assert isinstance(plan.root, FieldGroup)
+
+
+# --------------------------------------------------------------------------- #
+# Review fixes: owners, member identity, option counts
+# --------------------------------------------------------------------------- #
+
+
+def test_owners_are_the_humanised_ancestor_names() -> None:
+    plan = compile_schema(Book)
+    assert plan.spec(("title",)).owners == ()
+    assert plan.spec(("author", "name")).owners == ("author",)
+    assert plan.spec(("author", "address", "city")).owners == ("author", "address")
+
+    class Inner(BaseModel):
+        x: int
+
+    class Outer(BaseModel):
+        home_office: Inner
+
+    assert compile_schema(Outer).spec(("home_office", "x")).owners == ("home office",)
+
+
+def test_member_leaves_name_the_member_in_their_context() -> None:
+    class Short(BaseModel):
+        """A short one."""
+
+        a: int
+
+    class Long(BaseModel):
+        """A member whose docstring is far too long to repeat in every question."""
+
+        a: int
+
+    class Plain(BaseModel):
+        a: int
+
+    class Home(BaseModel):
+        pet: Union[Short, Long, Plain]
+
+    plan = compile_schema(Home)
+    (union,) = plan.unions
+    short, long, plain = (m.group.specs[0] for m in union.members)
+    assert short.context == "Home → pet (Short: A short one)"
+    assert long.context == "Home → pet (Long)"
+    assert plain.context == "Home → pet (Plain)"
+    assert plain.instructions == "Home → pet (Plain): a"
+    assert plain.scope == "pet (Plain)" and plain.scoped == "a (pet (Plain))"
+    assert short.member_labels == ("Short",)
+
+
+def test_nested_members_keep_the_member_in_the_context() -> None:
+    class Wing(BaseModel):
+        span: float
+
+    class Eagle(BaseModel):
+        kind: Literal["eagle"]
+        wing: Wing
+
+    class Owl(BaseModel):
+        kind: Literal["owl"]
+
+    class Sky(BaseModel):
+        bird: Union[Eagle, Owl]
+
+    plan = compile_schema(Sky)
+    span = plan.spec(("bird", "wing", "span"))
+    assert span.context == "Sky → bird (Eagle) → wing"
+    assert span.owners == ("bird", "wing")
+
+
+def test_the_number_of_options_not_members_is_checked_against_255() -> None:
+    def member(name: str, start: int, count: int) -> Any:
+        values = tuple(f"{name}{i}" for i in range(start, start + count))
+        tag: Any = Literal[values]
+        return create_model(name, kind=(tag, ...), x=(int, ...))
+
+    a = member("A", 0, 130)
+    b = member("B", 0, 130)
+
+    class Home(BaseModel):
+        pet: Union[a, b]  # type: ignore[valid-type]
+
+    with pytest.raises(ValueError, match="260 options"):
+        compile_schema(Home)
+    # an optional union needs one more option for `unstated`
+    c = member("C", 0, 127)
+    d = member("D", 0, 128)
+
+    class Tight(BaseModel):
+        pet: Union[c, d]  # type: ignore[valid-type]
+
+    assert len(compile_schema(Tight).unions[0].spec.key_map or {}) == 255
+
+    class TooTight(BaseModel):
+        pet: Optional[Union[c, d]] = None  # type: ignore[valid-type]
+
+    with pytest.raises(ValueError, match="256 options"):
+        compile_schema(TooTight)

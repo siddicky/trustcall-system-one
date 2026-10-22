@@ -957,5 +957,39 @@ async def test_the_template_wraps_the_description_not_the_context_or_hints() -> 
     await extractor.ainvoke("The count is 3.")
     (call,) = script.calls("extract")
     assert call[1]["fields"][spec.wire_name]["instructions"] == (
-        "Wide: the Wide's the count. Must be at least 0."
+        "Wide: the Wide's count. Must be at least 0."
     )
+
+
+async def test_reasked_codes_that_differ_by_a_digit_do_not_agree() -> None:
+    class Book(BaseModel):
+        isbn: Optional[str] = None
+
+    text = "ISBN 978-3-16-148410-0 (once misprinted as 978-3-16-148410-1)."
+    script = Script()
+    script.clairic = {
+        "isbn": ca(
+            "text", "978-3-16-148410-0", find="978-3-16-148410-0", confidence=0.6
+        )
+    }
+    script.reask = {"isbn": ca("text", "978-3-16-148410-1", find="978-3-16-148410-1")}
+    script.adjudicate = {"isbn": pick("a", ["a", "b", "neither"])}
+    extractor = make_extractor([Book], script)
+    record = (await extractor.ainvoke(text)).records[0]
+    assert isinstance(record.value, Book) and record.value.isbn == "978-3-16-148410-0"
+    assert len(script.calls("adjudicate")) == 1  # they disagree: Clef decides
+
+
+async def test_reasked_near_identical_text_still_agrees() -> None:
+    class Who(BaseModel):
+        name: Optional[str] = None
+
+    text = "Ada Lovelace wrote it; Ada Lovelaces notes."
+    script = Script()
+    script.clairic = {
+        "name": ca("text", "Ada Lovelace", find="Ada Lovelace", confidence=0.6)
+    }
+    script.reask = {"name": ca("text", "Ada Lovelaces", find="Ada Lovelaces")}
+    record = (await make_extractor([Who], script).ainvoke(text)).records[0]
+    assert isinstance(record.value, Who) and record.value.name is not None
+    assert script.calls("adjudicate") == []

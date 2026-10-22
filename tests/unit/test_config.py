@@ -87,6 +87,8 @@ def test_allow_null_removals_must_be_a_bool() -> None:
 def test_limit_defaults_and_hashing() -> None:
     limits = Limits()
     assert limits.max_depth == 8
+    assert limits.max_recursion == 2
+    assert limits.max_groups == 128
     assert limits.any_policy == "skip"
     assert limits.estimate_for_bounded_numbers is False
     assert limits.max_instruction_chars == 600
@@ -101,6 +103,11 @@ def test_limit_defaults_and_hashing() -> None:
         ({"max_depth": 0}, "max_depth"),
         ({"max_depth": True}, "max_depth"),
         ({"max_depth": 1.5}, "max_depth"),
+        ({"max_recursion": -1}, "max_recursion"),
+        ({"max_recursion": True}, "max_recursion"),
+        ({"max_recursion": 1.5}, "max_recursion"),
+        ({"max_groups": 0}, "max_groups"),
+        ({"max_groups": True}, "max_groups"),
         ({"any_policy": "drop"}, "any_policy"),
         ({"estimate_for_bounded_numbers": 1}, "estimate_for_bounded_numbers"),
         ({"max_instruction_chars": 5}, "max_instruction_chars"),
@@ -115,6 +122,7 @@ def test_limits_are_validated(kwargs: dict[str, Any], match: str) -> None:
 def test_limits_accept_valid_values() -> None:
     limits = Limits(max_depth=1, any_policy="text", estimate_for_bounded_numbers=True)
     assert (limits.max_depth, limits.any_policy) == (1, "text")
+    assert Limits(max_recursion=0, max_groups=1).max_recursion == 0
 
 
 # --------------------------------------------------------------------------- #

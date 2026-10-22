@@ -188,10 +188,15 @@ async def test_nested_instructions_carry_the_parent_context() -> None:
         for name, field in call[1]["fields"].items()
     }
     assert fields["title"]["instructions"] == "the Book's title"
-    assert fields["author.name"]["instructions"] == "Book → author: the Book's name"
+    # nested fields are named through their owners: the author's name, not the
+    # Book's (which would invite the title)
+    assert (
+        fields["author.name"]["instructions"]
+        == "Book → author: the Book's author's name"
+    )
     assert (
         fields["author.address.city"]["instructions"]
-        == "Book → author → address: the Book's city"
+        == "Book → author → address: the Book's author's address's city"
     )
     # the attribution question names the field with its ancestors
     (attribution,) = script.calls("attribution")
@@ -205,7 +210,7 @@ async def test_nested_instructions_carry_the_parent_context() -> None:
     assert meta.field == "author.address"
     (presence_question,) = payload["questions"].values()
     assert presence_question["instructions"] == (
-        "Book → author: Does `input` state the Book's address?"
+        "Book → author: Does `input` state the Book's author's address?"
     )
     assert payload["state"] == {"input": TEXT}
 
@@ -303,16 +308,26 @@ async def test_a_borderline_sub_model_with_all_null_leaves_is_absent() -> None:
     assert answer.rejected_reason == "absent" and answer.raw == {"noul": 0.35}
 
 
-async def test_a_borderline_sub_model_with_a_value_is_kept() -> None:
+async def test_a_borderline_sub_model_with_a_value_but_a_gap_is_dropped() -> None:
     script = book_script()
     script.group_presence = {"author.address": 0.35}
     script.clairic["author.address.city"] = ca("text", None, p_null=0.99)
-    record = only(await run([Book], script))
-    # only the zip came back, but that is evidence: the sub-model stands, and
-    # its missing required field is reported by validation
-    assert not record.valid
-    assert record.errors == ("author.address.city: Input should be a valid string",)
-    assert after(record)["author"]["address"] == {"city": None, "zip": "97201"}
+    result = await run([Book], script)
+    record = only(result)
+    # only the zip came back: the sub-model stands as evidence, but it cannot be
+    # built without its required city, so it is dropped and the record survives
+    assert record.valid, record.errors
+    assert book(record).author.address is None
+    (rejected,) = [r for r in record.rejected if r.reason == "invalid_optional_group"]
+    assert rejected.path == "/author/address" and rejected.op is None
+    assert "author.address.city" in rejected.detail
+    assert any("treated as absent" in w for w in result.warnings)
+    answer = record.fields["author.address"]
+    assert answer.value is None and answer.rejected_reason == "invalid_optional_group"
+    # the leaf answers it held are reported as dropped, not as standing
+    zip_answer = record.fields["author.address.zip"]
+    assert zip_answer.value is None
+    assert zip_answer.rejected_reason == "invalid_optional_group"
 
 
 async def test_the_presence_thresholds_are_configurable() -> None:
@@ -330,13 +345,51 @@ async def test_the_presence_thresholds_are_configurable() -> None:
     assert ["author.address.city", "author.address.zip"] not in extract_fields(script)
 
 
-async def test_a_confident_sub_model_with_null_leaves_is_not_made_absent() -> None:
-    script = book_script()  # presence 0.95
+async def test_a_confident_sub_model_with_null_leaves_is_dropped_if_invalid() -> None:
+    script = book_script()  # presence 0.95: not borderline, so not "all null"
     script.clairic["author.address.city"] = ca("text", None, p_null=0.99)
     script.clairic["author.address.zip"] = ca("text", None, p_null=0.99)
+    result = await run([Book], script)
+    record = only(result)
+    assert record.valid, record.errors
+    assert book(record).author.address is None
+    (rejected,) = [r for r in record.rejected if r.reason == "invalid_optional_group"]
+    assert rejected.path == "/author/address"
+    assert record.fields["author.address"].rejected_reason == "invalid_optional_group"
+    assert any("author.address" in w and "absent" in w for w in result.warnings)
+
+
+async def test_an_invalid_required_sub_model_still_invalidates_the_record() -> None:
+    script = book_script()
+    script.clairic["author.name"] = ca("text", None, p_null=0.99)
     record = only(await run([Book], script))
-    assert not record.valid  # present but its required city is missing
-    assert record.errors[0].startswith("author.address.city")
+    assert not record.valid
+    assert record.errors[0].startswith("author.name:")
+
+
+async def test_a_group_below_a_dropped_one_goes_with_it() -> None:
+    class Inner(BaseModel):
+        code: str
+        extra: Optional[Address] = None
+
+    class Mid(BaseModel):
+        title: str
+        inner: Optional[Inner] = None
+
+    script = Script()
+    script.clairic = {
+        "title": ca("text", "Dune", find="Dune"),
+        "inner.code": ca("text", None, p_null=0.99),
+        "inner.extra.city": ca("text", "Reno", find="Reno"),
+        "inner.extra.zip": ca("text", None, p_null=0.99),
+    }
+    record = only(await run([Mid], script, "Dune, Reno"))
+    # extra stands (valid), inner fails on its code: inner and what is in it go
+    assert record.valid
+    assert record.value == Mid(title="Dune")
+    paths = [r.path for r in record.rejected if r.reason == "invalid_optional_group"]
+    assert paths == ["/inner"]
+    assert record.fields["inner.extra.city"].value is None
 
 
 class Deep(BaseModel):
@@ -448,7 +501,7 @@ async def test_a_nested_low_confidence_value_is_asked_again() -> None:
     assert call[2].field == "author.address.city"
     assert list(call[1]["fields"]) == ["author.address.city"]
     assert call[1]["fields"]["author.address.city"]["instructions"].startswith(
-        "Book → author → address: the Book's city"
+        "Book → author → address: the Book's author's address's city"
     )
 
 
@@ -461,7 +514,7 @@ async def test_a_nested_borderline_null_is_checked_with_its_ancestors_named() ->
     (call,) = script.calls("null_check")
     question = call[1]["questions"]["nullcheck.author.address.zip"]
     assert question["instructions"] == (
-        "Does `input` state the Book's zip (author → address)?"
+        "Does `input` state the Book's author's address's zip?"
     )
 
 
@@ -694,7 +747,7 @@ async def test_a_union_asks_only_the_chosen_members_fields() -> None:
     assert record.fields["pet.tricks"].value == 3
     assert span_text(OWNER_TEXT, record, "pet.nickname") == "Rex"
     answer = record.fields["pet"]
-    assert answer.engine == "clef" and answer.source == "clef"
+    assert answer.engine == "union_models" and answer.source == "clef"
     assert isinstance(answer.value, Dog)
     assert answer.raw["choice"] == "dog"
     # only the chosen member's answers are in the result
@@ -1030,7 +1083,7 @@ async def test_s1_field_skip_and_instructions_apply_to_nested_fields() -> None:
     assert list(call[1]["fields"]) == ["inner.a"]
     assert (
         call[1]["fields"]["inner.a"]["instructions"]
-        == "Outer → inner: the Outer's the first thing"
+        == "Outer → inner: the Outer's inner's first thing"
     )
 
 
@@ -1054,3 +1107,393 @@ async def test_a_union_member_is_one_unit_of_passes_under_every_split(
     )
     # the root, then the chosen member (two fields: one pass or one per field)
     assert len(script.calls("extract")) == expected
+
+
+# --------------------------------------------------------------------------- #
+# Review fixes: union members are validated as themselves
+# --------------------------------------------------------------------------- #
+
+
+class Kitty(BaseModel):
+    """A cat."""
+
+    name: str
+    indoor: bool = False
+
+
+class Pup(BaseModel):
+    """A dog."""
+
+    name: str
+    breed: Optional[str] = None
+
+
+class Household(BaseModel):
+    owner: str
+    pet: Union[Kitty, Pup]
+
+
+def household_script(choice: str, p: float = 0.95) -> Script:
+    script = Script()
+    script.clairic = {
+        "owner": ca("text", "Sam", find="Sam"),
+        "pet.Pup.name": ca("text", "Rex", find="Rex"),
+        "pet.Pup.breed": ca("text", None, p_null=0.99),
+        "pet.Kitty.name": ca("text", "Rex", find="Rex"),
+    }
+    script.clef = {
+        "pet": pick(choice, ["Kitty", "Pup"], p),
+        "pet.Kitty.indoor": noul(0.05),
+    }
+    return script
+
+
+async def test_the_chosen_member_survives_validation_when_members_overlap() -> None:
+    # Pup's document {"name": "Rex"} also validates as a Kitty: pydantic's smart
+    # union would pick the Kitty. The chosen member is validated as itself.
+    script = household_script("Pup")
+    record = only(await run([Household], script, "Sam has a dog named Rex."))
+    assert record.valid, record.errors
+    assert record.value == Household(owner="Sam", pet=Pup(name="Rex"))
+    assert type(record.value.pet) is Pup
+    assert after(record)["pet"] == {"name": "Rex", "breed": None}
+    answer = record.fields["pet"]
+    assert answer.engine == "union_models" and isinstance(answer.value, Pup)
+
+
+async def test_the_other_overlapping_member_can_be_chosen_too() -> None:
+    script = household_script("Kitty")
+    script.clef["pet.Kitty.indoor"] = noul(0.9)
+    record = only(await run([Household], script, "Sam has an indoor cat named Rex."))
+    assert record.value == Household(owner="Sam", pet=Kitty(name="Rex", indoor=True))
+    assert type(record.value.pet) is Kitty
+
+
+async def test_an_invalid_chosen_member_is_reported_not_swapped_for_another() -> None:
+    class Cat(BaseModel):
+        name: str
+        lives: Optional[int] = None
+
+    class Dog(BaseModel):
+        name: str
+        tricks: int
+
+    class Home(BaseModel):
+        pet: Union[Cat, Dog]
+
+    script = Script()
+    script.clairic = {
+        "pet.Dog.name": ca("text", "Rex", find="Rex"),
+        "pet.Dog.tricks": ca("number", None, p_null=0.99),
+        "pet.Cat.name": ca("text", "Rex", find="Rex"),
+        "pet.Cat.lives": ca("number", None, p_null=0.99),
+    }
+    script.clef = {"pet": pick("Dog", ["Cat", "Dog"])}
+    result = await run([Home], script, "A dog named Rex.")
+    record = only(result)
+    # {"name": "Rex"} would be a valid Cat, but the choice was Dog
+    assert not record.valid and record.value is None
+    assert record.errors == ("pet.tricks: Input should be a valid integer",)
+    assert record.fields["pet"].value is None
+    assert record.fields["pet"].raw["choice"] == "Dog"
+
+
+async def test_an_invalid_member_of_an_optional_union_is_dropped() -> None:
+    class Dog(BaseModel):
+        name: str
+        tricks: int
+
+    class Fish(BaseModel):
+        water: str
+
+    class Home(BaseModel):
+        owner: str
+        pet: Optional[Union[Dog, Fish]] = None
+
+    script = Script()
+    script.clairic = {
+        "owner": ca("text", "Sam", find="Sam"),
+        "pet.Dog.name": ca("text", "Rex", find="Rex"),
+        "pet.Dog.tricks": ca("number", None, p_null=0.99),
+    }
+    script.clef = {"pet": pick("Dog", ["Dog", "Fish", "unstated"])}
+    result = await run([Home], script, "Sam has a dog named Rex.")
+    record = only(result)
+    assert record.valid and book_free(record) == Home(owner="Sam")
+    assert [
+        r.path for r in record.rejected if r.reason == "invalid_optional_group"
+    ] == ["/pet"]
+    assert record.fields["pet"].rejected_reason == "invalid_optional_group"
+    assert any("failed validation" in w for w in result.warnings)
+
+
+def book_free(record: ResultRecord) -> BaseModel:
+    assert record.value is not None
+    return record.value
+
+
+async def test_the_fallback_member_is_validated_as_itself_too() -> None:
+    script = household_script("Pup", 0.5)
+    result = await run([Household], script, "Sam has a dog named Rex.")
+    record = only(result)
+    assert record.valid, record.errors
+    # Kitty and Pup each found one value: the tie goes to the earlier member
+    assert type(record.value.pet) is Kitty  # type: ignore[union-attr]
+
+
+async def test_discriminated_unions_still_validate_through_instances() -> None:
+    script = owner_script()
+    record = only(await run([Owner], script, OWNER_TEXT))
+    assert type(record.value.pet) is Dog  # type: ignore[union-attr]
+    assert record.valid
+
+
+async def test_a_typed_dict_sub_model_stays_a_dict() -> None:
+    from typing_extensions import TypedDict
+
+    class Geo(TypedDict):
+        lat: float
+        lon: float
+
+    class Place(BaseModel):
+        name: str
+        geo: Optional[Geo] = None
+
+    script = Script()
+    script.clairic = {
+        "name": ca("text", "Oslo", find="Oslo"),
+        "geo.lat": ca("number", 59.9),
+        "geo.lon": ca("number", 10.7),
+    }
+    record = only(await run([Place], script, "Oslo at 59.9, 10.7."))
+    assert record.valid, record.errors
+    assert record.value == Place(name="Oslo", geo={"lat": 59.9, "lon": 10.7})
+
+
+# --------------------------------------------------------------------------- #
+# Review fixes: only Clairic values are evidence
+# --------------------------------------------------------------------------- #
+
+
+class Checked(BaseModel):
+    city: str
+    verified: bool = False
+
+
+class Person(BaseModel):
+    name: str
+    address: Optional[Checked] = None
+
+
+async def test_a_bool_leaf_is_no_evidence_that_a_borderline_group_exists() -> None:
+    script = Script()
+    script.clairic = {
+        "name": ca("text", "Ann", find="Ann"),
+        "address.city": ca("text", None, p_null=0.99),
+    }
+    script.clef = {"address.verified": noul(0.05)}  # the bool always resolves
+    script.group_presence = {"address": 0.35}
+    record = only(await run([Person], script, "Ann likes tea."))
+    assert record.valid, record.errors
+    assert record.value == Person(name="Ann")
+    assert record.fields["address"].rejected_reason == "absent"
+
+
+async def test_a_required_literal_is_no_evidence_either() -> None:
+    class Mood(BaseModel):
+        mood: Literal["happy", "sad"]
+        note: Optional[str] = None
+
+    class Holder(BaseModel):
+        name: str
+        mood: Optional[Mood] = None
+
+    script = Script()
+    script.clairic = {
+        "name": ca("text", "Ann", find="Ann"),
+        "mood.note": ca("text", None, p_null=0.99),
+    }
+    script.clef = {"mood.mood": pick("happy", ["happy", "sad"])}
+    script.group_presence = {"mood": 0.3}
+    record = only(await run([Holder], script, "Ann says hi."))
+    assert record.valid and record.value == Holder(name="Ann")
+
+
+async def test_the_union_fallback_is_decided_by_clairic_evidence() -> None:
+    class Calm(BaseModel):
+        name: Optional[str] = None
+        quiet: bool = False
+        still: bool = False
+
+    class Loud(BaseModel):
+        name: Optional[str] = None
+        shouts: bool = False
+
+    class Beast(BaseModel):
+        kind: Union[Calm, Loud]
+
+    script = Script()
+    script.clairic = {
+        "kind.Calm.name": ca("text", None, p_null=0.99),
+        "kind.Loud.name": ca("text", "Rex", find="Rex"),
+    }
+    script.clef = {
+        "kind": pick("Loud", ["Calm", "Loud"], 0.5),
+        "kind.Calm.quiet": noul(0.9),
+        "kind.Calm.still": noul(0.9),
+        "kind.Loud.shouts": noul(0.05),
+    }
+    record = only(await run([Beast], script, "Rex."))
+    # Calm has two resolved bools, Loud one name: the name is the evidence
+    assert isinstance(record.value, Beast) and isinstance(record.value.kind, Loud)
+
+
+# --------------------------------------------------------------------------- #
+# Review fixes: presence, scheduling, wording
+# --------------------------------------------------------------------------- #
+
+
+class Dropping:
+    """Wraps a transport and leaves the answers of some Clef questions out."""
+
+    def __init__(self, script: Script, kind: str) -> None:
+        self.script = script
+        self.kind = kind
+
+    async def run(
+        self, model: str, payload: Any, *, meta: Any, timeout: float | None = None
+    ) -> Any:
+        import dataclasses
+
+        response = await self.script.transport.run(model, payload, meta=meta)
+        if meta.kind != self.kind or meta.field is None:
+            return response
+        body = dict(response.body)
+        body["answers"] = {}
+        return dataclasses.replace(response, body=body)
+
+
+async def test_a_missing_presence_answer_lands_in_the_borderline_band() -> None:
+    from trustcall_system_one import create_extractor
+
+    script = book_script()
+    # asked, not skipped; and with every leaf null it is judged absent
+    script.clairic["author.address.city"] = ca("text", None, p_null=0.99)
+    script.clairic["author.address.zip"] = ca("text", None, p_null=0.99)
+    extractor = create_extractor([Book], transport=Dropping(script, "presence"))
+    record = only(await extractor.ainvoke(TEXT))
+    assert ["author.address.city", "author.address.zip"] in extract_fields(script)
+    assert record.valid and book(record).author.address is None
+    assert record.fields["author.address"].raw == {"noul": 0.35}
+
+
+class Siblings(BaseModel):
+    title: str
+    home: Optional[Address] = None
+    work: Optional[Address] = None
+    mail: Optional[Address] = None
+
+
+async def test_sibling_presence_questions_share_one_request() -> None:
+    script = Script()
+    script.clairic = {
+        "title": ca("text", "Dune", find="Dune"),
+        "home.city": ca("text", "Reno", find="Reno"),
+        "home.zip": ca("text", None, p_null=0.99),
+        "mail.city": ca("text", "Rome", find="Rome"),
+        "mail.zip": ca("text", None, p_null=0.99),
+    }
+    script.group_presence = {"work": 0.0}
+    result = await run([Siblings], script, "Dune: home Reno, mail Rome.")
+    record = only(result)
+    assert record.value == Siblings(
+        title="Dune", home=Address(city="Reno"), mail=Address(city="Rome")
+    )
+    # the entity gate and one request for the three siblings
+    calls = script.calls("presence")
+    assert len(calls) == 2
+    assert calls[1][2].field == "home,work,mail"
+    assert sorted(calls[1][1]["questions"]) == [
+        "home.__presence",
+        "mail.__presence",
+        "work.__presence",
+    ]
+    assert not any("work.city" in f for f in extract_fields(script))
+
+
+async def test_the_chosen_member_is_asked_before_the_parents_clairic_pass_ends() -> (
+    None
+):
+    import asyncio
+
+    from trustcall_system_one.testing import FakeTransport, route
+
+    script = owner_script()
+    started = asyncio.Event()
+
+    async def extract(model: str, payload: Any, meta: Any) -> Any:
+        if "pet.Dog.tricks" in payload["fields"]:
+            started.set()
+        else:
+            # the root's own Clairic pass cannot finish until the member is asked:
+            # a member that waited for it would deadlock here
+            await asyncio.wait_for(started.wait(), timeout=2)
+        return script._extract(model, payload, meta)
+
+    script.transport = FakeTransport(
+        route(
+            presence=script._presence,
+            extract=extract,
+            clef_fields=script._clef_fields,
+            attribution=script._attribution,
+        )
+    )
+    record = only(await run([Owner], script, OWNER_TEXT))
+    assert record.valid and type(record.value.pet) is Dog  # type: ignore[union-attr]
+
+
+async def test_container_entries_carry_the_containers_engine() -> None:
+    script = book_script()
+    script.group_presence = {"author.address": 0.05}
+    record = only(await run([Book], script))
+    assert record.fields["author.address"].engine == "submodel"
+    assert record.fields["author.address"].raw == {"noul": 0.05}
+    script = owner_script()
+    record = only(await run([Owner], script, OWNER_TEXT))
+    pet = record.fields["pet"]
+    assert pet.engine == "union_models" and pet.raw["choice"] == "dog"
+    leaves = [a for a in record.fields.values() if a.engine in ("clairic", "const")]
+    assert {a.pretty for a in leaves} >= {"name", "pet.tricks", "pet.kind"}
+    assert "pet" not in {a.pretty for a in leaves}
+
+
+async def test_member_leaves_name_the_member_in_their_instructions() -> None:
+    script = owner_script()
+    await run([Owner], script, OWNER_TEXT)
+    fields = {
+        name: field
+        for call in script.calls("extract")
+        for name, field in call[1]["fields"].items()
+    }
+    assert fields["pet.Dog.tricks"]["instructions"] == (
+        "Owner → pet (Dog): the Owner's pet's tricks"
+    )
+    assert fields["pet.Dog.nickname"]["instructions"] == (
+        "Owner → pet (Dog): the Owner's pet's nickname"
+    )
+
+
+async def test_a_recursive_models_deferred_field_is_warned_about_once() -> None:
+    class Tree(BaseModel):
+        label: str
+        parent: Optional["Tree"] = None
+        children: list[Address] = []
+
+    Tree.model_rebuild()
+    script = Script()
+    script.clairic = {"label": ca("text", "oak", find="oak")}
+    script.group_presence = {"parent": 0.0}
+    result = await run([Tree], script, "oak")
+    mentions = [w for w in result.warnings if "collection fields" in w]
+    assert len(mentions) == 1 and "Tree.children" in mentions[0]
+    assert sum("max_recursion" in w for w in result.warnings) == 1

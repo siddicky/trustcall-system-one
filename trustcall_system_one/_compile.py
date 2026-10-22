@@ -132,6 +132,8 @@ _IDENTITY_NAMES = (
     "sku",
 )
 _MAX_CHOICE_OPTIONS = 255
+_SHORT_DOC = 40
+_MIN_CHOICE_OPTIONS = 2
 _UNSTATED_TEXT = "The input does not state this."
 _MIN_SCORE_LEVELS, _MAX_SCORE_LEVELS = 2, 10
 _AGGREGATION_RE = re.compile(
@@ -445,8 +447,10 @@ class FieldSpec:
             except below a union of models, where it carries the member's label
             after the union field (members may share field names, while every
             wire name is unique in the plan). Empty means ``path``.
-        scope: For a nested field, its ancestors' names (``"author → address"``);
-            empty at the top level.
+        scope: For a nested field, its ancestors' names (``"author → address"``,
+            ``"pet (Dog)"`` below a union member); empty at the top level.
+        member_labels: Labels of the union members this field is below, outermost
+            first (empty outside unions of models).
     """
 
     path: Path
@@ -478,6 +482,14 @@ class FieldSpec:
     hints: tuple[str, ...] = ()
     wire_path: Path = ()
     scope: str = ""
+    member_labels: tuple[str, ...] = ()
+
+    @property
+    def owners(self) -> tuple[str, ...]:
+        """Humanised names of the fields this one is nested in, outermost first."""
+        return tuple(
+            _humanise(part) for part in self.path[:-1] if isinstance(part, str)
+        )
 
     @property
     def scoped(self) -> str:
@@ -519,6 +531,8 @@ class FieldGroup:
         unions: The unions of models that are fields of this group.
         identity: Names of the group's fields that identify a record.
         member: For the root group of a union member, the member's label.
+        typed_dict: Whether the group was declared as a ``TypedDict`` (its value
+            is a plain dict, not an instance of ``model``).
     """
 
     path: Path
@@ -534,6 +548,7 @@ class FieldGroup:
     unions: tuple["UnionGroup", ...] = ()
     identity: tuple[str, ...] = ()
     member: str = ""
+    typed_dict: bool = False
 
     @property
     def pretty(self) -> str:
@@ -663,19 +678,49 @@ class SchemaPlan:
         yield from self.specs
         yield from self.member_specs
 
-    def spec(self, path: Path) -> FieldSpec:
+    def spec(self, path: Path, member: str | None = None) -> FieldSpec:
         """Return the spec for a path.
 
-        Below a union of models several members may use the same path; the first
-        is returned.
+        Several members of a union of models may declare the same field, so a path
+        below a union can be ambiguous; then ``member`` (the member's label, see
+        ``UnionMember.label``) says which one, or ``spec_by_wire_path`` names the
+        exact field.
+
+        Args:
+            path: The field's document path.
+            member: Restrict to fields below this union member.
 
         Raises:
-            KeyError: If no field has that path.
+            KeyError: If no field has that path (in that member).
+            ValueError: If the path belongs to several members and ``member``
+                does not settle which.
+        """
+        found = [s for s in self.all_specs() if s.path == path]
+        if member is not None:
+            found = [s for s in found if member in s.member_labels]
+        if not found:
+            raise KeyError(path)
+        if len(found) > 1:
+            labels = sorted({label for s in found for label in s.member_labels})
+            raise ValueError(
+                f"the path {pretty(path)!r} is declared by several union members "
+                f"({', '.join(labels)}); pass member=... or use spec_by_wire_path"
+            )
+        return found[0]
+
+    def spec_by_wire_path(self, wire_path: Path) -> FieldSpec:
+        """Return the spec whose wire names were allocated for ``wire_path``.
+
+        Below a union of models the member's label follows the union field
+        (``("pet", "Dog", "name")``), which tells members apart.
+
+        Raises:
+            KeyError: If no field has that wire path.
         """
         for spec in self.all_specs():
-            if spec.path == path:
+            if (spec.wire_path or spec.path) == wire_path:
                 return spec
-        raise KeyError(path)
+        raise KeyError(wire_path)
 
     def _select(self, paths: Iterable[Path] | None) -> list[FieldSpec]:
         every = list(self.all_specs())
@@ -910,10 +955,30 @@ def _length_hints(c: Mapping[str, Any], unit: str) -> list[str]:
     return []
 
 
-def _context(title: str, path: Path) -> str:
-    """Return the " → "-joined model title and ancestor field names."""
-    ancestors = [_humanise(str(part)) for part in path[:-1] if isinstance(part, str)]
-    return " → ".join([title, *ancestors])
+def _ancestors(path: Path, members: Mapping[int, str] | None = None) -> list[str]:
+    """Humanised names of a path's ancestors, each union field followed by its member.
+
+    ``members`` maps the index of a union field in ``path`` to the member's tag
+    (``"Dog"`` or ``"Dog: A dog"``), giving ``"pet (Dog)"``.
+    """
+    names: list[str] = []
+    for index, part in enumerate(path[:-1]):
+        if not isinstance(part, str):
+            continue
+        name = _humanise(part)
+        if members and index in members:
+            name = f"{name} ({members[index]})"
+        names.append(name)
+    return names
+
+
+def _context(title: str, path: Path, members: Mapping[int, str] | None = None) -> str:
+    """Return the " → "-joined model title and ancestor field names.
+
+    Below a union of models the member follows the union field:
+    ``"Owner → pet (Dog)"``.
+    """
+    return " → ".join([title, *_ancestors(path, members)])
 
 
 def _member_description(member: enum.Enum) -> str | None:
@@ -971,6 +1036,7 @@ class _Kind:
     bounds: dict[str, Any] = field(default_factory=dict)
     models: tuple[type[BaseModel], ...] = ()
     union: "_UnionInfo | None" = None
+    typed_dict: bool = False
 
 
 @dataclass
@@ -982,6 +1048,7 @@ class _UnionInfo:
     option_members: dict[str, int]
     option_tags: dict[str, Any]
     criteria: dict[str, str]
+    originals: list[Any] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -998,6 +1065,7 @@ class _Ctx:
     limits: Limits
     model: type[BaseModel]
     discriminator: Any = None
+    chain: tuple[type[BaseModel], ...] = ()
 
 
 def _resolve(ctx: _Ctx, tp: Any) -> Any:
@@ -1273,27 +1341,47 @@ def _too_deep(ctx: _Ctx) -> bool:
     return len(ctx.path) + 1 > ctx.limits.max_depth
 
 
+def _too_recursive(ctx: _Ctx, model: type[BaseModel]) -> bool:
+    """Whether ``model`` would reappear on its ancestor chain too many times."""
+    return ctx.chain.count(model) > ctx.limits.max_recursion
+
+
 def _model_kind(ctx: _Ctx, engine: Engine, models: tuple[Any, ...]) -> _Kind:
-    """Record a nested-model field, applying the depth guard.
+    """Record a nested-model field, applying the depth and recursion guards.
 
     A sub-model is expanded by the compiler down to ``limits.max_depth`` (the
-    longest leaf path): a self-referencing model expands until the limit, where
-    the field is skipped with a ``max_depth`` warning. An optional sub-model gets
+    longest leaf path), and a model may reappear on its own ancestor chain at
+    most ``limits.max_recursion`` times; past either limit the field is skipped
+    with a ``max_depth`` or ``max_recursion`` warning. An optional sub-model gets
     a presence question. Collections are recorded for a later engine.
     """
     if _too_deep(ctx):
         return _Kind("skip", warnings=["max_depth"])
     resolved = tuple(_as_model(model) for model in models)
+    if engine == "submodel" and _too_recursive(ctx, resolved[0]):
+        return _Kind("skip", warnings=["max_recursion"])
+    typed = typing_extensions.is_typeddict(models[0])
     if engine == "submodel" and not ctx.required:
-        return _Kind(engine, clef="noul", models=resolved)
-    return _Kind(engine, models=resolved)
+        return _Kind(engine, clef="noul", models=resolved, typed_dict=typed)
+    return _Kind(engine, models=resolved, typed_dict=typed)
+
+
+def _member_doc(model: type[BaseModel]) -> str:
+    """The model's docstring on one line, or an empty string."""
+    return _clean(inspect.cleandoc(model.__doc__)) if model.__doc__ else ""
+
+
+def _member_tag(model: type[BaseModel], label: str) -> str:
+    """The label of a union member, with its docstring when that is short."""
+    doc = _member_doc(model).rstrip(".")
+    return f"{label}: {doc}" if doc and len(doc) <= _SHORT_DOC else label
 
 
 def _member_text(model: type[BaseModel], label: str) -> str:
     """Describe a union member for the choice: its docstring, else its fields."""
-    doc = inspect.cleandoc(model.__doc__) if model.__doc__ else ""
-    if doc.strip():
-        return _clean(doc)
+    doc = _member_doc(model)
+    if doc:
+        return doc
     names = ", ".join(model.model_fields) or "no fields"
     return f"{label}: has the fields {names}."
 
@@ -1344,30 +1432,46 @@ def _find_discriminator(
     return None
 
 
-def _union_models_kind(ctx: _Ctx, members: tuple[Any, ...]) -> _Kind:
+def _union_models_kind(
+    ctx: _Ctx, members: tuple[Any, ...], labels: list[str] | None = None
+) -> _Kind:
     """Classify a union of models: one Clef choice over its members.
 
     The options are the discriminator's values when the members share a tag
     field (from ``Field(discriminator=...)`` or a common ``Literal``), else the
     member names; each option's criteria is the member's docstring, falling back
-    to its field list. An optional union gets an ``unstated`` option.
+    to its field list. An optional union gets an ``unstated`` option. A member
+    that would reappear on the ancestor chain too often is left out (the field is
+    skipped when none is left); with a single option left, nothing is asked.
+
+    Args:
+        ctx: The field.
+        members: The member models.
+        labels: The members' labels, when already fixed (the compiler pins them
+            when it drops members after expanding them).
     """
     if _too_deep(ctx):
         return _Kind("skip", warnings=["max_depth"])
+    originals = list(members)
     models = [_as_model(m) for m in members]
-    labels: list[str] = []
-    for model in models:
-        base, number = model.__name__, 1
-        label = base
-        while label in labels:
-            number += 1
-            label = f"{base}_{number}"
-        labels.append(label)
-    if len(models) > _MAX_CHOICE_OPTIONS - (0 if ctx.required else 1):
-        raise ValueError(
-            f"field {ctx.pretty!r}: a union of {len(models)} models has too many "
-            f"options for one Clef choice (at most {_MAX_CHOICE_OPTIONS})"
-        )
+    notes: list[str] = []
+    if labels is None:
+        labels = []
+        for model in models:
+            base, number = model.__name__, 1
+            label = base
+            while label in labels:
+                number += 1
+                label = f"{base}_{number}"
+            labels.append(label)
+        keep = [i for i, m in enumerate(models) if not _too_recursive(ctx, m)]
+        if len(keep) != len(models):
+            notes.append("max_recursion")
+            models = [models[i] for i in keep]
+            originals = [originals[i] for i in keep]
+            labels = [labels[i] for i in keep]
+        if not models:
+            return _Kind("skip", warnings=notes)
     tag = _find_discriminator(ctx, models)
     candidates: list[_Candidate] = []
     owners: list[int] = []
@@ -1390,6 +1494,7 @@ def _union_models_kind(ctx: _Ctx, members: tuple[Any, ...]) -> _Kind:
         option_members={},
         option_tags={},
         criteria={},
+        originals=originals,
     )
     key_map: dict[str, Any] = {}
     for option, candidate, owner in zip(options, candidates, owners, strict=True):
@@ -1404,13 +1509,21 @@ def _union_models_kind(ctx: _Ctx, members: tuple[Any, ...]) -> _Kind:
         unstated = _unstated_option(options)
         options.append(unstated)
         key_map[unstated.id] = UNSTATED
+    if len(options) > _MAX_CHOICE_OPTIONS:
+        raise ValueError(
+            f"field {ctx.pretty!r}: the union offers {len(options)} options (one "
+            "per discriminator value, plus `unstated` when optional) but a Clef "
+            f"choice supports at most {_MAX_CHOICE_OPTIONS}"
+        )
     return _Kind(
         "union_models",
-        clef="choice",
+        # a single option leaves nothing to ask: the member is simply used
+        clef="choice" if len(options) >= _MIN_CHOICE_OPTIONS else None,
         options=options,
         key_map=key_map,
         models=tuple(models),
         union=info,
+        warnings=notes,
     )
 
 
@@ -1704,10 +1817,30 @@ class _Draft:
     min_confidence: float
     alias: str | None
     warnings: list[str]
-    messages: list[str]
+    messages: list[tuple[str, str]]
+    model: type[BaseModel]
+    ctx: _Ctx
+    members: dict[int, str] = field(default_factory=dict)
+    member_labels: tuple[str, ...] = ()
 
 
 _NUMBER_TYPES = frozenset({"number", "estimate", "forecast"})
+
+
+def _warning_message(pretty_name: str, tag: str, ctx: _Ctx) -> str:
+    """Turn a short warning tag into a plan warning."""
+    if tag == "max_recursion":
+        return (
+            f"{pretty_name}: max_recursion: {ctx.model.__name__} reappears on its "
+            f"own ancestor chain more than limits.max_recursion="
+            f"{ctx.limits.max_recursion} times; the field is skipped"
+        )
+    if tag == "max_depth":
+        return (
+            f"{pretty_name}: max_depth: the field is nested deeper than "
+            f"limits.max_depth={ctx.limits.max_depth}; it is skipped"
+        )
+    return f"{pretty_name}: {tag}"
 
 
 def _draft_field(
@@ -1717,6 +1850,9 @@ def _draft_field(
     *,
     prefix: Path = (),
     wire_prefix: Path | None = None,
+    chain: tuple[type[BaseModel], ...] = (),
+    members: Mapping[int, str] | None = None,
+    member_labels: tuple[str, ...] = (),
     gates: GateConfig,
     limits: Limits,
 ) -> _Draft:
@@ -1729,6 +1865,11 @@ def _draft_field(
         prefix: Document path of the model (empty for the root model).
         wire_prefix: What wire names are allocated under (``prefix`` unless the
             model is a member of a union).
+        chain: The models of the enclosing groups, root first (for the
+            recursion guard).
+        members: For a field below union members, the tag of each member by the
+            index of its union field in ``prefix``.
+        member_labels: The labels of those members, outermost first.
         gates: Thresholds.
         limits: Structural limits.
     """
@@ -1752,6 +1893,7 @@ def _draft_field(
         limits=limits,
         model=model,
         discriminator=info.discriminator,
+        chain=chain,
     )
     kind = _Kind("skip") if options.get("skip") else _classify(ctx, shape)
     wanted_clef = options.get("clef")
@@ -1768,12 +1910,16 @@ def _draft_field(
     if "instructions" in options:
         description = _clean(options["instructions"])
     warnings = list(kind.warnings)
-    messages: list[str] = []
+    messages: list[tuple[str, str]] = []
     if _AGGREGATION_RE.search(description):
         warnings.append("aggregation")
         messages.append(
-            f"{pretty_name}: description {description!r} looks like an aggregate; "
-            "derive it with a pydantic computed_field instead of extracting it"
+            (
+                "aggregation",
+                f"{pretty_name}: description {description!r} looks like an "
+                "aggregate; derive it with a pydantic computed_field instead of "
+                "extracting it",
+            )
         )
     override = options.get("clairic_type")
     if override is not None and kind.clairic is not None:
@@ -1783,18 +1929,24 @@ def _draft_field(
         ):
             warnings.append("clairic_type_mismatch")
             messages.append(
-                f"{pretty_name}: clairic_type={override!r} does not match the "
-                f"{native!r} field the annotation implies"
+                (
+                    "clairic_type_mismatch",
+                    f"{pretty_name}: clairic_type={override!r} does not match the "
+                    f"{native!r} field the annotation implies",
+                )
             )
     alias, alias_warning = _validation_key(name, info)
     if alias_warning is not None:
         warnings.append(alias_warning)
         messages.append(
-            f"{pretty_name}: the validation alias is an AliasPath or has no plain "
-            "string choice; documents are keyed by the field name"
+            (
+                alias_warning,
+                f"{pretty_name}: the validation alias is an AliasPath or has no "
+                "plain string choice; documents are keyed by the field name",
+            )
         )
     for tag in kind.warnings:
-        messages.append(f"{pretty_name}: {tag}")
+        messages.append((tag, _warning_message(pretty_name, tag, ctx)))
     null_threshold = options.get(
         "null_threshold",
         gates.required_null_threshold if required else gates.optional_null_threshold,
@@ -1822,6 +1974,10 @@ def _draft_field(
         alias=alias,
         warnings=warnings,
         messages=messages,
+        model=model,
+        ctx=ctx,
+        members=dict(members or {}),
+        member_labels=member_labels,
     )
 
 
@@ -1842,9 +1998,10 @@ def _build_spec(
     clef_question: Question | None = None
     instructions = description
     nested = len(path) > 1  # nested fields always carry their parent context
+    context = _context(title, path, draft.members)
 
     if kind.clairic is not None:
-        prefix = _context(title, path) if shortened_clairic or nested else ""
+        prefix = context if shortened_clairic or nested else ""
         instructions = _synthesise(
             kind,
             description=description,
@@ -1874,7 +2031,7 @@ def _build_spec(
             raise ValueError(f"field {pretty_name!r}: {exc}") from exc
 
     if kind.clef is not None:
-        prefix = _context(title, path) if shortened_clef or nested else ""
+        prefix = context if shortened_clef or nested else ""
         role: Role = (
             "union_type"
             if kind.clairic is not None
@@ -1954,17 +2111,12 @@ def _build_spec(
         nullable=draft.nullable,
         alias=draft.alias,
         models=kind.models,
-        context=(
-            _context(title, path)
-            if (shortened_clairic or nested) and kind.clairic
-            else ""
-        ),
-        clef_context=(
-            _context(title, path) if (shortened_clef or nested) and kind.clef else ""
-        ),
+        context=context if (shortened_clairic or nested) and kind.clairic else "",
+        clef_context=context if (shortened_clef or nested) and kind.clef else "",
         hints=tuple(kind.hints) if kind.clairic is not None else (),
         wire_path=draft.wire_path,
-        scope=" → ".join(_humanise(str(part)) for part in path[:-1]),
+        scope=" → ".join(_ancestors(path, draft.members)),
+        member_labels=draft.member_labels,
     )
 
 
@@ -1990,7 +2142,11 @@ def _identity(specs: tuple[FieldSpec, ...]) -> tuple[str, ...]:
 
 @dataclass
 class _GroupDraft:
-    """The classified fields of one model, before names and text exist."""
+    """The classified fields of one model, before names and text exist.
+
+    ``dead`` marks a group that can never validate because a required field of
+    it was skipped by a limit.
+    """
 
     model: type[BaseModel]
     path: Path
@@ -1998,6 +2154,8 @@ class _GroupDraft:
     container: _Draft | None
     items: "list[_Draft | _GroupDraft | _UnionDraft]"
     member: str = ""
+    dead: bool = False
+    typed_dict: bool = False
 
 
 @dataclass
@@ -2008,22 +2166,90 @@ class _UnionDraft:
     members: list[_GroupDraft]
 
 
+@dataclass
+class _Budget:
+    """Counts the groups a schema compiles to against ``limits.max_groups``."""
+
+    root: str
+    limit: int
+    groups: int = 0
+
+    def take(self, model: type[BaseModel]) -> None:
+        self.groups += 1
+        if self.groups > self.limit:
+            raise ValueError(
+                f"{self.root} compiles to more than {self.limit} field groups "
+                f"(limits.max_groups) while expanding {model.__name__}; reduce it "
+                "with limits.max_recursion or limits.max_depth, mark the recursive "
+                "fields s1_field(skip=True), or raise limits.max_groups"
+            )
+
+
+_LIMIT_TAGS = frozenset({"max_depth", "max_recursion", "no_viable_member"})
+
+
+def _skipped_by_limit(draft: _Draft) -> bool:
+    """Whether a required field was dropped by a limit (so it can never validate)."""
+    return (
+        draft.required
+        and draft.kind.engine == "skip"
+        and any(tag in _LIMIT_TAGS for tag in draft.kind.warnings)
+    )
+
+
 def _expand(
     model: type[BaseModel],
     *,
     path: Path,
     wire_path: Path,
+    chain: tuple[type[BaseModel], ...],
+    members: Mapping[int, str],
+    member_labels: tuple[str, ...],
     container: _Draft | None,
     member: str,
     gates: GateConfig,
     limits: Limits,
+    budget: _Budget,
 ) -> _GroupDraft:
     """Classify the fields of ``model`` and, recursively, of its sub-models.
 
-    Expansion stops where ``_model_kind`` skips a field for ``max_depth``, so a
-    self-referencing model unrolls down to the limit.
+    Expansion stops where a field is skipped for ``max_depth`` or
+    ``max_recursion``, so a self-referencing model unrolls to the limits. A union
+    member that can never validate because a required field of it was skipped is
+    left out of the union (and the union field is skipped when no member is left).
+
+    Raises:
+        ValueError: If the schema compiles to more than ``limits.max_groups``
+            groups.
     """
+    budget.take(model)
     items: list[_Draft | _GroupDraft | _UnionDraft] = []
+    dead = False
+
+    def child(
+        sub: type[BaseModel], draft: _Draft, *, label: str = "", typed: bool = False
+    ) -> _GroupDraft:
+        deeper = dict(members)
+        labels = member_labels
+        if label:
+            deeper[len(draft.path) - 1] = _member_tag(sub, label)
+            labels = (*member_labels, label)
+        group = _expand(
+            sub,
+            path=draft.path,
+            wire_path=(*draft.wire_path, label) if label else draft.wire_path,
+            chain=(*chain, sub),
+            members=deeper,
+            member_labels=labels,
+            container=None if label else draft,
+            member=label,
+            gates=gates,
+            limits=limits,
+            budget=budget,
+        )
+        group.typed_dict = typed
+        return group
+
     for name, info in model.model_fields.items():
         draft = _draft_field(
             model,
@@ -2031,40 +2257,74 @@ def _expand(
             info,
             prefix=path,
             wire_prefix=wire_path,
+            chain=chain,
+            members=members,
+            member_labels=member_labels,
             gates=gates,
             limits=limits,
         )
         kind = draft.kind
+        if _skipped_by_limit(draft):
+            dead = True
         if kind.engine == "submodel":
-            items.append(
-                _expand(
-                    kind.models[0],
-                    path=draft.path,
-                    wire_path=draft.wire_path,
-                    container=draft,
-                    member="",
-                    gates=gates,
-                    limits=limits,
-                )
-            )
+            sub = child(kind.models[0], draft, typed=kind.typed_dict)
+            items.append(sub)
+            if sub.dead and draft.required:
+                dead = True
         elif kind.engine == "union_models":
             assert kind.union is not None
-            members = [
-                _expand(
+            labels = list(kind.union.labels)
+            originals = list(kind.union.originals)
+            groups = [
+                child(
                     sub,
-                    path=draft.path,
-                    wire_path=(*draft.wire_path, label),
-                    container=None,
-                    member=label,
-                    gates=gates,
-                    limits=limits,
+                    draft,
+                    label=label,
+                    typed=typing_extensions.is_typeddict(original),
                 )
-                for sub, label in zip(kind.models, kind.union.labels, strict=True)
+                for sub, label, original in zip(
+                    kind.models, labels, originals, strict=True
+                )
             ]
-            items.append(_UnionDraft(draft, members))
+            alive = [i for i, group in enumerate(groups) if not group.dead]
+            if len(alive) != len(groups):
+                dropped = [labels[i] for i in range(len(groups)) if i not in alive]
+                draft.warnings.append("member_excluded")
+                draft.messages.append(
+                    (
+                        "member_excluded",
+                        f"{draft.ctx.pretty}: member(s) {', '.join(dropped)} left "
+                        "out of the union: a required field of them was skipped by "
+                        "a limit, so they could never validate",
+                    )
+                )
+                if alive:
+                    draft.kind = _union_models_kind(
+                        draft.ctx,
+                        tuple(originals[i] for i in alive),
+                        [labels[i] for i in alive],
+                    )
+                    groups = [groups[i] for i in alive]
+                else:
+                    draft.kind = _Kind("skip", warnings=["no_viable_member"])
+                    draft.warnings.append("no_viable_member")
+                    draft.messages.append(
+                        (
+                            "no_viable_member",
+                            f"{draft.ctx.pretty}: no_viable_member: every member of "
+                            "the union was left out; the field is skipped",
+                        )
+                    )
+                    groups = []
+                if _skipped_by_limit(draft):
+                    dead = True
+            if groups:
+                items.append(_UnionDraft(draft, groups))
+            else:
+                items.append(draft)
         else:
             items.append(draft)
-    return _GroupDraft(model, path, wire_path, container, items, member)
+    return _GroupDraft(model, path, wire_path, container, items, member, dead)
 
 
 def _name_requests(
@@ -2079,7 +2339,8 @@ def _name_requests(
         if isinstance(item, _GroupDraft):
             _name_requests(item, clairic, clef)
         elif isinstance(item, _UnionDraft):
-            clef.append((item.draft.wire_path, None))
+            if item.draft.kind.clef is not None:
+                clef.append((item.draft.wire_path, None))
             for member in item.members:
                 _name_requests(member, clairic, clef)
         else:
@@ -2118,6 +2379,7 @@ class _Assembler:
         self.member_groups: list[FieldGroup | None] = []
         self.unions: list[UnionGroup] = []
         self.messages: list[str] = []
+        self.seen: set[tuple[type[BaseModel], str, str]] = set()
 
     def spec(self, draft: _Draft, *, in_member: bool) -> FieldSpec:
         wire = self.clairic_names.get(draft.wire_path, "")
@@ -2134,7 +2396,12 @@ class _Assembler:
             and draft.kind.clairic is not None,
             shortened_clef=clef_name in self.clef_short,
         )
-        self.messages.extend(draft.messages)
+        # a recursive model declares the same field at every level: say it once
+        for tag, text in draft.messages:
+            key = (draft.model, draft.name, tag)
+            if key not in self.seen:
+                self.seen.add(key)
+                self.messages.append(text)
         (self.member_specs if in_member else self.flat).append(built)
         return built
 
@@ -2174,6 +2441,7 @@ class _Assembler:
             unions=tuple(unions),
             identity=_identity(tuple(specs)),
             member=node.member,
+            typed_dict=node.typed_dict,
         )
         sink[slot] = built
         return built
@@ -2227,10 +2495,14 @@ def _compile_model(
         model,
         path=(),
         wire_path=(),
+        chain=(model,),
+        members={},
+        member_labels=(),
         container=None,
         member="",
         gates=gates,
         limits=limits,
+        budget=_Budget(model.__name__, limits.max_groups),
     )
     # Names are allocated for the whole schema at once so that a collision gives
     # every colliding path the digest form, whatever the declaration order.
