@@ -573,12 +573,12 @@ max_attempts=5, stop_on_repeat=True, allow_pattern_reask=True)`.
    names no field are carried over to the next round, and when the record validates each is taken
    back in turn and stays back while the record still validates, until no single one can go; if
    the loop ends invalid they are all taken back. A revert never brings back a value that a message
-   named and a repair replaced. A kept named set is then refined: each of its answers is taken back
-   in turn, and stays back, when the error that caused it stays away and no new error appears
-   without it (an answer that merely rode along, such as the caption of a range whose ends were
-   wrong), unless its earlier value is known to be wrong (named and replaced in an earlier
-   round); this repeats until no single answer can go, so answers that are only needed
-   together (a booking's start and end) stay. On an update, a repair that comes back to the RECORD's value for a
+   named and a repair replaced. Named answers are therefore never
+   taken back one by one, even when the record would still validate without one: that would
+   reinstate a value the validator showed wrong (an `end < start` error that reverts one date
+   lands on 10 May to 10 May). Known, accepted trade-off: a named field that merely rode along
+   (the caption of a range whose ends were wrong) keeps its re-asked value when that differs.
+   On an update, a repair that comes back to the RECORD's value for a
    field whose operation was meant to change it is a failed repair: the field keeps the answer
    the operation came from and the operation is reported `RejectedOp(op, path, "validation")`.
    An error about a list element counts as one the record already held (no request, the update's

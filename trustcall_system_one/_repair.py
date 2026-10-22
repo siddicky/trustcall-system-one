@@ -1225,7 +1225,7 @@ async def repair_loop(
             [o for o in fresh if not o.target.hit.named],  # judged one by one later
         )
         kept: list[list[Outcome]] = []
-        for index, group in enumerate(groups):
+        for group in groups:
             if group and pending.problems:
                 # answers to a model-level error stay only if that error went away
                 cause = _errors(plan, _model_level(group), chosen)
@@ -1233,10 +1233,6 @@ async def repair_loop(
                 if not cause - after:
                     pending = await _revert(group, refresh)
                     group = []
-            if group and index == 0:  # the named set: keep only what it needs
-                group, pending = await _refine(
-                    plan, state, group, pending, chosen, refresh
-                )
             kept.append(group)
         for outcome in kept[0]:  # what a message named is never reinstated
             state.bad.add(_pair(outcome))
@@ -1292,49 +1288,6 @@ async def _revert(
         assert outcome.undo is not None
         outcome.undo()
     return await refresh()
-
-
-async def _refine(
-    plan: SchemaPlan,
-    state: RepairState,
-    group: list[Outcome],
-    pending: Pending,
-    chosen: Mapping[str, str],
-    refresh: Callable[[], Awaitable[Pending]],
-) -> tuple[list[Outcome], Pending]:
-    """Take back the answers of a kept named set that the record does not need.
-
-    A message that names several fields asks all of them again, and the answers
-    stay together because a validator may need both (a booking's start and end).
-    When one of them turns out to be unnecessary, because the record is just as
-    valid with that field's earlier value, the earlier value comes back: the
-    repair changes as little as it must. An answer is taken back only if the
-    error that caused it stays away and no new error appears, and never if that
-    would restore a value an error named and a repair replaced. This repeats until
-    no single answer can go, so answers that are only needed together are kept.
-
-    Returns:
-        The answers that stay and the errors the record has now.
-    """
-    cause = _errors(plan, _model_level(group), chosen)
-    kept = list(group)
-    changed = True
-    while changed:
-        changed = False
-        for outcome in _free(state, kept):
-            assert outcome.undo is not None and outcome.redo is not None
-            before = _errors(plan, pending.problems, pending.chosen)
-            outcome.undo()
-            trial = await refresh()
-            now = _errors(plan, trial.problems, trial.chosen)
-            if cause & now or not now <= before:
-                outcome.redo()
-                trial = await refresh()
-            else:
-                kept.remove(outcome)
-                changed = True
-            pending = trial
-    return kept, pending
 
 
 async def _minimise(

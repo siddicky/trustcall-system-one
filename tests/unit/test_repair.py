@@ -1481,24 +1481,16 @@ class OrderedStay(BaseModel):
         return self
 
 
-async def test_a_named_answer_the_record_does_not_need_is_taken_back() -> None:
-    # either date alone makes the record valid again (start = end): the set is kept
-    # because it fixed the error, then refined, one answer at a time, to what the
-    # record needs. Exactly one of the two stays.
+async def test_named_answers_are_kept_as_a_set_never_one_by_one() -> None:
+    # either date alone would make the record valid again (start = end), but the
+    # start's first answer was shown wrong by the validator: both stay
     world = stay_world()
     record = only(await run([OrderedStay], world, STAY))
     stay = value_of(record, OrderedStay)
-    assert stay.end >= stay.start
+    assert (stay.start, stay.end) == (dt.date(2024, 5, 1), dt.date(2024, 5, 10))
     assert (stay.guest, stay.room) == ("Ann Lee", "12")
     assert sorted(c[2].field or "" for c in repair_calls(world)) == ["end", "start"]
-    reverted = [
-        name
-        for name in ("start", "end")
-        if any("reverted, it was not needed" in n for n in record.fields[name].warnings)
-    ]
-    assert len(reverted) == 1
-    kept = "end" if reverted == ["start"] else "start"
-    assert record.fields[kept].repaired and not record.fields[reverted[0]].repaired
+    assert record.fields["start"].repaired and record.fields["end"].repaired
 
 
 class Range(BaseModel):
@@ -1513,9 +1505,15 @@ class Range(BaseModel):
         return self
 
 
-async def test_named_answers_that_only_rode_along_are_taken_back() -> None:
-    # the message names label, low and high; only the two ends were wrong, and
-    # the caption's re-ask (a different quote) is not needed once they are fixed
+async def test_a_named_field_that_rode_along_keeps_its_re_asked_value() -> None:
+    """Known, accepted limitation: a named answer is never taken back on its own.
+
+    The message names label, low and high; only the two ends were wrong, but the
+    caption was asked again too and its re-ask (a different quote) differs. Named
+    answers are kept or reverted strictly as a SET, because taking them back one
+    by one would reinstate values a validator showed wrong (see OrderedStay).
+    The price is that a field that merely rode along keeps its re-asked value.
+    """
     text = "Range A runs from 3 to 9, also called B."
     world = Script()
     world.clairic = {
@@ -1530,10 +1528,9 @@ async def test_named_answers_that_only_rode_along_are_taken_back() -> None:
     }
     record = only(await run([Range], world, text))
     value = value_of(record, Range)
-    assert (value.label, value.low, value.high) == ("A", 3, 9)
-    assert record.fields["low"].repaired and record.fields["high"].repaired
-    assert not record.fields["label"].repaired
-    assert any("reverted" in n for n in record.fields["label"].warnings)
+    assert (value.label, value.low, value.high) == ("B", 3, 9)
+    assert all(record.fields[n].repaired for n in ("label", "low", "high"))
+    assert not any("reverted" in n for n in record.fields["label"].warnings)
     assert sorted(c[2].field or "" for c in repair_calls(world)) == [
         "high",
         "label",
