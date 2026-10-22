@@ -863,6 +863,72 @@ async def test_an_item_that_is_matched_and_flagged_for_removal_is_a_conflict() -
     assert skip.candidates and skip.candidates[0][0] == "1"
 
 
+async def test_a_refused_change_to_a_flagged_item_is_a_conflict_not_a_removal() -> None:
+    from trustcall_system_one.testing import clef_response, noul
+
+    text = "Order SO-10442: drop the tea towels to 1."
+    world = FakeWorld(text)
+    world.entity(
+        "the Order",
+        schema=Order,
+        mentions=["SO-10442"],
+        fields={"order_id": "SO-10442"},
+    )
+    add_line(world, "tea towels", "Tea towels", quantity=1)
+    world.delete("1", parent="Order")
+
+    def gate(model: str, payload: Doc, meta: Any) -> Any:
+        if meta.scope:  # the item's own gate refuses its change
+            answers = {qid: noul(0.1) for qid in payload["questions"]}
+            return clef_response(answers, model=payload["model"])
+        return world.handler(model, payload, meta)
+
+    extractor = create_extractor(
+        [One(Order)],
+        transport=FakeTransport(route(default=world.handler, gate=gate)),
+        enable_inserts=True,
+        enable_item_removals=True,
+    )
+    result = await extractor.ainvoke(text, existing=[("SO-10442", "Order", ORDER)])
+    (record,) = result.records
+    assert record.patches == () and record.after == record.before  # not removed
+    (skip,) = result.skipped
+    assert (skip.reason, skip.entity.parent) == ("conflict_update_delete", "e0")
+    assert "replace /quantity (gate_noul)" in skip.detail
+
+
+async def test_a_flagged_item_with_nothing_proposed_is_removed_whatever_gates_say() -> (
+    None
+):
+    from trustcall_system_one.testing import clef_response, noul
+
+    text = "Order SO-10442: please remove the tea towels."
+    world = FakeWorld(text)
+    world.entity(
+        "the Order",
+        schema=Order,
+        mentions=["SO-10442"],
+        fields={"order_id": "SO-10442"},
+    )
+    add_line(world, "tea towels", "Tea towels")
+    world.delete("1", parent="Order")
+
+    def gate(model: str, payload: Doc, meta: Any) -> Any:
+        answers = {qid: noul(0.1) for qid in payload["questions"]}
+        return clef_response(answers, model=payload["model"])
+
+    extractor = create_extractor(
+        [One(Order)],
+        transport=FakeTransport(route(default=world.handler, gate=gate)),
+        enable_inserts=True,
+        enable_item_removals=True,
+    )
+    result = await extractor.ainvoke(text, existing=[("SO-10442", "Order", ORDER)])
+    (record,) = result.records
+    assert [(p.op, p.path) for p in record.patches] == [("remove", "/items/1")]
+    assert result.skipped == ()
+
+
 async def test_the_identity_guard_refuses_one_items_update_only() -> None:
     text = "Order SO-10442: make the bath mats 1, and the steel kettle 3."
     world = FakeWorld(text)

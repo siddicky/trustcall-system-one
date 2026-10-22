@@ -60,6 +60,7 @@ from trustcall_system_one._diff import (
     new_positions,
     ops_for_errors,
     pointer,
+    short_form,
     sort_changes,
 )
 from trustcall_system_one._errors import ExtractionValidationError
@@ -1664,6 +1665,12 @@ class UpdateOutcome:
             the repair rounds.
         nested_skipped: The items of the record's nested lists that were found
             and not used, each with its ``EntityInfo.parent``.
+        proposed: The changes the input asked for, applied or not: the operations
+            that were applied, those the gate, the duplicate check or validation
+            refused, and the answers the verification ladder refused (attribution,
+            cross-check, null check). A short form of the record's name, a repeat
+            of what it holds and a field the input is silent about are not
+            changes. Empty means the input proposes nothing for the record.
     """
 
     record: ResultRecord | None
@@ -1672,6 +1679,7 @@ class UpdateOutcome:
     extracted: bool
     attempts: int = 0
     nested_skipped: tuple[SkippedEntity, ...] = ()
+    proposed: tuple[str, ...] = ()
 
 
 def _json_default(model: type[BaseModel], spec: FieldSpec) -> Any:
@@ -2559,6 +2567,7 @@ async def update_one(
     focus_plain: Focus | None = None,
     identity: Sequence[str] = (),
     placement: Placement | None = None,
+    propose_only: bool = False,
 ) -> UpdateOutcome:
     """Update one existing record of a schema from ``text``.
 
@@ -2604,6 +2613,10 @@ async def update_one(
             "identity_conflict")``, nothing is gated or applied) and the outcome
             carries an ``ambiguous_match`` skip next to the no-change record.
         placement: For an item of a nested list, whom it belongs to.
+        propose_only: Extract and verify, but stop before the nested items, the
+            change gate and the patch: the outcome has no record and only
+            ``proposed`` says what the input asks for (the removal rule asks this
+            of a record flagged for deletion when updates are off).
 
     Returns:
         The outcome.
@@ -2663,7 +2676,7 @@ async def update_one(
     ):
         return UpdateOutcome(None, None, None, False)
     info = entity or EntityInfo(key=ctx.key, label=ctx.label, qualify_p=qualify_p)
-    if not enable_updates:
+    if not enable_updates and not propose_only:
         skipped = SkippedEntity(
             plan.name,
             info,
@@ -2743,6 +2756,28 @@ async def update_one(
 
     await gather(verify_clairic(), _check_stated(plain, nodes, before))
     _settle(root)
+    refused_answers: list[str] = []
+    for leaf, old in leaves_with_old(nodes, before):
+        asked = by_wire.get(leaf.spec.wire_name)
+        if asked is None or asked not in candidates or not asked.reject:
+            continue
+        value = asked.resolved.value
+        if (
+            leaf.identity
+            and isinstance(value, str)
+            and isinstance(old, str)
+            and short_form(value, old)
+        ):
+            continue
+        refused_answers.append(f"{leaf.spec.pretty} ({asked.reject})")
+    if propose_only:
+        found = diff_group(
+            _group_node(root, ""),
+            before,
+            allow_null_removals=run.gates.allow_null_removals,
+        )
+        proposed = [f"{c.op} {c.path}" for c in found.changes] + refused_answers
+        return UpdateOutcome(None, None, handle, True, 1, proposed=tuple(proposed))
     conflict = (
         _identity_conflict(
             plan,
@@ -2773,6 +2808,14 @@ async def update_one(
             f"{conflict}; the update of record {target.record_id!r} was refused",
             tuple(sorted(options.items(), key=lambda item: (-item[1], item[0]))),
         )
+    proposed = [f"{op.op} {op.path}" for op in record.patches]
+    proposed += [
+        f"{r.op} {r.path} ({r.reason})"
+        for r in record.rejected
+        if r.op is not None
+        and r.reason not in ("identity_subset", "duplicate", "identity_conflict")
+    ]
+    proposed += refused_answers
     return UpdateOutcome(
         record,
         refused,
@@ -2780,4 +2823,5 @@ async def update_one(
         True,
         max(1 + rounds, nested.attempts),
         tuple(nested.skipped),
+        tuple(proposed),
     )

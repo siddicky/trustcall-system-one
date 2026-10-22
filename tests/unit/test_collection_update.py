@@ -25,6 +25,7 @@ from trustcall_system_one.testing import (
     FakeWorld,
     choice,
     clef_response,
+    noul,
     route,
 )
 
@@ -1000,7 +1001,7 @@ async def test_a_record_both_updated_and_deleted_is_a_conflict() -> None:
     assert conflict.entity.label == "Michael Chen"
     assert conflict.candidates == (("1", 0.92),)
     assert "neither updated nor deleted" in conflict.detail
-    assert "operation(s) passed the gate" in conflict.detail
+    assert "(proposed: add /notes/-; add /notes/-)" in conflict.detail
     assert result.deleted == ()  # an operation went through the gate: no delete
     assert result.untouched == ()  # the conflicting record was dealt with
     # the update ran to find out, and its operations are not in the result
@@ -1051,9 +1052,9 @@ async def test_a_mentioned_record_with_nothing_to_change_is_deleted() -> None:
     )
 
 
-async def test_a_matched_flagged_record_is_deleted_when_updates_are_disabled() -> None:
+async def test_stated_changes_to_a_flagged_record_conflict_with_updates_off() -> None:
     world = people_world()
-    world.delete("1", 0.97)
+    world.delete("1", 0.97)  # Michael: flagged, and the text states changes for him
     result = await invoke(
         world,
         EXISTING,
@@ -1061,16 +1062,106 @@ async def test_a_matched_flagged_record_is_deleted_when_updates_are_disabled() -
         enable_updates=False,
         enable_deletes=True,
     )
-    # no update could change him, so the removal stands; no request was spent on him
-    assert [(r.json_doc_id, r.kind) for r in result.records] == [
-        (None, "insert"),
-        ("1", "delete"),
-    ]
-    assert result.deleted == ("1",)
+    # the extraction ran to see what is proposed, but nothing was gated or applied
+    assert [(r.json_doc_id, r.kind) for r in result.records] == [(None, "insert")]
+    assert result.deleted == ()
     reasons = {s.entity.label: s.reason for s in result.skipped}
-    assert "Michael Chen" not in reasons
+    assert reasons["Michael Chen"] == "conflict_update_delete"
     assert reasons["Emma Thompson"] == "updates_disabled"
-    assert result.untouched == ()
+    conflict = next(s for s in result.skipped if s.reason == "conflict_update_delete")
+    assert "proposed: add /notes/-" in conflict.detail
+    assert kinds(result)["gate"] == 0
+    assert any(
+        m.kind == "extract" and m.entity == "e2" for _, _, m in world.transport().calls
+    )
+
+
+async def test_a_flagged_record_with_nothing_proposed_is_deleted_with_updates_off() -> (
+    None
+):
+    world = silent_michael_world()
+    world.delete("1", 0.97)
+    result = await invoke(world, EXISTING, enable_updates=False, enable_deletes=True)
+    assert [(r.json_doc_id, r.kind) for r in result.records] == [("1", "delete")]
+    assert result.deleted == ("1",)
+    assert {s.entity.label: s.reason for s in result.skipped} == {
+        "Emma Thompson": "updates_disabled"
+    }
+    assert kinds(result)["gate"] == 0
+
+
+def flagged_world(fields: dict[str, Any]) -> FakeWorld:
+    """Michael is mentioned, matched and flagged; ``fields`` is what the text states."""
+    world = FakeWorld(CONVERSATION)
+    world.entity(
+        "Michael Chen",
+        schema=Person,
+        mentions=["Michael Chen", "Michael"],
+        fields={"name": "Michael Chen", **fields},
+        matches={"name": "Michael Chen"},
+    )
+    world.delete("1", 0.97)
+    return world
+
+
+def refuse_the_gate(world: FakeWorld) -> Any:
+    def gate(model: str, payload: Body, meta: CallMeta) -> Any:
+        answers = {qid: noul(0.1) for qid in payload["questions"]}
+        return clef_response(answers, model=payload["model"])
+
+    return FakeTransport(route(default=world.handler, gate=gate))
+
+
+async def test_a_change_the_gate_refuses_still_makes_a_flagged_record_a_conflict() -> (
+    None
+):
+    world = flagged_world({"notes": MICHAEL_NOTES})
+    extractor = create_extractor(
+        [Many(Person, identity="name")],
+        transport=refuse_the_gate(world),
+        enable_deletes=True,
+    )
+    result = await extractor.ainvoke(CONVERSATION, existing=EXISTING)
+    # the refused change is not "nothing proposed": the record is not deleted
+    assert result.deleted == () and result.records == ()
+    (skip,) = result.skipped
+    assert (
+        skip.reason == "conflict_update_delete" and skip.entity.label == "Michael Chen"
+    )
+    assert "proposed: add /notes/- (gate_noul)" in skip.detail
+    assert kinds(result)["gate"] >= 1
+
+
+async def test_an_unattributed_change_still_conflicts_with_a_flagged_record() -> None:
+    world = flagged_world({"notes": MICHAEL_NOTES})
+
+    def refuse(model: str, payload: Body, meta: CallMeta) -> Any:
+        answers = {qid: noul(0.02) for qid in payload["questions"]}
+        return clef_response(answers, model=payload["model"])
+
+    extractor = create_extractor(
+        [Many(Person, identity="name")],
+        transport=FakeTransport(route(default=world.handler, attribution=refuse)),
+        enable_deletes=True,
+    )
+    result = await extractor.ainvoke(CONVERSATION, existing=EXISTING)
+    assert result.deleted == () and result.records == ()
+    (skip,) = result.skipped
+    assert skip.reason == "conflict_update_delete"
+    assert "notes (attribution)" in skip.detail
+
+
+async def test_a_flagged_record_the_text_only_names_is_still_deleted() -> None:
+    world = flagged_world({})
+    extractor = create_extractor(
+        [Many(Person, identity="name")],
+        transport=refuse_the_gate(world),
+        enable_deletes=True,
+    )
+    result = await extractor.ainvoke(CONVERSATION, existing=EXISTING)
+    assert result.deleted == ("1",)
+    assert result.skipped == ()
+    assert kinds(result)["gate"] == 0  # nothing was proposed to gate
 
 
 async def test_a_flagged_record_an_ambiguous_entity_may_be_is_not_deleted() -> None:

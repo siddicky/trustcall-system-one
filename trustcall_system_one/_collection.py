@@ -1328,6 +1328,7 @@ async def _update_entity(
     target: ExistingRecord,
     *,
     enable_updates: bool,
+    propose_only: bool = False,
 ) -> UpdateOutcome:
     focus, plain = _focuses(scope, info)
     return await update_one(
@@ -1342,6 +1343,7 @@ async def _update_entity(
         focus_plain=plain,
         identity=identity_fields(scope.plan, scope.cardinality),
         placement=scope.placement(),
+        propose_only=propose_only,
     )
 
 
@@ -1450,9 +1452,9 @@ async def apply_collection(
        unless ``enable_updates`` is off (``updates_disabled``); a new
        entity is inserted if ``enable_inserts`` (else ``inserts_disabled``); an
        entity that could not be matched is ``ambiguous_match``. If the record is
-       also flagged for deletion the update runs and decides: with no operation
-       through the gate the record is deleted (the input only says "remove it"),
-       with at least one it is a ``conflict_update_delete`` and neither happens;
+       also flagged for deletion the extraction runs and decides on what the input
+       proposes: nothing (it only says "remove it") deletes the record, any change,
+       applied or refused, is a ``conflict_update_delete`` and neither happens;
     4. the records flagged for deletion are deleted (``kind="delete"``, ``after``
        ``None``), last, in record order; records nothing happened to are untouched.
 
@@ -1532,17 +1534,25 @@ async def apply_collection(
     async def flagged_work(info: EntityInfo, record: ExistingRecord) -> _Work:
         """An entity matched to a record the input also says to delete.
 
-        The update runs first. If no operation survives the gate (the input says
-        "remove it" and nothing else about it) the record is deleted; if the update
-        has at least one gated operation the input both changes and removes the
-        record, which is a conflict: neither happens. An identity conflict (a wrong
-        match) is reported as such and holds the delete (``match_delete_held``).
+        The extraction runs first (with updates off it only proposes: nothing is
+        applied, nothing is gated) and decides on what the input PROPOSES for the
+        record, whether or not it would have passed the gate, the verification or
+        validation. Nothing proposed ("please remove X"): the record is deleted.
+        Anything proposed ("drop the quantity of X to 1" flagged by mistake): the
+        input both changes and removes it, a ``conflict_update_delete`` in which
+        neither happens, with the proposed changes in its detail. An identity
+        conflict (a wrong match) is reported as such and holds the delete
+        (``match_delete_held``).
         """
         handle = (record.schema_name, record.record_id)
-        if not enable_updates:  # nothing could be changed: the removal stands
-            return _Work(info, handled=handle)
-        done = await _update_entity(run, scope, info, record, enable_updates=True)
-        kept = done.record.patches if done.record is not None else ()
+        done = await _update_entity(
+            run,
+            scope,
+            info,
+            record,
+            enable_updates=True,
+            propose_only=not enable_updates,
+        )
         if done.skipped is not None and done.skipped.reason == "ambiguous_match":
             return _Work(
                 info,
@@ -1553,7 +1563,7 @@ async def apply_collection(
                 done.handled,
                 done.nested_skipped,
             )
-        if not kept:
+        if not done.proposed:
             return _Work(
                 info,
                 attempts=done.attempts,
@@ -1569,7 +1579,7 @@ async def apply_collection(
                 "conflict_update_delete",
                 f"{info.label!r} matches the record {record.record_id!r}, and the "
                 f"input also says that record should be deleted (p={p:.2f}) while "
-                f"changing it ({len(kept)} operation(s) passed the gate); it was "
+                f"changing it (proposed: {'; '.join(done.proposed)}); it was "
                 "neither updated nor deleted",
                 ((record.record_id, info.match_probs.get(record.record_id, 0.0)),),
             ),

@@ -521,13 +521,21 @@ schema title: "Person").
      `ResultRecord(kind="delete", json_doc_id=<id>, before=<record>, after=None, value=None,
      entity=None, delete_p=p)` and `ExtractionResult.deleted` lists its id;
    * a record both matched (accepted) and flagged for delete (the input MENTIONS it, as in "please
-     remove X"): the update runs first and decides. If no operation survives the gate (nothing but
-     "remove it" is said about it) the record is deleted (`kind="delete"`); if at least one gated
-     operation exists ("drop the quantity of X to 1" flagged by mistake) the input both changes
-     and removes it, which is `SkippedEntity(reason="conflict_update_delete", candidates=((id,
-     match p),))`: neither an update nor a delete, its operations are not in the result. With
-     `enable_updates=False` nothing could change, so the removal stands without a request; an
-     identity-conflict refusal (a wrong match) is reported as such and holds the delete;
+     remove X"): the extraction runs first and the decision is made on what the input PROPOSES
+     for the record (`UpdateOutcome.proposed`: the operations that were applied, the ones the gate,
+     the duplicate check or validation refused, and the answers the verification ladder refused;
+     a short form of the record's name, a repeat of what it holds and a field the input is silent
+     about are not changes). Nothing proposed (nothing but "remove it" is said about it) → the
+     record is deleted (`kind="delete"`). Anything proposed, passed or refused ("drop the quantity
+     of X to 1" flagged by mistake, even if the gate then refuses the change) → the input both
+     changes and removes it: `SkippedEntity(reason="conflict_update_delete", candidates=((id,
+     match p),))`, neither an update nor a delete, with the proposed changes listed in its
+     `detail`. The rule does not depend on `enable_updates`: with updates off the extraction and
+     verification still run, to see what is proposed, but nothing is gated or applied. An
+     identity-conflict refusal (a wrong match) is reported as such and holds the delete. Cost: every
+     flagged and matched entity costs one extraction (Clairic per group plus the cross-check and
+     the ladder; with updates on also the gate for its changes), and, if it holds collections, their
+     discovery and item pipelines as for any updated entity;
    * a record flagged for delete that an `ambiguous_match` entity most likely is (its best record
      candidate, at 0.25 or more, including an identity-conflict refusal) is not deleted either:
      run warning `match_delete_held`;
@@ -601,8 +609,9 @@ assignment, thresholds, `on_ambiguous`, `match_collision` etc.; then
   item, over `{input, records: {r0: <item>, ...}, parent}` ("Does `input` state that `records.r0`
   should be deleted from `parent.label` ..."), at `match.delete_threshold` → `remove /items/<i>`
   (a mapping: `remove /stock/<key>`); an item both matched and flagged follows the same rule as a
-  top-level record (step 9): no operation through the gate (the text only says to remove it) →
-  `remove`, otherwise `SkippedEntity(conflict_update_delete)` with no operation.
+  top-level record (step 9): nothing proposed for the item (the text only says to remove it) →
+  `remove`, any proposed change, passed or refused → `SkippedEntity(conflict_update_delete)` with
+  no operation.
 
 All operations join the parent's list and follow its rules (see "Operation order" below);
 `apply_ops` knows the nested list pointers (`_fix_missing_parents` creates a list the record lacks,
