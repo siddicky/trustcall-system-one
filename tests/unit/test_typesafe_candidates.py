@@ -627,6 +627,7 @@ def test_duration_parts_sum_in_the_fields_unit() -> None:
 
 def test_the_part_questions_are_the_cookbooks() -> None:
     questions = date_questions("the deadline")
+    # the cookbook's seven, then the two of a distance from today
     assert list(questions) == [
         "mode",
         "month",
@@ -635,6 +636,8 @@ def test_the_part_questions_are_the_cookbooks() -> None:
         "day_anchor",
         "weekday",
         "week_offset",
+        "offset_count",
+        "offset_unit",
     ]
     assert questions["year"]["criteria"]["1900"] is None
     assert questions["year"]["criteria"]["2050"] is None

@@ -456,6 +456,11 @@ def _name_gap(gap: str, *, words: bool, particles: bool = False) -> bool:
     return True
 
 
+def _initial(text: str) -> bool:
+    """Whether a mention is a single capital letter: the initial of a name."""
+    return len(text) == 1 and text.isupper()
+
+
 def _one_name(source: str, whole: Span, parts: Sequence[Span]) -> bool:
     """Whether ``whole`` is ONE name that ``parts`` (inside it) merely quote.
 
@@ -473,11 +478,21 @@ def _one_name(source: str, whole: Span, parts: Sequence[Span]) -> bool:
     # a particle ("van") lies inside a name only between capitalised single tokens
     particles = words and all(source[start : start + 1].isupper() for start, _ in parts)
     cursor = whole[0]
+    after_initial = False
     for start, end in sorted(parts):
-        if not _name_gap(source[cursor:start], words=words, particles=particles):
+        gap = source[cursor:start]
+        if after_initial and gap.startswith("."):
+            gap = gap[
+                1:
+            ]  # "J" and "Okafor" of "J. Okafor": the period is the initial's
+        if not _name_gap(gap, words=words, particles=particles):
             return False
         cursor = end
-    return _name_gap(source[cursor : whole[1]], words=words, particles=particles)
+        after_initial = _initial(source[start:end])
+    tail = source[cursor : whole[1]]
+    if after_initial and tail.startswith("."):
+        tail = tail[1:]
+    return _name_gap(tail, words=words, particles=particles)
 
 
 def _resolve_overlaps(mentions: Sequence[Mention], source: str) -> list[Mention]:

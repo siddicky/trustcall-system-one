@@ -203,6 +203,8 @@ _NP_STOP = _words(
 )
 _WORD = re.compile(r"[A-Za-z][\w'\u2019\-]*")
 _CLAUSE_SPLIT = re.compile(
+    # a cell of a table: `| Room 3 |`, or a tab-separated field
+    r"[|\t]|"
     # a comma or a colon between two digits is part of a number or a time
     r"(?:(?<!\d)[,:]|[,:](?!\d)|;|\u2014|(?<!\d)\u2013|\u2013(?!\d))|"
     # a spaced dash between two digits is a range ("10 - 12")

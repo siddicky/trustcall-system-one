@@ -577,16 +577,30 @@ class RepairConfig:
             ``pattern`` (or another format check) when the input holds text that
             could satisfy it. Clairic only quotes the input, so it cannot
             reformat; without this switch such a field is never asked again.
+        keep_uncertain: A field that is null makes the record invalid; when the
+            repair gets a value for it that the attribution check can neither
+            confirm nor refute (its probability stays between
+            ``verify.attribution_drop`` and ``verify.attribution_keep`` after the
+            second look), the value stands, noted ``attribution_uncertain``,
+            instead of the record being lost with every other field it holds. A
+            value the check refutes (below ``attribution_drop``) never stands. No
+            threshold changes; off, the repair is as strict as the first pass.
     """
 
     enabled: bool = True
     max_attempts: int = 5
     stop_on_repeat: bool = True
     allow_pattern_reask: bool = True
+    keep_uncertain: bool = True
 
     def __post_init__(self) -> None:
         """Validate every setting."""
-        for name in ("enabled", "stop_on_repeat", "allow_pattern_reask"):
+        for name in (
+            "enabled",
+            "stop_on_repeat",
+            "allow_pattern_reask",
+            "keep_uncertain",
+        ):
             _check_flag(name, getattr(self, name))
         if isinstance(self.max_attempts, bool) or not isinstance(
             self.max_attempts, int

@@ -47,7 +47,7 @@ __all__ = [
 JOIN_AFTER_DANGLING = 0.2
 JOIN_AFTER_TERMINAL = 0.5
 _DESCRIPTION_CHARS = 60
-_MAX_PIECES_PER_SENTENCE = 8
+_MAX_PIECES_PER_SENTENCE = 12  # a row of a table is a sentence of its cells
 
 
 def line_id(index: int) -> str:

@@ -840,6 +840,70 @@ def _top(answer: ChoiceAnswer, by_option: Mapping[str, Candidate]) -> Candidate 
     return by_option[ranked[0]] if ranked else None
 
 
+def _same(c: Candidate) -> str:
+    """What makes two options the same answer: their value, spaces and case aside."""
+    return " ".join(str(c.value).split()).casefold()
+
+
+@dataclass(frozen=True)
+class _Pooled:
+    """The best value of a pick, with the odds of all the options that say it.
+
+    Attributes:
+        candidate: The likeliest option of the best value (``None``: no option had
+            any probability).
+        held: The probability the value holds in all (the options' sum).
+        shapes: How many options say it.
+        rival: The probability of the best different answer, ``none`` included.
+    """
+
+    candidate: Candidate | None
+    held: float = 0.0
+    shapes: int = 0
+    rival: float = 0.0
+
+
+def _pooled(answer: ChoiceAnswer, by_option: Mapping[str, Candidate]) -> _Pooled:
+    """The best *value* of a pick: options that say the same thing share their odds.
+
+    The input offers one value in several shapes: ``Hearthside Maple Granola`` as a
+    span, as the sentence ``S000`` and as the block ``B000``. Jev spreads its
+    probability over the three, so the best single option holds a third of what the
+    value holds, and its ``confidence`` (the lead of the chosen option over the next
+    one, which here is the same value) is low although nothing else was in doubt
+    (live: a product name at 0.42, an event name at 0.50, a surname at 0.39: below
+    ``min_confidence``, so a stated value was rejected and the record was invalid).
+
+    Args:
+        answer: Jev's answer to a pick.
+        by_option: The candidates by option id.
+
+    Returns:
+        The best value: its likeliest option, its pooled probability, the number of
+        options that say it and the best rival.
+    """
+    pooled: dict[str, float] = {}
+    best: dict[str, tuple[float, Candidate]] = {}
+    size: Counter[str] = Counter()
+    for option, p in answer.probabilities.items():
+        candidate = by_option.get(option)
+        if option == NONE or candidate is None:
+            continue
+        key = _same(candidate)
+        pooled[key] = pooled.get(key, 0.0) + p
+        size[key] += 1
+        if key not in best or p > best[key][0]:
+            best[key] = (p, candidate)
+    if not pooled:
+        return _Pooled(None)
+    key = max(pooled, key=lambda k: pooled[k])
+    rival = max(
+        [p for k, p in pooled.items() if k != key]
+        + [float(answer.probabilities.get(NONE, 0.0))]
+    )
+    return _Pooled(best[key][1], min(1.0, pooled[key]), size[key], rival)
+
+
 def _parts_of(answers: Mapping[str, Any], prefix: str, names: Any) -> dict[str, Part]:
     parts: dict[str, Part] = {}
     for part in names:
@@ -1289,10 +1353,16 @@ def _finish(
         if answer is None:
             out.update(p_null=1.0, confidence=0.0)
             return
-        top = _top(answer, {_lookup(c): c for c in options})
+        pick = _pooled(answer, {_lookup(c): c for c in options})
+        top = pick.candidate
         p_null = float(answer.probabilities.get(NONE, 0.0))
         out["p_null"] = p_null
         out["confidence"] = answer.confidence
+        if pick.shapes > 1:
+            # one value offered in several shapes: its odds are the sum of theirs and
+            # its confidence is its lead over the best DIFFERENT answer (`none` too)
+            lead = pick.held - pick.rival
+            out["confidence"] = max(answer.confidence, lead)
         if top is not None:
             out["guess"] = top.value
         # Jev's own choice of `none` is "not stated", whatever the threshold; the
@@ -1300,8 +1370,11 @@ def _finish(
         # whose p_null is BELOW the field's threshold means Jev chose `none` (its
         # probability for it was the largest, though under the threshold): p_null
         # stays P(none) and is never raised to hide that, and `guess` is the best
-        # candidate.
-        chose_none = answer.choice == NONE
+        # candidate. (Several shapes of one value that together outweigh `none` are
+        # a choice of that value, not of `none`.)
+        chose_none = answer.choice == NONE and not (
+            pick.shapes > 1 and pick.held > p_null
+        )
         if top is not None and not chose_none and p_null <= _null_threshold(spec):
             out["value"] = top.value
             out["span"] = _span(base, top)
@@ -1378,14 +1451,18 @@ def _of_its_kind(job: _Job, accepted: list[int]) -> list[int]:
 
 
 _APPOSITION = re.compile(
-    r"\s*(?:,|(?:is|was|are|were|who|which|she|he|they|it)\b)", re.I
+    # a comma, colon, semicolon or bracket, a spaced dash ("J. Okafor - buyer"), or a
+    # copula or pronoun
+    r"\s*[,:;(]|\s+[-\u2013\u2014]\s|\s*(?:is|was|are|were|who|which|she|he|they|it)\b",
+    re.I,
 )
 
 
 def _apposition(clause: Candidate, value: Candidate) -> bool:
-    """Whether ``clause`` is ``value`` followed by a comma or a copula or pronoun.
+    """Whether ``clause`` is ``value`` followed by a separator, a copula or a pronoun.
 
-    "Olivia Davis, she's a pilot" and "Olivia Davis is a pilot" say something about
+    "Olivia Davis, she's a pilot", "J. Okafor - buyer" and "Olivia Davis is a pilot"
+    say something about
     Olivia Davis; "Olivia Davis's husband" (a possessive) and "the CEO of Acme" (the
     value inside a larger noun phrase) refer to someone else.
     """

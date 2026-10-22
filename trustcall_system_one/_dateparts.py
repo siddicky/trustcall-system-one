@@ -5,10 +5,14 @@ This is TypeSafe's date extraction cookbook, generalised to the Clairic types
 and never writes a date: it answers closed ``choice`` questions about the *parts*
 the text names, all in one request, and code resolves and validates them.
 
-* ``date``: seven choices (cookbook): ``mode`` (``absolute``, ``relative`` or
+* ``date``: the cookbook's seven choices: ``mode`` (``absolute``, ``relative`` or
   ``none``), ``month``, ``day``, ``year`` (1900 to 2050, plus ``none`` and
   ``out_of_range``), ``day_anchor`` (today, tomorrow, the day after, a weekday),
-  ``weekday`` and ``week_offset``. Code reads only the parts ``mode`` calls for.
+  ``weekday`` and ``week_offset``; and two of this library's for a date given as a
+  distance from today ("three days ago", "in two weeks", "a month from now"):
+  ``offset_count`` and ``offset_unit`` (the unit and the direction in one choice:
+  ``days_ago``, ``weeks_ahead``, ...), read when ``day_anchor`` is ``offset``. Code
+  reads only the parts ``mode`` calls for.
   A date without a year takes the reference date's year (the next if it is more than
   31 days past); "next Thursday" is the following calendar week, "this Thursday" this
   week, a bare "Thursday" the next one on or after the reference date.
@@ -77,7 +81,23 @@ WEEKDAY_NAMES = [
     "Sunday",
 ]
 YEAR_WINDOW = list(range(1900, 2051))
-DATE_PARTS = ("mode", "month", "day", "year", "day_anchor", "weekday", "week_offset")
+DATE_PARTS = (
+    "mode",
+    "month",
+    "day",
+    "year",
+    "day_anchor",
+    "weekday",
+    "week_offset",
+    "offset_count",
+    "offset_unit",
+)
+OFFSET_UNITS = tuple(
+    f"{unit}_{way}"
+    for unit in ("days", "weeks", "months", "years")
+    for way in ("ago", "ahead")
+)
+"""The choices of ``offset_unit``: a unit and the direction from today."""
 TIME_PARTS = ("mode", "hour", "minute")
 DURATION_UNITS = ("years", "months", "weeks", "days", "hours", "minutes", "seconds")
 
@@ -178,14 +198,16 @@ def date_questions(role: str) -> dict[str, dict[str, Any]]:
         ),
         "day_anchor": _choice(
             f"If {role} is relative to today, which day is it? 'today', 'tomorrow', "
-            "'yesterday', 'day_after' (the day after tomorrow), or 'weekday' (a named "
-            "day of the week).",
+            "'yesterday', 'day_after' (the day after tomorrow), 'weekday' (a named "
+            "day of the week), or 'offset' (a number of days, weeks, months or years "
+            "before or after today: 'three days ago', 'in two weeks').",
             {
                 "today": None,
                 "tomorrow": None,
                 "yesterday": None,
                 "day_after": None,
                 "weekday": None,
+                "offset": None,
                 "none": _ABSENT,
             },
         ),
@@ -199,6 +221,18 @@ def date_questions(role: str) -> dict[str, dict[str, Any]]:
             "'previous' for 'last Thursday' or 'Thursday last week'; 'none' for a "
             "bare weekday with no qualifier (just 'Thursday' / 'on Thursday').",
             {"current": None, "next": None, "previous": None, "none": _ABSENT},
+        ),
+        "offset_count": _choice(
+            f"If {role} is a number of days, weeks, months or years from today ('three "
+            "days ago', 'in two weeks', 'a month from now'), what is the number ('a' "
+            "and 'an' are 1)?",
+            {str(n): None for n in range(1, 61)} | {"none": _ABSENT},
+        ),
+        "offset_unit": _choice(
+            f"If {role} is a number of days, weeks, months or years from today, which "
+            "unit is it in, and is it before today ('ago', 'earlier', 'last') or after "
+            "it ('in two weeks', 'a month from now')?",
+            {u: None for u in OFFSET_UNITS} | {"none": _ABSENT},
         ),
     }
 
@@ -292,6 +326,32 @@ def _result(
     )
 
 
+def _shift(today: date, count: int, unit: str) -> date | None:
+    """``today`` moved ``count`` units (``unit`` is one of ``OFFSET_UNITS``).
+
+    ``None`` when there is no such date. A month or a year that lands past the end of
+    a month stops on its last day (a month before 31 March is 28 February).
+    """
+    name, _, way = unit.partition("_")
+    sign = -1 if way == "ago" else 1
+    try:
+        if name == "days":
+            return today + timedelta(days=sign * count)
+        if name == "weeks":
+            return today + timedelta(weeks=sign * count)
+        months = count * (12 if name == "years" else 1)
+        year, month = divmod(today.year * 12 + today.month - 1 + sign * months, 12)
+        month += 1
+        for day in range(today.day, 28, -1):
+            try:
+                return date(year, month, day)
+            except ValueError:
+                continue
+        return date(year, month, min(today.day, 28))
+    except (OverflowError, ValueError):
+        return None
+
+
 def _resolve_weekday(today: date, weekday: str, week_offset: str) -> date:
     index = WEEKDAY_NAMES.index(weekday)
     monday = today - timedelta(days=today.weekday())
@@ -343,6 +403,16 @@ def _date_of(
         offsets = {"yesterday": -1, "today": 0, "tomorrow": 1, "day_after": 2}
         if anchor in offsets:
             return today + timedelta(days=offsets[anchor]), used, "", ()
+        if anchor == "offset":
+            used += ["offset_count", "offset_unit"]
+            count = parts["offset_count"].choice if "offset_count" in parts else ""
+            unit = parts["offset_unit"].choice if "offset_unit" in parts else ""
+            if not count.isdigit() or unit not in OFFSET_UNITS:
+                return None, used, "relative offset not read", ()
+            shifted = _shift(today, int(count), unit)
+            if shifted is None:
+                return None, used, "relative offset out of range", ()
+            return shifted, used, "", ()
         if anchor == "weekday":
             used += ["weekday", "week_offset"]
             weekday = parts["weekday"].choice

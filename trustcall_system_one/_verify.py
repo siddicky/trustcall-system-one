@@ -1144,6 +1144,10 @@ class FieldState:
             ``sentences`` list strategy). They come from the input alone, so there
             is no input-only cross-check to run, and Clairic's list type, which
             cannot read such a field, is never asked to re-read it.
+        settle: The answer is a repair of a field that is null, so that the record
+            is invalid without it (``RepairConfig.keep_uncertain``): a value whose
+            attribution stays between the drop and the keep bar after the second
+            look stands.
     """
 
     spec: FieldSpec
@@ -1159,6 +1163,7 @@ class FieldState:
     cross: Resolved | None = None
     crosscheck_agree: bool | None = None
     sentences: bool = False
+    settle: bool = False
 
     @property
     def value(self) -> Any:
@@ -2074,8 +2079,40 @@ def requestable(spec: FieldSpec, plan: SchemaPlan | None = None) -> bool:
     return _ORDERED_UNITS.search(spec.description) is not None
 
 
+def _today_note(ctx: Ctx, spec: FieldSpec) -> str:
+    """Say what day it is to the attribution of a date.
+
+    The note reads ``Today is Monday, 2026-03-23.``
+
+    Only for a date or datetime field (or a list of them) of an invoke that has a
+    reference date; empty otherwise.
+
+    A date that the input gives as "yesterday", "three days ago" or "last Tuesday" was
+    resolved against the reference date; a question that asks whether the input states
+    that date cannot be answered by a model that does not know what day it is (live:
+    0.03 for ``2026-03-17`` over "Completed last Tuesday", 0.09 for yesterday's date).
+    """
+    clairic = spec.clairic
+    if clairic is None:
+        return ""
+    kind = clairic.items if clairic.type == "list" else clairic.type
+    reference = ctx.run.reference_date
+    if kind not in ("date", "datetime") or not reference:
+        return ""
+    try:
+        today = date.fromisoformat(reference[:10])
+    except ValueError:
+        return ""
+    return f"Today is {today:%A}, {today.isoformat()}. "
+
+
 def _attribution_question(
-    description: str, value: Any, *, element: bool, ask_for: bool = False
+    description: str,
+    value: Any,
+    *,
+    element: bool,
+    ask_for: bool = False,
+    today: str = "",
 ) -> NoulQuestion:
     """The question "is this value stated about the entity?" for a value or element.
 
@@ -2090,7 +2127,8 @@ def _attribution_question(
         return NoulQuestion(
             type="noul",
             instructions=(
-                f'According to `input`, is "{text}" {_element_phrase(description)} '
+                f'{today}According to `input`, is "{text}" '
+                f"{_element_phrase(description)} "
                 "of `entity.label`? Something the input asks to include counts."
             ),
             criteria=NoulCriteria(true=_YES, false=_NO),
@@ -2103,9 +2141,9 @@ def _attribution_question(
         instructions = f"Does `input` ask for {text} of `entity.label` (as the {noun})?"
     else:
         instructions = (
-            f'Does `input` state that {description} of `entity.label` is "{text}", '
-            "or does it follow by simple arithmetic or date math from figures the "
-            "input states about `entity.label`?"
+            f"{today}Does `input` state that {description} of `entity.label` is "
+            f'"{text}", or does it follow by simple arithmetic or date math from '
+            "figures the input states about `entity.label`?"
         )
     return NoulQuestion(
         type="noul",
@@ -2243,14 +2281,15 @@ def _attr_id(st: FieldState, index: int | None) -> str:
 
 
 def _attribution_questions(
-    states: list[FieldState], plan: SchemaPlan
+    states: list[FieldState], plan: SchemaPlan, ctx: Ctx
 ) -> dict[str, Question]:
     questions: dict[str, Question] = {}
     for st in states:
+        today = _today_note(ctx, st.spec)
         if _is_list(st):
             for index, element in enumerate(st.resolved.value):
                 questions[_attr_id(st, index)] = _attribution_question(
-                    st.spec.scoped, element, element=True
+                    st.spec.scoped, element, element=True, today=today
                 )
         else:
             questions[_attr_id(st, None)] = _attribution_question(
@@ -2258,6 +2297,7 @@ def _attribution_questions(
                 st.resolved.value,
                 element=False,
                 ask_for=requestable(st.spec, plan),
+                today=today,
             )
     return questions
 
@@ -2287,7 +2327,7 @@ async def _attribution(ctx: Ctx, targets: list[FieldState]) -> None:
     """Check that each value, and each list element, is stated about the entity."""
     if not targets:
         return
-    questions = _attribution_questions(targets, ctx.plan)
+    questions = _attribution_questions(targets, ctx.plan, ctx)
     known: dict[str, Answer] = {}
     for st in targets:
         hint = ctx.attribution_hints.get(st.spec.wire_name)
@@ -2410,6 +2450,7 @@ async def _recheck_scalar(ctx: Ctx, st: FieldState) -> None:
                     checked.value,
                     element=False,
                     ask_for=requestable(st.spec, ctx.plan),
+                    today=_today_note(ctx, st.spec),
                 ),
                 ctx.text,
                 checked.span,
@@ -2429,6 +2470,12 @@ async def _recheck_scalar(ctx: Ctx, st: FieldState) -> None:
         )
     elif p >= verify.attribution_keep:
         _adopt(st, checked)
+    elif st.settle and p >= verify.attribution_drop:
+        # neither confirmed nor refuted, and a null here loses the whole record
+        _adopt(st, checked)
+        st.notes.append(
+            f"attribution_uncertain: p={p:.2f} (kept: the field is required)"
+        )
     else:
         st.set_reject(
             "attribution", "still not stated about the entity after a re-ask", p
@@ -2470,7 +2517,11 @@ async def _recheck_elements(
         return
     questions: dict[str, Question] = {
         _attr_id(st, index): _recheck_question(
-            _attribution_question(st.spec.scoped, value, element=True), ctx.text, span
+            _attribution_question(
+                st.spec.scoped, value, element=True, today=_today_note(ctx, st.spec)
+            ),
+            ctx.text,
+            span,
         )
         for index, (value, span) in candidates.items()
     }

@@ -920,6 +920,9 @@ class RepairState:
             but not yet known to be needed (see ``repair_loop``).
         bad: ``(wire name, value)`` pairs that an error implicated by name and
             that a repair then replaced: never put back.
+        settle: The record is an insert and ``repair.keep_uncertain`` is on: a
+            text value for a field that was null may stand on an uncertain
+            attribution (see ``FieldState.settle``).
     """
 
     rounds: int = 0
@@ -928,6 +931,7 @@ class RepairState:
     formatted: set[str] = field(default_factory=set)
     tentative: list["Outcome"] = field(default_factory=list)
     bad: set[tuple[str, str]] = field(default_factory=set)
+    settle: bool = False
 
 
 @dataclass
@@ -1026,6 +1030,8 @@ async def _ask_clairic(
     target: Target,
     blocks: _Blocks,
     label: str,
+    *,
+    settle: bool = False,
 ) -> Outcome:
     spec = ask.spec
     wire = spec.wire_name
@@ -1074,7 +1080,15 @@ async def _ask_clairic(
         spec,
         note,
         ask.category,
-        state=FieldState(spec, resolved, target.type_answer),
+        state=FieldState(
+            spec,
+            resolved,
+            target.type_answer,
+            settle=settle
+            and target.previous is None
+            and spec.clairic is not None
+            and spec.clairic.type == "text",
+        ),
     )
 
 
@@ -1087,7 +1101,7 @@ async def _ask_one(ctx: Ctx, state: RepairState, target: Target) -> Outcome:
         state.formatted.add(target.wire)
     if ask.spec.engine == "clef":
         return await _ask_clef(ctx, ask, target, blocks, label)
-    return await _ask_clairic(ctx, ask, target, blocks, label)
+    return await _ask_clairic(ctx, ask, target, blocks, label, settle=state.settle)
 
 
 def sentence_repair(state: "RepairState", target: Target) -> Outcome:
