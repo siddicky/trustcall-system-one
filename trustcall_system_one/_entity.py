@@ -14,11 +14,18 @@
    group at once;
 5. assembly: decide which optional sub-models and union members stand, build the
    nested document, validate it, and describe how every field got its value.
+
+``update_one`` is the update path for a single existing record: the same groups
+are asked with the record shown after the input (and a second, input-only
+Clairic pass per group), the answers go through the cross-check and the ladder,
+``_diff`` turns what differs from the record into operations, each is judged by
+the change gate (``_gates``), applied, and the patched document is validated.
 """
 
 import asyncio
 import contextlib
 import dataclasses
+import json
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -33,23 +40,42 @@ from trustcall_system_one._compile import (
     UnionGroup,
     UnionMember,
 )
+from trustcall_system_one._diff import (
+    Change,
+    GroupNode,
+    LeafNode,
+    UnionNode,
+    apply_ops,
+    diff_group,
+    is_change,
+    leaves_with_old,
+    new_positions,
+    ops_for_errors,
+    sort_changes,
+)
 from trustcall_system_one._errors import ExtractionValidationError
+from trustcall_system_one._existing import ExistingRecord, normalise_record
+from trustcall_system_one._gates import dedup_elements, gate_changes
 from trustcall_system_one._names import Path
 from trustcall_system_one._render import RenderedState
 from trustcall_system_one._run import Answer, Run, gather
 from trustcall_system_one._types import (
     EntityInfo,
     FieldAnswer,
+    PatchOp,
     RejectedOp,
     ResultRecord,
+    SkippedEntity,
     json_pointer,
 )
 from trustcall_system_one._verify import (
     Ctx,
+    ExistingBlock,
     FieldState,
     Resolved,
     accept,
     ask_clairic,
+    crosscheck,
     resolve,
     resolve_clef,
     run_ladder,
@@ -62,7 +88,7 @@ from trustcall_system_one._wire import (
     NoulQuestion,
 )
 
-__all__ = ["InsertOutcome", "insert_one"]
+__all__ = ["InsertOutcome", "UpdateOutcome", "insert_one", "update_one"]
 
 Span = tuple[int, int]
 Extracted = dict[str, tuple[ClairicAnswer | None, RenderedState | None]]
@@ -83,11 +109,18 @@ class InsertOutcome:
     extracted: bool
 
 
-def _note_unsupported(run: Run, plan: SchemaPlan) -> None:
-    """Warn about fields this milestone leaves to their pydantic default.
+def _note_unsupported(run: Run, plan: SchemaPlan, *, updating: bool = False) -> None:
+    """Warn about fields this milestone leaves alone.
 
-    A field a recursive model declares at every level is named once.
+    An insert leaves them to their pydantic default, an update leaves them as the
+    record has them. A field a recursive model declares at every level is named
+    once.
     """
+    outcome = (
+        "left as the record has it"
+        if updating
+        else "left unset so the model default applies"
+    )
     seen: set[tuple[type[BaseModel], str]] = set()
     for group in plan.all_groups():
         for spec in group.specs:
@@ -96,8 +129,7 @@ def _note_unsupported(run: Run, plan: SchemaPlan) -> None:
                 seen.add(key)
                 run.warn(
                     f"{plan.name}.{spec.pretty}: {spec.engine} fields are not "
-                    f"extracted until {_MILESTONE[spec.engine]}; left unset so "
-                    "the model default applies"
+                    f"extracted until {_MILESTONE[spec.engine]}; {outcome}"
                 )
     for message in plan.warnings:
         run.warn(f"{plan.name}: {message}")
@@ -205,15 +237,36 @@ def _group_meta_field(group: FieldGroup) -> str | None:
 async def _clairic_pass(
     ctx: Ctx, specs: list[FieldSpec], field_: str | None
 ) -> Extracted:
-    """One Clairic request for ``specs`` (chunked if the input is too long)."""
+    """One Clairic request for ``specs`` (chunked if the input is too long).
+
+    For an update with the cross-check on, the same fields are asked a second
+    time, concurrently, without the existing record (call kind ``crosscheck``);
+    those answers are kept in ``ctx.crossed``.
+    """
     fields = {spec.wire_name: ctx.clairic_field(spec) for spec in specs}
     single = specs[0].wire_name if len(specs) == 1 else field_
-    return await ask_clairic(
+    descriptions = {spec.wire_name: spec.scoped for spec in specs}
+    primary = ask_clairic(
         ctx,
         fields,
         meta=ctx.meta("extract", field=single),
-        descriptions={spec.wire_name: spec.scoped for spec in specs},
+        descriptions=descriptions,
     )
+    if not ctx.crosscheck:
+        return await primary
+    plain = ctx.input_only()
+    outcomes: list[Any] = await gather(
+        primary,
+        ask_clairic(
+            plain,
+            fields,
+            meta=plain.meta("crosscheck", field=single),
+            descriptions=descriptions,
+        ),
+    )
+    ctx.crossed.update(outcomes[1])
+    extracted: Extracted = outcomes[0]
+    return extracted
 
 
 async def _extract(
@@ -262,7 +315,16 @@ async def _resolve_clairic(
         candidate = clef_answers.get(spec.clef_name)
         type_answer = candidate if isinstance(candidate, ChoiceAnswer) else None
     resolved = await resolve(ctx, spec, answer, anchored, type_answer)
-    state = FieldState(spec, resolved, type_answer)
+    echoed = ctx.echoes.get(spec.wire_name)
+    notes: list[str] = []
+    if echoed:  # chunks whose answers were read from the existing record
+        if resolved.ok and resolved.value is None:
+            resolved = dataclasses.replace(
+                resolved, ok=False, reason="echo_span", detail="; ".join(echoed)
+            )
+        else:
+            notes = [f"echo_span: {note}" for note in echoed]
+    state = FieldState(spec, resolved, type_answer, notes=notes)
     rejection = accept(spec, resolved)
     if rejection is not None:
         state.set_reject(*rejection)
@@ -588,9 +650,11 @@ def _unique(items: list[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(items))
 
 
-def _clairic_answer(state: FieldState) -> tuple[FieldAnswer, list[RejectedOp]]:
+def _clairic_answer(
+    state: FieldState, where: str | None = None
+) -> tuple[FieldAnswer, list[RejectedOp]]:
     spec, resolved = state.spec, state.resolved
-    pointer = json_pointer(spec.path)
+    pointer = where if where is not None else json_pointer(spec.path)
     value = state.value
     rejected: list[RejectedOp] = []
     if state.reject:
@@ -615,6 +679,7 @@ def _clairic_answer(state: FieldState) -> tuple[FieldAnswer, list[RejectedOp]]:
         spans=resolved.spans,
         source=_source(spec, value),
         attribution_p=state.attribution_p,
+        crosscheck_agree=state.crosscheck_agree,
         reask=state.reask,
         rejected_reason=state.reject,
         warnings=_unique([*resolved.notes, *state.notes]),
@@ -623,13 +688,19 @@ def _clairic_answer(state: FieldState) -> tuple[FieldAnswer, list[RejectedOp]]:
 
 
 def _clef_answer(
-    spec: FieldSpec, resolved: Resolved
+    spec: FieldSpec, resolved: Resolved, where: str | None = None
 ) -> tuple[FieldAnswer, list[RejectedOp]]:
     rejected: list[RejectedOp] = []
     reason = None if resolved.ok else (resolved.reason or "invalid")
     if reason is not None:
         rejected.append(
-            RejectedOp(None, json_pointer(spec.path), reason, resolved.detail, None)
+            RejectedOp(
+                None,
+                where if where is not None else json_pointer(spec.path),
+                reason,
+                resolved.detail,
+                None,
+            )
         )
     value = resolved.value if resolved.ok else None
     answer = FieldAnswer(
@@ -839,30 +910,32 @@ def _fragment(
 
 
 def _unsay(out: _Assembly, pretty_path: str) -> None:
-    """Mark a sub-model's presence note as dropped for failing validation."""
-    note = out.notes.get(pretty_path)
-    if note is not None:
-        note.present = False
-        note.reason = "invalid_optional_group"
+    """Mark a dropped sub-model's notes, and those of everything below it.
+
+    The presence note of the dropped group and the presence and union-choice
+    notes of the groups and unions inside it (found by path prefix) say that
+    nothing of them stands: ``present`` is false and the reason is
+    ``invalid_optional_group``.
+    """
+    for key, note in out.notes.items():
+        if key == pretty_path or key.startswith(f"{pretty_path}."):
+            note.present = False
+            note.reason = "invalid_optional_group"
 
 
-def _place_union(
-    ctx: Ctx,
-    result: _UnionResult,
-    doc: dict[str, Any],
-    out: _Assembly,
-    trail: tuple[str, ...],
-) -> None:
-    union = result.union
-    spec = union.spec
+def _union_note(result: _UnionResult, out: _Assembly, where: str) -> UnionMember | None:
+    """Record a union's choice (and why it was rejected, if it was).
+
+    Returns:
+        The member that was chosen, if any.
+    """
+    spec = result.union.spec
     chosen = result.chosen
     reason = None
     if not result.resolved.ok:
         reason = result.resolved.reason or "invalid"
         out.rejected.append(
-            RejectedOp(
-                None, json_pointer(spec.path), reason, result.resolved.detail, None
-            )
+            RejectedOp(None, where, reason, result.resolved.detail, None)
         )
         if result.fallback and chosen is not None:
             reason = "low_confidence_fallback"
@@ -875,6 +948,19 @@ def _place_union(
         out.notes[spec.pretty] = _Note(
             spec, raw, result.resolved.confidence, chosen is not None, reason
         )
+    return chosen
+
+
+def _place_union(
+    ctx: Ctx,
+    result: _UnionResult,
+    doc: dict[str, Any],
+    out: _Assembly,
+    trail: tuple[str, ...],
+) -> None:
+    union = result.union
+    spec = union.spec
+    chosen = _union_note(result, out, json_pointer(spec.path))
     if chosen is None:
         _absent(doc, union)
         return
@@ -1062,3 +1148,389 @@ async def insert_one(
     await run_ladder(ctx, list(_leaf_states(root)))
     _settle(root)
     return InsertOutcome(_assemble(ctx, root, qualify_p), extracted=True)
+
+
+# --------------------------------------------------------------------------- #
+# Updates: one existing record
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class UpdateOutcome:
+    """What ``update_one`` produced.
+
+    Attributes:
+        record: The update record (also when it made no change), or ``None``
+            when the presence gate found nothing about the record in the input
+            or updates are disabled.
+        skipped: The skipped entity, when updates are disabled.
+        handled_id: The existing record's id when the record was dealt with
+            (updated or skipped); ``None`` when it stays untouched.
+        extracted: Whether any extraction request was made.
+    """
+
+    record: ResultRecord | None
+    skipped: SkippedEntity | None
+    handled_id: str | None
+    extracted: bool
+
+
+def _group_node(result: _GroupResult, key: str) -> GroupNode:
+    """The tree the diff walks, from the groups as they were asked and answered."""
+    group = result.group
+    node = GroupNode(key, group, present=result.present)
+    if not result.present:
+        return node
+    for leaf in result.leaves:
+        spec = leaf.spec
+        state = leaf.state
+        handled = (
+            state is not None and (state.reject is not None or not state.resolved.ok)
+        ) or (leaf.resolved is not None and not leaf.resolved.ok)
+        node.leaves.append(
+            LeafNode(
+                key=_key(spec),
+                spec=spec,
+                value=leaf.final(),
+                handled=handled,
+                identity=spec.identity or str(spec.path[-1]) in group.identity,
+                spans=tuple(state.spans) if state is not None else (),
+            )
+        )
+    for child in result.children:
+        node.children.append(_group_node(child, _key(child.group)))
+    for union in result.unions:
+        union_key = _key(union.union)
+        member = (
+            _group_node(union.members[union.chosen.label], union_key)
+            if union.chosen is not None
+            else None
+        )
+        node.unions.append(
+            UnionNode(
+                key=union_key,
+                union=union.union,
+                chosen=union.chosen,
+                member=member,
+                handled=not union.resolved.ok,
+            )
+        )
+    return node
+
+
+def _answers(result: _GroupResult, out: _Assembly, base: tuple[str, ...]) -> None:
+    """Describe every asked field of an update (no document is built).
+
+    The pointers of the rejections are document pointers (aliases), like the
+    operations'.
+    """
+    group = result.group
+    if group.spec is not None and group.spec.clef is not None:
+        out.notes[group.pretty] = _Note(
+            group.spec,
+            {"noul": result.presence},
+            None,
+            result.present,
+            None if result.present else "absent",
+        )
+    if not result.present:
+        return
+    for leaf in result.leaves:
+        spec = leaf.spec
+        where = json_pointer((*base, _key(spec)))
+        if leaf.state is not None:
+            answer, rejects = _clairic_answer(leaf.state, where)
+        elif leaf.resolved is not None:
+            answer, rejects = _clef_answer(spec, leaf.resolved, where)
+        else:
+            answer, rejects = _filled_answer(spec, leaf.value), []
+        out.answers[spec.pretty] = answer
+        out.rejected.extend(rejects)
+    for child in result.children:
+        _answers(child, out, (*base, _key(child.group)))
+    for union in result.unions:
+        below = (*base, _key(union.union))
+        chosen = _union_note(union, out, json_pointer(below))
+        if chosen is not None:
+            _answers(union.members[chosen.label], out, below)
+
+
+async def _load_cross(ctx: Ctx, st: FieldState) -> None:
+    """Resolve the input-only answer of a field (``ctx`` is the input-only one)."""
+    pair = ctx.crossed.get(st.spec.wire_name)
+    if pair is None:
+        return
+    answer, anchored = pair
+    st.cross = await resolve(ctx, st.spec, answer, anchored, st.type_answer)
+
+
+def _validate_document(
+    plan: SchemaPlan, document: Mapping[str, Any]
+) -> tuple[BaseModel | None, ValidationError | None]:
+    try:
+        return plan.schema.model_validate(document), None
+    except ValidationError as exc:
+        return None, exc
+
+
+@dataclass
+class _Verdict:
+    """What became of one computed operation."""
+
+    change: Change
+    reason: str | None = None  # why it was not applied
+    p: float | None = None  # the change gate's probability, if it was asked
+
+
+async def _judge_changes(
+    ctx: Ctx, before: dict[str, Any], changes: list[Change], out: list[RejectedOp]
+) -> list[_Verdict]:
+    """Run the near-duplicate check and the change gate over the operations."""
+    verdicts = [_Verdict(change) for change in changes]
+    dedups = await dedup_elements(ctx, before, changes)
+    for index, found in dedups.items():
+        if found.duplicate:
+            verdict = verdicts[index]
+            verdict.reason = "duplicate"
+            verdict.p = found.p
+            change = verdict.change
+            out.append(
+                RejectedOp(
+                    change.op,
+                    change.path,
+                    "duplicate",
+                    f"{change.value!r} is the same fact as {found.other!r}",
+                    found.p,
+                )
+            )
+    live = [v for v in verdicts if v.reason is None]
+    gated = await gate_changes(ctx, before, [v.change for v in live])
+    for verdict, answer in zip(live, gated, strict=True):
+        verdict.p = answer.p
+        if answer.passed:
+            continue
+        change = verdict.change
+        if answer.p is None:
+            verdict.reason = "gate_missing"
+            detail = "the change gate gave no answer"
+        else:
+            verdict.reason = "gate_noul"
+            detail = (
+                f"the input does not support the change (p={answer.p:.2f} < "
+                f"{answer.needed})"
+            )
+        out.append(RejectedOp(change.op, change.path, verdict.reason, detail, answer.p))
+    return verdicts
+
+
+def _owner(changes: list[Change], op: PatchOp) -> Change | None:
+    """The computed change an applied (possibly repaired) operation came from."""
+    path = op.repaired_from or op.path
+    return next((c for c in changes if c.path == path), None)
+
+
+async def _finish_update(
+    ctx: Ctx,
+    root: _GroupResult,
+    before: dict[str, Any],
+    target: ExistingRecord,
+    entity: EntityInfo,
+) -> ResultRecord:
+    run, plan = ctx.run, ctx.plan
+    out = _Assembly()
+    _answers(root, out, ())
+    nodes = _group_node(root, "")
+    diff = diff_group(nodes, before, allow_null_removals=run.gates.allow_null_removals)
+    rejected = [*out.rejected, *diff.rejected]
+    verdicts = await _judge_changes(ctx, before, diff.changes, rejected)
+    passed = [v.change for v in verdicts if v.reason is None]
+    ordered = sort_changes(passed)
+    applied = apply_ops(before, [change.as_op() for change in ordered])
+    reasons: dict[int, str] = {}
+    for op, error in applied.failed:
+        change = next(
+            (c for c in ordered if c.path == op.path and c.value == op.value), None
+        )
+        rejected.append(RejectedOp(op.op, op.path, "apply_failed", error, None))
+        if change is not None:
+            reasons[id(change)] = "apply_failed"
+    model, failure = _validate_document(plan, applied.doc)
+    if failure is not None:
+        bad = ops_for_errors(applied.applied, [e["loc"] for e in failure.errors()])
+        if bad:
+            for op in bad:
+                detail = next(
+                    (
+                        f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}"
+                        for e in failure.errors()
+                        if e["loc"]
+                    ),
+                    "",
+                )
+                rejected.append(RejectedOp(op.op, op.path, "validation", detail, None))
+                owner = _owner(ordered, op)
+                if owner is not None:
+                    reasons[id(owner)] = "validation"
+            keep = [op for op in applied.applied if not any(op is b for b in bad)]
+            applied = apply_ops(before, keep)
+            model, failure = _validate_document(plan, applied.doc)
+    # the fields: how each answer fared
+    answers = dict(out.answers)
+    for verdict in verdicts:
+        change = verdict.change
+        reason = verdict.reason or reasons.get(id(change))
+        for name in change.fields:
+            answer = answers.get(name)
+            if answer is None:
+                continue
+            answers[name] = dataclasses.replace(
+                answer,
+                gate_p=verdict.p,
+                value=None if reason else answer.value,
+                rejected_reason=reason or answer.rejected_reason,
+            )
+    valid = failure is None and model is not None
+    final: dict[str, FieldAnswer] = {}
+    for key, answer in answers.items():
+        if valid and model is not None and answer.value is not None:
+            with contextlib.suppress(AttributeError):
+                answer = dataclasses.replace(answer, value=_lookup(model, answer.path))
+        final[key] = answer
+    for note in out.notes.values():
+        value = None
+        if valid and model is not None and note.present:
+            with contextlib.suppress(AttributeError):
+                value = _lookup(model, note.spec.path)
+        final[note.spec.pretty] = _note_answer(note, value)
+    errors = tuple(_error_strings(failure)) if failure is not None else ()
+    record = ResultRecord(
+        schema_name=plan.name,
+        json_doc_id=target.record_id,
+        kind="update",
+        value=model if valid else None,
+        before=before,
+        after=applied.doc,
+        patches=tuple(applied.applied),
+        rejected=tuple(rejected),
+        fields=final,
+        entity=entity,
+        valid=valid,
+        errors=errors,
+    )
+    if not valid and run.strict:
+        raise ExtractionValidationError(
+            f"{plan.name} {target.record_id!r} failed validation after the update: "
+            + "; ".join(errors),
+            errors=list(errors),
+            record=record,
+            calls=tuple(run.calls),
+        )
+    return record
+
+
+async def update_one(
+    run: Run,
+    plan: SchemaPlan,
+    text: str,
+    target: ExistingRecord,
+    *,
+    label: str,
+    enable_updates: bool = True,
+    skip_presence: bool = False,
+) -> UpdateOutcome:
+    """Update one existing record of a schema from ``text``.
+
+    The steps:
+
+    1. the presence gate (skipped when the schema is forced): a record the input
+       does not talk about is left untouched, with no further request;
+    2. with ``enable_updates`` off the record is skipped (``updates_disabled``);
+    3. every Clairic group is asked with the record shown after the input, and
+       asked again without it (the cross-check, call kind ``crosscheck``); an
+       answer whose span lies in the record is rejected (``echo_span``);
+    4. the answers that would change the record are cross-checked, and the
+       verification ladder runs on the input alone (a re-ask never sees the
+       record);
+    5. ``_diff`` computes the operations, each is judged by the change gate and
+       applied, and the patched document is validated.
+
+    A run in which no operation is applied is still an ``update`` record with an
+    empty ``patches`` and ``after == before``.
+
+    Args:
+        run: The invoke's context.
+        plan: The compiled schema.
+        text: The user's input.
+        target: The record to update (any keys; they are normalised to the
+            schema's validation keys).
+        label: How prompts name the entity (``"the Contact"``).
+        enable_updates: Whether updating is allowed.
+        skip_presence: Skip the presence gate (the schema was forced).
+
+    Returns:
+        The outcome.
+
+    Raises:
+        ExtractionValidationError: In strict mode, if the patched record does
+            not validate.
+        StateTruncatedError: In strict mode, if Clairic keeps truncating.
+        TransportError: If a request failed (it is in ``run.calls`` first).
+    """
+    before = normalise_record(plan, target.data)
+    block = ExistingBlock(
+        target.record_id, plan.name, json.dumps(before, ensure_ascii=False)
+    )
+    ctx = Ctx(
+        run=run,
+        plan=plan,
+        text=text,
+        label=label,
+        existing=block,
+        crosscheck=run.verify.input_only_crosscheck,
+    )
+    _note_unsupported(run, plan, updating=True)
+    qualify_p: float | None = None
+    if not skip_presence:
+        qualify_p = await _presence(ctx)
+        if qualify_p < run.presence.threshold_absent:
+            return UpdateOutcome(None, None, None, False)
+    entity = EntityInfo(key=ctx.key, label=ctx.label, qualify_p=qualify_p)
+    if not enable_updates:
+        skipped = SkippedEntity(
+            plan.name,
+            entity,
+            "updates_disabled",
+            f"the input is about the existing record {target.record_id!r}, but "
+            "enable_updates is off",
+        )
+        return UpdateOutcome(None, skipped, target.record_id, False)
+
+    root = await _run_unit(ctx, plan.root)
+    plain = ctx.input_only()
+    states = list(_leaf_states(root))
+    by_wire = {st.spec.wire_name: st for st in states}
+    unchanged: set[str] = set()
+    new_at: dict[str, list[int]] = {}
+    for leaf, old in leaves_with_old(_group_node(root, ""), before):
+        state = by_wire.get(leaf.spec.wire_name)
+        if state is None or not state.has_value():
+            continue
+        value = state.resolved.value
+        if isinstance(value, list):
+            fresh = new_positions(leaf.spec, value, old)
+            if fresh:
+                new_at[leaf.spec.wire_name] = fresh
+            else:
+                unchanged.add(leaf.spec.wire_name)
+        elif not is_change(leaf.spec, value, old):
+            unchanged.add(leaf.spec.wire_name)
+    candidates = [
+        st for st in states if st.has_value() and st.spec.wire_name not in unchanged
+    ]
+    if ctx.crosscheck and candidates:
+        await gather(*(_load_cross(plain, st) for st in candidates))
+        await crosscheck(plain, candidates, new_at)
+    await run_ladder(plain, [st for st in states if st.spec.wire_name not in unchanged])
+    _settle(root)
+    record = await _finish_update(plain, root, before, target, entity)
+    return UpdateOutcome(record, None, target.record_id, True)

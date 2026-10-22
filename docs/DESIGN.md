@@ -147,7 +147,8 @@ own), `field` = one per field.
 | `_flatten.py`, `_coerce.py` | flatten/unflatten/prune_nulls; answer → python value |
 | `_render.py` | Clairic text state (focus/input/existing blocks, offsets); Clef structured state |
 | `_collection.py`, `_coref.py`, `_match.py` | **collection engine**; mention clustering; record matching + assignment |
-| `_entity.py`, `_verify.py` | per-entity passes; attribution, cross-check, re-ask, borderline-null |
+| `_existing.py` | `existing` coercion (five shapes, policy, `__any__`), key normalisation, target selection |
+| `_entity.py`, `_verify.py` | per-entity passes (insert, update); attribution, cross-check, re-ask, borderline-null |
 | `_diff.py`, `_gates.py`, `_repair.py` | ops + apply; thresholds + change gate; repair loop |
 | `_run.py`, `_extractor.py` | per-invoke context (usage, call log, semaphores); factory + sync bridge |
 | `testing.py` (public) | `FakeTransport`, `FakeWorld`, recording/cassette transports |
@@ -294,7 +295,7 @@ vs ops inside the parent's patch list such as `add /pets/-`), and removal flag
 | --- | --- | --- |
 | Answer-level thresholds | on | reject if `p_null > null_threshold`, `confidence < 0.5`, span inside `<existing>`, Clef choice < 0.55 |
 | Attribution | on | above |
-| Input-only cross-check (updates) | on | second Clairic pass without `<existing>`; null there → reject as echo; disagreement → Clef `choice{a, b, neither}` ≥ 0.6. Covers number/date answers that carry no span |
+| Input-only cross-check (updates) | on (`verify.input_only_crosscheck`) | second Clairic pass per group (call kind `crosscheck`) with the same fields and NO `<existing>` block, for every candidate change: agree (normalised equality; text similarity ≥ 0.9 only for free text) → proceed; null there while the primary answer is not null → reject `echo_crosscheck`; two different values → Clef `choice{a: primary, b: cross-check, neither}` (kind `adjudicate`) at ≥ `verify.adjudicate_min`: `a` keeps, `b` takes the input-only value, anything else rejects `crosscheck_disagree`; a list element must have an agreeing cross-check element or is dropped `echo_crosscheck`. Covers number/date answers that carry no span |
 | Low-confidence re-ask | on (< 0.85) | isolated single-field request on mention windows; disagreement → Clef adjudication |
 | Borderline-null | on (`p_null` 0.25–0.75) | Clef `noul` "does the input state it?" → re-ask or null |
 | List near-duplicate dedup | on | difflib 0.6–0.9 vs record elements → Clef `noul` "same fact?" |
@@ -302,14 +303,114 @@ vs ops inside the parent's patch list such as `add /pets/-`), and removal flag
 | State-variant self-consistency | off (`k=1`) | opt-in |
 | `guess` as a value | never | metadata only |
 
-Diff walks the field plan, never the document: absent → `add` (parents first); differs
-(normalised) → `replace`; null answer → **no op** (silence is not deletion; opt-in
-`gates.allow_null_removals`); scalar lists use set semantics → `add /notes/-` for new
-elements only. Order: replace → remove (highest index first) → add. Apply with
-`jsonpatch.apply_patch` on a deep copy; on conflict try `_fix_string_concat` then
-`_fix_missing_parents`, recording `repaired_from`. Clairic requests always send
+Diff walks the field plan, never the document (`_diff.py`): absent → `add`; differs
+(normalised: ISO dates, `math.isclose` numbers, stripped text, enum values) → `replace`;
+equal → nothing; null answer → **no op**, recorded as `RejectedOp(op=None,
+reason="not_mentioned")` (silence is not deletion; opt-in `gates.allow_null_removals`);
+scalar lists use set semantics → `add /notes/-` for new elements only. Order: replace →
+remove (highest array index first) → add (`/-`), a deterministic sort key. Apply with
+`jsonpatch.apply_patch` on a deep copy, op by op; on conflict try `_fix_string_concat`
+then `_fix_missing_parents`, recording `repaired_from`. The full rules are in "Update path".
+
+Clairic requests always send
 `options.return_state_text=true` so span offsets are re-anchored on sentinel markers;
 `truncated: true` → re-ask the same fields on overlapping chunks that cover the whole input (size from the returned `state_text`, overlap ≥ `verify.window_chars`), concurrently, and merge per field: every non-null scalar is kept as a candidate, ranked by confidence; candidates that agree (normalised equality / text ratio ≥ 0.9 / equal numbers) are one value, disagreeing ones go to a Clef `adjudicate` over the distinct candidates (≥ `verify.adjudicate_min`; one request for all conflicting fields, and a decisive `neither` makes the field null), then to attribution in confidence order (one request, first to pass wins; its probability is handed to the ladder so it is not asked twice), then the most confident stands for the ladder to judge; dates, times, durations, numbers and digit-heavy strings agree only when equal after normalisation, never on text similarity; lists are united in input order and an overlapping span replaces a kept element only if it contains exactly that one (confidence breaks ties for equal spans); an all-null merge reports the lowest `p_null` so the borderline-null check still fires; a chunk that is still truncated is split smaller once, then warn/raise `StateTruncatedError`. Any part of the input that is not sent always produces a warning.
+
+## Update path (`One` schema with an existing record)
+
+`ainvoke(text, existing=...)`: `_existing.py` coerces `existing` (five shapes, `"__any__"`,
+`existing_schema_policy`), then each `One` schema that has a record runs `update_one`
+(`_entity.py`); a schema without a record is extracted as an insert (`enable_inserts` decides about
+inserts next to existing records of the same schema, which needs `Many`, M7-M8).
+
+**`existing` (`_existing.py`).** Shapes: `{schema_name: record}` (the id is the schema name);
+`list[SchemaInstance]`; `list[(record_id, schema_name, record)]`; `list[(record_id, BaseModel)]`
+(schema name = class name); bare `list[BaseModel]` (ids minted with `uuid4`). A record is a
+dict or a model (dumped by alias, JSON mode, so `before`/`after`/patch values are
+JSON-compatible); ids are non-empty strings, unique per schema. `existing_schema_policy`:
+`True` raises `ValueError` for an unknown schema name; `False` keeps the record as opaque
+context (never shown to a model, never patched, a warning, listed in
+`ExtractionResult.untouched`); `"ignore"` drops it (debug log). `"__any__"` is always known and
+is the record of every schema that has none of its own. Record keys are normalised to the keys the schema
+validates (alias where there is one) at every level of sub-models and unions, so diffs,
+patches and validation talk about the same keys. Cardinality: dict form → `One(S)`; an explicit
+`One(S)` with exactly one list-form record of S → that record; several → `ValueError`
+("use Many"); list-form records of S with no explicit wrapper imply `Many(S)` →
+`NotImplementedError` naming M7-M8.
+
+**Pipeline** (`update_one`):
+1. Presence gate as for inserts (skipped for a forced schema). Absent → no operation, no
+   further call, the record id is in `untouched`.
+2. `enable_updates=False` → `SkippedEntity(reason="updates_disabled")` (after presence, no
+   extraction call); the record is neither updated nor untouched.
+3. Clairic per group with the record rendered after the input as
+   `<existing id="…" schema="…">{json}</existing>` (`RenderedState.existing_span`; only the
+   input is ever narrowed or chunked, the record always follows whole). An answer whose span
+   lies in the block is rejected `echo_span` (a list element individually; for chunked asks the
+   chunk's echo is nulled before the merge). A second, input-only pass per group runs
+   concurrently (kind `crosscheck`).
+4. Candidate changes (a non-null answer that differs from the record) are cross-checked.
+   Answers equal to the record are not (no operation can follow).
+5. The verification ladder (low-confidence re-ask, borderline-null, attribution) runs on the
+   *input only*: its re-asks never see the record. Fields equal to the record are skipped.
+6. `diff_group` → operations; near-duplicate list elements → `list_dedup`; one gate request
+   per remaining operation; sort; apply; validate.
+
+**Operation shapes.** Leaf the record lacks (key absent or null) → `add /field`; leaf that
+differs → `replace /field`; paths use the schema's validation keys. An *identity* field
+(`plan.identity`, `s1_field(identity=True)`) is never replaced by a proper token subset of the
+existing value ("Dana" for "Dana Whitfield"): `identity_subset`, before any model is asked;
+other identity edits go to the gate. A scalar list the record lacks → one `add /list` of the
+deduplicated list; otherwise one `add /list/-` per new element (elements of the record that the
+answer omits are left alone). A new element that resembles a record element (difflib ratio
+0.6–0.9) goes to one Clef `noul` (kind `list_dedup`, "Is "new" the same fact as "old"?"),
+p ≥ 0.6 drops it as `duplicate`; ratio ≥ 0.9 is a `duplicate` without asking. An optional
+(or required) sub-model the input states while the record lacks it → ONE `add` of the whole
+sub-document (gated once); one the record has is diffed leaf by leaf; one the input does not
+state → no operation. A union whose chosen member is not the record's member (found by its
+discriminator, else by validating) → ONE `replace` of the whole union value (an `add` when the
+record has none); the member's single-value `Literal` tags are written out even when only
+defaulted, so the value cannot validate as another member; the same member → leaf by leaf.
+Removals exist only with `gates.allow_null_removals=True`: a silent field the record holds
+becomes `replace /f null` (nullable), `remove /f` (has a default) or a `required_field`
+rejection, and the gate asks "Does `input` state that `f` was removed or no longer applies?"
+at `gates.remove_threshold`.
+
+**Change gate (`_gates.py`, always on).** One Clef request per operation (kind `gate`, model
+`gate_model`) with its own state `{"input", "entity": {"label", "mentions"}, "record",
+"proposed_change": {"op", "path", "field", "from", "to"}}`; question "Does `input` state the
+information in `proposed_change.to` about `entity.label`, as new or changed compared to
+`record`?" (true: states it and the record does not hold it; false: only a shorter or partial
+form, another value, somebody else, or a repeat of the record). Thresholds: add
+`gates.add_threshold` 0.55, replace 0.6, remove or set-null 0.85. An operation applies only if
+it survived attribution (the ladder) AND the gate; an attribution failure leaves no operation,
+so the gate is not even asked. A narrowed Clef state cuts `input` only (never the record).
+
+**Apply and validate.** `apply_ops` applies the operations one by one on a deep copy;
+`_fix_string_concat` (an `add /f/-` whose `/f` is a string becomes a `replace` of the
+concatenation) then `_fix_missing_parents` (missing ancestors added outermost first, `[]` before
+an `-`/index step, `{}` otherwise; the parents carry `repaired_from`); an operation that still
+fails is `apply_failed`. The patched document is validated (alias-aware); on failure the
+operations whose paths lie on the line of an error location (one path a prefix of the other;
+`/list/-` stands for `/list`; a location-less model-wide error implicates none) are dropped
+(`validation`) and the record is validated once more; still failing → `valid=False`,
+`value=None` (the repair loop is M6; `strict` raises `ExtractionValidationError`).
+
+**Result.** `ResultRecord(kind="update", json_doc_id=<record id>, before=<normalised record>,
+after=<patched document>, patches=<applied operations in applied order>, rejected, fields,
+valid)`. A run that applies nothing is still an `update` record: `patches == ()`, `after ==
+before`, `value` the validated record. `fields` carries `crosscheck_agree` and `gate_p`.
+`untouched` lists existing ids that got neither a record nor a skipped entity (plus opaque
+ones).
+
+**`RejectedOp.reason` values.** Answers that never became an operation (`op=None`):
+`not_mentioned`; answer level `p_null`, `low_confidence`, `low_choice_prob`, `abstain`,
+`unstated`, `type_uncertain`, `missing_answer`, `unparseable`, `invalid`; ladder
+`adjudication_failed`, `null_check`, `attribution`, `attribution_missing`, `none_of_these`
+(list element); update checks `echo_span`, `echo_crosscheck`, `crosscheck_disagree`;
+sub-models `invalid_optional_group`. Computed operations that were thrown away (`op` is the
+operation): `identity_subset`, `duplicate`, `required_field`, `gate_noul`, `gate_missing`
+(no gate answer), `apply_failed`, `validation`. Paths are JSON Pointers of the document.
 
 ## Repair loop (`_repair.py`)
 
@@ -438,6 +539,18 @@ library's logic.
 4. **Push and PR:** after M10, a Haiku subagent pushes the branch and opens the draft PR;
    CI fixes go to Haiku or Sonnet per the table above. If a Haiku subagent's work fails
    review or its fix doesn't hold, the task is re-run on Sonnet.
+
+### Design decisions settled from the examples review
+
+* A field the input does not state is never an operation and is reported as
+  `RejectedOp(op=None, reason="not_mentioned")`; the older `p_null`/`unchanged` reasons for
+  silent or equal fields are gone (an equal answer is simply no operation).
+* The "Dana" / "Dana Whitfield" case is a deterministic rule in the diff (`identity_subset`),
+  not left to the gate; the gate stays as the backstop for other identity edits.
+* An update run that applies nothing is still an `update` record with empty `patches`.
+* Gate state keys are `input`, `entity`, `record`, `proposed_change`; paths are JSON Pointers
+  with the schema's validation keys (`/name`, `/notes/-`).
+* The input-only cross-check, not the span, is what catches an echoed number or date.
 
 ### Branch, packaging, tooling
 

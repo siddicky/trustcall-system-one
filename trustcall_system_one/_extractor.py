@@ -34,11 +34,21 @@ from trustcall_system_one._config import (
     Prices,
     VerifyConfig,
 )
-from trustcall_system_one._entity import insert_one
+from trustcall_system_one._entity import insert_one, update_one
 from trustcall_system_one._errors import TrustcallSystemOneError
+from trustcall_system_one._existing import (
+    ExistingRecord,
+    coerce_existing,
+    target_for,
+)
 from trustcall_system_one._run import Run, gather
 from trustcall_system_one._schemas import SchemaLike, coerce_schema
-from trustcall_system_one._types import ExtractionResult, ResultRecord, Usage
+from trustcall_system_one._types import (
+    ExtractionResult,
+    ResultRecord,
+    SkippedEntity,
+    Usage,
+)
 from trustcall_system_one._wire import CLAIRIC, CLEF
 from trustcall_system_one.transport import CloudflareTransport, Transport
 
@@ -46,6 +56,9 @@ __all__ = ["ExtractionInput", "Extractor", "create_extractor"]
 
 T = TypeVar("T")
 _JOIN_TIMEOUT = 10.0
+_CANCEL_GRACE = 2.0
+"""Seconds the bridge thread waits for cancelled calls to unwind before it cancels
+what is still running."""
 
 
 class ExtractionInput(TypedDict, total=False):
@@ -53,7 +66,8 @@ class ExtractionInput(TypedDict, total=False):
 
     Attributes:
         text: The text to extract from.
-        existing: Existing records to update (arrives in M5).
+        existing: Existing records to update (any of the five shapes, see
+            ``Extractor.ainvoke``).
         images: Images sent along with the text.
         reference_date: Date that relative dates in the text are resolved against.
     """
@@ -124,15 +138,24 @@ class _Core:
                 loop.run_forever()
             finally:
                 with contextlib.suppress(Exception):
-                    # Cancel what is left and let it finish, so that nothing
-                    # is destroyed pending and every future gets resolved.
+                    # Let what is left finish, so that nothing is destroyed
+                    # pending and every future gets resolved. The calls that
+                    # close() cancelled are unwinding already (their cleanup
+                    # may need the loop), so they are waited for first: a
+                    # second cancel() that lands after the first one was
+                    # delivered interrupts that cleanup. Only what is still
+                    # running after the grace period is cancelled.
                     tasks = list(asyncio.all_tasks(loop))
-                    for task in tasks:
-                        task.cancel()
                     if tasks:
-                        loop.run_until_complete(
-                            asyncio.gather(*tasks, return_exceptions=True)
+                        _, stuck = loop.run_until_complete(
+                            asyncio.wait(tasks, timeout=_CANCEL_GRACE)
                         )
+                        for task in stuck:
+                            task.cancel()
+                        if stuck:
+                            loop.run_until_complete(
+                                asyncio.gather(*stuck, return_exceptions=True)
+                            )
                     loop.run_until_complete(loop.shutdown_asyncgens())
                 loop.close()
 
@@ -290,6 +313,16 @@ def _note_failure(exc: Exception, run: Run) -> None:
         f"trustcall-system-one: {len(run.calls)} call(s) were made before this "
         f"failure ({kinds}); {run.usage.input_tokens} input tokens"
     )
+
+
+@dataclass(frozen=True)
+class _Done:
+    """The outcome of one schema, whether it was inserted or updated."""
+
+    record: ResultRecord | None
+    skipped: SkippedEntity | None
+    handled_id: str | None
+    extracted: bool
 
 
 def _inner(item: Any) -> SchemaLike:
@@ -452,10 +485,24 @@ class Extractor:
         ``enable_inserts`` says). Several schemas run in parallel and each is
         gated by a presence check.
 
+        With ``existing`` a ``One`` schema that has a record is updated: the
+        record is shown to the model next to the text, the answers are compared
+        with it, and what differs becomes JSON Patch operations that a Clef gate
+        checks one by one (see ``ResultRecord.patches`` and ``.rejected``). A
+        schema without a record is extracted as an insert. Records are taken in
+        five shapes: ``{schema_name: record}``; ``list[SchemaInstance]``;
+        ``list[(record_id, schema_name, record)]``; ``list[(record_id,
+        BaseModel)]``; and a bare ``list[BaseModel]`` (ids are minted). A record
+        is a dict or a pydantic model; ``"__any__"`` as schema name applies to
+        any schema. Several list-form records of a schema imply ``Many`` (M7-M8);
+        a ``One`` takes exactly one.
+
         Args:
             input: The text, or an ``ExtractionInput`` carrying it. Explicit
                 keyword arguments override the keys of an ``ExtractionInput``.
-            existing: Existing records to update. Not supported yet (M5).
+            existing: Existing records to update (see above). Records of a schema
+                the extractor does not know are handled by
+                ``existing_schema_policy``.
             schema: Force one of the extractor's schemas (a name, a schema or a
                 wrapper): only it runs and its presence gate is skipped, like
                 trustcall's ``tool_choice``.
@@ -465,11 +512,18 @@ class Extractor:
                 the extractor's.
 
         Returns:
-            The records, models, usage, cost, call log and warnings.
+            The records, models, usage, cost, call log and warnings;
+            ``untouched`` lists the ids of existing records the input did not
+            touch (including opaque ones kept by ``existing_schema_policy=False``).
 
         Raises:
-            NotImplementedError: For ``existing`` (M5) and ``Many`` schemas (M7).
-            ValueError: If ``schema`` is not one of the extractor's schemas.
+            NotImplementedError: For ``Many`` schemas (M7) and for list-form
+                existing records of a schema without an explicit wrapper (they
+                imply ``Many``, M7-M8).
+            ValueError: If ``schema`` is not one of the extractor's schemas, or
+                ``existing`` is malformed, names an unknown schema under
+                ``existing_schema_policy=True``, or gives a ``One`` several
+                records.
             ExtractionValidationError: With ``strict``, on a validation failure.
             StateTruncatedError: With ``strict``, if Clairic keeps truncating.
             TransportError: If a request failed.
@@ -484,20 +538,31 @@ class Extractor:
                 reference_date = input.get("reference_date")
         else:
             text = input
-        if existing is not None:
-            raise NotImplementedError(
-                "existing / update extraction arrives in M5; "
-                "call without existing= to insert"
-            )
         selected = self._select(schema)
-        cards = [resolve_cardinality(item) for item in selected]
-        for card in cards:
+        records = coerce_existing(
+            existing,
+            [self.plan_for(item).name for item in self.schemas],
+            self.existing_schema_policy,
+        )
+        cards = [resolve_cardinality(item, existing) for item in selected]
+        for item, card in zip(selected, cards, strict=True):
             if isinstance(card, Many):
-                raise NotImplementedError("Many(...) arrives in M7")
+                if isinstance(item, Many):
+                    raise NotImplementedError("Many(...) arrives in M7")
+                name = self.plan_for(item).name
+                raise NotImplementedError(
+                    f"list-form existing records of {name} imply Many({name}); "
+                    "matching several records arrives in M7-M8. Wrap the schema "
+                    f"in One({name}) to update a single record"
+                )
         if not text.strip() and not images:
             return ExtractionResult(
                 cost=self.prices.cost(Usage()),
-                warnings=("the input is empty; nothing was extracted",),
+                untouched=records.ids,
+                warnings=(
+                    *records.warnings,
+                    "the input is empty; nothing was extracted",
+                ),
             )
         run = Run(
             transport=self.core.transport(),
@@ -515,16 +580,26 @@ class Extractor:
             ),
             strict=self.strict,
         )
+        for warning in records.warnings:
+            run.warn(warning)
         jobs = []
-        for card in cards:
+        for item, card in zip(selected, cards, strict=True):
             assert isinstance(card, One)
             plan = self.plan_for(card)
             label = card.label or f"the {plan.title}"
-            jobs.append(
-                insert_one(
-                    run, plan, text, label=label, skip_presence=schema is not None
-                )
+            target = target_for(
+                plan.name, records, explicit=isinstance(item, (One, Many))
             )
+            if target is None:
+                jobs.append(
+                    self._insert(run, plan, text, label, skip=schema is not None)
+                )
+            else:
+                jobs.append(
+                    self._update(
+                        run, plan, text, target, label, skip=schema is not None
+                    )
+                )
         try:
             outcomes = await gather(*jobs)
         except TrustcallSystemOneError as exc:
@@ -535,19 +610,52 @@ class Extractor:
         except Exception as exc:
             _note_failure(exc, run)
             raise
-        records: list[ResultRecord] = [
+        results: list[ResultRecord] = [
             o.record for o in outcomes if o.record is not None
         ]
+        handled = {o.handled_id for o in outcomes if o.handled_id is not None}
         return ExtractionResult(
-            records=tuple(records),
+            records=tuple(results),
             responses=tuple(
-                r.value for r in records if r.valid and r.value is not None
+                r.value for r in results if r.valid and r.value is not None
             ),
+            skipped=tuple(o.skipped for o in outcomes if o.skipped is not None),
+            untouched=tuple(i for i in records.ids if i not in handled),
             attempts=1 if any(o.extracted for o in outcomes) else 0,
             usage=run.usage,
             cost=self.prices.cost(run.usage),
             calls=tuple(run.calls),
             warnings=tuple(run.warnings),
+        )
+
+    @staticmethod
+    async def _insert(
+        run: Run, plan: SchemaPlan, text: str, label: str, *, skip: bool
+    ) -> _Done:
+        outcome = await insert_one(run, plan, text, label=label, skip_presence=skip)
+        return _Done(outcome.record, None, None, outcome.extracted)
+
+    async def _update(
+        self,
+        run: Run,
+        plan: SchemaPlan,
+        text: str,
+        target: ExistingRecord,
+        label: str,
+        *,
+        skip: bool,
+    ) -> _Done:
+        outcome = await update_one(
+            run,
+            plan,
+            text,
+            target,
+            label=label,
+            enable_updates=self.enable_updates,
+            skip_presence=skip,
+        )
+        return _Done(
+            outcome.record, outcome.skipped, outcome.handled_id, outcome.extracted
         )
 
     @overload
@@ -755,14 +863,16 @@ def create_extractor(
             by ``close``.
         clairic_model: Model id of the extraction model.
         clef_model: Model id of the decision and verification model.
-        gate_model: Model id of the change-gate model (updates, M5).
+        gate_model: Model id of the change-gate model (updates).
         enable_inserts: Allow inserting new records next to existing ones. With no
             ``existing`` records the extractor always inserts.
-        enable_updates: Allow updating existing records (M5).
+        enable_updates: Allow updating existing records.
         enable_deletes: Allow deleting existing records (M8).
         enable_item_removals: Allow removing items from nested lists (M9).
         existing_schema_policy: How ``existing`` records of unknown schemas are
-            treated (M5).
+            treated: ``True`` raises ``ValueError``, ``False`` keeps them as
+            context only (never patched, listed in ``untouched``, with a
+            warning) and ``"ignore"`` drops them.
         presence: Presence-gate thresholds.
         verify: Verification-ladder settings.
         gates: Answer-level thresholds.

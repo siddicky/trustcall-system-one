@@ -108,6 +108,29 @@ def test_mode_selection() -> None:
     assert resolve_offline(False, {}) is True  # no credentials: offline
 
 
+def test_offline_locate_never_guesses_between_occurrences() -> None:
+    offline = importlib.import_module("_offline")
+    source = "Berlin is big. Then we flew to Berlin again. " + "x" * 200
+    wanted = source.rfind("Berlin")
+    window = source[wanted - 30 : wanted + 30]
+    state = f"<input>\n{window}\n</input>"
+    # found by its surrounding text, so it is the second occurrence that is meant
+    span = offline.locate(state, "Berlin", 1, source)
+    assert span is not None and state[span[0] : span[1]] == "Berlin"
+    assert span[0] == state.index("flew to Berlin") + len("flew to ")
+    # a state that holds only the OTHER occurrence must not be answered with it
+    other = "<input>\nBerlin is big.\n</input>"
+    with pytest.raises(offline.ScriptError, match="another occurrence"):
+        offline.locate(other, "Berlin", 1, source)
+    # a state that holds neither is simply a miss
+    assert (
+        offline.locate("<input>\nsomething else\n</input>", "Berlin", 1, source) is None
+    )
+    # a needle that occurs once in the text needs no context
+    once = "We met in Paris. " + "y" * 100
+    assert offline.locate("<input>\nin Paris.\n</input>", "Paris", 0, once) is not None
+
+
 # --------------------------------------------------------------------------- #
 # 01: works today
 # --------------------------------------------------------------------------- #
@@ -191,12 +214,12 @@ def test_02_support_ticket(capsys: pytest.CaptureFixture[str]) -> None:
     assert "requests that mention 'shipping_address': presence" in out
 
 
-@pytest.mark.xfail(raises=NotImplementedError, strict=True, reason="needs M5")
 def test_03_update_contact(capsys: pytest.CaptureFixture[str]) -> None:
     module = load("03_update_contact")
     result = run("03_update_contact", capsys)
     (record,) = result.records
     assert (record.kind, record.json_doc_id) == ("update", "crm-4711")
+    assert record.valid and result.untouched == ()
     assert {(p.op, p.path) for p in record.patches} == {
         ("replace", "/city"),
         ("replace", "/company"),
@@ -204,6 +227,8 @@ def test_03_update_contact(capsys: pytest.CaptureFixture[str]) -> None:
         ("replace", "/phone"),
         ("add", "/notes/-"),
     }
+    # replaces first (in the order of the fields), then the append
+    assert [p.op for p in record.patches] == ["replace"] * 4 + ["add"]
     before = module.EXISTING.model_dump()
     assert record.before == before
     after = record.after
@@ -213,12 +238,31 @@ def test_03_update_contact(capsys: pytest.CaptureFixture[str]) -> None:
     assert after["phone"] == "+49 30 5555 0198"
     assert after["notes"][:2] == before["notes"]  # existing notes kept
     assert after["notes"][2:] == ["asked to be introduced to our logistics team"]
-    # untouched fields are untouched, and each says why no operation was made
+    # untouched fields are untouched, and each says why no operation was made:
+    # the email is never mentioned; "Dana" is a token subset of the identity
     assert (after["name"], after["email"]) == (before["name"], before["email"])
     assert {r.path: r.reason for r in record.rejected} == {
-        "/name": "gate_noul",
-        "/email": "p_null",
+        "/name": "identity_subset",
+        "/email": "not_mentioned",
     }
+    assert {r.path: r.op for r in record.rejected} == {
+        "/name": "replace",
+        "/email": None,
+    }
+
+
+def test_03_update_contact_calls_follow_the_update_pipeline(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = run("03_update_contact", capsys)
+    kinds = [call.kind for call in result.calls]
+    assert kinds[0] == "presence"
+    # the record is read next to the note, and again without it
+    assert sorted(kinds[1:3]) == ["crosscheck", "extract"]
+    # one change-gate request per applied operation, none for the refused name
+    assert kinds.count("gate") == 5 and kinds.count("attribution") == 1
+    assert kinds[-5:] == ["gate"] * 5
+    assert len(kinds) == 9
 
 
 def test_04_repair_has_no_repair_loop_yet(capsys: pytest.CaptureFixture[str]) -> None:
@@ -308,7 +352,9 @@ def test_06_attribution_guard(capsys: pytest.CaptureFixture[str]) -> None:
     }
 
 
-@pytest.mark.xfail(raises=NotImplementedError, strict=True, reason="needs M9")
+# M5 made the update call itself work: the collection of line items is left as the
+# record has it, so the example returns an update with no patch instead of raising.
+@pytest.mark.xfail(raises=AssertionError, strict=True, reason="needs M9")
 def test_07_order_line_items(capsys: pytest.CaptureFixture[str]) -> None:
     module = load("07_order_line_items")
     result = run("07_order_line_items", capsys)

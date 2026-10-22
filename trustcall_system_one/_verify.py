@@ -17,8 +17,8 @@ Clef-engine answers are not verified further; they are decisions already.
 import dataclasses
 import enum
 import re
-from collections.abc import Mapping
-from dataclasses import dataclass, field
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Any
@@ -33,7 +33,7 @@ from trustcall_system_one._chunk import (
     settled,
     split_ranges,
 )
-from trustcall_system_one._coerce import coerce, coerce_union
+from trustcall_system_one._coerce import Coerced, coerce, coerce_union
 from trustcall_system_one._compile import (
     FieldSpec,
     Role,
@@ -64,11 +64,13 @@ from trustcall_system_one.transport import CallMeta
 __all__ = [
     "Asked",
     "Ctx",
+    "ExistingBlock",
     "FieldState",
     "Resolved",
     "accept",
     "agree",
     "ask_clairic",
+    "crosscheck",
     "display",
     "resolve",
     "resolve_clef",
@@ -89,6 +91,21 @@ _NOT_STATED = "The input states no value for this."
 # --------------------------------------------------------------------------- #
 
 
+@dataclass(frozen=True)
+class ExistingBlock:
+    """The existing record as it is shown to Clairic (updates).
+
+    Attributes:
+        record_id: The record's id (the ``id`` attribute of the block).
+        schema_name: The schema name (the ``schema`` attribute).
+        text: The record as JSON.
+    """
+
+    record_id: str
+    schema_name: str
+    text: str
+
+
 @dataclass
 class Ctx:
     """What the passes for one entity share.
@@ -103,6 +120,15 @@ class Ctx:
         attribution_hints: Attribution probabilities already measured for a
             field's value (by wire name, with the value shown as text), so the
             ladder does not ask the same question again.
+        existing: The record shown after the input in every Clairic request of
+            this context (updates); ``None`` for an insert and for the
+            input-only passes (see ``input_only``).
+        crosscheck: Whether every Clairic pass is repeated without the record
+            (call kind ``crosscheck``); the answers land in ``crossed``.
+        crossed: The cross-check answers by wire name, with the state to map
+            their spans with.
+        echoes: Notes by wire name about chunked answers that were thrown away
+            because their span lay in the existing record.
     """
 
     run: Run
@@ -112,6 +138,21 @@ class Ctx:
     key: str = "e0"
     mentions: tuple[str, ...] = ()
     attribution_hints: dict[str, tuple[str, float]] = field(default_factory=dict)
+    existing: ExistingBlock | None = None
+    crosscheck: bool = False
+    crossed: dict[str, tuple[ClairicAnswer | None, RenderedState | None]] = field(
+        default_factory=dict
+    )
+    echoes: dict[str, list[str]] = field(default_factory=dict)
+
+    def input_only(self) -> "Ctx":
+        """The same context without the record: every request is about the input.
+
+        The verification ladder of an update runs on this, so that a re-ask can
+        never read the value back from the record it is checking. The
+        attribution hints are shared with the original.
+        """
+        return dataclasses.replace(self, existing=None, crosscheck=False)
 
     def meta(self, kind: CallKind, *, field: str | None = None) -> CallMeta:
         """Routing context for a call. The entity is its key, not its label."""
@@ -200,10 +241,14 @@ class Ctx:
             windows = mention_windows(
                 len(self.text), spans, self.run.verify.window_chars
             )
+        existing = self.existing
         return render_clairic(
             self.text,
             label=self.label,
             mentions=self.mentions,
+            existing=existing.text if existing is not None else None,
+            existing_id=existing.record_id if existing is not None else None,
+            existing_schema=existing.schema_name if existing is not None else None,
             windows=windows or None,
         )
 
@@ -288,7 +333,10 @@ async def ask_clairic(
     ranges = windows or [(0, len(ctx.text))]
     overlap = run.verify.window_chars
     covered = sum(end - start for start, end in ranges)
-    size = chunk_size(_chars_read(rendered, response, anchored), covered, overlap)
+    reserved = len(ctx.existing.text) if ctx.existing is not None else 0
+    size = chunk_size(
+        _room(_chars_read(rendered, response, anchored), reserved), covered, overlap
+    )
     responses: list[tuple[Span, ClairicResponse, RenderedState | None]] = []
     attempts = 0
     still_truncated = True
@@ -303,7 +351,7 @@ async def ask_clairic(
             still_truncated = False
             break
         read = [
-            _chars_read(ctx.rendered(windows=[chunk]), resp, anch)
+            _room(_chars_read(ctx.rendered(windows=[chunk]), resp, anch), reserved)
             for chunk, resp, anch in truncated
         ]
         smaller = min(
@@ -330,6 +378,10 @@ async def ask_clairic(
         run.warn(f"clairic_truncated: {message}")
     if not responses:  # could not split: use what the full request returned
         return {name: (response.answers.get(name), anchored) for name in fields}
+    responses = [
+        (chunk, _without_echoes(ctx, resp, anch), anch)
+        for chunk, resp, anch in responses
+    ]
     identity = identity_state(ctx.text)
     names = list(fields)
     outcomes = {
@@ -488,6 +540,66 @@ async def _settle_all(
     return result
 
 
+def _room(read: int | None, reserved: int) -> int | None:
+    """How many input characters fit a request once the record's room is taken.
+
+    The record follows the input whole in every request, so it is part of what
+    Clairic has to read: the characters it was seen to read cover the input
+    *and* (when the state was cut inside the input) none of the record.
+    """
+    return None if read is None else max(0, read - reserved)
+
+
+def _without_echoes(
+    ctx: Ctx, response: ClairicResponse, anchored: RenderedState | None
+) -> ClairicResponse:
+    """Null the answers of a chunk whose span lies in the existing record.
+
+    The chunks are merged in original-input offsets, where the record is not
+    visible any more, so an echo has to be caught here. The answer becomes a
+    confident null and ``ctx.echoes`` remembers why, so a field that ends up
+    null is reported as ``echo_span`` and not as unstated.
+    """
+    if anchored is None or anchored.existing_span is None:
+        return response
+    answers = dict(response.answers)
+    changed = False
+    for name, answer in response.answers.items():
+        spans: list[list[int]] = []
+        if answer.span is not None and len(answer.span) == 2:
+            spans.append(answer.span)
+        if answer.spans is not None:
+            spans.extend(pair for pair in answer.spans if len(pair) == 2)
+        echoed = [pair for pair in spans if anchored.in_existing((pair[0], pair[1]))]
+        if not echoed:
+            continue
+        if isinstance(answer.value, list) and answer.spans is not None:
+            keep = [
+                i
+                for i, pair in enumerate(answer.spans)
+                if not (len(pair) == 2 and anchored.in_existing((pair[0], pair[1])))
+            ]
+            if keep and len(answer.spans) == len(answer.value):
+                answers[name] = answer.model_copy(
+                    update={
+                        "value": [answer.value[i] for i in keep],
+                        "spans": [answer.spans[i] for i in keep],
+                    }
+                )
+                ctx.echoes.setdefault(name, []).append(
+                    f"{len(answer.value) - len(keep)} element(s) were read from "
+                    "the existing record"
+                )
+                changed = True
+                continue
+        answers[name] = answer.model_copy(
+            update={"value": None, "span": None, "spans": None, "p_null": 0.99}
+        )
+        ctx.echoes.setdefault(name, []).append("the span lies in the existing record")
+        changed = True
+    return response.model_copy(update={"answers": answers}) if changed else response
+
+
 def _chars_read(
     sent: RenderedState, response: ClairicResponse, anchored: RenderedState | None
 ) -> int | None:
@@ -573,6 +685,9 @@ class FieldState:
         dropped: List elements thrown away by the attribution check, as
             ``(position in the model's answer list, reason, detail, p)``.
         notes: Short notes for ``FieldAnswer.warnings``.
+        cross: The input-only cross-check answer (updates), resolved the same way.
+        crosscheck_agree: Whether the cross-check agreed (``None`` when none
+            ran for this field).
     """
 
     spec: FieldSpec
@@ -585,6 +700,8 @@ class FieldState:
     reask: bool = False
     dropped: list[tuple[int, str, str, float | None]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    cross: Resolved | None = None
+    crosscheck_agree: bool | None = None
 
     @property
     def value(self) -> Any:
@@ -677,6 +794,20 @@ async def resolve(
     else:
         coerced = coerce(spec, answer, gates)
     notes: list[str] = []
+    echo_lost: list[tuple[int, str, str]] = []
+    if coerced.ok and rendered is not None and rendered.existing_span is not None:
+        coerced, echo_lost, everything = _drop_echoes(rendered, coerced)
+        if everything:
+            return Resolved(
+                ok=False,
+                reason="echo_span",
+                detail="the answer's span lies in the existing record, not the input",
+                raw=raw,
+                p_null=coerced.p_null,
+                confidence=coerced.confidence,
+                guess=coerced.guess,
+                lost=tuple(echo_lost),
+            )
     span = _map_span(rendered, coerced.span, notes)
     spans: tuple[Span, ...] | None = None
     if coerced.spans is not None:
@@ -699,6 +830,7 @@ async def resolve(
     value = coerced.value
     origin = coerced.kept
     lost = [(index, "unparseable", message) for index, message in coerced.failed]
+    lost.extend(echo_lost)
     if spec.item_kind == "choice" and isinstance(value, list) and value:
         before = origin if origin is not None else tuple(range(len(value)))
         value, spans, element_notes, positions, drops = await _choose_elements(
@@ -719,6 +851,47 @@ async def resolve(
         origin=origin,
         lost=tuple(lost),
     )
+
+
+def _drop_echoes(
+    rendered: RenderedState, coerced: Coerced
+) -> tuple[Coerced, list[tuple[int, str, str]], bool]:
+    """Throw away what was read from the existing record.
+
+    A scalar whose span lies in the ``<existing>`` block is an echo. For a list
+    each element is judged by its own span; the ones that echo are dropped and
+    reported as ``(position in the model's answer list, "echo_span", detail)``.
+
+    Returns:
+        The answer without the echoed elements, the dropped elements and whether
+        nothing is left of the answer.
+    """
+    value = coerced.value
+    if isinstance(value, list):
+        spans = coerced.spans
+        if spans is None or len(spans) != len(value):
+            return coerced, [], False
+        keep = [i for i, pair in enumerate(spans) if not rendered.in_existing(pair)]
+        if len(keep) == len(value):
+            return coerced, [], False
+        before = coerced.kept if coerced.kept is not None else tuple(range(len(value)))
+        lost = [
+            (before[i], "echo_span", f"{value[i]!r} was read from the existing record")
+            for i in range(len(value))
+            if i not in keep
+        ]
+        if not keep:
+            return coerced, lost, True
+        kept = replace(
+            coerced,
+            value=[value[i] for i in keep],
+            spans=tuple(spans[i] for i in keep),
+            kept=tuple(before[i] for i in keep),
+        )
+        return kept, lost, False
+    if coerced.span is not None and rendered.in_existing(coerced.span):
+        return coerced, [], True
+    return coerced, [], False
 
 
 async def _choose_elements(
@@ -1331,6 +1504,129 @@ async def _recheck_elements(
         else:
             _drop(st, index, value, p, missing=p is None)
     st.attribution_p = tuple(probabilities)
+
+
+# --------------------------------------------------------------------------- #
+# Input-only cross-check (updates)
+# --------------------------------------------------------------------------- #
+
+
+def _cross_value(st: FieldState) -> Any:
+    """What the input-only pass gave for a field (``None`` if nothing usable)."""
+    if st.cross is None:
+        return None
+    checked = _effective(st.spec, st.cross)
+    return None if checked is None else checked.value
+
+
+def _cross_list(st: FieldState, new: list[int] | None) -> None:
+    """Check the new elements of a list against the input-only pass.
+
+    A new element stands only if the cross-check list has an agreeing element;
+    the others are dropped as ``echo_crosscheck``. A list has no "two different
+    values" case: an element the second pass did not give is simply unsupported.
+    """
+    elements = list(st.resolved.value)
+    spans = list(st.resolved.spans) if st.resolved.spans else None
+    found = _cross_value(st)
+    others = list(found) if isinstance(found, list) else []
+    fuzzy = _fuzzy(st.spec)
+    wanted = range(len(elements)) if new is None else new
+    unsupported = [
+        index
+        for index in wanted
+        if not any(agree(elements[index], other, fuzzy=fuzzy) for other in others)
+    ]
+    st.crosscheck_agree = not unsupported
+    if not unsupported:
+        return
+    for index in unsupported:
+        st.dropped.append(
+            (_origin(st, index), "echo_crosscheck", display(elements[index]), None)
+        )
+    survivors = [i for i in range(len(elements)) if i not in unsupported]
+    if not survivors:
+        st.set_reject(
+            "echo_crosscheck",
+            "the input alone gives none of these elements",
+            None,
+        )
+        return
+    st.resolved = replace(
+        st.resolved,
+        value=[elements[i] for i in survivors],
+        spans=tuple(spans[i] for i in survivors) if spans else None,
+        origin=tuple(_origin(st, i) for i in survivors),
+    )
+    st.notes.append(
+        f"dropped {len(unsupported)} element(s): not given by the input alone"
+    )
+
+
+async def _cross_scalar(ctx: Ctx, st: FieldState) -> None:
+    spec = st.spec
+    found = _cross_value(st)
+    if found is None:
+        st.crosscheck_agree = False
+        st.set_reject(
+            "echo_crosscheck",
+            "the input alone does not give this value (the second pass, "
+            "without the existing record, found none)",
+            None,
+        )
+        return
+    if agree(st.resolved.value, found, fuzzy=_fuzzy(spec)):
+        st.crosscheck_agree = True
+        return
+    st.crosscheck_agree = False
+    verdict, p = await _adjudicate(ctx, st, st.resolved.value, found)
+    if verdict == "a":
+        return
+    if verdict == "b" and st.cross is not None:
+        st.notes.append("adjudicated_to_crosscheck")
+        _adopt(st, st.cross)
+        return
+    st.set_reject(
+        "crosscheck_disagree",
+        "the pass with the record and the input-only pass gave different values "
+        "and the adjudication was not decisive",
+        p,
+    )
+
+
+async def crosscheck(
+    ctx: Ctx,
+    states: Sequence[FieldState],
+    new_elements: Mapping[str, list[int]] | None = None,
+) -> None:
+    """Check each candidate change against the input-only pass.
+
+    ``FieldState.cross`` holds the answer of the second Clairic pass over the
+    same field, made without the existing record. For a scalar: the cross-check
+    agreeing (normalised equality, text similarity only for free text, as in
+    ``agree``) lets the value proceed; a null cross-check while the primary
+    answer is not null rejects it as ``echo_crosscheck`` (it came from the
+    record); two different values go to a Clef ``choice`` ``{a: primary,
+    b: cross-check, neither}``: ``a`` keeps the primary value, ``b`` takes the
+    cross-check's, anything else (or a probability below
+    ``verify.adjudicate_min``) rejects it as ``crosscheck_disagree``. For a list
+    each new element needs an agreeing element in the cross-check.
+
+    Args:
+        ctx: The entity context.
+        states: The fields that would change the record.
+        new_elements: For list fields (by wire name), the positions of the
+            elements that are new relative to the record; all of them if absent.
+    """
+    lookup = new_elements or {}
+
+    async def one(st: FieldState) -> None:
+        if _is_list(st):
+            _cross_list(st, lookup.get(st.spec.wire_name))
+        else:
+            await _cross_scalar(ctx, st)
+
+    await gather(*(one(st) for st in states if st.has_value()))
 
 
 # --------------------------------------------------------------------------- #

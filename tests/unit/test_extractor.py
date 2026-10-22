@@ -27,6 +27,7 @@ from trustcall_system_one import (
     AuthError,
     ExtractionResult,
     ExtractionValidationError,
+    Extractor,
     Many,
     One,
     Prices,
@@ -1163,14 +1164,15 @@ async def test_default_transport_is_created_lazily_and_needs_credentials_only_th
 # --------------------------------------------------------------------------- #
 
 
-async def test_existing_is_not_supported_before_m5() -> None:
-    extractor = make_extractor([Person], person_script())
-    with pytest.raises(NotImplementedError, match="M5"):
-        await extractor.ainvoke(PERSON_TEXT, existing={"Person": {"name": "Ada"}})
-    with pytest.raises(NotImplementedError, match="M5"):
-        await extractor.ainvoke({"text": PERSON_TEXT, "existing": []})
-    with pytest.raises(NotImplementedError, match="M5"):
-        extractor.invoke(PERSON_TEXT, existing=[])
+async def test_an_empty_existing_is_the_same_as_none() -> None:
+    empties: list[Any] = [[], {}, None]
+    for existing in empties:
+        script = person_script()
+        result = await make_extractor([Person], script).ainvoke(
+            PERSON_TEXT, existing=existing
+        )
+        (record,) = result.records
+        assert record.kind == "insert" and result.untouched == ()
 
 
 async def test_many_is_not_supported_before_m7_and_fails_at_invoke_not_creation() -> (
@@ -1828,17 +1830,30 @@ def test_close_from_the_bridge_thread_closes_the_owned_transport_on_the_loop(
     extractor.close()
 
 
-def test_the_loop_thread_lets_cancelled_tasks_finish_before_it_closes() -> None:
+def _close_during_a_call() -> tuple[bool, bool]:
+    """Close an extractor while a transport call is running.
+
+    Returns:
+        Whether the call's cleanup ran to the end, and whether it was
+        interrupted by a second cancellation.
+    """
+    entered = threading.Event()
     finished = threading.Event()
+    interrupted = threading.Event()
 
     class Slow:
         async def run(
             self, model: str, payload: Any, *, meta: Any, timeout: float | None = None
         ) -> TransportResponse:
+            entered.set()
             try:
                 await asyncio.sleep(60)
             finally:
-                await asyncio.sleep(0.05)  # cleanup that needs the loop to run
+                try:
+                    await asyncio.sleep(0.05)  # cleanup that needs the loop to run
+                except asyncio.CancelledError:
+                    interrupted.set()
+                    raise
                 finished.set()
             raise AssertionError("unreachable")
 
@@ -1847,13 +1862,95 @@ def test_the_loop_thread_lets_cancelled_tasks_finish_before_it_closes() -> None:
         target=lambda: _swallow(extractor.invoke, PERSON_TEXT), daemon=True
     )
     thread.start()
-    for _ in range(100):
-        if extractor.core._loop is not None and extractor.core._pending:
-            break
-        threading.Event().wait(0.02)
+    # Wait until the transport call is running. ``core._pending`` alone is not
+    # enough: it is filled as soon as the coroutine is submitted, possibly before
+    # the loop thread has started it, and a task cancelled before its first step
+    # never runs its ``finally`` (so ``finished`` would never be set).
+    assert entered.wait(5)
     extractor.close()
     thread.join(5)
-    assert finished.wait(5)
+    return finished.wait(5), interrupted.is_set()
+
+
+def test_the_loop_thread_lets_cancelled_tasks_finish_before_it_closes() -> None:
+    """The bridge's shutdown must not cancel a call a second time.
+
+    ``close()`` cancels the in-flight call (the first cancel); if the loop's
+    shutdown sweep then cancels every task again, the second cancel can land
+    while the call is in its ``finally`` and interrupts the cleanup. Whether it
+    does depends on how the two callbacks fall into loop iterations, so the
+    close is repeated.
+    """
+    for _ in range(30):
+        finished, interrupted = _close_during_a_call()
+        assert finished and not interrupted
+
+
+def test_a_call_that_ignores_cancellation_is_cancelled_again_after_the_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("trustcall_system_one._extractor._CANCEL_GRACE", 0.05)
+    entered = threading.Event()
+    cancels: list[int] = []
+
+    class Stubborn:
+        async def run(
+            self, model: str, payload: Any, *, meta: Any, timeout: float | None = None
+        ) -> TransportResponse:
+            entered.set()
+            while True:
+                try:
+                    await asyncio.sleep(60)
+                except asyncio.CancelledError:
+                    cancels.append(1)
+                    if len(cancels) >= 2:
+                        raise
+
+    extractor = create_extractor([Person], transport=Stubborn())
+    thread = threading.Thread(
+        target=lambda: _swallow(extractor.invoke, PERSON_TEXT), daemon=True
+    )
+    thread.start()
+    assert entered.wait(5)
+    extractor.close()
+    thread.join(5)
+    assert not thread.is_alive()
+    assert len(cancels) == 2  # once by close(), once by the sweep after the grace
+
+
+def test_a_call_cancelled_before_it_starts_leaves_nothing_behind() -> None:
+    """The library side of the race above: closing right after submitting."""
+
+    class Never:
+        async def run(
+            self, model: str, payload: Any, *, meta: Any, timeout: float | None = None
+        ) -> TransportResponse:
+            await asyncio.sleep(60)
+            raise AssertionError("unreachable")
+
+    for _ in range(25):
+        extractor = create_extractor([Person], transport=Never())
+        errors: list[BaseException] = []
+
+        def call(extractor: Extractor = extractor, sink: Any = errors) -> None:
+            try:
+                extractor.invoke(PERSON_TEXT)
+            except BaseException as exc:
+                sink.append(exc)
+
+        thread = threading.Thread(target=call, daemon=True)
+        thread.start()
+        for _ in range(500):
+            if extractor.core._pending:
+                break
+            threading.Event().wait(0.001)
+        extractor.close()  # may land before the loop ran the first step
+        thread.join(5)
+        assert not thread.is_alive()
+        assert not extractor.core._pending
+        assert extractor.core._loop is None
+        assert len(errors) == 1
+        assert isinstance(errors[0], TrustcallSystemOneError)
 
 
 # --------------------------------------------------------------------------- #

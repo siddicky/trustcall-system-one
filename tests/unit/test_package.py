@@ -54,3 +54,14 @@ def test_bad_request_error_defaults_cf_errors_to_empty_list() -> None:
 
 def test_model_response_error_exposes_raw() -> None:
     assert ModelResponseError("x", raw={"a": 1}).raw == {"a": 1}
+
+
+def test_schema_instance_is_a_named_tuple_export() -> None:
+    package = importlib.import_module("trustcall_system_one")
+    instance = package.SchemaInstance("rid", "Person", {"name": "Ada"})
+    assert instance == ("rid", "Person", {"name": "Ada"})
+    assert (instance.record_id, instance.schema_name, instance.record) == (
+        "rid",
+        "Person",
+        {"name": "Ada"},
+    )

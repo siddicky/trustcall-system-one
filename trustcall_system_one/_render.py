@@ -7,7 +7,7 @@ engine can tell where the user's text is::
     <input>
     ...the user's text, verbatim...
     </input>
-    <existing>...</existing>        (updates only)
+    <existing id="..." schema="...">...</existing>        (updates only)
 
 Clairic answers text fields with spans (offsets into the state it was sent).
 ``RenderedState`` remembers where the input sits so a span can be mapped back to
@@ -145,6 +145,8 @@ def render_clairic(
     label: str,
     mentions: Sequence[str] = (),
     existing: str | None = None,
+    existing_id: str | None = None,
+    existing_schema: str | None = None,
     windows: Sequence[Span] | None = None,
 ) -> RenderedState:
     """Lay out the Clairic state for one entity.
@@ -153,7 +155,11 @@ def render_clairic(
         text: The user's input, verbatim.
         label: What to call the entity (``"the Person"``).
         mentions: How the input refers to the entity, when known.
-        existing: The entity's existing record, rendered as text (updates).
+        existing: The entity's existing record, rendered as text (updates). It
+            always follows the input block whole: only the input is ever cut.
+        existing_id: The record's id, written as the ``id`` attribute of the
+            ``<existing>`` tag.
+        existing_schema: The record's schema name (the ``schema`` attribute).
         windows: Ranges of ``text`` to keep instead of all of it; they must be
             disjoint and in increasing order (see ``mention_windows``).
 
@@ -164,6 +170,11 @@ def render_clairic(
     if mentions:
         quoted = ", ".join(f'"{_attribute(m)}"' for m in mentions)
         focus.append(f"The input mentions it as: {quoted}.")
+    if existing is not None:
+        focus.append(
+            "The existing record after the input is context only: answer from "
+            "the input text, never from the existing record."
+        )
     focus.append("</focus>\n")
     head = "\n".join(focus)
 
@@ -193,7 +204,12 @@ def render_clairic(
     out += _INPUT_CLOSE
     existing_span: Span | None = None
     if existing is not None:
-        out += "\n<existing>\n"
+        attrs = ""
+        if existing_id is not None:
+            attrs += f' id="{_attribute(existing_id)}"'
+        if existing_schema is not None:
+            attrs += f' schema="{_attribute(existing_schema)}"'
+        out += f"\n<existing{attrs}>\n"
         existing_span = (len(out), len(out) + len(existing))
         out += existing + "\n</existing>"
     return RenderedState(

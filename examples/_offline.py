@@ -168,6 +168,16 @@ def locate(
                     f"{needle!r} (occurrence {occurrence}) is not in the text"
                 )
         for margin in (24, 12, 6, 0):
+            if margin == 0 and source.count(needle) != 1:
+                # Without surrounding text a match in the state could be another
+                # occurrence than the one meant: only a needle that occurs once
+                # in the text may be found without context.
+                if state.find(needle, start, end) >= 0:
+                    raise ScriptError(
+                        f"{needle!r} (occurrence {occurrence}) is not in the "
+                        "narrowed state, which holds another occurrence of it"
+                    )
+                return None
             lo, hi = max(0, at - margin), min(len(source), at + len(needle) + margin)
             found = state.find(source[lo:hi], start, end)
             if found >= 0:

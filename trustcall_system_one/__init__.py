@@ -46,6 +46,7 @@ from trustcall_system_one._types import (
     PatchOp,
     RejectedOp,
     ResultRecord,
+    SchemaInstance,
     SkippedEntity,
     Usage,
 )
@@ -91,6 +92,7 @@ __all__ = [
     "RateLimitError",
     "RejectedOp",
     "ResultRecord",
+    "SchemaInstance",
     "SchemaPlan",
     "ServerError",
     "SkippedEntity",

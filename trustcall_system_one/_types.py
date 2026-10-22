@@ -3,7 +3,7 @@
 import dataclasses
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 from pydantic import BaseModel
 
@@ -24,6 +24,7 @@ __all__ = [
     "PatchOp",
     "RejectedOp",
     "ResultRecord",
+    "SchemaInstance",
     "SkippedEntity",
     "Usage",
     "json_pointer",
@@ -188,6 +189,25 @@ def json_pointer(path: Path) -> str:
     )
 
 
+class SchemaInstance(NamedTuple):
+    """An existing record with its id and the name of its schema.
+
+    This is the element of the list form of ``existing`` (a plain
+    ``(record_id, schema_name, record)`` tuple is accepted as well).
+
+    Attributes:
+        record_id: The id the caller knows the record by (it comes back as
+            ``ResultRecord.json_doc_id``).
+        schema_name: Name of the schema, or ``"__any__"`` for a record that may
+            belong to any schema of the extractor.
+        record: The record, as a dict or a pydantic model.
+    """
+
+    record_id: str
+    schema_name: str
+    record: "dict[str, Any] | BaseModel"
+
+
 @dataclass(frozen=True)
 class Mention:
     """A piece of the input that refers to an entity.
@@ -322,12 +342,14 @@ class ResultRecord:
     Attributes:
         schema_name: Name of the schema.
         json_doc_id: Id of the existing record (``None`` for inserts).
-        kind: ``"insert"``, ``"update"`` or ``"delete"``.
+        kind: ``"insert"``, ``"update"`` or ``"delete"``. An update that applies
+            no operation is still ``"update"``, with empty ``patches`` and
+            ``after == before``.
         value: The validated model, or ``None`` when validation failed.
         before: The record before the change (updates and deletes).
         after: The document after the change; for an invalid insert, the
             candidate document that failed validation.
-        patches: Operations that were applied.
+        patches: Operations that were applied, in the order they were applied.
         rejected: Answers and operations that were thrown away.
         fields: How each asked field got its value, keyed by dotted path.
         entity: What is known about the entity.
@@ -388,7 +410,10 @@ class ExtractionResult:
         records: Every record, in order of first mention (deletes last).
         responses: The validated models of the valid records, in order.
         skipped: Entities that were found and not used.
-        untouched: Ids of existing records the input did not mention.
+        untouched: Ids of existing records that got neither a record nor a
+            skipped entity: the input did not mention them (presence gate),
+            they belong to a schema that did not run, or they are opaque
+            records kept by ``existing_schema_policy=False``.
         deleted: Ids of existing records that were deleted.
         attempts: Extraction rounds that ran (0 when nothing was extracted).
         usage: Token and request totals by model and by call kind.

@@ -89,6 +89,14 @@ class Script:
             consumed one call at a time).
         null_check: Probability by question id for ``null_check`` calls.
         adjudicate: Choice answers by field wire name for ``adjudicate`` calls.
+        cross: Clairic answers by wire name for ``crosscheck`` calls (updates); a
+            field that is not here is answered as in ``clairic``, which is what
+            an input-only reading of the same text gives.
+        gate: Change-gate probability by the proposed change's JSON Pointer path
+            (a list is consumed one call at a time); ``gate_default`` answers
+            the rest.
+        dedup: ``list_dedup`` probability by the new element's text;
+            ``dedup_default`` answers the rest.
         truncated: Number of ``extract`` calls to flag as truncated.
         state_text: Rewrites the state Clairic says it read.
         limit: ``limit(state, n)`` gives how many characters of a state Clairic
@@ -107,6 +115,11 @@ class Script:
     )
     null_check: dict[str, float] = field(default_factory=dict)
     adjudicate: dict[str, dict[str, Any]] = field(default_factory=dict)
+    cross: dict[str, dict[str, Any]] = field(default_factory=dict)
+    gate: dict[str, float | list[float]] = field(default_factory=dict)
+    gate_default: float = 0.95
+    dedup: dict[str, float] = field(default_factory=dict)
+    dedup_default: float = 0.05
     truncated: int = 0
     state_text: Callable[[str], str] | None = None
     limit: Callable[[str, int], int | None] | None = None
@@ -124,6 +137,9 @@ class Script:
                 reask=self._reask,
                 null_check=self._null_check,
                 adjudicate=self._adjudicate,
+                crosscheck=self._crosscheck,
+                gate=self._gate,
+                list_dedup=self._dedup,
             )
         )
 
@@ -210,6 +226,38 @@ class Script:
             # one id per field when chunk answers disagree, else a bare "adjudicate"
             name = qid.removeprefix("adjudicate.") if "." in qid else meta.field
             answers[qid] = self.adjudicate[name]
+        return clef_response(answers)
+
+    def _crosscheck(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
+        state, cut = self._read(payload["state"])
+        answers = {
+            name: _build(self.cross.get(name, self.clairic[name]), state)
+            for name in payload["fields"]
+        }
+        return clairic_response(answers, truncated=cut, state_text=state)
+
+    def _gate(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
+        path = payload["state"]["proposed_change"]["path"]
+        value = self.gate.get(path, self.gate_default)
+        if isinstance(value, list):
+            p = value[0]
+            if len(value) > 1:
+                value.pop(0)
+        else:
+            p = value
+        return clef_response(
+            {qid: noul(p) for qid in payload["questions"]}, model=payload["model"]
+        )
+
+    def _dedup(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
+        answers = {}
+        for qid, question in payload["questions"].items():
+            text = question["instructions"]
+            p = next(
+                (p for part, p in self.dedup.items() if f'"{part}"' in text),
+                self.dedup_default,
+            )
+            answers[qid] = noul(p)
         return clef_response(answers)
 
     # ---- inspection ----------------------------------------------------- #

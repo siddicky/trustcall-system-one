@@ -333,6 +333,10 @@ class VerifyConfig:
             entity; it may use ``{label}`` and ``{desc}``.
         adjudicate_min: Probability a Clef adjudication needs for one of two
             disagreeing answers to win.
+        input_only_crosscheck: Updates only: ask every Clairic field a second
+            time with the input alone (no existing record) and reject a changed
+            value the input alone does not give (``echo_crosscheck``); two
+            different values go to a Clef adjudication.
         self_consistency_k: Number of state variants to ask; only 1 is
             supported.
     """
@@ -349,11 +353,17 @@ class VerifyConfig:
     window_chars: int = 600
     instruction_template: str = "{label}'s {desc}"
     adjudicate_min: float = 0.6
+    input_only_crosscheck: bool = True
     self_consistency_k: int = 1
 
     def __post_init__(self) -> None:
         """Validate every setting."""
-        for name in ("attribution", "reask_low_confidence", "borderline_null"):
+        for name in (
+            "attribution",
+            "reask_low_confidence",
+            "borderline_null",
+            "input_only_crosscheck",
+        ):
             _check_flag(name, getattr(self, name))
         for name in (
             "attribution_keep",

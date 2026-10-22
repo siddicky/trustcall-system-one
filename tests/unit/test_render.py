@@ -306,3 +306,37 @@ def test_input_chars_counts_every_piece() -> None:
     assert (
         render_clairic("0123456789abcdef", label="x", windows=windows).input_chars == 7
     )
+
+
+def test_the_existing_block_carries_the_record_id_and_schema() -> None:
+    rendered = render_clairic(
+        TEXT,
+        label="the Contact",
+        existing='{"name": "Ada"}',
+        existing_id='crm-"1"',
+        existing_schema="Contact",
+    )
+    assert '\n<existing id="crm-\'1\'" schema="Contact">\n' in rendered.text
+    assert rendered.text.endswith('{"name": "Ada"}\n</existing>')
+    assert rendered.existing_span is not None
+    assert rendered.text[slice(*rendered.existing_span)] == '{"name": "Ada"}'
+    assert rendered.text.index("</input>") < rendered.text.index("<existing")
+
+
+def test_the_focus_tells_the_reader_the_record_is_context_only() -> None:
+    plain = render_clairic(TEXT, label="x")
+    with_record = render_clairic(TEXT, label="x", existing="{}")
+    assert "existing record" not in plain.text
+    focus = with_record.text[: with_record.text.index("<input>")]
+    assert "context only" in focus
+    # the sentinels of the input and existing blocks only appear where they belong
+    assert focus.count("<existing") == 0 and focus.count("<input>") == 0
+
+
+def test_the_record_is_never_cut_when_the_input_is_narrowed() -> None:
+    text = "abcdefghij" * 100
+    rendered = render_clairic(
+        text, label="x", existing='{"k": "v"}', windows=[(10, 60), (500, 540)]
+    )
+    assert rendered.text.endswith('{"k": "v"}\n</existing>')
+    assert rendered.input_chars == 90

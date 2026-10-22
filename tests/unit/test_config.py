@@ -233,3 +233,10 @@ def test_limits_clef_state_token_budget() -> None:
     for bad in (999, 0, True, 5000.5):
         with pytest.raises(ValueError, match="clef_state_token_budget"):
             Limits(clef_state_token_budget=bad)  # type: ignore[arg-type]
+
+
+def test_the_input_only_crosscheck_is_on_by_default_and_must_be_a_bool() -> None:
+    assert VerifyConfig().input_only_crosscheck is True
+    assert VerifyConfig(input_only_crosscheck=False).input_only_crosscheck is False
+    with pytest.raises(ValueError, match="input_only_crosscheck"):
+        VerifyConfig(input_only_crosscheck="yes")  # type: ignore[arg-type]

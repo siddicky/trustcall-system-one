@@ -40,7 +40,7 @@ from trustcall_system_one._wire import (
 )
 from trustcall_system_one.transport import CallMeta, Transport
 
-__all__ = ["CLEF_BATCH", "Answer", "Question", "Run", "both", "gather"]
+__all__ = ["CLEF_BATCH", "Answer", "Question", "Run", "gather"]
 
 CLEF_BATCH = 64
 """Most questions a single Clef request may carry."""
@@ -53,7 +53,32 @@ Question = Union[NoulQuestion, ChoiceQuestion, ScoreQuestion]  # noqa: UP007
 """Any Clef question."""
 
 T = TypeVar("T")
-U = TypeVar("U")
+
+
+def _being_cancelled() -> bool:
+    """Whether the current task has a cancellation request that is not delivered yet.
+
+    Python 3.11+ counts the requests (``Task.cancelling``). 3.10 has no such
+    counter; there ``gather`` does not need one, because it waits with
+    ``asyncio.wait`` and so a ``CancelledError`` raised by that wait is by
+    construction the caller's own cancellation (a child's cancellation only shows
+    up as a finished task).
+    """
+    task = asyncio.current_task()
+    cancelling = getattr(task, "cancelling", None)
+    return cancelling is not None and cancelling() > 0
+
+
+async def _stop(tasks: Sequence["asyncio.Future[Any]"]) -> None:
+    """Cancel whatever is still running and wait until all of it has stopped."""
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _error(task: "asyncio.Future[Any]") -> BaseException | None:
+    """A finished task's own error (``None`` for a result or a cancellation)."""
+    return None if task.cancelled() else task.exception()
 
 
 async def gather(*awaitables: Awaitable[T]) -> list[T]:
@@ -65,27 +90,44 @@ async def gather(*awaitables: Awaitable[T]) -> list[T]:
     raised: a sibling that ends up cancelled (by this very cleanup, or because
     something it awaited was cancelled) never hides it behind a
     ``CancelledError``.
+
+    The caller's own cancellation always wins. A real error is substituted for a
+    cancelled sibling only while the calling task is not being cancelled itself:
+    the wait below is ``asyncio.wait``, which raises ``CancelledError`` in the
+    caller only when the caller was cancelled (so on Python 3.10, which lacks
+    ``Task.cancelling``, that is the signal), and on 3.11+ a cancellation request
+    that has not been delivered yet (``cancelling() > 0``) also stops the
+    substitution.
     """
     tasks = [asyncio.ensure_future(item) for item in awaitables]
+    pending: set[asyncio.Future[Any]] = set(tasks)
+    finished: set[asyncio.Future[Any]] = set()
     try:
-        return list(await asyncio.gather(*tasks))
-    except BaseException as exc:
-        for task in tasks:
-            task.cancel()
-        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
-        if isinstance(exc, asyncio.CancelledError):
-            for outcome in outcomes:  # a sibling's cancellation got here first
-                if isinstance(outcome, BaseException) and not isinstance(
-                    outcome, asyncio.CancelledError
-                ):
-                    raise outcome from None
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            if any(t.cancelled() or t.exception() is not None for t in done):
+                finished = done
+                break
+    except BaseException:  # the caller was cancelled (or interrupted)
+        await _stop(tasks)
         raise
-
-
-async def both(first: Awaitable[T], second: Awaitable[U]) -> tuple[T, U]:
-    """Like ``gather`` for two awaitables of different types."""
-    results: list[Any] = await gather(first, second)
-    return results[0], results[1]
+    if pending:  # a child failed or was cancelled: stop the others
+        await _stop(tasks)
+        failure = next((e for t in tasks if t in finished and (e := _error(t))), None)
+        if failure is None and not _being_cancelled():
+            # a sibling's cancellation got here first: the real error is behind it
+            failure = next((e for t in tasks if (e := _error(t))), None)
+        if failure is not None:
+            raise failure from None
+        raise asyncio.CancelledError
+    failure = next((e for t in tasks if (e := _error(t))), None)
+    if failure is not None:
+        raise failure from None
+    if any(t.cancelled() for t in tasks):
+        raise asyncio.CancelledError
+    return [t.result() for t in tasks]
 
 
 @dataclass(frozen=True)

@@ -393,6 +393,44 @@ async def test_a_group_below_a_dropped_one_goes_with_it() -> None:
     paths = [r.path for r in record.rejected if r.reason == "invalid_optional_group"]
     assert paths == ["/inner"]
     assert record.fields["inner.extra.city"].value is None
+    # the notes of what sits below the dropped group go with it as well: no
+    # grandchild keeps saying "clef" (present) or has no reason
+    for path in ("inner", "inner.extra"):
+        note = record.fields[path]
+        assert note.value is None and note.source == "default", path
+        assert note.rejected_reason == "invalid_optional_group", path
+
+
+async def test_a_union_below_a_dropped_group_goes_with_it() -> None:
+    class Cat(BaseModel):
+        kind: Literal["cat"] = "cat"
+        lives: int
+
+    class Dog(BaseModel):
+        kind: Literal["dog"] = "dog"
+        good: bool
+
+    class Owner(BaseModel):
+        name: str
+        pet: Union[Cat, Dog]
+
+    class Home(BaseModel):
+        title: str
+        owner: Optional[Owner] = None
+
+    script = Script()
+    script.clairic = {
+        "title": ca("text", "Cosy", find="Cosy"),
+        "owner.name": ca("text", None, p_null=0.99),  # required: the group fails
+        "owner.pet.Cat.lives": ca("number", 9, find="9"),
+    }
+    script.clef = {"owner.pet": pick("Cat", ["Cat", "Dog"])}
+    record = only(await run([Home], script, "Cosy, 9"))
+    assert record.valid and record.value == Home(title="Cosy")
+    assert record.fields["owner"].rejected_reason == "invalid_optional_group"
+    choice = record.fields["owner.pet"]
+    assert choice.value is None and choice.source == "default"
+    assert choice.rejected_reason == "invalid_optional_group"
 
 
 class Deep(BaseModel):

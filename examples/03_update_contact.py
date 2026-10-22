@@ -1,8 +1,6 @@
 """Update a CRM record from a short note, as a JSON Patch, without clobbering it.
 
-Needs milestone M5 (the update path); until it lands ``invoke(existing=...)`` raises
-``NotImplementedError`` (``tests/unit/test_examples.py`` expects that and flips when
-M5 does). ``uv run python examples/03_update_contact.py [--offline]``
+``uv run python examples/03_update_contact.py [--offline]``
 
 The idea this library borrows from trustcall: do not ask a model to regenerate a
 record, ask what the new text *says*, and turn the difference into RFC 6902 patch
@@ -10,17 +8,21 @@ operations in code. Silence is never deletion.
 
 What to look at in the output:
 
-* The patch. Exactly four ``replace`` operations (city, company, title, phone) and
+* The patch. Exactly four ``replace`` operations (phone, city, company, title) and
   one ``add /notes/-``: the facts the note actually states. Existing notes stay and
-  the new one is appended.
-* "Not applied". ``email`` is absent from the note: Clairic answers null with a high
-  ``p_null`` and no operation is made (``p_null``). ``name`` is the interesting one:
-  Clairic returns the verbatim span "Dana", a short form, so a naive diff would
-  rename the contact from "Dana Whitfield" to "Dana". The change gate (a Clef yes/no
-  per operation, comparing the proposed change against the record) refuses it
-  (``gate_noul``). A value equal to the record's would be dropped as ``unchanged``.
-* Each applied operation passed two checks: the value is stated about this record
-  (attribution) and the change gate said the input supports the change.
+  the new one is appended (a list has set semantics: only elements the record does
+  not hold are added).
+* "Not applied". ``email`` is absent from the note: Clairic answers null, so there
+  is no operation and the field is reported as ``not_mentioned``. ``name`` is the
+  interesting one: Clairic returns the verbatim span "Dana", a short form, so a
+  naive diff would rename the contact from "Dana Whitfield" to "Dana". The diff
+  never replaces an identity value with a token subset of the existing one
+  (``identity_subset``), before any model is asked about it.
+* Each applied operation passed three checks: the value is stated about this record
+  (attribution), a second Clairic pass over the note alone, without the record,
+  read the same value (the cross-check: it catches a value merely echoed from the
+  record), and the change gate (one Clef yes/no per operation, comparing the
+  proposed change against the record) said the note supports the change.
 
 ``json_doc_id`` is the id you gave the record, so patches can be written back to
 your store. Live mode runs on the real models; offline mode scripts the answers.
@@ -104,8 +106,9 @@ def offline_script() -> OfflineScript:
             ),
         },
     )
-    # The change gate: every proposed operation is checked against the record.
-    script.handlers["gate"] = change_gate(default=0.94, deny={'"Dana"': 0.07})
+    # The change gate: every proposed operation is checked against the record. (The
+    # short name never gets that far: the diff refuses it as an identity subset.)
+    script.handlers["gate"] = change_gate(default=0.94)
     return script
 
 

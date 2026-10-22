@@ -1,6 +1,7 @@
 """Tests for the per-invoke Run: calls, call log, usage and warnings."""
 
 import asyncio
+import contextlib
 from collections.abc import Mapping
 from typing import Any
 
@@ -17,7 +18,7 @@ from trustcall_system_one import (
     VerifyConfig,
 )
 from trustcall_system_one._render import render_clairic
-from trustcall_system_one._run import Run, both, gather
+from trustcall_system_one._run import Run, gather
 from trustcall_system_one._wire import (
     ClairicField,
     NoulAnswer,
@@ -328,13 +329,12 @@ async def test_a_failing_sibling_cancels_the_other_requests() -> None:
     assert cancelled.is_set()
 
 
-async def test_gather_and_both_return_results_in_order() -> None:
+async def test_gather_returns_results_in_order() -> None:
     async def value(x: Any) -> Any:
         await asyncio.sleep(0)
         return x
 
     assert await gather(value(1), value(2)) == [1, 2]
-    assert await both(value("a"), value(3)) == ("a", 3)
     assert await gather() == []
 
 
@@ -386,3 +386,66 @@ async def test_gather_with_a_cancelled_sibling_and_no_error_raises_cancelled() -
     future = asyncio.ensure_future(victim())
     with pytest.raises(asyncio.CancelledError):
         await gather(future, cancel_it(future))
+
+
+async def test_gather_keeps_the_callers_cancellation_over_a_sibling_error() -> None:
+    """The caller is cancelled and a child fails while it is being stopped."""
+    started = asyncio.Event()
+
+    async def fails_when_stopped() -> None:
+        started.set()
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            raise ValueError("cleanup failed") from None
+
+    async def waits() -> None:
+        await asyncio.sleep(10)
+
+    task = asyncio.ensure_future(gather(fails_when_stopped(), waits()))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def _cancelled_child_with_error_behind_it() -> None:
+    """``gather`` of a child that ends cancelled and one that errors when stopped."""
+    shared: asyncio.Future[None] = asyncio.ensure_future(asyncio.sleep(10))
+    release = asyncio.Event()
+
+    async def waits() -> None:
+        await shared  # ends cancelled: the child cancellation
+
+    async def boom() -> None:
+        shared.cancel()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            raise ValueError("the real error") from None
+
+    await gather(waits(), boom())
+
+
+async def test_gather_substitutes_the_real_error_for_a_cancelled_sibling() -> None:
+    with pytest.raises(ValueError, match="the real error"):
+        await _cancelled_child_with_error_behind_it()
+
+
+@pytest.mark.skipif(
+    not hasattr(asyncio.Task, "cancelling"), reason="Task.cancelling needs 3.11"
+)
+async def test_gather_does_not_substitute_while_the_caller_is_being_cancelled() -> None:
+    """A swallowed cancellation leaves ``cancelling() > 0``: gather stays cancelled."""
+
+    async def caller() -> None:
+        # swallowed, not uncancelled: the task is still "being cancelled"
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.sleep(10)
+        await _cancelled_child_with_error_behind_it()
+
+    task = asyncio.ensure_future(caller())
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
