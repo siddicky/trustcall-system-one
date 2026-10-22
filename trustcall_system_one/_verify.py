@@ -1114,6 +1114,10 @@ class FieldState:
         cross: The input-only cross-check answer (updates), resolved the same way.
         crosscheck_agree: Whether the cross-check agreed (``None`` when none
             ran for this field).
+        sentences: Whether the elements are sentences read by Clef (the
+            ``sentences`` list strategy). They come from the input alone, so there
+            is no input-only cross-check to run, and Clairic's list type, which
+            cannot read such a field, is never asked to re-read it.
     """
 
     spec: FieldSpec
@@ -1128,6 +1132,7 @@ class FieldState:
     notes: list[str] = field(default_factory=list)
     cross: Resolved | None = None
     crosscheck_agree: bool | None = None
+    sentences: bool = False
 
     @property
     def value(self) -> Any:
@@ -2008,7 +2013,12 @@ async def _judge(ctx: Ctx, st: FieldState, answers: dict[str, Answer]) -> None:
             keep.append(False)
             pending.append(index)
     st.attribution_p = tuple(probabilities)
-    if pending:
+    if pending and st.sentences:
+        # Clairic's list type cannot re-read a sentence: not stated clearly enough
+        for index in pending:
+            was = probabilities[index]
+            _drop(st, index, elements[index], was, missing=was is None)
+    elif pending:
         await _recheck_elements(ctx, st, elements, spans, pending, keep, probabilities)
     survivors = [i for i, flag in enumerate(keep) if flag]
     if not survivors:
@@ -2304,7 +2314,9 @@ async def crosscheck(
     lookup = new_elements or {}
 
     async def one(st: FieldState) -> None:
-        if _is_list(st):
+        if st.sentences:  # read from the input alone: nothing to check against
+            st.crosscheck_agree = True
+        elif _is_list(st):
             _cross_list(st, lookup.get(st.spec.wire_name))
         else:
             await _cross_scalar(ctx, st)
@@ -2332,6 +2344,7 @@ async def run_ladder(ctx: Ctx, states: list[FieldState]) -> None:
                 _low_confidence(ctx, st)
                 for st in states
                 if st.has_value()
+                and not st.sentences
                 and st.resolved.confidence is not None
                 and st.resolved.confidence < verify.low_confidence
             )

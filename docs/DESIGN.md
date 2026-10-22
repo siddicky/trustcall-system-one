@@ -150,10 +150,11 @@ own), `field` = one per field.
 | `_existing.py` | `existing` coercion (five shapes, policy, `__any__`), key normalisation, target selection |
 | `_entity.py`, `_verify.py` | per-entity passes (insert, update); attribution, cross-check, re-ask, borderline-null |
 | `_nested.py` | nested collections: the guard (`max_depth`/`max_recursion`), an insert's items as the parent's document and answers, an update's item records as operations of the parent |
+| `_sentences.py` | sentence splitter, entity scoping and the Clef pass of the `sentences` list strategy |
 | `_diff.py`, `_gates.py`, `_repair.py` | ops + apply; thresholds + change gate; repair loop |
 | `_run.py`, `_extractor.py` | per-invoke context (usage, call log, semaphores); factory + sync bridge |
 | `testing.py` (public) | `FakeTransport`, `FakeWorld`, `RecordingTransport`, `CassetteTransport` (+ `CassetteMissError`, `request_key`, `trace_to_cassette`) |
-| `evals/` (repo top level, not packaged) | smoke scenarios and invariants (later: the eval dataset, scorer, runner and sweeps) |
+| `evals/` (repo top level, not packaged) | eval dataset, scorer, runner and sweeps (`python -m evals`), smoke scenarios and invariants |
 
 ### Public API
 
@@ -192,7 +193,9 @@ class Extractor:  # frozen; per-invoke state lives in _Run
   (`schema_name`, `label`, `candidates`).
 - **`s1_field(...)`** → `Field(json_schema_extra={"trustcall_system_one": {...}})` with
   `instructions, null_threshold, min_confidence, clairic_type, unit, decimals, integer,
-  identity, skip, clef, criteria`.
+  identity, skip, clef, criteria, list_strategy` (`"list"`, `"sentences"` or `"auto"` for a
+  `list[str]` of free text; unset follows `Limits.list_strategy`, default `"auto"`; see "Open-ended
+  lists").
 - **Result:** `ExtractionResult{records, responses, skipped, untouched, deleted, attempts (the
   extraction round plus the repair rounds),
   usage, cost_usd, calls, warnings}` + a trustcall-compatible `response_metadata` property.
@@ -700,6 +703,50 @@ rejected) is assembled as `[]` on an insert, not as `null` (which fails validati
 should be a valid list"); a nullable one keeps `None` and a defaulted one its default. An update
 makes no operation for it.
 
+**Open-ended lists: the sentences strategy (`_sentences.py`, M10a).** Clairic's `list` type is a span
+picker. For defined items (names, contacts) it is confident (0.9995 live); for an open-ended field
+("things worth remembering") it returns word fragments at confidence 1e-6 to 1e-23, so the answer is
+rejected and no note is ever added (live runs 2: examples 03 and 05). A `list[str]` field of free
+text can therefore be read another way, chosen per field with `s1_field(list_strategy=...)` or for
+every field with `limits.list_strategy`:
+
+| strategy | what happens |
+| --- | --- |
+| `"list"` | Clairic's `list` type only (the behaviour before M10a) |
+| `"sentences"` | Clairic is not asked about the field at all. The input is split into sentences in code; Clef is asked one `noul` per candidate sentence (call kind `sentences`, `CallMeta.field` the wire name): "Is this sentence one of the <field description>, about `entity.label`: "<sentence>"?", with criteria. A sentence at or above `verify.sentence_keep` (0.6) is an element, verbatim, with its span |
+| `"auto"` (default) | Clairic's list first (the request and the cross-check are the same as `"list"`). If its answer holds elements but its confidence is below `limits.list_auto_below` (0.5; a null or empty answer is the model saying there is nothing, not distrust), or the answer is missing, the field is read by sentences instead |
+
+Splitting (`split_sentences`, no dependency): a boundary is `.`, `!` or `?` (with closing quotes and
+brackets) followed by whitespace and a capital, digit, quote or bracket; not after an abbreviation or
+an initial ("Dr.", "Mrs.", "Inc.", "J.", "e.g.", "i.e.", "U.S.", "a.m."), not inside a number or an
+address ("3.5", "$1.5M", "example.com"), not before a lower-case word; a line break always splits, a
+leading bullet or speaker label ("Me: ") is not part of the sentence, and `;` splits clauses. A word
+that is also a common word ("no", "am", "sat") ends a sentence, except in front of a number ("No. 5",
+"Oct. 5"). Offsets are exact: `text[start:end] == sentence`.
+
+Scoping: a `One` (no mentions) asks about every sentence. An entity of a `Many` is asked only about
+the sentences that mention it (a mention span overlapping the sentence, or a mention text as a whole
+word) and the next `limits.sentence_follow` sentences (4: conversational filler sits between a
+name and the facts, "have you heard from Michael Chen? Actually, yes. We had a video call last
+week. He's switched jobs..."). More than `limits.max_sentences` (200) candidates are cut with a
+warning. `Run.call_clef` batches the questions: at most 64 per request, concurrent.
+
+The elements then take the usual path. The ladder runs on them (attribution per element; an element
+in the middle band is dropped, since Clairic's list type cannot re-read it; no low-confidence
+re-ask; no input-only cross-check, the sentences come from the input alone and the field is marked
+`crosscheck_agree=True`); on an update `_diff` keeps only the elements the record lacks, a
+near-duplicate of an existing note goes to the `list_dedup` question and is rejected as `duplicate`
+when it is the same fact, and each remaining `add /notes/-` passes the change gate. Existing notes
+are never touched. `FieldAnswer.warnings` says how the field was read (`list_strategy:sentences`,
+`list_strategy:auto->sentences (the list answer had confidence ...)`, `sentences:k/n`) and
+`FieldAnswer.raw` lists every candidate with its probability. `list_strategy` on a field that is not
+a `list[str]` of free text is a compile-time `ValueError`.
+
+The change is not free: elements are whole sentences, not tidy paraphrases (Clairic is extractive
+and so is this), and an entity's notes depend on the scoping window. `python -m evals run --config
+list|sentences|auto --tag notes` compares the strategies; `limits.sentence_follow` and
+`verify.sentence_keep` are the knobs to sweep.
+
 Clairic requests always send
 `options.return_state_text=true` so span offsets are re-anchored on sentinel markers;
 `truncated: true` → re-ask the same fields on overlapping chunks that cover the whole input (size from the returned `state_text`, overlap ≥ `verify.window_chars`), concurrently, and merge per field: every non-null scalar is kept as a candidate, ranked by confidence; candidates that agree (normalised equality / text ratio ≥ 0.9 / equal numbers) are one value, disagreeing ones go to a Clef `adjudicate` over the distinct candidates (≥ `verify.adjudicate_min`; one request for all conflicting fields, and a decisive `neither` makes the field null), then to attribution in confidence order (one request, first to pass wins; its probability is handed to the ladder so it is not asked twice), then the most confident stands for the ladder to judge; dates, times, durations, numbers and digit-heavy strings agree only when equal after normalisation, never on text similarity; lists are united in input order and an overlapping span replaces a kept element only if it contains exactly that one (confidence breaks ties for equal spans); an all-null merge reports the lowest `p_null` so the borderline-null check still fires; a chunk that is still truncated is split smaller once, then warn/raise `StateTruncatedError`. Any part of the input that is not sent always produces a warning.
@@ -1102,10 +1149,39 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
   question), so `test_recorded.py` answers those from the model's recorded answer to the same
   question ids about the same entity (the one deliberate loosening, in the test, never in
   `CassetteTransport`) and asserts the live outcomes: four `replace` operations and no note for
-  03, Tom's Lisbon kept at
+  03 (with `limits.list_strategy="list"`, as that commit had no other), Tom's Lisbon kept at
   attribution 0.7736 for 06. Example 05 was not converted into a test: since 05207aa discovery
   realigns Clairic's list values and spans (M9), which changes the mentions (9 instead of 7) and
   with them the key of every later request (12 of 36 requests hit); `make record` replaces it.
+- Evals (`evals/`, `make evals`, `uv run python -m evals ...`): a dataset of 24 small cases
+  (`evals/cases.py`), each with the input, schemas, existing records, expected operations (`Op`:
+  kind, path, value or a text it must contain, the record), expected final values (`Val`) and
+  `must_not` checks (`MustNot`: an operation, a final value, an insert, a delete), plus a
+  `FakeWorld` that answers it offline like an ideal model (with the odd injected fault: a fact
+  offered for the wrong person, an open-ended list Clairic is unsure of). The runner scores each
+  case: op precision and recall (one-to-one matching of produced and expected operations), field
+  value accuracy, `must_not` violations by kind (bleed, wrong deletes, wrong inserts), valid-record
+  rate, requests, input tokens and wall time, and writes `results.json` and `summary.md`.
+  `python -m evals run [--cases a,b] [--tag notes] [--config default|list|sentences|auto|
+  no_verify|strict|lenient] [--set group.field=value] [--live] [--record DIR] [--replay DIR]
+  [--out DIR]`; `python -m evals sweep --param group.field=v1,v2,... [--param ...]` runs the grid
+  and tabulates one row per point; `python -m evals list` names the cases. Default is offline
+  (each case answered by its world; a regression test of the library and the harness at once,
+  `tests/unit/test_evals_harness.py`: 24/24 pass, and the strategies `list`, `sentences` and `auto`
+  can be compared on the notes cases). `--live` needs the Cloudflare credentials in the
+  environment. `--record DIR` writes `<case>.jsonl` cassettes; `--replay DIR` answers from them
+  and, with `--live`, sends only the requests that are not recorded (`CassetteTransport(strict=
+  False, inner=live)`), so a sweep over thresholds replays the first-pass requests. Which knobs
+  change requests is tabulated in `evals/configs.py`: `REQUEST_LIGHT` (act on answers already
+  received: `verify.attribution_keep/drop`, `verify.low_confidence`, `verify.sentence_keep`,
+  `gates.add/replace/remove_threshold`, `gates.min_*`, `limits.list_auto_below`, `match.accept`,
+  ...; only follow-up requests that depend on the decision are new) and `REQUEST_CHANGING`
+  (`limits.list_strategy`, `limits.sentence_follow`, `gates.*_null_threshold` (sent as Clairic
+  `null_threshold`), `verify.instruction_template`, `verify.window_chars`,
+  `verify.input_only_crosscheck`, `passes.split`, the presence and discovery thresholds, `repair.*`:
+  every point needs its requests live). The sweep prints a note for each request-changing knob and
+  the number of requests it had to send live per point. `docs/LIVE_RUNBOOK.md` has the commands
+  of a live run.
 
 ## Request and latency profile (information, not a constraint)
 
@@ -1234,6 +1310,12 @@ fields never clobbered", type table, cardinality rules, verification knobs, requ
 6. Clef option-id pattern isn't explicitly published — reuse the question-id pattern; the
    live smoke test checks it.
 7. trustcall is MIT, this repo is Unlicense — reimplement by behaviour and credit.
+8. Clairic's `list` type cannot read open-ended fields (confidence 1e-6 to 1e-23 live). Mitigated
+   by the sentences strategy (see "Open-ended lists"); the live evals decide whether `"auto"` is
+   the right default and what `sentence_follow` and `sentence_keep` should be.
+9. Cassettes are snapshots of request bodies: any change to the wording of a question, the
+   rendering of a state or a threshold that is sent to a model (`null_threshold`) changes the key.
+   A replay that misses names the call; record again rather than loosening the match.
 
 ## Verification
 
@@ -1243,7 +1325,9 @@ fields never clobbered", type table, cardinality rules, verification knobs, requ
 2. The README Emma/Michael/Sarah/Olivia scenario passes on `FakeWorld`, including bleed,
    coreference, collision and zero-entity cases.
 3. If `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN` are available in the session, run
-   `make smoke` against the live API and record cassettes; if not, report that live
-   verification was not possible and leave `make smoke` as the documented check.
+   `make smoke` against the live API and record cassettes (`make record`); if not, report that live
+   verification was not possible and leave `make smoke` as the documented check. The commands of a
+   live session (smoke, record, evals baseline, threshold and strategy sweeps, and which numbers to
+   report) are in `docs/LIVE_RUNBOOK.md`.
 4. A Haiku subagent pushes and opens the draft PR; the main session watches CI and sends
    fixes to Haiku or Sonnet subagents (per the execution table) until it is green.

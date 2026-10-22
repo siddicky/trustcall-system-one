@@ -34,6 +34,7 @@ from evals.scenarios import CONTACT_EXISTING, CONTACT_NOTE, PASSAGE, Colleague
 from evals.smoke import SCENARIOS, Scenario
 from trustcall_system_one import (
     CallMeta,
+    Limits,
     Many,
     One,
     TransportResponse,
@@ -131,7 +132,10 @@ def replay(
     path = RECORDED / f"legacy_05207aa_{name}.jsonl"
     inner = RewordedAttribution(path)
     cassette = CassetteTransport(path, strict=False, inner=inner)
-    extractor = create_extractor(schemas, transport=cassette, **kwargs)
+    # the library of that commit had no sentence reading: Clairic's list only
+    extractor = create_extractor(
+        schemas, transport=cassette, limits=Limits(list_strategy="list"), **kwargs
+    )
     return extractor, cassette, inner
 
 

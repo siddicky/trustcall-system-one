@@ -124,6 +124,7 @@ _S1_KEYS = frozenset(
         "skip",
         "clef",
         "criteria",
+        "list_strategy",
     }
 )
 _IDENTITY_NAMES = (
@@ -263,6 +264,7 @@ def s1_field(
     skip: bool = False,
     clef: str | None = None,
     criteria: Mapping[str, Any] | list[Any] | None = None,
+    list_strategy: str | None = None,
 ) -> dict[str, Any]:
     """Build ``json_schema_extra`` carrying per-field extraction options.
 
@@ -285,6 +287,13 @@ def s1_field(
         criteria: Clef criteria: ``{"true": ..., "false": ...}`` for noul, an
             option-to-description mapping for choice, or an ordered list of
             level descriptions for score.
+        list_strategy: For a ``list[str]`` field of free text: ``"list"`` (ask
+            Clairic's ``list`` type, good for defined items such as names),
+            ``"sentences"`` (split the input into sentences in code and ask Clef
+            one yes/no question per candidate sentence, good for open-ended items
+            such as "things worth remembering") or ``"auto"`` (ask Clairic first,
+            use sentences when its confidence is low). Unset follows
+            ``Limits.list_strategy``.
 
     Returns:
         ``{"trustcall_system_one": {...}}``.
@@ -338,6 +347,13 @@ def s1_field(
         ):
             raise ValueError("criteria must be a mapping or a list")
         options["criteria"] = criteria
+    if list_strategy is not None:
+        if list_strategy not in ("list", "sentences", "auto"):
+            raise ValueError(
+                "list_strategy must be 'list', 'sentences' or 'auto', "
+                f"got {list_strategy!r}"
+            )
+        options["list_strategy"] = list_strategy
     return {S1_KEY: options}
 
 
@@ -2214,6 +2230,17 @@ def _build_spec(
                 instructions=question_text,
                 criteria=_choice_criteria(kind, override_criteria),
             )
+
+    if "list_strategy" in options and not (
+        clairic_field is not None
+        and clairic_field.type == "list"
+        and clairic_field.items == "text"
+        and kind.item_kind == "str"
+    ):
+        raise ValueError(
+            f"field {pretty_name!r}: s1_field(list_strategy=...) only applies to a "
+            "list of free text (list[str])"
+        )
 
     return FieldSpec(
         path=path,

@@ -55,9 +55,11 @@ Planned modules, from the "Package layout" table in `docs/DESIGN.md`:
 - `trustcall_system_one/_entity.py`: per-entity passes.
 - `trustcall_system_one/_nested.py`: nested collections (items turned into the parent's document, answers and patch operations).
 - `trustcall_system_one/_verify.py`: attribution, cross-check, re-ask and borderline-null handling.
+- `trustcall_system_one/_sentences.py`: sentence splitter and the Clef pass of the `sentences` list strategy.
 - `trustcall_system_one/_diff.py`: ops and apply.
 - `trustcall_system_one/_gates.py`: thresholds and the change gate.
 - `trustcall_system_one/_repair.py`: repair loop.
 - `trustcall_system_one/_run.py`: per-invoke context (usage, call log, semaphores).
 - `trustcall_system_one/_extractor.py`: extractor factory and sync bridge.
 - `trustcall_system_one/testing.py` (public): `FakeTransport`, `FakeWorld`, recording and cassette transports.
+- `evals/` (top level, not packaged): the eval dataset, scorer, runner and sweeps (`uv run python -m evals ...`), the live smoke scenarios and their invariants. `tests/live/` is the live smoke test, `tests/recorded/` its cassettes.

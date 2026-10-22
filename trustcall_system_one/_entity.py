@@ -91,6 +91,8 @@ from trustcall_system_one._repair import (
     repair_loop,
 )
 from trustcall_system_one._run import Answer, Run, gather
+from trustcall_system_one._sentences import eligible as sentences_eligible
+from trustcall_system_one._sentences import read_sentences
 from trustcall_system_one._types import (
     EntityInfo,
     FieldAnswer,
@@ -343,6 +345,77 @@ async def _clef_pass(
     )
 
 
+def _list_strategy(ctx: Ctx, spec: FieldSpec) -> str:
+    """How a field is read: ``"list"`` (Clairic), ``"sentences"`` or ``"auto"``.
+
+    Only a list of free text can be read by sentences; the field's own
+    ``s1_field(list_strategy=...)`` wins over ``Limits.list_strategy``.
+    """
+    if not sentences_eligible(spec):
+        return "list"
+    own = spec.extra.get("list_strategy")
+    return str(own) if own else ctx.run.limits.list_strategy
+
+
+def _distrusted(ctx: Ctx, state: FieldState) -> bool:
+    """Whether Clairic's list answer is one it does not trust itself.
+
+    True when the answer is missing, or it holds elements whose confidence is
+    below ``Limits.list_auto_below`` (the fragments an open-ended field gets:
+    confidence 1e-6 to 1e-23 live). A null or empty answer is not distrust: the
+    model said there is nothing.
+    """
+    resolved = state.resolved
+    if not resolved.ok and resolved.reason == "missing_answer":
+        return True
+    gave = isinstance(resolved.raw, list) and bool(resolved.raw)
+    confidence = resolved.confidence
+    return (
+        gave and confidence is not None and confidence < ctx.run.limits.list_auto_below
+    )
+
+
+async def _sentence_state(
+    ctx: Ctx, spec: FieldSpec, *, instead_of: FieldState | None = None
+) -> FieldState:
+    """Read a list field by sentences (see ``_sentences``)."""
+    ctx.crossed.pop(spec.wire_name, None)  # the input-only pass is moot
+    resolved = await read_sentences(ctx, spec)
+    state = FieldState(spec, resolved, sentences=True)
+    if instead_of is not None:
+        was = instead_of.resolved.confidence
+        state.notes.append(
+            "list_strategy:auto->sentences"
+            + (
+                f" (the list answer had confidence {was:.2g})"
+                if was is not None
+                else ""
+            )
+        )
+    rejection = accept(spec, resolved)
+    if rejection is not None:
+        state.set_reject(*rejection)
+    return state
+
+
+async def _resolve_field(
+    ctx: Ctx,
+    spec: FieldSpec,
+    extracted: Mapping[str, tuple[ClairicAnswer | None, RenderedState | None]],
+    clef_answers: dict[str, Answer],
+) -> FieldState:
+    """Resolve a Clairic-backed field, reading a list of text by sentences if asked."""
+    strategy = _list_strategy(ctx, spec)
+    if strategy == "sentences":
+        return await _sentence_state(ctx, spec)
+    state = await _resolve_clairic(
+        ctx, spec, extracted.get(spec.wire_name, (None, None)), clef_answers
+    )
+    if strategy == "auto" and _distrusted(ctx, state):
+        return await _sentence_state(ctx, spec, instead_of=state)
+    return state
+
+
 async def _resolve_clairic(
     ctx: Ctx,
     spec: FieldSpec,
@@ -440,7 +513,9 @@ async def _run_group(
     clairic_specs = [
         spec
         for spec in group.specs
-        if spec.engine == "clairic" and spec.path not in fixed
+        if spec.engine == "clairic"
+        and spec.path not in fixed
+        and _list_strategy(ctx, spec) != "sentences"
     ]
     clef_specs = [
         spec for spec in group.specs if spec.clef is not None and spec.path not in fixed
@@ -471,10 +546,7 @@ async def _run_group(
                 resolved = resolve_clef(spec, clef_answers.get(spec.clef_name), ctx)
                 leaves.append(_Leaf(spec, resolved=resolved))
         states = await gather(
-            *(
-                _resolve_clairic(ctx, spec, extracted[spec.wire_name], clef_answers)
-                for spec, _ in pending
-            )
+            *(_resolve_field(ctx, spec, extracted, clef_answers) for spec, _ in pending)
         )
         for (_, index), state in zip(pending, states, strict=True):
             leaves[index].state = state
@@ -517,7 +589,9 @@ async def _run_unit(
             spec
             for member in group.walk()
             for spec in member.specs
-            if spec.engine == "clairic" and spec.path not in (fixed or {})
+            if spec.engine == "clairic"
+            and spec.path not in (fixed or {})
+            and _list_strategy(ctx, spec) != "sentences"
         ]
         if specs:
             unit.shared = asyncio.ensure_future(_clairic_pass(ctx, specs, None))

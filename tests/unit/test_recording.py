@@ -397,3 +397,21 @@ def test_a_line_that_is_not_a_wire_trace_is_refused(tmp_path: Path) -> None:
     trace.write_text('{"request": {}}\n')
     with pytest.raises(ValueError, match="not a wire trace line"):
         trace_to_cassette(trace, tmp_path / "o.jsonl")
+
+
+async def test_a_fork_replays_the_same_recordings_from_the_start(
+    tmp_path: Path,
+) -> None:
+    path = await record(tmp_path, (CLAIRIC, clairic_payload(), META))
+    first = CassetteTransport(path)
+    await first.run(CLAIRIC, clairic_payload(), meta=META)
+    second = first.fork()
+    assert (second.hits, len(second)) == (0, 1)
+    await second.run(CLAIRIC, clairic_payload(), meta=META)
+    # the original is spent; the fork has its own cursor and its own settings
+    with pytest.raises(CassetteMissError):
+        await first.run(CLAIRIC, clairic_payload(), meta=META)
+    inner = world()
+    open_fork = first.fork(strict=False, inner=inner)
+    await open_fork.run(CLAIRIC, clairic_payload(name="x"), meta=META)
+    assert open_fork.forwarded == 1 and len(inner.calls) == 1

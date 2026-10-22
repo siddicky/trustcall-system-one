@@ -253,6 +253,22 @@ class Limits:
         clef_state_token_budget: Estimated tokens above which a Clef state is
             narrowed to mention windows. Clef silently truncates at 65,536
             tokens, so the budget leaves headroom for the estimate's error.
+        list_strategy: How a ``list[str]`` field of free text is read unless the
+            field says otherwise (``s1_field(list_strategy=...)``). ``"list"``
+            asks Clairic's ``list`` type, which is a span picker: confident for
+            defined items (names, contacts), hopeless for open-ended ones ("things
+            worth remembering"). ``"sentences"`` splits the input into sentences
+            in code and asks Clef one yes/no question per candidate sentence;
+            the sentences it accepts are the elements, verbatim. ``"auto"`` asks
+            Clairic first and falls back to sentences when its answer has a
+            confidence below ``list_auto_below``.
+        list_auto_below: With ``"auto"``, the list confidence below which the
+            sentences are used (a non-empty answer that Clairic itself does not
+            trust).
+        sentence_follow: With sentences for an entity that is mentioned, how many
+            sentences after one that mentions it still count as candidates.
+        max_sentences: Most candidate sentences asked about per field; more are
+            left out with a warning.
     """
 
     max_depth: int = 8
@@ -262,6 +278,10 @@ class Limits:
     estimate_for_bounded_numbers: bool = False
     max_instruction_chars: int = 600
     clef_state_token_budget: int = 56_000
+    list_strategy: Literal["list", "sentences", "auto"] = "auto"
+    list_auto_below: float = 0.5
+    sentence_follow: int = 4
+    max_sentences: int = 200
 
     def __post_init__(self) -> None:
         """Validate the limits."""
@@ -293,6 +313,18 @@ class Limits:
             raise ValueError("clef_state_token_budget must be an int")
         if self.clef_state_token_budget < 1_000:
             raise ValueError("clef_state_token_budget must be at least 1000")
+        if self.list_strategy not in ("list", "sentences", "auto"):
+            raise ValueError(
+                "list_strategy must be 'list', 'sentences' or 'auto', "
+                f"got {self.list_strategy!r}"
+            )
+        _check_unit("list_auto_below", self.list_auto_below)
+        for name, floor in (("sentence_follow", 0), ("max_sentences", 1)):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be an int")
+            if value < floor:
+                raise ValueError(f"{name} must be at least {floor}")
 
 
 def _check_unit(name: str, value: float, *, allow_zero: bool = False) -> None:
@@ -346,6 +378,9 @@ class VerifyConfig:
             ``Literal`` or an ``Enum``) that would change or add to the record
             becomes an operation. Such answers always resolve, whether or not
             the input says anything about the field.
+        sentence_keep: Probability at or above which a candidate sentence is kept
+            as a list element when a ``list[str]`` field is read by sentences
+            (see ``Limits.list_strategy``).
         self_consistency_k: Number of state variants to ask; only 1 is
             supported.
     """
@@ -364,6 +399,7 @@ class VerifyConfig:
     adjudicate_min: float = 0.6
     input_only_crosscheck: bool = True
     clef_stated_min: float = 0.7
+    sentence_keep: float = 0.6
     self_consistency_k: int = 1
 
     def __post_init__(self) -> None:
@@ -383,6 +419,7 @@ class VerifyConfig:
             "null_confirm_no",
             "adjudicate_min",
             "clef_stated_min",
+            "sentence_keep",
         ):
             _check_unit(name, getattr(self, name))
         if self.attribution_drop > self.attribution_keep:

@@ -678,6 +678,10 @@ class FakeWorld:
       is the entity's value, else ``neither``.
     * ``list_dedup`` (``dedup.<i>``): 0.95 if the two quoted texts are the same
       after folding, else 0.05.
+    * ``sentences`` (``sentence.<i>``, one per candidate sentence of a ``list[str]``
+      field read by sentences; ``CallMeta.field`` is the field's wire name): 0.95
+      if the quoted sentence contains (after folding) one of the focused entity's
+      values for that field, else 0.04.
     * ``gate`` (Clef ``gate``): 0.9 if ``proposed_change.to`` is new compared to
       ``record`` (not equal to what the record holds at the path, nor an element
       of the list it is appended to), else 0.05.
@@ -1225,6 +1229,7 @@ class FakeWorld:
             "stated": self._has_field,
             "adjudicate": self._adjudicate,
             "list_dedup": self._dedup,
+            "sentences": self._sentences,
             "gate": self._gate,
             "match": self._match,
             "delete": self._delete,
@@ -1635,6 +1640,26 @@ class FakeWorld:
                         chosen = option
                         break
             answers[qid] = _pick(chosen, list(options), 0.9)
+        return clef_response(answers, model=payload["model"])
+
+    def _sentences(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
+        element = self._focus(payload, meta)
+        present, value = (
+            self._lookup(element, meta.field or "")
+            if element is not None
+            else (False, None)
+        )
+        held = [
+            _fold(v)
+            for v in (value if isinstance(value, list) else [value])
+            if present and v is not None
+        ]
+        answers = {}
+        for qid, question in payload["questions"].items():
+            found = re.search(r': "(.*)"\?\s*$', question["instructions"], re.S)
+            text = _fold(found.group(1)) if found else ""
+            hit = any(v and v in text for v in held)
+            answers[qid] = noul(0.95 if hit else 0.04)
         return clef_response(answers, model=payload["model"])
 
     def _dedup(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
@@ -2066,6 +2091,28 @@ class CassetteTransport:
                 except (ValueError, KeyError, TypeError) as exc:
                     raise ValueError(f"{path}:{number}: not a recorded call") from exc
                 self._entries.setdefault(key, []).append(entry)
+
+    def fork(
+        self, *, strict: bool | None = None, inner: Transport | None = None
+    ) -> "CassetteTransport":
+        """A new cassette over the same recordings, replaying from the start.
+
+        The recordings are shared, not read again, so many runs can start from one
+        snapshot of a directory that is still being written to.
+
+        Args:
+            strict: Raise on a miss; defaults to this cassette's setting.
+            inner: Where a miss goes when not strict; defaults to this cassette's.
+        """
+        other = CassetteTransport.__new__(CassetteTransport)
+        other.strict = self.strict if strict is None else strict
+        other._inner = self._inner if inner is None else inner
+        other._entries = self._entries
+        other._cursor = {}
+        other._lock = threading.Lock()
+        other.hits = other.forwarded = 0
+        other.misses = []
+        return other
 
     def __len__(self) -> int:
         """The number of recorded calls."""

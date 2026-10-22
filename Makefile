@@ -18,8 +18,10 @@ smoke:
 record:
 	TRUSTCALL_S1_LIVE=1 TRUSTCALL_S1_RECORD=tests/recorded uv run pytest -m live -s tests/live
 
+# The eval dataset against the scripted worlds (offline). Live, replayed or swept:
+# see docs/LIVE_RUNBOOK.md (`uv run python -m evals run --live`).
 evals:
-	TRUSTCALL_S1_LIVE=1 uv run pytest -m eval tests/evals
+	uv run python -m evals run
 
 lint:
 	uv lock --check

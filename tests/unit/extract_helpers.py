@@ -111,6 +111,9 @@ class Script:
             ``stated_default`` answers the rest.
         dedup: ``list_dedup`` probability by the new element's text;
             ``dedup_default`` answers the rest.
+        sentences: ``sentences`` probability by a part of the sentence asked about
+            (the first part found in it wins); ``sentences_default`` answers the
+            rest.
         truncated: Number of ``extract`` calls to flag as truncated.
         state_text: Rewrites the state Clairic says it read.
         limit: ``limit(state, n)`` gives how many characters of a state Clairic
@@ -138,6 +141,8 @@ class Script:
     stated_default: float = 0.95
     dedup: dict[str, float] = field(default_factory=dict)
     dedup_default: float = 0.05
+    sentences: dict[str, float] = field(default_factory=dict)
+    sentences_default: float = 0.04
     truncated: int = 0
     state_text: Callable[[str], str] | None = None
     limit: Callable[[str, int], int | None] | None = None
@@ -160,6 +165,7 @@ class Script:
                 gate=self._gate,
                 list_dedup=self._dedup,
                 stated=self._stated,
+                sentences=self._sentences,
             )
         )
 
@@ -308,6 +314,17 @@ class Script:
             p = next(
                 (p for part, p in self.dedup.items() if f'"{part}"' in text),
                 self.dedup_default,
+            )
+            answers[qid] = noul(p)
+        return clef_response(answers)
+
+    def _sentences(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
+        answers = {}
+        for qid, question in payload["questions"].items():
+            text = question["instructions"]
+            p = next(
+                (p for part, p in self.sentences.items() if part in text),
+                self.sentences_default,
             )
             answers[qid] = noul(p)
         return clef_response(answers)
