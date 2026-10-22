@@ -1,12 +1,33 @@
 """Result and accounting types shared across the package."""
 
 import dataclasses
-from dataclasses import dataclass
-from typing import Literal
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Literal
 
+from pydantic import BaseModel
+
+from trustcall_system_one._names import Path
 from trustcall_system_one._wire import ClairicUsage, ClefUsage, normalize_model_id
 
-__all__ = ["UNSTATED", "CallKind", "CallRecord", "Usage"]
+if TYPE_CHECKING:
+    from trustcall_system_one._config import CostReport
+
+__all__ = [
+    "UNSTATED",
+    "CallKind",
+    "CallRecord",
+    "EntityInfo",
+    "ExtractionResult",
+    "FieldAnswer",
+    "Mention",
+    "PatchOp",
+    "RejectedOp",
+    "ResultRecord",
+    "SkippedEntity",
+    "Usage",
+    "json_pointer",
+]
 
 
 class _Unstated:
@@ -150,3 +171,251 @@ class CallRecord:
     retries: int = 0
     error: str | None = None
     status_code: int | None = None
+
+
+# --------------------------------------------------------------------------- #
+# Results
+# --------------------------------------------------------------------------- #
+
+Span = tuple[int, int]
+"""``(start, end)`` offsets into the original input text."""
+
+
+def json_pointer(path: Path) -> str:
+    """Render a path as an RFC 6901 JSON Pointer (``("a", 0)`` -> ``"/a/0"``)."""
+    return "".join(
+        "/" + str(part).replace("~", "~0").replace("/", "~1") for part in path
+    )
+
+
+@dataclass(frozen=True)
+class Mention:
+    """A piece of the input that refers to an entity.
+
+    Attributes:
+        text: The mention as written.
+        span: ``(start, end)`` in the original input, when known.
+    """
+
+    text: str
+    span: Span | None = None
+
+
+@dataclass(frozen=True)
+class EntityInfo:
+    """What the engine knows about the entity a record describes.
+
+    Attributes:
+        key: Identifier of the entity within its schema (``"e0"`` for a ``One``).
+        label: How the entity was named in prompts (``"the Person"``).
+        mentions: Every mention found for it (empty for a ``One`` schema).
+        first_mention: The mention that orders entities.
+        qualify_p: Probability from the presence or qualification check, when
+            one ran.
+        match_probs: Probability of each existing record as the match (updates).
+        parent: Key of the parent entity for nested items.
+    """
+
+    key: str
+    label: str
+    mentions: tuple[Mention, ...] = ()
+    first_mention: Mention | None = None
+    qualify_p: float | None = None
+    match_probs: Mapping[str, float] = field(default_factory=dict, hash=False)
+    parent: str | None = None
+
+
+@dataclass(frozen=True)
+class FieldAnswer:
+    """Everything known about how one field got its value.
+
+    Attributes:
+        path: Position of the field in the document.
+        pretty: ``path`` joined with dots.
+        wire_name: The Clairic field or Clef question name that was sent.
+        engine: ``"clairic"``, ``"clef"`` or ``"const"``.
+        value: The final Python value (``None`` for a null, a rejected answer
+            and a field left to its default).
+        raw: The model's raw answer: the Clairic ``value``, or a dict with the
+            Clef answer's fields (``noul``, or ``choice`` and its odds).
+        p_null: Clairic's probability that the value is null.
+        confidence: The model's confidence in the answer.
+        guess: Clairic's ``guess``. Metadata only, never used as a value.
+        span: Supporting text in the original input.
+        spans: Supporting spans of a list answer, aligned with ``value``.
+        source: ``"clairic"``, ``"clef"``, ``"const"``, or ``"default"`` when
+            the value is null and pydantic's default applies.
+        attribution_p: Probability from the attribution check: a float for a
+            scalar, one float per original element for a list.
+        gate_p: Probability from the change gate (updates).
+        crosscheck_agree: Whether the input-only cross-check agreed (updates).
+        reask: Whether a re-ask contributed to the value.
+        rejected_reason: Why the answer was thrown away, if it was.
+        warnings: Short notes, such as ``span_outside_input``.
+    """
+
+    path: Path
+    pretty: str
+    wire_name: str
+    engine: str
+    value: Any = None
+    raw: Any = None
+    p_null: float | None = None
+    confidence: float | None = None
+    guess: Any = None
+    span: Span | None = None
+    spans: tuple[Span, ...] | None = None
+    source: Literal["clairic", "clef", "const", "default"] = "clairic"
+    attribution_p: float | tuple[float, ...] | None = None
+    gate_p: float | None = None
+    crosscheck_agree: bool | None = None
+    reask: bool = False
+    rejected_reason: str | None = None
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class PatchOp:
+    """One applied RFC 6902 operation (updates).
+
+    Attributes:
+        op: ``"add"``, ``"replace"`` or ``"remove"``.
+        path: JSON Pointer.
+        value: The value for ``add`` and ``replace``.
+        repaired_from: The path as first computed when apply repaired it.
+    """
+
+    op: str
+    path: str
+    value: Any = None
+    repaired_from: str | None = None
+
+
+@dataclass(frozen=True)
+class RejectedOp:
+    """An operation or answer that was computed and then thrown away.
+
+    Attributes:
+        op: The operation, or ``None`` for an answer that never became one
+            (every rejection of an insert).
+        path: JSON Pointer of the field.
+        reason: Short machine-readable reason, such as ``attribution``.
+        detail: A longer explanation.
+        p: The probability or confidence behind the decision, when there is one.
+    """
+
+    op: str | None
+    path: str
+    reason: str
+    detail: str = ""
+    p: float | None = None
+
+
+@dataclass(frozen=True)
+class ResultRecord:
+    """One extracted, updated or deleted record.
+
+    Attributes:
+        schema_name: Name of the schema.
+        json_doc_id: Id of the existing record (``None`` for inserts).
+        kind: ``"insert"``, ``"update"`` or ``"delete"``.
+        value: The validated model, or ``None`` when validation failed.
+        before: The record before the change (updates and deletes).
+        after: The document after the change; for an invalid insert, the
+            candidate document that failed validation.
+        patches: Operations that were applied.
+        rejected: Answers and operations that were thrown away.
+        fields: How each asked field got its value, keyed by dotted path.
+        entity: What is known about the entity.
+        valid: Whether ``value`` passed validation.
+        errors: Pydantic error strings when it did not.
+    """
+
+    schema_name: str
+    json_doc_id: str | None
+    kind: Literal["insert", "update", "delete"]
+    value: BaseModel | None
+    before: dict[str, Any] | None = None
+    after: dict[str, Any] | None = None
+    patches: tuple[PatchOp, ...] = ()
+    rejected: tuple[RejectedOp, ...] = ()
+    fields: Mapping[str, FieldAnswer] = field(default_factory=dict, hash=False)
+    entity: EntityInfo | None = None
+    valid: bool = True
+    errors: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SkippedEntity:
+    """An entity that was found and not turned into a record.
+
+    Attributes:
+        schema_name: Name of the schema.
+        entity: The entity.
+        reason: ``inserts_disabled``, ``updates_disabled``, ``ambiguous_match``,
+            ``not_qualified``, ``conflict_update_delete``, ``validation_failed``
+            or ``empty_after_verification``.
+        detail: A longer explanation.
+        candidates: Existing record ids with their match probability.
+    """
+
+    schema_name: str
+    entity: EntityInfo
+    reason: str
+    detail: str = ""
+    candidates: tuple[tuple[str, float], ...] = ()
+
+
+def _entity_key(record: "ResultRecord") -> str:
+    return record.entity.key if record.entity else ""
+
+
+def _no_cost() -> "CostReport":
+    from trustcall_system_one._config import CostReport
+
+    return CostReport(usd=0.0, unpriced_models=(), complete=True)
+
+
+@dataclass(frozen=True)
+class ExtractionResult:
+    """The outcome of one ``invoke``.
+
+    Attributes:
+        records: Every record, in order of first mention (deletes last).
+        responses: The validated models of the valid records, in order.
+        skipped: Entities that were found and not used.
+        untouched: Ids of existing records the input did not mention.
+        deleted: Ids of existing records that were deleted.
+        attempts: Extraction rounds that ran (0 when nothing was extracted).
+        usage: Token and request totals by model and by call kind.
+        cost: Priced part of ``usage``.
+        calls: One ``CallRecord`` per transport call, failed ones included.
+        warnings: Human-readable notes about anything that was degraded.
+    """
+
+    records: tuple[ResultRecord, ...] = ()
+    responses: tuple[BaseModel, ...] = ()
+    skipped: tuple[SkippedEntity, ...] = ()
+    untouched: tuple[str, ...] = ()
+    deleted: tuple[str, ...] = ()
+    attempts: int = 0
+    usage: Usage = field(default_factory=Usage)
+    cost: "CostReport" = field(default_factory=lambda: _no_cost())
+    calls: tuple[CallRecord, ...] = ()
+    warnings: tuple[str, ...] = ()
+
+    @property
+    def response_metadata(self) -> list[dict[str, str | None]]:
+        """One ``{"id", "json_doc_id"}`` entry per response, like trustcall's.
+
+        ``id`` is ``"<schema name>:<entity key>"`` (there is no tool call id) and
+        ``json_doc_id`` the id of the existing record, ``None`` for an insert.
+        """
+        return [
+            {
+                "id": f"{record.schema_name}:{_entity_key(record)}",
+                "json_doc_id": record.json_doc_id,
+            }
+            for record in self.records
+            if record.valid and record.value is not None
+        ]

@@ -309,3 +309,83 @@ def test_models_that_normalise_to_the_same_id_are_rejected() -> None:
         ConcurrencyConfig(per_model={"clef": 4, CLEF: 8})
     with pytest.raises(ValueError, match="more than once"):
         Prices({"clairic": 0.1, CLAIRIC: 0.2})
+
+
+# --------------------------------------------------------------------------- #
+# Result types
+# --------------------------------------------------------------------------- #
+
+
+def test_json_pointer_escapes_segments() -> None:
+    from trustcall_system_one._types import json_pointer
+
+    assert json_pointer(()) == ""
+    assert json_pointer(("a", 0, "b")) == "/a/0/b"
+    assert json_pointer(("a/b", "c~d")) == "/a~1b/c~0d"
+
+
+def test_result_types_are_frozen() -> None:
+    from trustcall_system_one import (
+        EntityInfo,
+        ExtractionResult,
+        FieldAnswer,
+        Mention,
+        PatchOp,
+        RejectedOp,
+        ResultRecord,
+        SkippedEntity,
+    )
+
+    entity = EntityInfo(key="e0", label="the Person")
+    instances = [
+        Mention("Ada", (0, 3)),
+        entity,
+        FieldAnswer(path=("a",), pretty="a", wire_name="a", engine="clairic"),
+        PatchOp("add", "/a", 1),
+        RejectedOp(None, "/a", "attribution"),
+        ResultRecord("Person", None, "insert", None),
+        SkippedEntity("Person", entity, "not_qualified"),
+        ExtractionResult(),
+    ]
+    for instance in instances:
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            instance.zzz = 1  # type: ignore[attr-defined]
+
+
+def test_result_defaults() -> None:
+    from trustcall_system_one import EntityInfo, ExtractionResult, ResultRecord
+
+    result = ExtractionResult()
+    assert result.records == () and result.responses == ()
+    assert result.skipped == () and result.untouched == () and result.deleted == ()
+    assert result.attempts == 0
+    assert result.usage.requests == 0
+    assert result.cost.complete and result.cost.usd == 0.0
+    assert result.calls == () and result.warnings == ()
+    assert result.response_metadata == []
+    entity = EntityInfo(key="e0", label="x")
+    assert entity.mentions == () and entity.first_mention is None
+    assert (
+        entity.qualify_p is None and entity.match_probs == {} and entity.parent is None
+    )
+    record = ResultRecord("P", None, "insert", None)
+    assert record.valid is True and record.errors == () and record.fields == {}
+
+
+def test_response_metadata_has_trustcalls_shape() -> None:
+    from pydantic import BaseModel
+
+    from trustcall_system_one import EntityInfo, ExtractionResult, ResultRecord
+
+    class P(BaseModel):
+        n: int = 1
+
+    entity = EntityInfo(key="e3", label="x")
+    good = ResultRecord("P", None, "insert", P(), entity=entity)
+    updated = ResultRecord("P", "doc-7", "update", P(), entity=entity)
+    bad = ResultRecord("P", None, "insert", None, entity=entity, valid=False)
+    result = ExtractionResult(records=(good, bad, updated), responses=(P(), P()))
+    assert result.response_metadata == [
+        {"id": "P:e3", "json_doc_id": None},
+        {"id": "P:e3", "json_doc_id": "doc-7"},
+    ]

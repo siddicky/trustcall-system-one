@@ -421,6 +421,10 @@ class FieldSpec:
         alias: The key ``model_validate`` expects for this field when it is not
             the field name (from ``alias`` or a plain-string
             ``validation_alias``); ``None`` when the name itself is the key.
+        models: For ``submodel``, ``collection`` and ``union_models`` fields, the
+            resolved model classes (a single one except for a union of models).
+            Forward references are resolved once, here, so expanders never
+            resolve names again. Empty for every other engine.
     """
 
     path: Path
@@ -446,6 +450,7 @@ class FieldSpec:
     clef_name: str = ""
     nullable: bool = False
     alias: str | None = None
+    models: tuple[type[BaseModel], ...] = field(default=(), hash=False)
 
 
 @dataclass(frozen=True, eq=False)
@@ -771,6 +776,7 @@ class _Kind:
     warnings: list[str] = field(default_factory=list)
     union_names: list[str] = field(default_factory=list)
     bounds: dict[str, Any] = field(default_factory=dict)
+    models: tuple[type[BaseModel], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -789,10 +795,15 @@ class _Ctx:
 
 
 def _resolve(ctx: _Ctx, tp: Any) -> Any:
-    """Resolve a leftover forward reference to the model or a module-level class.
+    """Resolve a leftover forward reference to a class.
 
-    pydantic leaves a reference nested in a generic (``list["Node"]``) as a
-    string on some Python versions. The common case is a model naming itself.
+    pydantic leaves a reference nested in a generic (``list["Pet"]``) as a
+    string on some Python versions. Names are looked up, in order, as the model
+    itself, in the namespace the model was defined in
+    (``__pydantic_parent_namespace__``, the locals of the defining function) and
+    in the globals of the model's module. The defining namespace comes before
+    the module so that a function-local class wins over an unrelated module-level
+    class of the same name.
     """
     if isinstance(tp, typing.ForwardRef):
         tp = tp.__forward_arg__
@@ -800,8 +811,22 @@ def _resolve(ctx: _Ctx, tp: Any) -> Any:
         return tp
     if tp == ctx.model.__name__:
         return ctx.model
+    local = getattr(ctx.model, "__pydantic_parent_namespace__", None)
+    if isinstance(local, Mapping):
+        found: Any = local.get(tp)
+        if type(found).__name__ == "_PydanticWeakRef":  # newer pydantic wraps values
+            found = found()
+        if isinstance(found, type):
+            return found
     found = getattr(sys.modules.get(ctx.model.__module__), tp, None)
     return found if isinstance(found, type) else tp
+
+
+def _as_model(tp: Any) -> type[BaseModel]:
+    """Return a pydantic model for a model-like class (TypedDicts are converted)."""
+    if isinstance(tp, type) and issubclass(tp, BaseModel):
+        return tp
+    return coerce_schema(tp)
 
 
 def _option_id(text: str, used: set[str]) -> str:
@@ -992,10 +1017,12 @@ def _list_kind(ctx: _Ctx, container: str, item: _Shape) -> _Kind:
     post = "" if container == "list" else container
     resolved = _resolve(ctx, item.base)
     base = _TEMPORAL_ALIASES.get(resolved, resolved)
-    if _is_model(base) or (
-        item.members is not None and all(_is_model(m.base) for m in item.members)
-    ):
-        return _model_kind(ctx, "collection")
+    if _is_model(base):
+        return _model_kind(ctx, "collection", (base,))
+    if item.members is not None:
+        members = [_resolve(ctx, m.base) for m in item.members]
+        if all(_is_model(m) for m in members):
+            return _model_kind(ctx, "collection", tuple(members))
     if base is typing.Any or base is object or base is dict:
         return _Kind("skip")
     if typing_extensions.get_origin(base) in _LITERAL_ORIGINS or _is_enum(base):
@@ -1035,7 +1062,7 @@ def _list_kind(ctx: _Ctx, container: str, item: _Shape) -> _Kind:
     return kind
 
 
-def _model_kind(ctx: _Ctx, engine: Engine) -> _Kind:
+def _model_kind(ctx: _Ctx, engine: Engine, models: tuple[Any, ...]) -> _Kind:
     """Record a nested-model field, applying the depth guard.
 
     Recursion is not detected here: a self-referencing model is recorded as a
@@ -1044,13 +1071,14 @@ def _model_kind(ctx: _Ctx, engine: Engine) -> _Kind:
     """
     if len(ctx.path) + 1 > ctx.limits.max_depth:
         return _Kind("skip", warnings=["max_depth"])
-    return _Kind(engine)
+    return _Kind(engine, models=tuple(_as_model(model) for model in models))
 
 
 def _union_kind(ctx: _Ctx, shape: _Shape) -> _Kind:
     members = shape.members or ()
-    if all(_is_model(m.base) for m in members):
-        return _model_kind(ctx, "union_models")
+    resolved = [_resolve(ctx, m.base) for m in members]
+    if all(_is_model(m) for m in resolved):
+        return _model_kind(ctx, "union_models", tuple(resolved))
     if all(typing_extensions.get_origin(m.base) in _LITERAL_ORIGINS for m in members):
         candidates: list[_Candidate] = []
         for member in members:
@@ -1099,7 +1127,7 @@ def _classify(ctx: _Ctx, shape: _Shape) -> _Kind:
     if origin in _LITERAL_ORIGINS or _is_enum(base):
         return _choice_kind(ctx, _candidates(base))
     if _is_model(base):
-        return _model_kind(ctx, "submodel")
+        return _model_kind(ctx, "submodel", (base,))
     if origin is tuple:
         args = typing_extensions.get_args(base)
         if len(args) == 2 and args[1] is Ellipsis:
@@ -1524,6 +1552,7 @@ def _build_spec(
         clef_name=clef_name,
         nullable=draft.nullable,
         alias=draft.alias,
+        models=kind.models,
     )
 
 

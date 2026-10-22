@@ -162,7 +162,7 @@ class AdaptiveLimiter:
         loop = asyncio.get_running_loop()
         state = self._states.get(loop)
         if state is None:
-            for stale in [lp for lp in self._states if lp.is_closed()]:
+            for stale in [lp for lp in list(self._states) if lp.is_closed()]:
                 del self._states[stale]
             state = self._states[loop] = _LoopState()
         return state
@@ -384,8 +384,10 @@ class CloudflareTransport:
         backoff_base: float = 0.25,
         backoff_max: float = 8.0,
         max_retry_after: float = 60.0,
+        call_deadline: float | None = 300.0,
         concurrency: ConcurrencyConfig | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        clock: Callable[[], float] = time.monotonic,
         extra_headers: Mapping[str, str] | None = None,
         send_metadata: bool = True,
     ) -> None:
@@ -409,8 +411,16 @@ class CloudflareTransport:
             backoff_max: Largest jittered retry delay (at least ``backoff_base``).
             max_retry_after: Longest server-requested wait to honour; a longer
                 ``Retry-After`` fails the call immediately.
+            call_deadline: Total wall-clock budget in seconds for one ``run()``
+                across every attempt, backoff sleep and wait for a limiter slot;
+                ``None`` for no budget. When the next sleep or attempt would not
+                fit, the call fails with a ``TransportError`` that says the
+                deadline was exceeded. Each attempt's timeout is capped by the
+                budget that is left.
             concurrency: Concurrency limits for the adaptive limiter.
             sleep: Awaitable sleep, injectable for tests.
+            clock: Monotonic clock in seconds used for ``call_deadline``,
+                injectable for tests.
             extra_headers: Headers added to (and able to override) the defaults.
             send_metadata: With a gateway, send ``cf-aig-metadata``. Its
                 ``entity`` value is an entity label that can be a person's
@@ -428,6 +438,10 @@ class CloudflareTransport:
             )
         if not max_retry_after > 0:
             raise ValueError("max_retry_after must be positive")
+        if call_deadline is not None and not (
+            math.isfinite(call_deadline) and call_deadline > 0
+        ):
+            raise ValueError("call_deadline must be positive and finite, or None")
         self._account_id = account_id
         self._api_token = api_token
         self._base_url = base_url
@@ -439,7 +453,9 @@ class CloudflareTransport:
         self._backoff_base = backoff_base
         self._backoff_max = backoff_max
         self._max_retry_after = max_retry_after
+        self._call_deadline = call_deadline
         self._sleep = sleep
+        self._clock = clock
         self._extra_headers = dict(extra_headers or {})
         self._send_metadata = send_metadata
         self._concurrency = concurrency or ConcurrencyConfig()
@@ -495,7 +511,7 @@ class CloudflareTransport:
             # First use from this loop: forget clients of closed loops. They
             # cannot be awaited any more, so dropping the reference is all
             # that can be done.
-            for stale in [lp for lp in self._clients if lp.is_closed()]:
+            for stale in [lp for lp in list(self._clients) if lp.is_closed()]:
                 del self._clients[stale]
             cap = self._concurrency.max_in_flight
             client = httpx.AsyncClient(
@@ -589,18 +605,18 @@ class CloudflareTransport:
         url, token = self._url_and_token(model)
         headers = self._headers(token, meta)
         client = self._get_client()
-        post_kwargs: dict[str, Any] = {}
-        if timeout is not None:
-            post_kwargs["timeout"] = httpx.Timeout(
-                timeout, connect=self._timeout.connect
-            )
         started = time.perf_counter()
+        begun = self._clock()
+        deadline = None if self._call_deadline is None else begun + self._call_deadline
         retries = 0
         previous_delay = self._backoff_base
         while True:
             retry_after: float | None = None
             failure: TransportError
             async with self.limiter.slot(model) as generation:
+                post_kwargs = self._post_kwargs(client, timeout, deadline)
+                if post_kwargs is None:
+                    raise self._deadline_error(retries, None)
                 try:
                     response = await client.post(
                         url, json=payload, headers=headers, **post_kwargs
@@ -642,7 +658,6 @@ class CloudflareTransport:
                 raise failure
             if retry_after is not None and retry_after > self._max_retry_after:
                 raise failure
-            retries += 1
             if retry_after is not None:
                 delay = retry_after
             else:
@@ -650,8 +665,63 @@ class CloudflareTransport:
                     self._backoff_max,
                     random.uniform(self._backoff_base, previous_delay * 3),
                 )
+            if deadline is not None and self._clock() + delay >= deadline:
+                raise self._deadline_error(retries, failure)
+            retries += 1
+            if retry_after is None:
                 previous_delay = delay
             await self._sleep(delay)
+
+    def _post_kwargs(
+        self,
+        client: httpx.AsyncClient,
+        timeout: float | None,
+        deadline: float | None,
+    ) -> dict[str, Any] | None:
+        """Build the per-attempt ``timeout`` keyword, capped by the deadline.
+
+        Returns:
+            The keyword arguments for ``client.post``, or ``None`` when no time
+            is left.
+        """
+        remaining = None if deadline is None else deadline - self._clock()
+        if remaining is not None and remaining <= 0:
+            return None
+        if timeout is None:
+            read = client.timeout.read
+            if remaining is None or (read is not None and read <= remaining):
+                return {}  # the client's own timeout is the tighter one
+            capped = remaining
+        elif remaining is not None and remaining < timeout:
+            capped = remaining
+        else:
+            return {"timeout": httpx.Timeout(timeout, connect=self._timeout.connect)}
+        connect = self._timeout.connect
+        return {
+            "timeout": httpx.Timeout(
+                capped, connect=capped if connect is None else min(connect, capped)
+            )
+        }
+
+    def _deadline_error(
+        self, retries: int, failure: TransportError | None
+    ) -> TransportError:
+        """Build the error raised when ``call_deadline`` is used up."""
+        message = f"call deadline of {self._call_deadline}s exceeded"
+        if retries:
+            message += f" after {retries} retr{'y' if retries == 1 else 'ies'}"
+        if failure is not None:
+            message += f"; last error: {failure}"
+        error = TransportError(
+            message,
+            status_code=failure.status_code if failure else None,
+            body=failure.body if failure else None,
+        )
+        error.retries = retries
+        if failure is not None:
+            error.retry_after = failure.retry_after
+            error.__cause__ = failure
+        return error
 
     @staticmethod
     def _unwrap(response: httpx.Response) -> dict[str, Any]:

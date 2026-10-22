@@ -157,7 +157,7 @@ identity, names, preamble, warnings}`.
 | `bool` | Clef `noul` with `criteria{true,false}`; abstain inside `0.5 ± 0.15` |
 | `Optional[bool]` | Clef `choice{yes,no,unstated}`; `unstated` maps to the `UNSTATED` sentinel (nullable field → `None`) |
 | `Literal` / `Enum` | Clef `choice` (2–255 options), `key_map` back to values; option ids are the sanitised value (Enum: the member name) and the criteria text keeps the original value/name and member description; `s1_field(clef="score")` for ordered enums |
-| `Literal` / `Enum` / bool-as-choice that is nullable or has a default | the same `choice` plus an `unstated` option (`unstated_2`, … on a collision) mapping to the `UNSTATED` sentinel, so an unmentioned field is not forced to a real value: `coerce` gives `None` for a nullable field and `ok=False, reason="unstated"` for a defaulted one (the default stays). A required non-nullable field gets no `unstated` option |
+| `Literal` / `Enum` / bool-as-choice that is nullable or has a default | the same `choice` plus an `unstated` option (`unstated_2`, … on a collision) mapping to the `UNSTATED` sentinel, so an unmentioned field is not forced to a real value: `coerce` gives `ok=True, value=None, reason="unstated"` for both (like a Clairic null; `prune_nulls` applies a default). A required non-nullable field gets no `unstated` option |
 | single-option `Literal` / `Enum` | required field: engine `const`, filled in code, no request (discriminator tags); nullable or defaulted: skipped with a `single_option` warning |
 | nested `BaseModel` / `TypedDict` (also self-referencing) | dotted paths; each sub-model is its own field group; recursion is recorded and bounded by the expander (`limits.max_depth`) |
 | `list[BaseModel]`, `dict[str, prim]` | handed to the collection engine |
@@ -270,7 +270,8 @@ re-validate; then `strict` raises `ExtractionValidationError`, otherwise the rec
 - `CloudflareTransport`: `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN` (fallback
   `CLOUDFLARE_AUTH_TOKEN`), optional `base_url` / `gateway=`; httpx async client; timeout
   60 s (connect 10 s); retries on 408/429/5xx/transport errors honouring `Retry-After`, else
-  decorrelated jitter; unwraps the REST `{success, result, errors, messages}` envelope and
+  decorrelated jitter, within a total `call_deadline` (default 300 s) per `run()` that also
+  caps each attempt's timeout and raises a `TransportError` when the next wait or attempt would not fit; unwraps the REST `{success, result, errors, messages}` envelope and
   accepts bare objects; errors `AuthError`, `BadRequestError` (with CF `errors[]`),
   `RateLimitError`, `ServerError`, `ModelResponseError`.
 - Concurrency: 64 in flight per transport per event loop (shared across invokes and batch),

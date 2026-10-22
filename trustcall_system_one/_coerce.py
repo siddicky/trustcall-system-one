@@ -430,11 +430,11 @@ def _choice(spec: FieldSpec, answer: ChoiceAnswer) -> Coerced:
         )
     value = spec.key_map[answer.choice]
     if value is UNSTATED:
-        # The model says the input does not state the value. For a nullable
-        # field that is a null; otherwise the caller keeps the field's default.
+        # The model says the input does not state the value. That is a null, as
+        # a Clairic null is; ``prune_nulls`` then applies a field's default.
         return Coerced(
             None,
-            spec.nullable,
+            True,
             "unstated",
             confidence=answer.confidence,
             score=probability,
@@ -578,9 +578,9 @@ def coerce(
     * Clef choice: ``spec.key_map[choice]``; an unknown option is not ok.
     * Clef score: the most probable level mapped through ``spec.key_map``; the
       weighted score is kept in ``Coerced.score``.
-    * A choice whose option maps to ``UNSTATED`` gives ``value=None`` with
-      ``reason="unstated"``: ``ok`` for a nullable field, not ok for a field with
-      a default (so the caller leaves the default).
+    * A choice whose option maps to ``UNSTATED`` gives ``ok=True``,
+      ``value=None`` and ``reason="unstated"``, like a Clairic null, for
+      nullable and defaulted fields alike (``prune_nulls`` applies the default).
     * A union of primitives is refused here (``ok=False``); it needs both
       answers, see ``coerce_union``.
 

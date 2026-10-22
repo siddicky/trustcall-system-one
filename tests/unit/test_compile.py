@@ -660,6 +660,94 @@ def test_deferred_lists_the_deferred_specs() -> None:
     assert list(plan.clairic_fields()) == ["name", "age"]
 
 
+def test_models_are_resolved_and_stored_on_the_spec() -> None:
+    class Owner(BaseModel):
+        pet: Pet
+        pets: list[Pet]
+        any_pet: Cat | Dog
+        many: list[Cat | Dog]
+        name: str
+
+    plan = compile_schema(Owner)
+    assert plan.spec(("pet",)).models == (Pet,)
+    assert plan.spec(("pets",)).models == (Pet,)
+    assert plan.spec(("any_pet",)).models == (Cat, Dog)
+    assert plan.spec(("many",)).models == (Cat, Dog)
+    assert plan.spec(("name",)).models == ()
+
+
+def test_recursive_models_store_themselves() -> None:
+    class Node(BaseModel):
+        children: list["Node"] = []
+        parent: Optional["Node"] = None
+
+    Node.model_rebuild()
+    plan = compile_schema(Node)
+    assert plan.spec(("children",)).models == (Node,)
+    assert plan.spec(("parent",)).models == (Node,)
+
+
+def test_function_local_models_resolve_through_the_defining_namespace() -> None:
+    class Pet(BaseModel):  # shadows the module-level Pet
+        owner_tag: int
+
+    class Owner(BaseModel):
+        pets: list["Pet"]
+        pet: "Pet"
+
+    Owner.model_rebuild()
+    plan = compile_schema(Owner)
+    assert plan.spec(("pets",)).models == (Pet,)
+    assert plan.spec(("pets",)).models[0] is not globals()["Pet"]
+    assert plan.spec(("pet",)).models == (Pet,)
+
+
+def _with_string_annotation(model: type[BaseModel], name: str, annotation: Any) -> None:
+    """Leave a reference unresolved, as pydantic does on Python 3.10."""
+    model.model_fields[name].annotation = annotation
+
+
+def test_unresolved_string_references_use_the_defining_namespace_first() -> None:
+    class Pet(BaseModel):  # shadows the module-level Pet
+        owner_tag: int
+
+    class Cat(BaseModel):  # shadows the module-level Cat
+        whiskers: int
+
+    class Owner(BaseModel):
+        pets: list[int]
+        many: list[int]
+
+    _with_string_annotation(Owner, "pets", list["Pet"])
+    _with_string_annotation(Owner, "many", list[Union["Cat", "Dog"]])
+    plan = compile_schema(Owner)
+    assert plan.spec(("pets",)).engine == "collection"
+    assert plan.spec(("pets",)).models == (Pet,)
+    assert plan.spec(("pets",)).models[0] is not globals()["Pet"]
+    assert plan.spec(("many",)).models == (Cat, globals()["Dog"])  # Dog: module
+
+
+def test_unresolved_string_references_fall_back_to_the_module() -> None:
+    class Owner(BaseModel):
+        pets: list[int]
+        any_pet: int
+
+    _with_string_annotation(Owner, "pets", list["Pet"])
+    _with_string_annotation(Owner, "any_pet", Union["Cat", "Dog"])
+    plan = compile_schema(Owner)
+    assert plan.spec(("pets",)).models == (globals()["Pet"],)
+    assert plan.spec(("any_pet",)).engine == "union_models"
+    assert plan.spec(("any_pet",)).models == (Cat, Dog)
+
+
+def test_unresolvable_string_references_are_skipped() -> None:
+    class Owner(BaseModel):
+        pets: list[int]
+
+    _with_string_annotation(Owner, "pets", eval("list['Nowhere']"))
+    assert compile_schema(Owner).spec(("pets",)).engine == "skip"
+
+
 def test_unsupported_types_are_skipped_with_a_warning() -> None:
     assert spec_for(bytes).warnings == ("unsupported_type",)
     assert spec_for(dict[int, str]).warnings == ("unsupported_mapping_key",)

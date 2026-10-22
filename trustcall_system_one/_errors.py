@@ -1,5 +1,7 @@
 """Exception hierarchy for trustcall-system-one."""
 
+from typing import Any
+
 __all__ = [
     "AuthError",
     "BadRequestError",
@@ -93,12 +95,27 @@ class ModelResponseError(TrustcallSystemOneError):
 
 
 class ExtractionValidationError(TrustcallSystemOneError):
-    """Terminal validation failure in strict mode."""
+    """Terminal validation failure in strict mode.
 
-    def __init__(self, message: str, *, errors: list[str] | None = None) -> None:
+    Attributes:
+        errors: The pydantic error strings.
+        record: The invalid ``ResultRecord``, when the engine attached it.
+        calls: The ``CallRecord`` log of the invoke up to the failure.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        errors: list[str] | None = None,
+        record: Any = None,
+        calls: tuple[Any, ...] = (),
+    ) -> None:
         """Create an extraction validation error."""
         super().__init__(message)
         self.errors: list[str] = [] if errors is None else errors
+        self.record = record
+        self.calls = calls
 
 
 class StateTruncatedError(TrustcallSystemOneError):

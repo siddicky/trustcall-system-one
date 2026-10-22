@@ -491,3 +491,54 @@ def test_builder_outputs_validate_against_the_published_output_schemas() -> None
         ),
     ):
         clef_validator.validate(body)
+
+
+# --------------------------------------------------------------------------- #
+# route
+# --------------------------------------------------------------------------- #
+
+
+async def test_route_dispatches_on_the_call_kind() -> None:
+    from trustcall_system_one.testing import route
+
+    seen: list[str] = []
+
+    def extract(model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
+        seen.append("extract")
+        return clairic_handler(model, payload, meta)
+
+    def clef(model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
+        seen.append(f"clef:{meta.kind}")
+        return clef_response({"q": noul(0.5)})
+
+    fake = FakeTransport(route(extract=extract, presence=clef, default=clef))
+    await fake.run(CLAIRIC, CLAIRIC_PAYLOAD, meta=META)
+    await fake.run(CLEF, CLEF_PAYLOAD, meta=CallMeta(kind="presence"))
+    await fake.run(CLEF, CLEF_PAYLOAD, meta=CallMeta(kind="attribution"))
+    assert seen == ["extract", "clef:presence", "clef:attribution"]
+
+
+async def test_route_without_a_default_leaves_other_kinds_unhandled() -> None:
+    from trustcall_system_one.testing import route
+
+    fake = FakeTransport(route(extract=clairic_handler))
+    with pytest.raises(AssertionError, match="unhandled"):
+        await fake.run(CLEF, CLEF_PAYLOAD, meta=CallMeta(kind="presence"))
+
+
+def test_route_rejects_unknown_kinds() -> None:
+    from trustcall_system_one.testing import route
+
+    with pytest.raises(ValueError, match="unknown call kind"):
+        route(extracts=clairic_handler)
+
+
+async def test_route_supports_async_handlers() -> None:
+    from trustcall_system_one.testing import route
+
+    async def slow(model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
+        return clairic_handler(model, payload, meta)
+
+    fake = FakeTransport(route(extract=slow))
+    result = await fake.run(CLAIRIC, CLAIRIC_PAYLOAD, meta=META)
+    assert result.body["answers"]["name"]["value"] == "Ada"

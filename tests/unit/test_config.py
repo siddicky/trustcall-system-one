@@ -5,7 +5,13 @@ from typing import Any
 
 import pytest
 
-from trustcall_system_one import GateConfig, Limits
+from trustcall_system_one import (
+    GateConfig,
+    Limits,
+    PassesConfig,
+    PresenceConfig,
+    VerifyConfig,
+)
 
 
 def test_gate_defaults() -> None:
@@ -109,3 +115,113 @@ def test_limits_are_validated(kwargs: dict[str, Any], match: str) -> None:
 def test_limits_accept_valid_values() -> None:
     limits = Limits(max_depth=1, any_policy="text", estimate_for_bounded_numbers=True)
     assert (limits.max_depth, limits.any_policy) == (1, "text")
+
+
+# --------------------------------------------------------------------------- #
+# VerifyConfig, PresenceConfig, PassesConfig, Limits.clef_state_token_budget
+# --------------------------------------------------------------------------- #
+
+
+def test_verify_defaults() -> None:
+    verify = VerifyConfig()
+    assert verify.attribution is True
+    assert (verify.attribution_keep, verify.attribution_drop) == (0.6, 0.3)
+    assert verify.reask_low_confidence is True
+    assert verify.low_confidence == 0.85
+    assert verify.borderline_null is True
+    assert verify.null_band == (0.25, 0.75)
+    assert (verify.null_confirm_yes, verify.null_confirm_no) == (0.6, 0.4)
+    assert verify.window_chars == 600
+    assert verify.instruction_template == "{label}'s {desc}"
+    assert verify.adjudicate_min == 0.6
+    assert verify.self_consistency_k == 1
+
+
+def test_verify_is_frozen_hashable_and_comparable() -> None:
+    verify = VerifyConfig()
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        verify.attribution = False  # type: ignore[misc]
+    assert hash(verify) == hash(VerifyConfig())
+    assert verify == VerifyConfig()
+    assert verify != VerifyConfig(window_chars=10)
+    assert VerifyConfig(null_band=[0.1, 0.9]) == VerifyConfig(null_band=(0.1, 0.9))  # type: ignore[arg-type]
+    assert len({verify, VerifyConfig(), VerifyConfig(low_confidence=0.9)}) == 2
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"attribution_keep": 0},
+        {"attribution_keep": 1.5},
+        {"attribution_keep": float("nan")},
+        {"attribution_keep": True},
+        {"attribution_drop": 0.7},  # above keep
+        {"low_confidence": 0},
+        {"null_confirm_yes": 0.3},  # below null_confirm_no
+        {"adjudicate_min": 2},
+        {"null_band": (0.8, 0.2)},
+        {"null_band": (0.1,)},
+        {"null_band": (-0.1, 0.5)},
+        {"window_chars": 0},
+        {"window_chars": 1.5},
+        {"instruction_template": "{nope}"},
+        {"instruction_template": "{}"},
+        {"instruction_template": "{label"},
+        {"instruction_template": 3},
+        {"attribution": 1},
+        {"borderline_null": "yes"},
+        {"self_consistency_k": 3},
+        {"self_consistency_k": 0},
+        {"self_consistency_k": True},
+    ],
+)
+def test_verify_rejects_bad_values(kwargs: dict[str, Any]) -> None:
+    with pytest.raises(ValueError):
+        VerifyConfig(**kwargs)
+
+
+def test_verify_accepts_boundary_values() -> None:
+    VerifyConfig(attribution_keep=1.0, attribution_drop=1.0, null_band=(0.0, 1.0))
+    VerifyConfig(instruction_template="{desc}")
+    VerifyConfig(instruction_template="{label}: {desc} ({label})")
+
+
+def test_the_self_consistency_error_says_what_is_supported() -> None:
+    with pytest.raises(ValueError, match="not supported"):
+        VerifyConfig(self_consistency_k=2)
+
+
+def test_presence_config() -> None:
+    presence = PresenceConfig()
+    assert (presence.threshold_absent, presence.threshold_present) == (0.2, 0.5)
+    assert hash(presence) == hash(PresenceConfig())
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        presence.threshold_absent = 0.1  # type: ignore[misc]
+    PresenceConfig(threshold_absent=0.0, threshold_present=0.3)
+    PresenceConfig(threshold_absent=0.5, threshold_present=0.5)
+    for kwargs in (
+        {"threshold_absent": 0.6},
+        {"threshold_absent": -0.1},
+        {"threshold_present": 0},
+        {"threshold_present": 1.1},
+        {"threshold_absent": float("nan")},
+    ):
+        with pytest.raises(ValueError):
+            PresenceConfig(**kwargs)
+
+
+def test_passes_config() -> None:
+    assert PassesConfig().split == "submodel"
+    for split in ("entity", "submodel", "field"):
+        assert PassesConfig(split=split).split == split
+    assert hash(PassesConfig()) == hash(PassesConfig())
+    with pytest.raises(ValueError, match="split"):
+        PassesConfig(split="everything")  # type: ignore[arg-type]
+
+
+def test_limits_clef_state_token_budget() -> None:
+    assert Limits().clef_state_token_budget == 56_000
+    assert Limits(clef_state_token_budget=5000).clef_state_token_budget == 5000
+    for bad in (999, 0, True, 5000.5):
+        with pytest.raises(ValueError, match="clef_state_token_budget"):
+            Limits(clef_state_token_budget=bad)  # type: ignore[arg-type]

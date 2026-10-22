@@ -4,9 +4,11 @@ import copy
 import inspect
 import json
 import time
+import typing
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any, Literal
 
+from trustcall_system_one._types import CallKind
 from trustcall_system_one._wire import (
     CLAIRIC,
     CLEF,
@@ -32,6 +34,7 @@ __all__ = [
     "clairic_response",
     "clef_response",
     "noul",
+    "route",
     "score",
 ]
 
@@ -42,6 +45,40 @@ Handler = Callable[
 
 
 _FULL_IDS = (CLAIRIC, CLEF, CLEF_FLASH)
+
+
+def route(*, default: Handler | None = None, **by_kind: Handler) -> Handler:
+    """Build a ``FakeTransport`` handler that dispatches on ``CallMeta.kind``.
+
+    Args:
+        default: Handler for kinds without their own; without one, such a call is
+            unhandled (``FakeTransport`` raises ``AssertionError``).
+        **by_kind: Handlers keyed by call kind, for example
+            ``route(presence=..., extract=..., attribution=...)``. Each has the
+            ``FakeTransport`` handler signature ``(model, payload, meta)``.
+
+    Returns:
+        A handler to pass to ``FakeTransport``.
+
+    Raises:
+        ValueError: If a key is not a known call kind.
+    """
+    known = set(typing.get_args(CallKind))
+    unknown = set(by_kind) - known
+    if unknown:
+        raise ValueError(
+            f"unknown call kind(s) {sorted(unknown)}; known: {sorted(known)}"
+        )
+
+    def handler(
+        model: str, payload: dict[str, Any], meta: CallMeta
+    ) -> "dict[str, Any] | Awaitable[dict[str, Any] | None] | None":
+        chosen = by_kind.get(meta.kind, default)
+        if chosen is None:
+            return None  # unhandled
+        return chosen(model, payload, meta)
+
+    return handler
 
 
 def _unhandled(model: str, meta: CallMeta, payload: Any, why: str) -> AssertionError:

@@ -8,7 +8,16 @@ from typing import Literal, TypeVar
 from trustcall_system_one._types import Usage
 from trustcall_system_one._wire import CLAIRIC, CLEF, CLEF_FLASH, normalize_model_id
 
-__all__ = ["ConcurrencyConfig", "CostReport", "GateConfig", "Limits", "Prices"]
+__all__ = [
+    "ConcurrencyConfig",
+    "CostReport",
+    "GateConfig",
+    "Limits",
+    "PassesConfig",
+    "PresenceConfig",
+    "Prices",
+    "VerifyConfig",
+]
 
 V = TypeVar("V")
 
@@ -230,12 +239,16 @@ class Limits:
         estimate_for_bounded_numbers: Emit a Clairic ``estimate`` field for a
             number with both a lower and an upper bound.
         max_instruction_chars: Longest instruction string sent to a model.
+        clef_state_token_budget: Estimated tokens above which a Clef state is
+            narrowed to mention windows. Clef silently truncates at 65,536
+            tokens, so the budget leaves headroom for the estimate's error.
     """
 
     max_depth: int = 8
     any_policy: Literal["skip", "text"] = "skip"
     estimate_for_bounded_numbers: bool = False
     max_instruction_chars: int = 600
+    clef_state_token_budget: int = 56_000
 
     def __post_init__(self) -> None:
         """Validate the limits."""
@@ -255,3 +268,162 @@ class Limits:
             raise ValueError("max_instruction_chars must be an int")
         if self.max_instruction_chars < 20:
             raise ValueError("max_instruction_chars must be at least 20")
+        if isinstance(self.clef_state_token_budget, bool) or not isinstance(
+            self.clef_state_token_budget, int
+        ):
+            raise ValueError("clef_state_token_budget must be an int")
+        if self.clef_state_token_budget < 1_000:
+            raise ValueError("clef_state_token_budget must be at least 1000")
+
+
+def _check_unit(name: str, value: float, *, allow_zero: bool = False) -> None:
+    """Require a real number in ``(0, 1]`` (or ``[0, 1]`` with ``allow_zero``)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number, got {value!r}")
+    low_ok = value >= 0 if allow_zero else value > 0
+    if not math.isfinite(value) or not low_ok or value > 1:
+        bounds = "[0, 1]" if allow_zero else "(0, 1]"
+        raise ValueError(f"{name} must be in {bounds}, got {value!r}")
+
+
+def _check_flag(name: str, value: object) -> None:
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be a bool, got {value!r}")
+
+
+@dataclass(frozen=True)
+class VerifyConfig:
+    """Switches and thresholds of the verification ladder.
+
+    The instance is immutable and hashable. Probabilities must lie in
+    ``(0, 1]``.
+
+    Attributes:
+        attribution: Check with Clef that each value is stated about the entity.
+        attribution_keep: Attribution probability at or above which a value is
+            kept.
+        attribution_drop: Probability below which a value is dropped; between
+            the two the value is re-asked in isolation and checked once more.
+        reask_low_confidence: Re-ask answers whose confidence is low.
+        low_confidence: Confidence below which an answer is re-asked.
+        borderline_null: Double-check answers whose ``p_null`` is in the band.
+        null_band: Inclusive ``(low, high)`` range of ``p_null`` that counts as
+            borderline.
+        null_confirm_yes: Probability that the input states the value at or
+            above which a null answer is re-asked.
+        null_confirm_no: Probability below which a non-null answer is nulled.
+        window_chars: Characters of context kept around each mention when the
+            state is narrowed.
+        instruction_template: Template for how a field is asked about an
+            entity; it may use ``{label}`` and ``{desc}``.
+        adjudicate_min: Probability a Clef adjudication needs for one of two
+            disagreeing answers to win.
+        self_consistency_k: Number of state variants to ask; only 1 is
+            supported.
+    """
+
+    attribution: bool = True
+    attribution_keep: float = 0.6
+    attribution_drop: float = 0.3
+    reask_low_confidence: bool = True
+    low_confidence: float = 0.85
+    borderline_null: bool = True
+    null_band: tuple[float, float] = (0.25, 0.75)
+    null_confirm_yes: float = 0.6
+    null_confirm_no: float = 0.4
+    window_chars: int = 600
+    instruction_template: str = "{label}'s {desc}"
+    adjudicate_min: float = 0.6
+    self_consistency_k: int = 1
+
+    def __post_init__(self) -> None:
+        """Validate every setting."""
+        for name in ("attribution", "reask_low_confidence", "borderline_null"):
+            _check_flag(name, getattr(self, name))
+        for name in (
+            "attribution_keep",
+            "attribution_drop",
+            "low_confidence",
+            "null_confirm_yes",
+            "null_confirm_no",
+            "adjudicate_min",
+        ):
+            _check_unit(name, getattr(self, name))
+        if self.attribution_drop > self.attribution_keep:
+            raise ValueError("attribution_drop must not exceed attribution_keep")
+        if self.null_confirm_no > self.null_confirm_yes:
+            raise ValueError("null_confirm_no must not exceed null_confirm_yes")
+        band = self.null_band
+        if not isinstance(band, (tuple, list)) or len(band) != 2:
+            raise ValueError(f"null_band must be a (low, high) pair, got {band!r}")
+        _check_unit("null_band[0]", band[0], allow_zero=True)
+        _check_unit("null_band[1]", band[1], allow_zero=True)
+        if band[0] > band[1]:
+            raise ValueError(f"null_band must have low <= high, got {band!r}")
+        object.__setattr__(self, "null_band", (float(band[0]), float(band[1])))
+        if isinstance(self.window_chars, bool) or not isinstance(
+            self.window_chars, int
+        ):
+            raise ValueError("window_chars must be an int")
+        if self.window_chars < 1:
+            raise ValueError("window_chars must be at least 1")
+        if not isinstance(self.instruction_template, str):
+            raise ValueError("instruction_template must be a string")
+        try:
+            self.instruction_template.format(label="the Thing", desc="a value")
+        except (KeyError, IndexError, ValueError) as exc:
+            raise ValueError(
+                f"instruction_template may only use {{label}} and {{desc}}: {exc!r}"
+            ) from exc
+        if isinstance(self.self_consistency_k, bool) or self.self_consistency_k != 1:
+            raise ValueError(
+                "self_consistency_k other than 1 is not supported yet, "
+                f"got {self.self_consistency_k!r}"
+            )
+
+
+@dataclass(frozen=True)
+class PresenceConfig:
+    """Thresholds of the presence gate.
+
+    The instance is immutable and hashable.
+
+    Attributes:
+        threshold_absent: Presence probability below which the input is taken
+            to contain no entity and nothing is extracted.
+        threshold_present: Probability at or above which the entity is surely
+            there. Between the two a ``One`` schema still extracts, since it
+            has no discovery list to fall back on.
+    """
+
+    threshold_absent: float = 0.2
+    threshold_present: float = 0.5
+
+    def __post_init__(self) -> None:
+        """Validate the thresholds."""
+        _check_unit("threshold_absent", self.threshold_absent, allow_zero=True)
+        _check_unit("threshold_present", self.threshold_present)
+        if self.threshold_absent > self.threshold_present:
+            raise ValueError("threshold_absent must not exceed threshold_present")
+
+
+@dataclass(frozen=True)
+class PassesConfig:
+    """How Clairic fields are grouped into requests.
+
+    The instance is immutable and hashable.
+
+    Attributes:
+        split: ``"entity"`` asks every field of an entity in one request,
+            ``"submodel"`` one request per sub-model (the same as ``"entity"``
+            for a flat schema) and ``"field"`` one request per field.
+    """
+
+    split: Literal["entity", "submodel", "field"] = "submodel"
+
+    def __post_init__(self) -> None:
+        """Validate the split."""
+        if self.split not in ("entity", "submodel", "field"):
+            raise ValueError(
+                f"split must be 'entity', 'submodel' or 'field', got {self.split!r}"
+            )

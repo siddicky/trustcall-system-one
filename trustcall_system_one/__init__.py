@@ -1,5 +1,6 @@
 """Validated extraction and JSON-Patch updates on Cloudflare System One models."""
 
+from trustcall_system_one._cardinality import Many, One
 from trustcall_system_one._compile import (
     FieldSpec,
     SchemaPlan,
@@ -11,7 +12,10 @@ from trustcall_system_one._config import (
     CostReport,
     GateConfig,
     Limits,
+    PassesConfig,
+    PresenceConfig,
     Prices,
+    VerifyConfig,
 )
 from trustcall_system_one._errors import (
     AuthError,
@@ -24,7 +28,24 @@ from trustcall_system_one._errors import (
     TransportError,
     TrustcallSystemOneError,
 )
-from trustcall_system_one._types import CallKind, CallRecord, Usage
+from trustcall_system_one._extractor import (
+    ExtractionInput,
+    Extractor,
+    create_extractor,
+)
+from trustcall_system_one._types import (
+    CallKind,
+    CallRecord,
+    EntityInfo,
+    ExtractionResult,
+    FieldAnswer,
+    Mention,
+    PatchOp,
+    RejectedOp,
+    ResultRecord,
+    SkippedEntity,
+    Usage,
+)
 from trustcall_system_one._version import __version__
 from trustcall_system_one._wire import CLAIRIC, CLEF, CLEF_FLASH
 from trustcall_system_one.transport import (
@@ -46,22 +67,38 @@ __all__ = [
     "CloudflareTransport",
     "ConcurrencyConfig",
     "CostReport",
+    "EntityInfo",
+    "ExtractionInput",
+    "ExtractionResult",
     "ExtractionValidationError",
+    "Extractor",
+    "FieldAnswer",
     "FieldSpec",
     "GateConfig",
     "Limits",
+    "Many",
+    "Mention",
     "ModelResponseError",
+    "One",
+    "PassesConfig",
+    "PatchOp",
+    "PresenceConfig",
     "Prices",
     "RateLimitError",
+    "RejectedOp",
+    "ResultRecord",
     "SchemaPlan",
     "ServerError",
+    "SkippedEntity",
     "StateTruncatedError",
     "Transport",
     "TransportError",
     "TransportResponse",
     "TrustcallSystemOneError",
     "Usage",
+    "VerifyConfig",
     "__version__",
     "compile_schema",
+    "create_extractor",
     "s1_field",
 ]

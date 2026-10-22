@@ -1,0 +1,709 @@
+"""Tests of the verification ladder, driven through the extractor."""
+
+# ruff: noqa: UP045 - tests deliberately spell Optional and Union
+
+import datetime as dt
+from typing import Any, Literal, Optional
+
+import pytest
+from pydantic import BaseModel, Field
+
+from tests.unit.extract_helpers import Script, ca, kinds, make_extractor, pick
+from trustcall_system_one import (
+    ResultRecord,
+    VerifyConfig,
+    compile_schema,
+    s1_field,
+)
+from trustcall_system_one._verify import Resolved, accept, agree, display
+
+
+class Person(BaseModel):
+    """A person mentioned in the text."""
+
+    name: str
+    city: Optional[str] = None
+    age: Optional[int] = None
+
+
+TEXT = "Ada Lovelace lives in London and is 36 years old."
+
+
+def person_script() -> Script:
+    script = Script()
+    script.clairic = {
+        "name": ca("text", "Ada Lovelace", find="Ada Lovelace"),
+        "city": ca("text", "London", find="London"),
+        "age": ca("number", 36),
+    }
+    return script
+
+
+def person(record: ResultRecord) -> Person:
+    assert isinstance(record.value, Person)
+    return record.value
+
+
+async def run_person(script: Script, **kwargs: Any) -> ResultRecord:
+    extractor = make_extractor([Person], script, **kwargs)
+    result = await extractor.ainvoke(TEXT)
+    (record,) = result.records
+    return record
+
+
+# --------------------------------------------------------------------------- #
+# Answer-level thresholds
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_clean_run_makes_no_verification_calls_besides_attribution() -> None:
+    script = person_script()
+    record = await run_person(script)
+    assert record.valid
+    assert record.value == Person(name="Ada Lovelace", city="London", age=36)
+    assert kinds(script.transport)[0] == "presence"
+    assert sorted(kinds(script.transport)[1:]) == ["attribution", "extract"]
+
+
+async def test_low_confidence_below_the_floor_is_rejected() -> None:
+    script = person_script()
+    script.clairic["city"] = ca("text", "London", find="London", confidence=0.4)
+    record = await run_person(script)
+    assert record.value == Person(name="Ada Lovelace", age=36)
+    answer = record.fields["city"]
+    assert answer.rejected_reason == "low_confidence"
+    assert answer.value is None
+    assert answer.source == "default"
+    (rejected,) = record.rejected
+    assert (rejected.op, rejected.path, rejected.reason) == (
+        None,
+        "/city",
+        "low_confidence",
+    )
+    assert rejected.p == 0.4
+    assert "reask" not in kinds(script.transport)  # rejected answers are not re-asked
+
+
+async def test_field_level_min_confidence_overrides_the_default() -> None:
+    class Strict(BaseModel):
+        name: Optional[str] = Field(
+            None, json_schema_extra=s1_field(min_confidence=0.95)
+        )
+
+    script = Script()
+    script.clairic = {"name": ca("text", "Ada", find="Ada", confidence=0.9)}
+    script.reask = {"name": ca("text", "Ada", find="Ada", confidence=0.9)}
+    script.adjudicate = {}
+    extractor = make_extractor([Strict], script)
+    result = await extractor.ainvoke("Ada is here.")
+    assert result.records[0].fields["name"].rejected_reason == "low_confidence"
+
+
+async def test_p_null_above_the_threshold_rejects_a_value() -> None:
+    script = person_script()
+    # city is optional: null_threshold 0.3; p_null 0.9 is outside the null band
+    script.clairic["city"] = ca("text", "London", find="London", p_null=0.9)
+    record = await run_person(script)
+    assert record.fields["city"].rejected_reason == "p_null"
+    assert record.fields["city"].p_null == 0.9
+    assert person(record).city is None
+
+
+async def test_unparseable_answer_is_rejected_not_raised() -> None:
+    script = person_script()
+    script.clairic["age"] = ca("number", "many")
+    record = await run_person(script)
+    assert record.fields["age"].rejected_reason == "unparseable"
+    assert record.rejected[0].detail
+    assert record.valid
+
+
+async def test_guess_is_never_used_as_a_value() -> None:
+    script = person_script()
+    script.clairic["city"] = ca("text", None, guess="Paris", p_null=0.95)
+    record = await run_person(script)
+    assert person(record).city is None
+    assert record.fields["city"].guess == "Paris"
+    assert record.fields["city"].value is None
+    assert record.fields["city"].rejected_reason is None  # a null is not a rejection
+
+
+# --------------------------------------------------------------------------- #
+# Attribution
+# --------------------------------------------------------------------------- #
+
+
+async def test_attribution_asks_one_noul_per_value_in_one_request() -> None:
+    script = person_script()
+    await run_person(script)
+    (call,) = script.calls("attribution")
+    questions = call[1]["questions"]
+    assert sorted(questions) == ["attr.age", "attr.city", "attr.name"]
+    assert questions["attr.city"]["instructions"] == (
+        'Does `input` state that city of `entity.label` is "London"?'
+    )
+    assert call[1]["state"] == {
+        "input": TEXT,
+        "entity": {"label": "the Person", "mentions": []},
+    }
+    assert questions["attr.city"]["type"] == "noul"
+    assert set(questions["attr.city"]["criteria"]) == {"true", "false"}
+
+
+async def test_attribution_below_drop_removes_the_value() -> None:
+    script = person_script()
+    script.attribution = {"attr.city": 0.1}
+    record = await run_person(script)
+    assert person(record).city is None
+    answer = record.fields["city"]
+    assert answer.rejected_reason == "attribution"
+    assert answer.attribution_p == 0.1
+    assert answer.value is None
+    assert [r.reason for r in record.rejected] == ["attribution"]
+    assert "reask" not in kinds(script.transport)
+
+
+async def test_attribution_at_or_above_keep_keeps_the_value() -> None:
+    script = person_script()
+    script.attribution = {"attr.city": 0.6}
+    record = await run_person(script)
+    assert person(record).city == "London"
+    assert record.fields["city"].attribution_p == 0.6
+
+
+async def test_middle_band_reasks_in_isolation_then_checks_again() -> None:
+    text = "x" * 40 + " Ada lives in London. " + "y" * 40
+    script = person_script()
+    script.clairic["name"] = ca("text", "Ada", find="Ada")
+    script.clairic["city"] = ca("text", "London", find="London")
+    script.clairic["age"] = ca("number", None, p_null=0.99)
+    script.attribution = {"attr.city": [0.45, 0.8]}
+    script.reask = {"city": ca("text", "London", find="London")}
+    extractor = make_extractor(
+        [Person], script, verify=VerifyConfig(window_chars=10, borderline_null=False)
+    )
+    result = await extractor.ainvoke(text)
+    record = result.records[0]
+    assert person(record).city == "London"
+    assert record.fields["city"].reask is True
+    assert record.fields["city"].attribution_p == 0.8
+    seen = kinds(script.transport)
+    assert seen.count("reask") == 1
+    assert seen.count("attribution") == 2
+    # the re-ask and the second check both see only the neighbourhood
+    reask_state = script.calls("reask")[0][1]["state"]
+    assert "…" in reask_state
+    assert "x" * 40 not in reask_state
+    assert script.calls("reask")[0][1]["fields"]["city"]["instructions"].endswith(
+        "Answer only from the text near these mentions."
+    )
+    second = script.calls("attribution")[1][1]
+    assert "…" in second["state"]["input"]
+    assert "y" * 40 not in second["state"]["input"]
+    # the span still maps to the original text
+    span = record.fields["city"].span
+    assert span is not None and text[span[0] : span[1]] == "London"
+
+
+async def test_middle_band_that_stays_low_drops_the_value() -> None:
+    script = person_script()
+    script.attribution = {"attr.city": [0.45, 0.4]}
+    script.reask = {"city": ca("text", "London", find="London")}
+    record = await run_person(script, verify=VerifyConfig(borderline_null=False))
+    assert record.fields["city"].rejected_reason == "attribution"
+    assert record.fields["city"].attribution_p == 0.4
+    assert record.fields["city"].reask is True
+
+
+async def test_middle_band_whose_reask_finds_nothing_drops_the_value() -> None:
+    script = person_script()
+    script.attribution = {"attr.city": 0.45}
+    script.reask = {"city": ca("text", None, p_null=0.99)}
+    record = await run_person(script, verify=VerifyConfig(borderline_null=False))
+    assert record.fields["city"].rejected_reason == "attribution"
+    assert kinds(script.transport).count("attribution") == 1
+
+
+async def test_list_elements_are_attributed_one_by_one() -> None:
+    class Notes(BaseModel):
+        notes: list[str]
+
+    text = "Notes: red, green, blue."
+    script = Script()
+    script.clairic = {
+        "notes": ca("list", ["red", "green", "blue"], find_all=["red", "green", "blue"])
+    }
+    script.attribution = {
+        "attr.notes.0": 0.9,
+        "attr.notes.1": 0.05,
+        "attr.notes.2": 0.7,
+    }
+    extractor = make_extractor([Notes], script)
+    result = await extractor.ainvoke(text)
+    record = result.records[0]
+    assert record.value == Notes(notes=["red", "blue"])
+    answer = record.fields["notes"]
+    assert answer.attribution_p == (0.9, 0.05, 0.7)
+    assert answer.spans is not None
+    assert [text[a:b] for a, b in answer.spans] == ["red", "blue"]
+    assert [(r.path, r.reason) for r in record.rejected] == [
+        ("/notes/1", "attribution")
+    ]
+    assert answer.warnings == ("dropped 1 element(s): attribution",)
+    (call,) = script.calls("attribution")
+    assert call[1]["questions"]["attr.notes.1"]["instructions"] == (
+        'Does `input` state this about `entity.label`: "green"?'
+    )
+
+
+async def test_list_with_every_element_dropped_is_rejected() -> None:
+    class Notes(BaseModel):
+        notes: Optional[list[str]] = None
+
+    script = Script()
+    script.clairic = {"notes": ca("list", ["a"], find_all=["a"])}
+    script.attribution = {"attr.notes.0": 0.0}
+    extractor = make_extractor([Notes], script)
+    result = await extractor.ainvoke("a")
+    record = result.records[0]
+    assert record.fields["notes"].rejected_reason == "attribution"
+    assert record.value == Notes()
+
+
+async def test_attribution_can_be_switched_off() -> None:
+    script = person_script()
+    await run_person(script, verify=VerifyConfig(attribution=False))
+    assert "attribution" not in kinds(script.transport)
+
+
+async def test_clef_engine_values_skip_attribution() -> None:
+    class Flag(BaseModel):
+        status: Literal["open", "closed"]
+
+    script = Script()
+    script.clef = {"status": pick("open", ["open", "closed"])}
+    extractor = make_extractor([Flag], script)
+    result = await extractor.ainvoke("It is open.")
+    assert result.records[0].value == Flag(status="open")
+    assert sorted(kinds(script.transport)) == ["clef_fields", "presence"]
+
+
+# --------------------------------------------------------------------------- #
+# Low-confidence re-ask and adjudication
+# --------------------------------------------------------------------------- #
+
+
+def low_confidence_script(first: str = "London") -> Script:
+    script = person_script()
+    script.clairic["city"] = ca("text", first, find=first, confidence=0.7)
+    return script
+
+
+async def test_low_confidence_reask_that_agrees_keeps_the_better_answer() -> None:
+    script = low_confidence_script()
+    script.reask = {"city": ca("text", "london", find="London", confidence=0.97)}
+    record = await run_person(script)
+    answer = record.fields["city"]
+    assert person(record).city == "london"  # the higher confidence
+    assert answer.confidence == 0.97
+    assert answer.reask is True
+    assert "adjudicate" not in kinds(script.transport)
+    # one re-ask for the one low-confidence field, with the narrowed state
+    (reask,) = script.calls("reask")
+    assert list(reask[1]["fields"]) == ["city"]
+
+
+async def test_low_confidence_reask_keeps_the_first_when_it_is_more_confident() -> None:
+    script = low_confidence_script()
+    script.reask = {"city": ca("text", "London", find="London", confidence=0.6)}
+    record = await run_person(script)
+    assert record.fields["city"].confidence == 0.7
+    assert record.fields["city"].reask is True
+
+
+async def test_agreement_is_fuzzy_for_text() -> None:
+    script = person_script()
+    script.clairic["city"] = ca("text", "Londonn", find="London", confidence=0.7)
+    script.reask = {"city": ca("text", "London", find="London", confidence=0.99)}
+    record = await run_person(script)
+    assert "adjudicate" not in kinds(script.transport)
+    assert record.fields["city"].value == "London"
+
+
+@pytest.mark.parametrize(
+    ("verdict", "city", "reason"),
+    [
+        ("a", "London", None),
+        ("b", "Paris", None),
+        ("neither", None, "adjudication_failed"),
+    ],
+)
+async def test_disagreeing_reask_goes_to_adjudication(
+    verdict: str, city: str | None, reason: str | None
+) -> None:
+    text = "Ada Lovelace lives in London but works in Paris and is 36 years old."
+    script = person_script()
+    script.clairic["city"] = ca("text", "London", find="London", confidence=0.7)
+    script.reask = {"city": ca("text", "Paris", find="Paris", confidence=0.9)}
+    script.adjudicate = {"city": pick(verdict, ["a", "b", "neither"], 0.9)}
+    extractor = make_extractor([Person], script)
+    result = await extractor.ainvoke(text)
+    record = result.records[0]
+    answer = record.fields["city"]
+    assert answer.value == city
+    assert answer.rejected_reason == reason
+    assert answer.reask is True
+    (call,) = script.calls("adjudicate")
+    question = call[1]["questions"]["adjudicate"]
+    assert question["type"] == "choice"
+    assert question["criteria"] == {
+        "a": "London",
+        "b": "Paris",
+        "neither": "The input states neither",
+    }
+    assert set(call[1]["state"]) == {"input", "entity"}
+
+
+async def test_adjudication_below_the_minimum_nulls_the_field() -> None:
+    text = "Ada Lovelace lives in London but works in Paris."
+    script = person_script()
+    script.clairic["city"] = ca("text", "London", find="London", confidence=0.7)
+    script.reask = {"city": ca("text", "Paris", find="Paris", confidence=0.9)}
+    script.adjudicate = {"city": pick("a", ["a", "b", "neither"], 0.5)}
+    extractor = make_extractor([Person], script)
+    record = (await extractor.ainvoke(text)).records[0]
+    assert record.fields["city"].rejected_reason == "adjudication_failed"
+    assert record.fields["city"].rejected_reason in [r.reason for r in record.rejected]
+    assert person(record).city is None
+
+
+async def test_reask_that_finds_nothing_is_adjudicated_against_no_value() -> None:
+    script = low_confidence_script()
+    script.reask = {"city": ca("text", None, p_null=0.99)}
+    script.adjudicate = {"city": pick("b", ["a", "b", "neither"])}
+    record = await run_person(script)
+    (call,) = script.calls("adjudicate")
+    assert call[1]["questions"]["adjudicate"]["criteria"]["b"] == (
+        "The input states no value for this."
+    )
+    assert record.fields["city"].value is None
+    assert record.fields["city"].warnings == ("adjudicated_to_null",)
+
+
+async def test_reask_can_be_switched_off() -> None:
+    script = low_confidence_script()
+    record = await run_person(script, verify=VerifyConfig(reask_low_confidence=False))
+    assert "reask" not in kinds(script.transport)
+    assert record.fields["city"].value == "London"
+
+
+async def test_reasked_values_go_through_attribution_again() -> None:
+    text = "Ada Lovelace lives in London but works in Paris and is 36 years old."
+    script = person_script()
+    script.clairic["city"] = ca("text", "London", find="London", confidence=0.7)
+    script.reask = {"city": ca("text", "Paris", find="Paris", confidence=0.9)}
+    script.adjudicate = {"city": pick("b", ["a", "b", "neither"], 0.9)}
+    script.attribution = {"attr.city": 0.05}
+    extractor = make_extractor([Person], script)
+    record = (await extractor.ainvoke(text)).records[0]
+    (call,) = script.calls("attribution")
+    assert (
+        call[1]["questions"]["attr.city"]["instructions"]
+        == 'Does `input` state that city of `entity.label` is "Paris"?'
+    )
+    assert record.fields["city"].rejected_reason == "attribution"
+
+
+# --------------------------------------------------------------------------- #
+# Borderline null
+# --------------------------------------------------------------------------- #
+
+
+async def test_borderline_null_that_the_input_states_is_reasked() -> None:
+    script = person_script()
+    script.clairic["city"] = ca("text", None, p_null=0.5)
+    script.null_check = {"nullcheck.city": 0.9}
+    script.reask = {"city": ca("text", "London", find="London", p_null=0.2)}
+    record = await run_person(script)
+    assert person(record).city == "London"
+    assert record.fields["city"].reask is True
+    (check,) = script.calls("null_check")
+    assert list(check[1]["questions"]) == ["nullcheck.city"]
+    assert check[1]["questions"]["nullcheck.city"]["instructions"] == (
+        "Does `input` state the Person's city?"
+    )
+    (reask,) = script.calls("reask")
+    assert reask[1]["fields"]["city"]["null_threshold"] == 0.95
+    assert (
+        "city"
+        in script.calls("attribution")[0][1]["questions"]["attr.city"]["instructions"]
+    )
+
+
+async def test_borderline_null_that_is_confirmed_stays_null() -> None:
+    script = person_script()
+    script.clairic["city"] = ca("text", None, p_null=0.5)
+    script.null_check = {"nullcheck.city": 0.1}
+    record = await run_person(script)
+    assert person(record).city is None
+    assert "reask" not in kinds(script.transport)
+
+
+async def test_borderline_null_still_null_after_the_reask() -> None:
+    script = person_script()
+    script.clairic["city"] = ca("text", None, p_null=0.5)
+    script.null_check = {"nullcheck.city": 0.9}
+    script.reask = {"city": ca("text", None, p_null=0.9)}
+    record = await run_person(script)
+    assert person(record).city is None
+    assert record.fields["city"].reask is True
+
+
+async def test_borderline_non_null_value_the_input_does_not_state_is_nulled() -> None:
+    class Guarded(BaseModel):
+        name: str
+        age: Optional[int] = Field(None, json_schema_extra=s1_field(null_threshold=0.9))
+
+    script = Script()
+    script.clairic = {
+        "name": ca("text", "Ada", find="Ada"),
+        "age": ca("number", 36, p_null=0.5),
+    }
+    script.null_check = {"nullcheck.age": 0.1}
+    extractor = make_extractor([Guarded], script)
+    record = (await extractor.ainvoke("Ada is here.")).records[0]
+    assert record.value == Guarded(name="Ada")
+    assert record.fields["age"].rejected_reason == "null_check"
+    assert [(r.reason, r.p) for r in record.rejected] == [("null_check", 0.1)]
+    assert "attr.age" not in script.calls("attribution")[0][1]["questions"]
+
+
+async def test_borderline_value_between_the_confirm_thresholds_is_left_alone() -> None:
+    class Guarded(BaseModel):
+        age: Optional[int] = Field(None, json_schema_extra=s1_field(null_threshold=0.9))
+
+    script = Script()
+    script.clairic = {"age": ca("number", 36, p_null=0.5)}
+    script.null_check = {"nullcheck.age": 0.5}
+    extractor = make_extractor([Guarded], script)
+    record = (await extractor.ainvoke("Ada is 36.")).records[0]
+    assert record.value == Guarded(age=36)
+
+
+async def test_borderline_band_is_inclusive_and_configurable() -> None:
+    script = person_script()
+    script.clairic["city"] = ca("text", None, p_null=0.25)
+    script.null_check = {"nullcheck.city": 0.1}
+    await run_person(script)
+    assert len(script.calls("null_check")) == 1
+    script = person_script()
+    script.clairic["city"] = ca("text", None, p_null=0.25)
+    await run_person(script, verify=VerifyConfig(null_band=(0.3, 0.7)))
+    assert script.calls("null_check") == []
+    script = person_script()
+    script.clairic["city"] = ca("text", None, p_null=0.5)
+    await run_person(script, verify=VerifyConfig(borderline_null=False))
+    assert script.calls("null_check") == []
+
+
+# --------------------------------------------------------------------------- #
+# Clef answers
+# --------------------------------------------------------------------------- #
+
+
+class Flags(BaseModel):
+    active: bool = False
+    verified: Optional[bool] = None
+    status: Literal["open", "closed"] = "open"
+
+
+def flags(record: ResultRecord) -> "Flags":
+    assert isinstance(record.value, Flags)
+    return record.value
+
+
+async def run_flags(clef: dict[str, Any]) -> ResultRecord:
+    script = Script()
+    script.clef = clef
+    extractor = make_extractor([Flags], script)
+    return (await extractor.ainvoke("The ticket was closed.")).records[0]
+
+
+async def test_noul_inside_the_abstain_band_is_rejected() -> None:
+    record = await run_flags(
+        {
+            "active": {"type": "noul", "noul": 0.55},
+            "verified": pick("unstated", ["yes", "no", "unstated"]),
+            "status": pick("closed", ["open", "closed", "unstated"]),
+        }
+    )
+    assert record.fields["active"].rejected_reason == "abstain"
+    assert record.value == Flags(active=False, status="closed")
+    assert ("/active", "abstain") in [(r.path, r.reason) for r in record.rejected]
+
+
+async def test_noul_outside_the_band_is_a_bool() -> None:
+    record = await run_flags(
+        {
+            "active": {"type": "noul", "noul": 0.05},
+            "verified": pick("yes", ["yes", "no", "unstated"]),
+            "status": pick("closed", ["open", "closed", "unstated"]),
+        }
+    )
+    assert record.fields["active"].value is False
+    assert record.value == Flags(active=False, verified=True, status="closed")
+
+
+async def test_unstated_on_defaulted_and_nullable_fields_gives_the_default() -> None:
+    record = await run_flags(
+        {
+            "active": {"type": "noul", "noul": 0.9},
+            "verified": pick("unstated", ["yes", "no", "unstated"]),
+            "status": pick("unstated", ["open", "closed", "unstated"]),
+        }
+    )
+    assert record.value == Flags(active=True, verified=None, status="open")
+    for name in ("verified", "status"):
+        answer = record.fields[name]
+        assert answer.value is None
+        assert answer.source == "default"
+        assert answer.rejected_reason is None
+        assert answer.warnings == ("unstated",)
+    assert record.rejected == ()
+
+
+async def test_clef_choice_below_the_probability_floor_is_rejected() -> None:
+    record = await run_flags(
+        {
+            "active": {"type": "noul", "noul": 0.9},
+            "verified": pick("unstated", ["yes", "no", "unstated"]),
+            "status": {
+                "type": "choice",
+                "choice": "closed",
+                "probabilities": {"open": 0.4, "closed": 0.5, "unstated": 0.1},
+                "confidence": 0.9,
+            },
+        }
+    )
+    assert record.fields["status"].rejected_reason == "low_choice_prob"
+    assert flags(record).status == "open"
+
+
+async def test_clef_choice_with_low_confidence_is_rejected() -> None:
+    record = await run_flags(
+        {
+            "active": {"type": "noul", "noul": 0.9},
+            "verified": pick("unstated", ["yes", "no", "unstated"]),
+            "status": {
+                "type": "choice",
+                "choice": "closed",
+                "probabilities": {"open": 0.1, "closed": 0.8, "unstated": 0.1},
+                "confidence": 0.3,
+            },
+        }
+    )
+    assert record.fields["status"].rejected_reason == "low_confidence"
+
+
+async def test_list_elements_matching_no_option_are_dropped() -> None:
+    class Tags(BaseModel):
+        kinds: list[Literal["bug", "feature"]]
+
+    script = Script()
+    script.clairic = {
+        "kinds": ca("list", ["bug", "wish"], find_all=["bug", "wish"], confidence=0.99)
+    }
+    script.clef = {
+        "kinds.el0": pick("bug", ["bug", "feature", "none_of_these"]),
+        "kinds.el1": pick("none_of_these", ["bug", "feature", "none_of_these"]),
+    }
+    extractor = make_extractor([Tags], script)
+    text = "A bug and a wish."
+    record = (await extractor.ainvoke(text)).records[0]
+    assert record.value == Tags(kinds=["bug"])
+    answer = record.fields["kinds"]
+    assert answer.spans is not None
+    assert [text[a:b] for a, b in answer.spans] == ["bug"]
+    assert any("wish" in note for note in answer.warnings)
+
+
+async def test_set_of_enum_elements_dedupes() -> None:
+    class Tags(BaseModel):
+        kinds: set[Literal["bug", "feature"]]
+
+    script = Script()
+    script.clairic = {"kinds": ca("list", ["bug", "bugs"], find_all=["bug", "bugs"])}
+    script.clef = {
+        "kinds.el0": pick("bug", ["bug", "feature", "none_of_these"]),
+        "kinds.el1": pick("bug", ["bug", "feature", "none_of_these"]),
+    }
+    extractor = make_extractor([Tags], script)
+    record = (await extractor.ainvoke("bug bugs")).records[0]
+    assert record.value == Tags(kinds={"bug"})
+
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+
+
+def test_agree_text_numbers_lists() -> None:
+    assert agree("London", "  london ")
+    assert agree("Londonn", "London")
+    assert not agree("London", "Paris")
+    assert agree(5, 5.0)
+    assert agree(dt.date(2020, 1, 1), dt.date(2020, 1, 1))
+    assert not agree(dt.date(2020, 1, 1), dt.date(2020, 1, 2))
+    assert agree(["a", "b"], ["B", "a"])
+    assert not agree(["a", "b"], ["a"])
+    assert not agree(["a", "a"], ["a", "b"])
+    assert agree(None, None)
+    assert not agree(None, "x")
+    assert not agree(True, 1.5)
+
+
+def test_display_formats_values_for_questions() -> None:
+    assert display(dt.date(2020, 1, 2)) == "2020-01-02"
+    assert display(dt.datetime(2020, 1, 2, 3, 4)) == "2020-01-02T03:04:00"
+    assert display(["a", 1]) == "a; 1"
+    from decimal import Decimal
+
+    assert display(Decimal("1E+2")) == "100"
+
+
+def test_accept_applies_the_answer_level_thresholds() -> None:
+    plan = compile_schema(Person)
+    city = plan.spec(("city",))
+    assert accept(city, Resolved(value="x", p_null=0.0, confidence=0.9)) is None
+    assert accept(city, Resolved(value=None, p_null=0.99)) is None
+    reason = accept(city, Resolved(value="x", p_null=0.5, confidence=0.9))
+    assert reason is not None and reason[0] == "p_null"
+    assert accept(city, Resolved(value="x", p_null=0.5), null_threshold=0.95) is None
+    low = accept(city, Resolved(value="x", p_null=0.0, confidence=0.1))
+    assert low is not None and low[0] == "low_confidence"
+    bad = accept(city, Resolved(ok=False, reason="unparseable", detail="nope"))
+    assert bad == ("unparseable", "nope", None)
+
+
+async def test_clef_questions_name_the_entity_at_the_description() -> None:
+    class Review(BaseModel):
+        best: bool = False  # "best" also occurs earlier in the compiled question
+        rating: Literal["best", "worst"] = "best"
+
+    script = Script()
+    script.clef = {
+        "best": {"type": "noul", "noul": 0.9},
+        "rating": pick("best", ["best", "worst", "unstated"]),
+    }
+    extractor = make_extractor([Review], script)
+    plan = extractor.plan_for(Review)
+    before = plan.spec(("best",)).clef
+    await extractor.ainvoke("The best.")
+    (call,) = script.calls("clef_fields")
+    assert call[1]["questions"]["best"]["instructions"] == (
+        "Does the input say this is true: the Review's best?"
+    )
+    assert call[1]["questions"]["rating"]["instructions"] == (
+        "Pick the option that best fits: the Review's rating"
+    )
+    assert plan.spec(("best",)).clef == before

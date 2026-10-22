@@ -553,12 +553,12 @@ def test_unstated_on_a_nullable_field_is_an_ok_none() -> None:
         assert result.score == 0.8
 
 
-def test_unstated_on_a_defaulted_field_is_not_ok_so_the_default_stays() -> None:
+def test_unstated_on_a_defaulted_field_is_an_ok_none() -> None:
     spec = spec_for(Level, Level.LOW)
     result = coerce(
         spec, choice("unstated", unstated=0.7, LOW=0.2, MID=0.05, HIGH=0.05)
     )
-    assert (result.value, result.ok, result.reason) == (None, False, "unstated")
+    assert (result.value, result.ok, result.reason) == (None, True, "unstated")
     real = coerce(spec, choice("HIGH", unstated=0.1, LOW=0.1, MID=0.1, HIGH=0.7))
     assert (real.value, real.ok, real.reason) == ("high", True, None)
 

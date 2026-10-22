@@ -1111,3 +1111,162 @@ async def test_transport_respects_global_limit_under_load() -> None:
     assert peak == 3
     assert transport.limiter.in_flight == 0
     await client.aclose()
+
+
+# --------------------------------------------------------------------------- #
+# call_deadline
+# --------------------------------------------------------------------------- #
+
+
+class FakeClock:
+    """A clock that only moves when the injected sleep is awaited."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.delays: list[float] = []
+
+    def __call__(self) -> float:
+        return self.now
+
+    async def sleep(self, delay: float) -> None:
+        self.delays.append(delay)
+        self.now += delay
+
+
+def make_clocked(
+    *responses: httpx.Response | Exception, **kwargs: Any
+) -> tuple[CloudflareTransport, Recorder, FakeClock]:
+    recorder = Recorder(*responses)
+    clock = FakeClock()
+    client = httpx.AsyncClient(transport=httpx.MockTransport(recorder))
+    transport = CloudflareTransport(
+        client=client,
+        account_id="acct",
+        api_token="tok",
+        sleep=clock.sleep,
+        clock=clock,
+        **kwargs,
+    )
+    return transport, recorder, clock
+
+
+async def test_default_call_deadline_is_300_seconds() -> None:
+    transport, rec, clock = make_clocked(
+        err(503, headers={"Retry-After": "50"}), max_retries=50, max_retry_after=60.0
+    )
+    with pytest.raises(TransportError, match="deadline") as info:
+        await run(transport)
+    assert clock.delays == [50.0] * 5  # the sixth wait would end at the deadline
+    assert info.value.retries == 5
+    assert len(rec.requests) == 6
+
+
+async def test_deadline_stops_retrying_with_a_deadline_error_that_keeps_retries() -> (
+    None
+):
+    transport, rec, clock = make_clocked(
+        err(503, headers={"Retry-After": "120"}),
+        max_retries=10,
+        max_retry_after=200.0,
+        call_deadline=300.0,
+    )
+    with pytest.raises(TransportError) as info:
+        await run(transport)
+    error = info.value
+    assert type(error) is TransportError
+    assert "deadline" in str(error)
+    assert "300" in str(error)
+    assert error.retries == 2
+    assert error.status_code == 503
+    assert isinstance(error.__cause__, ServerError)
+    assert clock.delays == [120.0, 120.0]
+    assert len(rec.requests) == 3
+    assert transport.limiter.in_flight == 0
+
+
+async def test_deadline_covers_backoff_sleeps_without_retry_after() -> None:
+    transport, rec, clock = make_clocked(
+        err(500),
+        max_retries=1000,
+        backoff_base=1.0,
+        backoff_max=10.0,
+        call_deadline=25.0,
+    )
+    with pytest.raises(TransportError, match="deadline"):
+        await run(transport)
+    assert sum(clock.delays) < 25.0
+    assert len(rec.requests) == len(clock.delays) + 1
+
+
+async def test_attempt_timeout_is_capped_by_the_remaining_budget() -> None:
+    transport, rec, _ = make_clocked(
+        err(503, headers={"Retry-After": "4"}), ok(), call_deadline=10.0
+    )
+    await transport.run(CLAIRIC, PAYLOAD, meta=META, timeout=60.0)
+    first, second = (r.extensions["timeout"] for r in rec.requests)
+    assert first["read"] == 10.0
+    assert first["connect"] == 10.0
+    assert second["read"] == 6.0
+    assert second["connect"] == 6.0
+
+
+async def test_explicit_timeout_below_the_budget_is_left_alone() -> None:
+    transport, rec, _ = make_clocked(ok(), call_deadline=100.0)
+    await transport.run(CLAIRIC, PAYLOAD, meta=META, timeout=3.0)
+    assert rec.requests[0].extensions["timeout"]["read"] == 3.0
+    assert rec.requests[0].extensions["timeout"]["connect"] == 10.0
+
+
+async def test_client_default_timeout_is_capped_only_when_the_budget_is_tighter() -> (
+    None
+):
+    transport, rec, _ = make_clocked(ok(), call_deadline=3.0)
+    await run(transport)
+    assert rec.requests[0].extensions["timeout"]["read"] == 3.0  # not httpx's 5.0
+    transport, rec, _ = make_clocked(ok(), call_deadline=30.0)
+    await run(transport)
+    assert rec.requests[0].extensions["timeout"]["read"] == 5.0
+
+
+async def test_no_deadline_means_unbounded_retries_in_time() -> None:
+    transport, _, clock = make_clocked(
+        err(503, headers={"Retry-After": "50"}),
+        max_retries=10,
+        max_retry_after=60.0,
+        call_deadline=None,
+    )
+    with pytest.raises(ServerError):
+        await run(transport)
+    assert clock.delays == [50.0] * 10
+
+
+async def test_time_spent_waiting_for_a_slot_counts_against_the_deadline() -> None:
+    transport, rec, clock = make_clocked(
+        ok(), call_deadline=5.0, concurrency=ConcurrencyConfig(per_model={CLAIRIC: 1})
+    )
+    release = asyncio.Event()
+    acquired = asyncio.Event()
+
+    async def hold() -> None:
+        async with transport.limiter.slot(CLAIRIC):
+            acquired.set()
+            await release.wait()
+
+    holder = asyncio.create_task(hold())
+    await acquired.wait()
+    call = asyncio.create_task(run(transport))
+    for _ in range(5):
+        await asyncio.sleep(0)  # let the call queue behind the holder
+    clock.now += 10.0
+    release.set()
+    with pytest.raises(TransportError, match="deadline"):
+        await call
+    await holder
+    assert rec.requests == []
+    assert transport.limiter.in_flight == 0
+
+
+@pytest.mark.parametrize("bad", [0, -1.0, float("nan"), float("inf")])
+def test_invalid_call_deadline_is_rejected(bad: float) -> None:
+    with pytest.raises(ValueError, match="call_deadline"):
+        CloudflareTransport(call_deadline=bad)
