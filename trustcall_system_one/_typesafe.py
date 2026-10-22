@@ -136,6 +136,9 @@ class TypeSafeConfig:
             ``needs_review`` (cookbook: 0.60).
         verify_selection: Whether to verify each selected scalar (SDE cascade stage
             2, one more request).
+        kind_min_prob: A list of text is read as statements, or as short values,
+            only when Jev chose that kind with at least this probability; anything
+            less is unclear and the list is not filtered.
         fire_threshold: Verification: P(wrong) above this escalates the field
             (cookbook: 0.7).
         context_chars: Characters of context quoted around a candidate in a yes/no.
@@ -152,6 +155,7 @@ class TypeSafeConfig:
     review_below: float = REVIEW_BELOW
     verify_selection: bool = True
     fire_threshold: float = 0.7
+    kind_min_prob: float = 0.5
     context_chars: int = 40
     max_list_candidates: int = 400
     max_input_chars: int = 60_000
@@ -164,6 +168,7 @@ class TypeSafeConfig:
             "join_after_terminal",
             "review_below",
             "fire_threshold",
+            "kind_min_prob",
         ):
             value = getattr(self, name)
             if not 0.0 <= value <= 1.0:
@@ -433,10 +438,17 @@ def from_jev(
     response = parse_clef(body)
     for qid, question in questions.items():
         answer = response.answers.get(qid)
+        # the "what does a list hold" question is a refinement: its answer, if it is
+        # missing or does not fit, is read as unclear and the call goes on
+        optional = qid.endswith("::kind")
         if answer is None:
+            if optional:
+                continue
             raise ModelResponseError(f"Jev did not answer question {qid!r}", raw=body)
         kind = question.get("type")
         if answer.type != kind:
+            if optional:
+                continue
             raise ModelResponseError(
                 f"Jev answered question {qid!r} with a {answer.type}, not a {kind}",
                 raw=body,
@@ -447,6 +459,8 @@ def from_jev(
             and isinstance(criteria, Mapping)
             and answer.choice not in criteria
         ):
+            if optional:
+                continue
             raise ModelResponseError(
                 f"Jev chose an option for {qid!r} that was not offered", raw=body
             )
@@ -714,6 +728,15 @@ _LIST_KIND = {
 }
 
 
+def _enumerated(spec: ClairicField) -> bool:
+    """Whether a list holds items chosen from a fixed set (``list[Literal[...]]``).
+
+    The library says so in the field's instructions ("Each item must be one of: ...");
+    such a list is neither names nor notes, and is not asked what it holds.
+    """
+    return "Each item must be one of:" in (spec.instructions or "")
+
+
 def _kind_question(desc: str) -> dict[str, Any]:
     """Whether the items of a list of text are short values or statements.
 
@@ -796,7 +819,8 @@ class _Job:
     finalists: list[Candidate] = field(default_factory=list)
     answer: ChoiceAnswer | None = None
     repair: _Repair | None = None
-    list_kind: str = "items"  # "items" or "statements": what a list of text holds
+    list_kind: str = "unclear"  # "statements", "items" or "unclear" (no filter)
+    kind_asked: bool = False
     members: dict[int, float] = field(default_factory=dict)
     parts: dict[str, Part] = field(default_factory=dict)
     time_parts: dict[str, Part] = field(default_factory=dict)
@@ -915,7 +939,7 @@ async def run_clairic(
 
     followups: dict[str, dict[str, Any]] = {}
     for job in jobs:
-        followups.update(_absorb(job, answers))
+        followups.update(_absorb(job, answers, config))
     if followups:
         answers = await ask(state, followups, "refine")
         for job in jobs:
@@ -1132,7 +1156,8 @@ def _stage_one(job: _Job) -> dict[str, Any]:
     elif job.kind == "list":
         for i, candidate in enumerate(job.options):
             out[f"{name}::in{i}"] = _member_question(desc, candidate)
-        if spec.items == "text" and job.options:
+        if spec.items == "text" and job.options and not _enumerated(spec):
+            job.kind_asked = True
             out[f"{name}::kind"] = _kind_question(desc)
     else:
         role = _role(spec, name)
@@ -1152,7 +1177,9 @@ def _stage_one(job: _Job) -> dict[str, Any]:
     return out
 
 
-def _absorb(job: _Job, answers: Mapping[str, Any]) -> dict[str, Any]:
+def _absorb(
+    job: _Job, answers: Mapping[str, Any], config: TypeSafeConfig
+) -> dict[str, Any]:
     """Read the first round of answers; return the questions of a second round."""
     name, spec = job.name, job.spec
     if job.kind == "pick":
@@ -1192,12 +1219,14 @@ def _absorb(job: _Job, answers: Mapping[str, Any]) -> dict[str, Any]:
             if isinstance(answer, NoulAnswer):
                 job.members[i] = answer.noul
         kind = answers.get(f"{name}::kind")
+        # Jev's answer decides only when it is a clear choice of one of the two; a
+        # missing, mistyped or unsure one leaves the list as it was (no filter).
         if (
             isinstance(kind, ChoiceAnswer)
-            and kind.choice == "statements"
-            and kind.probabilities.get("statements", 0.0) >= 0.5
+            and kind.choice in _LIST_KIND
+            and kind.probabilities.get(kind.choice, 0.0) >= config.kind_min_prob
         ):
-            job.list_kind = "statements"
+            job.list_kind = kind.choice
         if spec.items == "date":
             follow: dict[str, Any] = {}
             role_of = _role(spec, name)
@@ -1321,23 +1350,49 @@ def _of_its_kind(job: _Job, accepted: list[int]) -> list[int]:
     * Statements (notes): only whole sentences and clauses (and blocks). A name, a
       number or a noun phrase inside an accepted sentence is not a note of its own,
       and neither is one inside a sentence that was not accepted ("Berlin").
-    * Short values (names, tags): a clause or a sentence that contains an accepted
-      value is not one. "Olivia Davis, she's a 27-year-old graphic designer" is not
-      the name of a person whose name "Olivia Davis" was also accepted.
+    * Short values (names, tags): a sentence or block that contains an accepted value
+      is not one, and neither is a clause that is an apposition of one:
+      "Olivia Davis, she's a 27-year-old graphic designer" is not the name of a
+      person whose name "Olivia Davis" was also accepted. A clause that names
+      something *through* a value is kept: "Olivia Davis's husband", "the CEO of
+      Acme" are mentions of other people. Noun phrases are never dropped.
+    * Unclear (Jev did not clearly choose one of the two, or the list is a fixed
+      set of choices): nothing is dropped, as before the question existed.
     """
     options = job.options
     if job.list_kind == "statements":
         return [i for i in accepted if options[i].kind in _STATEMENT_KINDS]
-    values = [i for i in accepted if options[i].kind not in _STRUCTURAL]
-    return [
-        i
-        for i in accepted
-        if options[i].kind not in _STRUCTURAL
-        or not any(
-            options[i].start <= options[j].start and options[j].end <= options[i].end
-            for j in values
-        )
-    ]
+    if job.list_kind != "items":
+        return accepted
+    values = [options[i] for i in accepted if options[i].kind not in _STRUCTURAL]
+
+    def dropped(c: Candidate) -> bool:
+        inside = [v for v in values if c.start <= v.start and v.end <= c.end]
+        if c.kind in ("block", "sentence"):
+            return bool(inside)
+        if c.kind == "clause":
+            return any(_apposition(c, v) for v in inside)
+        return False
+
+    return [i for i in accepted if not dropped(options[i])]
+
+
+_APPOSITION = re.compile(
+    r"\s*(?:,|(?:is|was|are|were|who|which|she|he|they|it)\b)", re.I
+)
+
+
+def _apposition(clause: Candidate, value: Candidate) -> bool:
+    """Whether ``clause`` is ``value`` followed by a comma or a copula or pronoun.
+
+    "Olivia Davis, she's a pilot" and "Olivia Davis is a pilot" say something about
+    Olivia Davis; "Olivia Davis's husband" (a possessive) and "the CEO of Acme" (the
+    value inside a larger noun phrase) refer to someone else.
+    """
+    if clause.start != value.start:
+        return False
+    rest = clause.text[value.end - clause.start :]
+    return bool(_APPOSITION.match(rest))
 
 
 def _finish_list(job: _Job, base: int, today: date, config: TypeSafeConfig) -> None:
@@ -1345,6 +1400,8 @@ def _finish_list(job: _Job, base: int, today: date, config: TypeSafeConfig) -> N
     accepted = [i for i, p in job.members.items() if p >= 0.5]
     if job.spec.items == "text":
         accepted = _of_its_kind(job, accepted)
+        if job.kind_asked and job.list_kind == "unclear":
+            out["note"] = "list kind unclear: the members were not filtered"
     structural = [i for i in accepted if job.options[i].kind in _STRUCTURAL]
     drop = {
         i

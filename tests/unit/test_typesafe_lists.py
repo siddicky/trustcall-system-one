@@ -7,10 +7,12 @@ with ``none`` because the sum was offered under the text of the sentence, and a
 clause splitter that cut "$1,125.00" at its comma. Jev is scripted; nothing is sent.
 """
 
+import json
 import re
 from collections.abc import Callable
 from typing import Any
 
+import httpx
 import pytest
 
 from tests.unit.test_typesafe_transport import (
@@ -145,6 +147,12 @@ def test_a_name_beats_the_clause_that_contains_it() -> None:
     assert "Olivia Davis" in answer["value"]
 
 
+def test_a_whole_sentence_is_not_a_mention_when_a_name_in_it_was_taken() -> None:
+    """The live recording: "Her name is Olivia Davis, ..." was taken as a mention."""
+    answer = answer_of(INTRO, MENTIONS, {INTRO, "Olivia Davis"}, "items")
+    assert answer["value"] == ["Olivia Davis"]
+
+
 def test_a_clause_is_kept_when_no_value_inside_it_was_taken() -> None:
     """Mentions that are not names ("the tea towels at 5") stay phrases."""
     text = "Please add two more of the blue mugs and drop the tea towels at 5."
@@ -166,6 +174,41 @@ def test_phone_numbers_and_names_in_a_list_of_values_are_kept() -> None:
     assert answer["value"] == ["Dana Ruiz", "Priya Shah"]
 
 
+def test_mentions_named_through_another_person_are_kept() -> None:
+    """Possessive and relational mentions are other people, not the value's clause."""
+    text = (
+        "Olivia Davis's husband, a pilot, called yesterday. Dana's manager also called."
+    )
+    accepted = {
+        "Olivia Davis",
+        "Olivia Davis's husband",
+        "Dana",
+        "Dana's manager also called",
+    }
+    answer = answer_of(text, MENTIONS, accepted, "items")
+    assert set(answer["value"]) == accepted
+
+
+def test_a_clause_with_a_value_inside_a_noun_phrase_is_kept() -> None:
+    text = "Dana met Pat Lee, the CEO of Acme, in May."
+    answer = answer_of(text, MENTIONS, {"Pat Lee", "Acme", "the CEO of Acme"}, "items")
+    assert set(answer["value"]) == {"Pat Lee", "Acme", "the CEO of Acme"}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Olivia Davis, she's a 27-year-old graphic designer.",
+        "Olivia Davis is a graphic designer.",
+        "Olivia Davis who flies planes called.",
+    ],
+)
+def test_an_apposition_of_a_name_is_not_a_second_mention(text: str) -> None:
+    clause = text.removesuffix(".")
+    answer = answer_of(text, MENTIONS, {clause, "Olivia Davis"}, "items")
+    assert answer["value"] == ["Olivia Davis"]
+
+
 def test_a_sentence_over_the_names_it_holds_is_not_the_list() -> None:
     names = {"people": {"type": "list", "items": "text", "instructions": "Contacts"}}
     text = "Contact: Dana Ruiz, Priya Shah."
@@ -173,12 +216,75 @@ def test_a_sentence_over_the_names_it_holds_is_not_the_list() -> None:
     assert answer["value"] == ["Dana Ruiz", "Priya Shah"]
 
 
-def test_the_kind_is_items_unless_jev_is_sure_it_is_statements() -> None:
+def test_an_unsure_kind_filters_nothing() -> None:
     accepted = {MOVE_SENTENCE, "Berlin"}
     unsure = answer_of(MOVE, NOTES_FIELD, accepted, "statements", kind_p=0.45)
-    assert "Berlin" in unsure["value"]  # the default is items: nothing is dropped
+    # no kind was chosen clearly: nothing is dropped and the list says so
+    assert MOVE_SENTENCE in unsure["value"]
+    assert "Berlin" in unsure["value"]
+    assert "unclear" in unsure["note"]
     sure = answer_of(MOVE, NOTES_FIELD, accepted, "statements", kind_p=0.9)
     assert sure["value"] == [MOVE_SENTENCE]
+    assert "note" not in sure
+    # ... and the bar is a setting
+    jev = Jev(members(accepted, "statements", 0.7))
+    strict = TypeSafeConfig(verify_selection=False, kind_min_prob=0.8)
+    answer = clairic(make(jev, config=strict), clairic_payload(NOTES_FIELD, MOVE))
+    assert "Berlin" in answer.body["answers"]["notes"]["value"]
+    with pytest.raises(ValueError, match="kind_min_prob"):
+        TypeSafeConfig(kind_min_prob=1.5)
+
+
+class KindTamper(Jev):
+    """A Jev whose answer to the ``::kind`` question is missing or does not fit."""
+
+    def __init__(self, how: str) -> None:
+        super().__init__(members({MOVE_SENTENCE, "Berlin"}))
+        self.how = how
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        body = json.loads(Jev.__call__(self, request).content)
+        for qid in [q for q in body["answers"] if q.endswith("::kind")]:
+            if self.how == "missing":
+                del body["answers"][qid]
+            elif self.how == "wrong type":
+                body["answers"][qid] = {"type": "noul", "noul": 0.9}
+            else:  # an option that was not offered
+                body["answers"][qid] = {
+                    "type": "choice",
+                    "choice": "something else",
+                    "confidence": 0.9,
+                    "probabilities": {"something else": 0.9, "items": 0.1},
+                }
+        return httpx.Response(200, json=body)
+
+
+@pytest.mark.parametrize("how", ["missing", "wrong type", "not offered"])
+def test_a_missing_or_invalid_kind_answer_is_unclear_not_an_error(how: str) -> None:
+    jev = KindTamper(how)
+    sent = clairic(make(jev, config=NO_VERIFY), clairic_payload(NOTES_FIELD, MOVE))
+    answer = sent.body["answers"]["notes"]
+    assert answer["value"] == [MOVE_SENTENCE, "Berlin"]  # the old behaviour
+    assert "unclear" in answer["note"]
+
+
+def test_a_list_of_fixed_choices_is_not_asked_what_it_holds() -> None:
+    field = {
+        "tags": {
+            "type": "list",
+            "items": "text",
+            "instructions": "The tags. Each item must be one of: Red, Green, Blue.",
+        }
+    }
+    jev = Jev(members({"Red", "Green"}, "statements"))
+    sent = clairic(
+        make(jev, config=NO_VERIFY),
+        clairic_payload(field, "Red and Green were both mentioned."),
+    )
+    assert not any("tags::kind" in r["questions"] for r in jev.requests)
+    answer = sent.body["answers"]["tags"]
+    assert answer["value"] == ["Red", "Green"]
+    assert "note" not in answer
 
 
 def test_the_kind_is_one_more_question_in_the_same_request() -> None:
@@ -278,3 +384,49 @@ def test_a_number_field_never_returns_text(field: str) -> None:
     sent = clairic(make(jev, config=NO_VERIFY), clairic_payload(spec, INVOICE))
     value = sent.body["answers"][field]["value"]
     assert value is None or isinstance(value, int | float)
+
+
+# --------------------------------------------------------------------------- #
+# A total over several lines; ranges are not cut
+# --------------------------------------------------------------------------- #
+
+TABLE = (
+    "Invoice INV-2291 from Northwind Supply.\n"
+    "Line 1: 4 pallets of premium hardwood flooring at $250.00 each\n"
+    "Line 2: 2 boxes of stainless steel fixings and anchors at $40.00 each\n"
+    "Shipping and handling: $80.00\n"
+)
+TABLE_SUM = "370 (the sum of 250 + 40 + 80)"
+
+
+def test_a_total_over_several_lines_is_offered_with_an_exact_span() -> None:
+    def script(
+        qid: str, question: dict[str, Any], body: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        if qid == "total::pick":
+            assert TABLE_SUM in question["criteria"]
+            return choice(question, TABLE_SUM)
+        return None
+
+    jev = Jev(script)
+    payload = clairic_payload(TOTAL_FIELD, TABLE)
+    sent = clairic(make(jev, config=NO_VERIFY), payload)
+    answer = sent.body["answers"]["total"]
+    assert answer["value"] == 370
+    start, end = answer["span"]
+    quoted = payload["state"][start:end]
+    assert quoted.startswith("$250.00") and quoted.endswith("$80.00")
+    assert "\n" in quoted  # from the first amount to the last, over the lines
+
+
+def test_a_range_is_not_cut_at_its_dash() -> None:
+    for text, kept in (
+        ("Pages 10\u201312, and more.", "Pages 10\u201312"),
+        ("Pages 10 - 12 and more.", "Pages 10 - 12"),
+        ("Pages 10-12, and more.", "Pages 10-12"),
+    ):
+        texts = {c.text for c in build_structure(text, to_lines(text), {}).candidates}
+        assert kept in texts
+    spaced = "He left \u2013 then returned."
+    cut = {c.text for c in build_structure(spaced, to_lines(spaced), {}).candidates}
+    assert "He left" in cut  # a dash between words still splits

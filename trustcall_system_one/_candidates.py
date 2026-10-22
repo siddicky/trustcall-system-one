@@ -204,7 +204,9 @@ _NP_STOP = _words(
 _WORD = re.compile(r"[A-Za-z][\w'\u2019\-]*")
 _CLAUSE_SPLIT = re.compile(
     # a comma or a colon between two digits is part of a number or a time
-    r"(?:(?<!\d)[,:]|[,:](?!\d)|[;\u2014\u2013])|\s[-\u2013\u2014]\s|"
+    r"(?:(?<!\d)[,:]|[,:](?!\d)|;|\u2014|(?<!\d)\u2013|\u2013(?!\d))|"
+    # a spaced dash between two digits is a range ("10 - 12")
+    r"(?<!\d)\s[-\u2013\u2014]\s|\s[-\u2013\u2014]\s(?!\d)|"
     r"\s(?:and|or|but|while|because|so|then|which|who|that)\s",
     re.IGNORECASE,
 )
@@ -1012,7 +1014,9 @@ def pattern_candidates(
         found.extend(_number_candidates(text, field_, field_.type != "list"))
     elif kind == "date":
         found.extend(date_mentions(text))
-    found = [c for c in found if len(c.text) <= MAX_ID_CHARS]
+    # a candidate with an id (a sum over several lines) is named by its id, not
+    # by its text, so its text may be longer
+    found = [c for c in found if len(c.text) <= MAX_ID_CHARS or c.id]
     return _finalize(found, text, width)
 
 

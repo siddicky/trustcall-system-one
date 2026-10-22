@@ -1862,23 +1862,31 @@ splitter, since the cookbook recovers blocks only, not sentence ends.
 held "Berlin" and a phone number next to the sentence they came from, and a person whose label was a
 whole clause). A `list` of text asks one more question in the same request as its members,
 `<field>::kind` (the question the library asks of Clef for `list_strategy: auto`): are the items short
-named values (names, tags, ids) or free-form statements? Jev's answer, at 0.5 or more for
-`statements` (anything else is `items`), decides what the accepted members may be:
+named values (names, tags, ids) or free-form statements? The answer has three states, by
+`TypeSafeConfig.kind_min_prob` (0.5): Jev chose `statements` or `items` with at least that probability,
+or the answer is **unclear** (a lower probability, a missing answer, an answer of the wrong type or with an
+option that was not offered; none of these fails the call). A list of fixed choices (`list[Literal]`, "Each
+item must be one of: ...") is not asked at all. What the accepted members may be:
 
 * **statements** (notes): only whole sentences, clauses and blocks. A name, a number or a noun phrase is
   not a note, whether or not the sentence around it was accepted; a clause inside an accepted
   sentence is dropped as before.
-* **items** (names, tags, mentions): everything the generators find, except that a sentence or clause that
-  *contains* an accepted value is not itself one ("Olivia Davis, she's a 27-year-old graphic designer" is
-  not the name of a person whose name "Olivia Davis" was also accepted, so the label of an entity found by
-  discovery is the name). A clause with no accepted value inside stays (mentions that are not names,
-  such as "the tea towels at 5").
+* **items** (names, tags, mentions): a sentence or block that contains an accepted value is dropped, and so
+  is a clause that is an **apposition** of one: it starts at the value and the value is followed by a comma, a
+  copula or a pronoun ("Olivia Davis, she's a 27-year-old graphic designer", "Olivia Davis is a pilot"), so
+  the label of an entity found by discovery is the name. A clause that names something through a value
+  is kept ("Olivia Davis's husband", "the CEO of Acme", "Dana's manager"): those are other
+  people. Noun phrases are never dropped.
+* **unclear**: nothing is filtered, as before the question existed, and the answer carries
+  `note: "list kind unclear: the members were not filtered"`.
 
-Two smaller repairs from the same run: a comma or colon between digits (`$1,125.00`, `2:30`) is not a
-clause boundary, and a **sum** is offered under an option id that says what it is
+Smaller repairs from the same run: a comma, colon or dash between digits (`$1,125.00`, `2:30`, `10-12`)
+is not a clause boundary, and a **sum** is offered under an option id that says what it is
 (`1080 (the sum of 1000 + 80)`, described as "the total of the amounts written in '4 pallets at $250.00
 each, shipping $80.00'") with a sentence in the instructions that such an option is the total, where it had
-been offered under the text of the sentence and Jev chose `none` for the total of an invoice.
+been offered under the text of the sentence and Jev chose `none` for the total of an invoice. A candidate
+with an id is not bound by the 100-character limit of an option text, so a total over several lines
+is offered too (its span runs from the first amount to the last).
 
 **Date extraction** (cookbook: "TypeSafe answers `Choice` questions about the date in one call,
 code turns those answers into a `date`. The model reads what the text says and never does the
