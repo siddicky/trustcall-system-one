@@ -2116,6 +2116,7 @@ _SECRET_ENV = (
     "CLOUDFLARE_API_TOKEN",
     "CLOUDFLARE_AUTH_TOKEN",
     "EXPERIENTIAL_API_KEY",
+    "TYPESAFE_API_KEY",
 )
 _REDACTED = "<redacted>"
 _MIN_SECRET = 16
@@ -2163,6 +2164,7 @@ _GATEWAY_PATH = re.compile(
     r"(?<=gateway\.ai\.cloudflare\.com/v1/)[^/\s\"'?#]+", re.IGNORECASE
 )
 _EXPERIENTIAL_KEY = re.compile(r"\bxpl_[A-Za-z0-9_-]{16,}")
+_TYPESAFE_KEY = re.compile(r"\bapikey_[A-Za-z0-9_-]{16,}")
 _ACCOUNT_ID = re.compile(r"(?<=accounts/)[0-9a-fA-F]{32}(?![0-9A-Za-z])")
 _BEARER_HEADER = re.compile(
     r"(?i)(authorization[\"']?\s*[:=]\s*[\"']?)bearer\s+[^\s\"',}]+"
@@ -2177,10 +2179,10 @@ def scrub(text: str, extra: Iterable[str] = ()) -> str:
 
     For error messages, reports and other text that is not replayed as data: the
     exact values of the Cloudflare environment variables, of
-    ``EXPERIENTIAL_API_KEY`` and of ``extra`` (for example
+    ``EXPERIENTIAL_API_KEY``, ``TYPESAFE_API_KEY`` and of ``extra`` (for example
     ``CloudflareTransport.sensitive_values()`` or
-    ``ExperientialTransport.sensitive_values()``), any ``xpl_`` Experiential
-    Labs key, the account id in a
+    ``ExperientialTransport.sensitive_values()`` or ``TypeSafeTransport``), any
+    ``xpl_`` Experiential Labs key, any ``apikey_`` TypeSafe key, the account id in a
     Cloudflare API URL (``api.cloudflare.com/client/v4/accounts/<id>``), an AI
     Gateway URL (``gateway.ai.cloudflare.com/v1/<id>/``) or an ``accounts/<32 hex
     characters>`` path, and the bearer token of an ``Authorization`` header (or a
@@ -2206,6 +2208,7 @@ def scrub(text: str, extra: Iterable[str] = ()) -> str:
     text = _GATEWAY_PATH.sub(_REDACTED, text)
     text = _ACCOUNT_ID.sub(_REDACTED, text)
     text = _EXPERIENTIAL_KEY.sub(_REDACTED, text)
+    text = _TYPESAFE_KEY.sub(_REDACTED, text)
     text = _BEARER_HEADER.sub(rf"\1Bearer {_REDACTED}", text)
     return _BEARER_TOKEN.sub(f"Bearer {_REDACTED}", text)
 
@@ -2279,8 +2282,8 @@ class RecordingTransport:
     Only payloads and bodies are written: never headers, tokens or account ids
     (the wrapped transport owns those). As a second line of defence a call whose
     request or response holds the exact value of ``CLOUDFLARE_ACCOUNT_ID``,
-    ``CLOUDFLARE_API_TOKEN``, ``CLOUDFLARE_AUTH_TOKEN``, ``EXPERIENTIAL_API_KEY``
-    or of the credentials of the wrapped ``CloudflareTransport``,
+    ``CLOUDFLARE_API_TOKEN``, ``CLOUDFLARE_AUTH_TOKEN``, ``EXPERIENTIAL_API_KEY``,
+    ``TYPESAFE_API_KEY`` or of the credentials of the wrapped ``CloudflareTransport``,
     ``ExperientialTransport`` or ``RoutingTransport`` (``sensitive_values()``; 16
     characters or more) is NOT written, with a ``RuntimeWarning``: a cassette
     replays exactly what was asked and answered, so it is never edited. The message

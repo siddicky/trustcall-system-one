@@ -18,6 +18,7 @@ from trustcall_system_one import (
     clef_fallback_on_from_env,
     clef_provider_from_env,
     create_extractor,
+    provider_from_env,
     system_one_transport,
 )
 from trustcall_system_one.testing import CassetteTransport, RecordingTransport, scrub
@@ -41,10 +42,15 @@ class Settings:
             a request that is not recorded goes to the live API; without it,
             such a request fails the case (``CassetteMissError``).
         concurrency: Cases run at the same time.
-        clef_provider: Who serves Clef when requests go live: ``cloudflare`` or
-            ``experiential``. ``None`` decides from ``TRUSTCALL_S1_CLEF_PROVIDER``
-            (Cloudflare when it is unset; an ``EXPERIENTIAL_API_KEY`` alone never
-            selects Experiential). Clairic always goes to Cloudflare.
+        provider: Who serves BOTH models when requests go live: ``cloudflare``
+            (the default) or ``typesafe`` (Jev for Clairic and Clef; needs
+            ``TYPESAFE_API_KEY``). ``None`` decides from ``TRUSTCALL_S1_PROVIDER``.
+        clef_provider: Who serves Clef when requests go live with the Cloudflare
+            provider: ``cloudflare``, ``experiential`` or ``decisions`` (the Decisions
+            API answers every Clef request as the primary). ``None`` decides from
+            ``TRUSTCALL_S1_CLEF_PROVIDER`` (Cloudflare when it is unset; an
+            ``EXPERIENTIAL_API_KEY`` alone never selects another). Clairic goes to
+            Cloudflare unless ``provider`` is ``typesafe``.
         clef_fallback: ``decisions`` adds the Decisions API as the fallback of
             Clef on live requests; ``None`` reads ``TRUSTCALL_S1_CLEF_FALLBACK``
             (no fallback when it is unset).
@@ -59,7 +65,8 @@ class Settings:
     record: Path | None = None
     replay: Path | None = None
     concurrency: int = 4
-    clef_provider: Literal["cloudflare", "experiential"] | None = None
+    provider: Literal["cloudflare", "typesafe"] | None = None
+    clef_provider: Literal["cloudflare", "experiential", "decisions"] | None = None
     clef_fallback: Literal["decisions", "none"] | None = None
     clef_fallback_on: frozenset[str] | None = None
 
@@ -77,6 +84,15 @@ class SuiteResult:
         clef_provider: Who served the live Clef requests (empty without ``live``).
         clef_fallback: ``decisions (on ...)`` when the Decisions API was the
             fallback, with the failures that trigger it.
+        provider: ``cloudflare`` or ``typesafe``: who served both models (empty
+            without ``live``).
+        extraction: A label of what answered extraction (Clairic), for tabulating
+            combinations: ``cloudflare clairic``, ``typesafe jev`` or, offline,
+            ``scripted world``.
+        decisions: A label of what answered the decisions (Clef): ``cloudflare
+            clef``, ``experiential clef``, ``experiential decisions
+            (gpt-6-luna-decisions, hard cap 0.8)`` (plus ``+ fallback decisions``),
+            ``typesafe jev`` or ``scripted world``.
     """
 
     config: str
@@ -86,17 +102,46 @@ class SuiteResult:
     mode: str
     clef_provider: str = ""
     clef_fallback: str = ""
+    provider: str = ""
+    extraction: str = ""
+    decisions: str = ""
+
+
+def combination(
+    provider: str, clef_provider: str, clef_fallback: str
+) -> tuple[str, str]:
+    """The labels of what answers extraction and what answers decisions."""
+    if provider == "typesafe":
+        return "typesafe jev", "typesafe jev"
+    decisions = {
+        "cloudflare": "cloudflare clef",
+        "experiential": "experiential clef",
+        "decisions": "experiential decisions (gpt-6-luna-decisions, hard cap 0.8)",
+    }.get(clef_provider, clef_provider)
+    if clef_fallback == "decisions":
+        decisions += " + fallback decisions"
+    return "cloudflare clairic", decisions
 
 
 def _have_credentials(
-    clef_provider: str = "cloudflare", clef_fallback: str = "none"
+    clef_provider: str = "cloudflare",
+    clef_fallback: str = "none",
+    provider: str = "cloudflare",
 ) -> bool:
-    """Cloudflare credentials (Clairic) and, for Experiential Clef, its key."""
+    """Whether the credentials of the providers in use are set.
+
+    Cloudflare (Clairic), or TypeSafe alone, and the Experiential key for Experiential
+    or Decisions Clef.
+    """
+    if provider == "typesafe":
+        return bool((os.environ.get("TYPESAFE_API_KEY") or "").strip())
     account = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
     token = os.environ.get("CLOUDFLARE_API_TOKEN") or os.environ.get(
         "CLOUDFLARE_AUTH_TOKEN"
     )
-    needs_key = clef_provider == "experiential" or clef_fallback == "decisions"
+    needs_key = clef_provider in ("experiential", "decisions") or (
+        clef_fallback == "decisions"
+    )
     if needs_key and not (os.environ.get("EXPERIENTIAL_API_KEY") or "").strip():
         return False
     return bool(account and token)
@@ -112,9 +157,14 @@ def _fallback(settings: Settings) -> Literal["decisions", "none"]:
     return settings.clef_fallback or clef_fallback_from_env()
 
 
-def _provider(settings: Settings) -> Literal["cloudflare", "experiential"]:
+def _provider(settings: Settings) -> Literal["cloudflare", "experiential", "decisions"]:
     """The provider that serves Clef: the setting, else the environment."""
     return settings.clef_provider or clef_provider_from_env()
+
+
+def _main_provider(settings: Settings) -> Literal["cloudflare", "typesafe"]:
+    """The provider that serves both models: the setting, else the environment."""
+    return settings.provider or provider_from_env()
 
 
 def count_unknown_outcomes(calls: Sequence[Any]) -> int:
@@ -222,28 +272,45 @@ async def run_suite(
     skipped = [c.id for c in cases if c not in runnable]
     # Shown in the report whenever a live request is possible: live, or a replay
     # that sends the requests it has no recording for.
-    provider = _provider(settings) if settings.live or settings.replay else ""
-    fallback = _fallback(settings) if provider else "none"
-    if settings.live and not _have_credentials(provider or "cloudflare", fallback):
+    possible = settings.live or settings.replay is not None
+    main = _main_provider(settings) if possible else ""
+    provider = "typesafe" if main == "typesafe" else _provider(settings) if main else ""
+    fallback = _fallback(settings) if main == "cloudflare" else "none"
+    if settings.live and not _have_credentials(
+        provider or "cloudflare", fallback, main or "cloudflare"
+    ):
+        if main == "typesafe":
+            raise RuntimeError(
+                "--live with --provider typesafe needs TYPESAFE_API_KEY in the "
+                "environment"
+            )
         raise RuntimeError(
             "--live needs CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN in the "
             "environment"
             + (
-                ", and EXPERIENTIAL_API_KEY for Experiential or the Decisions fallback"
-                if provider == "experiential" or fallback == "decisions"
+                ", and EXPERIENTIAL_API_KEY for Experiential, the Decisions API or "
+                "the Decisions fallback"
+                if provider in ("experiential", "decisions") or fallback == "decisions"
                 else ""
             )
         )
     if settings.record is not None:
         settings.record.mkdir(parents=True, exist_ok=True)
     gate = asyncio.Semaphore(max(1, settings.concurrency))
-    live = (
-        system_one_transport(
-            provider, clef_fallback=fallback, clef_fallback_on=_fallback_on(settings)
+    live = None
+    if settings.live and main == "typesafe":
+        live = system_one_transport(provider="typesafe")
+    elif settings.live and provider:
+        live = system_one_transport(
+            provider,  # type: ignore[arg-type]
+            provider="cloudflare",
+            clef_fallback=fallback,
+            clef_fallback_on=_fallback_on(settings),
         )
-        if settings.live and provider
-        else None
-    )
+    if possible:
+        extraction, decisions = combination(main, provider, fallback)
+    else:
+        extraction = decisions = "scripted world"
     snapshot = CassetteTransport(settings.replay) if settings.replay else None
 
     async def one(case: Case) -> CaseResult:
@@ -265,6 +332,9 @@ async def run_suite(
         f"{fallback} (on {','.join(sorted(_fallback_on(settings)))})"
         if provider and fallback != "none"
         else "",
+        main,
+        extraction,
+        decisions,
     )
 
 

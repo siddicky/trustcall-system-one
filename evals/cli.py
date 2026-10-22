@@ -68,7 +68,8 @@ def _common(parser: argparse.ArgumentParser) -> None:
         "--live",
         action="store_true",
         help="send requests to Cloudflare (needs CLOUDFLARE_ACCOUNT_ID and "
-        "CLOUDFLARE_API_TOKEN); the default answers from each case's scripted world",
+        "CLOUDFLARE_API_TOKEN), or to TypeSafe with --provider typesafe; the "
+        "default answers from each case's scripted world",
     )
     parser.add_argument(
         "--clef-fallback",
@@ -91,14 +92,26 @@ def _common(parser: argparse.ArgumentParser) -> None:
         "TRUSTCALL_S1_CLEF_FALLBACK_ON, else unavailable",
     )
     parser.add_argument(
+        "--provider",
+        choices=("cloudflare", "typesafe"),
+        default=None,
+        help="who serves BOTH models on live requests: cloudflare, or typesafe "
+        "(Jev answers Clairic and Clef; needs TYPESAFE_API_KEY, no Cloudflare "
+        "credential; excludes --clef-provider other than cloudflare and "
+        "--clef-fallback); default: TRUSTCALL_S1_PROVIDER, else cloudflare (a "
+        "TYPESAFE_API_KEY alone never switches). It only matters with --live",
+    )
+    parser.add_argument(
         "--clef-provider",
-        choices=("cloudflare", "experiential"),
+        choices=("cloudflare", "experiential", "decisions"),
         default=None,
         help="who serves Clef on live requests (Clairic stays on Cloudflare); "
         "default: TRUSTCALL_S1_CLEF_PROVIDER, else cloudflare (an "
-        "EXPERIENTIAL_API_KEY alone never moves Clef). experiential needs "
-        "EXPERIENTIAL_API_KEY and never retries an uncertain request; it only "
-        "matters with --live",
+        "EXPERIENTIAL_API_KEY alone never moves Clef). experiential and decisions "
+        "need EXPERIENTIAL_API_KEY and never retry an uncertain request; decisions "
+        "is the Decisions API (gpt-6-luna-decisions) answering ALL Clef requests, "
+        "with its hard-pick cap of 0.8 and 32-question limit; it only matters "
+        "with --live",
     )
     parser.add_argument("--record", type=Path, help="write cassettes to this directory")
     parser.add_argument(
@@ -158,11 +171,16 @@ def _out_dir(args: argparse.Namespace, name: str) -> Path:
 
 
 def _settings(args: argparse.Namespace, overrides: dict[str, Any]) -> Settings:
-    given = args.clef_provider or args.clef_fallback or args.clef_fallback_on
+    given = (
+        args.provider
+        or args.clef_provider
+        or args.clef_fallback
+        or args.clef_fallback_on
+    )
     if given and not args.live:
         print(
-            "note: --clef-provider, --clef-fallback and --clef-fallback-on have "
-            "no effect without "
+            "note: --provider, --clef-provider, --clef-fallback and "
+            "--clef-fallback-on have no effect without "
             "--live: nothing is sent, requests are answered offline or from the "
             "cassettes",
             file=sys.stderr,
@@ -173,6 +191,7 @@ def _settings(args: argparse.Namespace, overrides: dict[str, Any]) -> Settings:
         record=args.record,
         replay=args.replay,
         concurrency=args.concurrency,
+        provider=args.provider,
         clef_provider=args.clef_provider,
         clef_fallback=args.clef_fallback,
         clef_fallback_on=args.clef_fallback_on,

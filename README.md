@@ -700,6 +700,46 @@ when any earlier attempt may have run. The Decisions API sends bare picks (proba
 and 1): they are capped at `DecisionsTransport(decisions_hard_cap=0.8)`, below the removal
 gate (0.85), so a fallback answer can add or replace a value but cannot remove one by itself.
 
+### Clef from the Decisions API
+
+`TRUSTCALL_S1_CLEF_PROVIDER=decisions` (or `system_one_transport("decisions")`, or `--clef-provider
+decisions` in the evals) makes Experiential's Decisions API (`gpt-6-luna-decisions`, served by OpenAI)
+answer **every** Clef request, not only after a failure, while Clairic stays on Cloudflare. It is an
+opt-in like the others (an `EXPERIENTIAL_API_KEY` alone changes nothing), takes at most 32 questions
+per request, and a bare pick is capped at 0.8 so it cannot authorise a removal by itself.
+
+### TypeSafe-only: Jev for extraction and decisions
+
+TypeSafe's **Jev** can replace both Cloudflare models, so one key and one provider serve the whole
+pipeline. Opt in with `TRUSTCALL_S1_PROVIDER=typesafe` **and** `TYPESAFE_API_KEY` (the key alone changes
+nothing), or pass the transport:
+
+```python
+from trustcall_system_one import One, TypeSafeTransport, create_extractor
+
+# no Cloudflare credentials; the key is read from TYPESAFE_API_KEY
+extractor = create_extractor([One(Contact)], transport=TypeSafeTransport())
+# or: system_one_transport(provider="typesafe")
+# optional: TypeSafeTransport(model="jev-1.14.0", escalate=my_reasoning_model_hook)
+```
+
+Jev answers closed questions and generates nothing, so the library turns Clairic into **selection**
+(TypeSafe's extraction cookbooks): code finds the candidate spans (emails, phones, amounts, ids, names,
+sentences, clauses), Jev picks one or `none`, and the answer carries the exact text and span. Dates,
+times and durations are read as parts (month, day, year, anchor, weekday) that code resolves against
+`reference_date`; free text is read as blocks after Jev stitches hard-wrapped lines; every selected value is
+verified by two yes/no questions and a doubted one comes back as a low-confidence or null answer for the
+usual ladder (or goes to your `escalate` hook). **Jev can only select a value that is among the
+candidates**, so a value no generator finds is never returned, and a Clairic call is a few requests
+(stitch, select, verify), not one. The thresholds are the cookbooks' and have not been tuned for this
+library. See [`docs/DESIGN.md`](https://github.com/siddicky/trustcall-system-one/blob/main/docs/DESIGN.md)
+("TypeSafe-only provider") for the design and its limits.
+
+To compare the three combinations on the evals (live; see the runbook): Cloudflare Clairic and Clef
+(`--provider cloudflare`), Cloudflare Clairic with the Decisions API for Clef (`--clef-provider
+decisions`), and Jev for both (`--provider typesafe`). `results.json` records the combination as
+`extraction` and `decisions` labels.
+
 ## Extract one record
 
 Schemas are plain pydantic models (also `TypedDict`s, JSON Schemas or annotated
@@ -1140,6 +1180,6 @@ every result, narrow the repair) and the `existing` conventions come from
 [trustcall](https://github.com/hinthornw/trustcall) by William Fu-Hinthorn (LangChain), which is
 MIT-licensed. This is a clean reimplementation of its behaviour on different models, not a port of
 its code.
-Clairic and Clef are Cloudflare's System One models.
+Clairic and Clef are Cloudflare's System One models; Jev is TypeSafe's.
 
 This repository is released into the public domain under the Unlicense; see [`LICENSE`](https://github.com/siddicky/trustcall-system-one/blob/main/LICENSE).

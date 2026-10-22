@@ -1,0 +1,23 @@
+{
+    "model": "jev-latest",
+    "state": {
+        "focus": "Answer for the entity named here only: the Person Dana Whit.",
+        "input": "From: Dana Whit <dana.whit@acme-corp.com>\nTo: billing@acme-corp.com\nCc: orders@acme-corp.com\nReply-To: dana.personal@gmail.com\n\nHi team - please don't use the billing alias for this one. Send my receipt to my personal address instead. Thanks, Dana."
+    },
+    "questions": {
+        "email": {
+            "type": "choice",
+            "instructions": {
+                "question": "Which candidate is the email address where Dana Whit wants the receipt sent? Pick __none__ if `input` does not state it.",
+                "field": "The email address where the receipt should be sent."
+            },
+            "criteria": {
+                "candidate_0": "dana.whit@acme-corp.com (in: \"From: Dana Whit <dana.whit@acme-corp.com>\")",
+                "candidate_1": "billing@acme-corp.com (in: \"To: billing@acme-corp.com\")",
+                "candidate_2": "orders@acme-corp.com (in: \"Cc: orders@acme-corp.com\")",
+                "candidate_3": "dana.personal@gmail.com (in: \"Reply-To: dana.personal@gmail.com\")",
+                "__none__": "The input does not state it, or none of the other options is it."
+            }
+        }
+    }
+}

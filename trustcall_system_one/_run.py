@@ -555,8 +555,9 @@ class Run:
         except Exception as exc:
             self._unparsable(self.clairic_model, meta, len(fields), sent, exc)
             raise
+        # a stand-in provider's calls are filed under the model that answered
         self._record(
-            self.clairic_model,
+            sent.served_model or self.clairic_model,
             meta,
             len(fields),
             usage=response.usage,
