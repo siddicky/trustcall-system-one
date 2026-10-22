@@ -57,7 +57,7 @@ from trustcall_system_one import (
     system_one_transport,
 )
 from trustcall_system_one._candidates import pattern_candidates
-from trustcall_system_one._render import estimate_tokens
+from trustcall_system_one._render import estimate_request_tokens, estimate_tokens
 from trustcall_system_one._repair import _Blocks
 from trustcall_system_one._run import Run
 from trustcall_system_one._structure import join_questions, structure_key, to_lines
@@ -195,20 +195,22 @@ def test_routing_and_fallback_say_the_budget_of_who_serves() -> None:
 def test_the_engine_narrows_a_clef_state_to_what_the_transport_takes() -> None:
     text = "word " * 6000  # about 10k tokens
     plain = Run(transport=FakeTransport(lambda *_: None))
-    assert estimate_tokens(plain.clef_state(text)) > 5_000  # the library limit: 24k
+    assert (
+        estimate_request_tokens(plain.clef_state(text)) > 5_000
+    )  # the library limit: 24k
     narrow = FakeTransport(lambda *_: None)
     narrow.state_token_budget = 3_000  # type: ignore[attr-defined]
     run_ = Run(transport=narrow)
     state = run_.clef_state(text)
-    assert estimate_tokens(state) <= 3_000
+    assert estimate_request_tokens(state) <= 3_000
     assert run_.warnings  # it was narrowed, and says so
     # the smaller of the two wins, in both directions
     tight = Run(transport=narrow, limits=Limits(clef_state_token_budget=1_500))
-    assert estimate_tokens(tight.clef_state(text)) <= 1_500
+    assert estimate_request_tokens(tight.clef_state(text)) <= 1_500
     roomy = FakeTransport(lambda *_: None)
     roomy.state_token_budget = 90_000  # type: ignore[attr-defined]
     capped = Run(transport=roomy, limits=Limits(clef_state_token_budget=2_000))
-    assert estimate_tokens(capped.clef_state(text)) <= 2_000
+    assert estimate_request_tokens(capped.clef_state(text)) <= 2_000
 
 
 async def test_a_clef_request_over_jevs_limits_is_split_and_narrowed() -> None:

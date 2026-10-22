@@ -223,6 +223,9 @@ class Ctx:
             name it next to the label ("the Bill INV-2291"), so a figure that
             belongs to another invoice in the same input is not attributed to
             this one.
+        identity: For an update of a collection entity, the names of its identity
+            fields (a dotted path for a nested one), as ``Many(identity=...)`` or the
+            schema gave them; the diff protects them from a token-subset overwrite.
         sentence_fields: Names of the fields that were read by sentences in this
             context (shared by its input-only copy), for the novelty check.
     """
@@ -251,6 +254,7 @@ class Ctx:
     scope: str = ""
     others: tuple[Span, ...] = ()
     identity_hint: str = ""
+    identity: tuple[str, ...] = ()
     sentence_fields: set[str] = field(default_factory=set)
 
     def input_only(self) -> "Ctx":
@@ -587,7 +591,7 @@ def compact_block(ctx: Ctx, fields: Iterable[str]) -> ExistingBlock | None:
         return None
     plan = ctx.plan
     by_wire = {spec.wire_name: spec for spec in plan.all_specs() if spec.wire_name}
-    keep = {_root_key(plan, name) for name in plan.identity}
+    keep = {_root_key(plan, name.split(".", 1)[0]) for name in plan.identity}
     keep.update(
         _root_key(plan, str(by_wire[wire].path[0]))
         for wire in fields

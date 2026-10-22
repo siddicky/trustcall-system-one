@@ -66,7 +66,11 @@ from trustcall_system_one._dateparts import (
     duration_questions,
     time_questions,
 )
-from trustcall_system_one._errors import BadRequestError, ModelResponseError
+from trustcall_system_one._errors import (
+    BadRequestError,
+    ModelResponseError,
+    RequestTooLargeError,
+)
 from trustcall_system_one._structure import (
     JOIN_AFTER_DANGLING,
     JOIN_AFTER_TERMINAL,
@@ -367,7 +371,7 @@ def _fit(state: Any, room: float, anchors: Sequence[str]) -> Any:
         state = _shrink(state, int((cost - room) * 3.0) + 3, anchors)
         narrowed = estimate_tokens(state)
         if narrowed >= cost:  # nothing is left to cut
-            raise BadRequestError(
+            raise RequestTooLargeError(
                 f"the state cannot be narrowed to the {int(room)} tokens that Jev "
                 "takes together with this request's largest question"
             )
@@ -406,12 +410,15 @@ def to_jev_clef(
     The narrowing keeps windows around the passages the questions quote and cuts
     other text from its end, in as many rounds as it takes. A request that cannot be
     made to fit (a question that alone is as large as the context, a state that
-    cannot be cut small enough) is refused here, locally, with nothing sent.
+    cannot be cut small enough) is refused here, locally, with nothing sent: a
+    ``RequestTooLargeError``, which the engine recognises as a size refusal
+    (``is_size_rejection``) and contains as a ``request_rejected`` warning.
 
     Raises:
-        BadRequestError: If the payload is not a Clef request, holds images (Jev
-            reads text), has a question too large for Jev's context or a state that
-            cannot be narrowed to fit it.
+        RequestTooLargeError: If the request has a question too large for Jev's
+            context or a state that cannot be narrowed to fit it (nothing was sent).
+        BadRequestError: If the payload is not a Clef request or holds images (Jev
+            reads text).
     """
     try:
         request = ClefRequest.model_validate(payload)
@@ -432,7 +439,7 @@ def to_jev_clef(
     cap = min(b for b in (question_budget, request_budget) if b is not None)
     widest = max(costs, key=lambda qid: costs[qid])
     if costs[widest] >= cap:  # no state at all would make it fit
-        raise BadRequestError(
+        raise RequestTooLargeError(
             f"question {widest!r} alone is about {int(costs[widest])} tokens: more "
             f"than the {cap} that Jev takes for a question and its state"
         )

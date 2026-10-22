@@ -1,5 +1,6 @@
 """Exception hierarchy for trustcall-system-one."""
 
+import re
 from typing import Any
 
 __all__ = [
@@ -9,11 +10,16 @@ __all__ = [
     "ExtractionValidationError",
     "ModelResponseError",
     "RateLimitError",
+    "RequestTooLargeError",
     "ServerError",
     "StateTruncatedError",
     "TransportError",
     "TrustcallSystemOneError",
     "UncertainOutcomeError",
+    "exception_chain",
+    "is_request_rejection",
+    "is_size_rejection",
+    "may_have_run",
 ]
 
 
@@ -115,6 +121,21 @@ class BadRequestError(TransportError):
         self.cf_errors: list[dict[str, object]] = [] if cf_errors is None else cf_errors
 
 
+class RequestTooLargeError(BadRequestError):
+    """A Clef request that was refused locally, before anything was put on the wire.
+
+    Raised by the engine when a request stays over its size budget
+    (``Run.clef_budget``) after its state was narrowed and its questions split, and
+    by ``TypeSafeTransport`` when a request cannot be made to fit Jev's context (a
+    question as large as the context, a state that cannot be narrowed). The engine
+    treats it like the provider's own "request too large" rejection
+    (``is_size_rejection``): that one request is dropped (its questions go
+    unanswered) with a ``request_rejected`` warning, and the invoke goes on. Nothing
+    was sent, so it is safe to contain; an error that says ``maybe_sent`` or carries
+    a ``partial_usage`` is never treated as one, whatever its class.
+    """
+
+
 class ServerError(TransportError):
     """Server failed (5xx) after retries were exhausted."""
 
@@ -207,3 +228,82 @@ class AmbiguousMatchError(TrustcallSystemOneError):
         self.schema_name = schema_name
         self.label = label
         self.candidates = candidates
+
+
+_SIZE_MESSAGE = re.compile(
+    r"requires\s+\d[\d,]*\s+tokens|max_tokens_exceeded|maximum context length",
+    re.IGNORECASE,
+)
+"""The size refusals that are recognised by their text: Cloudflare's ``Request
+requires 69639 tokens; the maximum is 65529``, the Decisions API's
+``max_tokens_exceeded`` and the common "maximum context length"."""
+
+
+def exception_chain(exc: BaseException) -> list[BaseException]:
+    """An error and its chain: ``primary_error``, ``__cause__``, ``__context__``."""
+    seen: list[BaseException] = []
+    pending: list[BaseException | None] = [exc]
+    while pending:
+        link = pending.pop()
+        if link is None or any(link is other for other in seen):
+            continue
+        seen.append(link)
+        pending.extend(
+            (getattr(link, "primary_error", None), link.__cause__, link.__context__)
+        )
+    return seen
+
+
+def may_have_run(exc: BaseException) -> bool:
+    """Whether the request behind an error may have been run, and charged.
+
+    True when the error, or anything in its chain (a fallback's error carries the
+    primary's as ``primary_error``), is an ``UncertainOutcomeError`` or a
+    ``ServerError``, says ``maybe_sent``, or reports a ``partial_usage``. Such a
+    request is never contained, resent or split: the caller decides.
+    """
+    for link in exception_chain(exc):
+        if isinstance(link, (UncertainOutcomeError, ServerError)):
+            return True
+        if getattr(link, "maybe_sent", False):
+            return True
+        if getattr(link, "partial_usage", None) is not None:
+            return True
+    return False
+
+
+def is_size_rejection(exc: BaseException) -> bool:
+    """Whether a provider refused one request because of its size.
+
+    HTTP 413, a ``RequestTooLargeError`` (a local refusal: the engine's own, or
+    ``TypeSafeTransport``'s when Jev's context cannot hold the request), or a
+    400/422 whose message or body is one of the recognised size refusals
+    (``_SIZE_MESSAGE``). Nothing else counts: a field error is not a size error
+    however it is worded. An error that may have been run and charged
+    (``may_have_run``: ``maybe_sent``, ``partial_usage``, an uncertain outcome) is
+    never one, whatever its class.
+    """
+    if not isinstance(exc, BadRequestError) or may_have_run(exc):
+        return False
+    if isinstance(exc, RequestTooLargeError):
+        return True
+    if exc.status_code == 413:
+        return True
+    if exc.status_code not in (400, 422):
+        return False
+    return bool(_SIZE_MESSAGE.search(f"{exc} {exc.body!s}"))
+
+
+def is_request_rejection(exc: BaseException) -> bool:
+    """Whether an error is a refusal of THIS request that the engine contains.
+
+    Contained by default are only the size refusals (``is_size_rejection``): the
+    same request would be refused again, every other request is unaffected, and
+    the engine drops that request and goes on. Everything else keeps raising: any
+    other 400 or 422 (a malformed field is a bug that every request shares, not a
+    one-off), a rejected key (``AuthError``), a rate limit, a server failure, a wrong
+    URL or model (404), and above all anything that may have been run and charged
+    (``UncertainOutcomeError``, ``ServerError``, ``maybe_sent``, ``partial_usage``,
+    also behind a fallback's ``primary_error``): that is the caller's decision.
+    """
+    return is_size_rejection(exc)
