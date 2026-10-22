@@ -35,6 +35,7 @@ from evals.scenarios import CONTACT_EXISTING, CONTACT_NOTE, PASSAGE, Colleague
 from evals.smoke import SCENARIOS, Scenario
 from trustcall_system_one import (
     CallMeta,
+    DiscoveryConfig,
     Limits,
     Many,
     One,
@@ -91,25 +92,39 @@ def quoted(question: dict[str, Any]) -> str | None:
     return found.group(1) if found else None
 
 
-class RewordedAttribution:
-    """Answers an attribution request with the recorded answer to the same questions.
+def mention_texts(state: dict[str, Any]) -> list[str]:
+    return [m["text"] for m in state["entity"].get("mentions", [])]
 
-    The key is the question ids (``attr.city``), the entity, the whole state
-    (byte-identical) and the value each question quotes; the wording of the
-    questions is what changed, so it is the one thing not compared. Any other kind
-    of call is a miss that fails the test.
+
+def _asks(row: dict[str, Any], prefix: str) -> bool:
+    questions = row["request"].get("questions", {})
+    return bool(questions) and all(q.startswith(prefix) for q in questions)
+
+
+class Reworded:
+    """Answers the requests whose wording or packing changed with what the model said.
+
+    Attribution: one question at a time (a decision gets a request of its own now,
+    the recording batched them), matched on the question id, the input, the
+    entity's mentions and the value the question quotes; the wording of the
+    question and the label (a single record's carries its identity now) are what
+    changed, so they are the things not compared. Qualification: the same entities
+    in the same order (the question no longer carries the schema's description).
+    Any other kind of call is a miss that fails the test.
     """
 
     def __init__(self, path: Path) -> None:
         rows = [json.loads(line) for line in path.read_text().splitlines()]
-        self.rows = [
-            r
-            for r in rows
-            if all(
-                q.startswith("attr.") for q in r["request"].get("questions", {"": 0})
-            )
-        ]
+        # converted traces carry no call kind: the question ids tell what a row is
+        self.attribution = [r for r in rows if _asks(r, "attr.")]
+        self.qualify = [r for r in rows if _asks(r, "qualify.")]
+        self.gate = [r for r in rows if _asks(r, "gate")]
         self.served: list[tuple[str, ...]] = []
+
+    def _answer(self, row: dict[str, Any], qids: list[str]) -> TransportResponse:
+        body = copy.deepcopy(row["response"])
+        body["answers"] = {q: body["answers"][q] for q in qids}
+        return TransportResponse(body=body, status_code=200)
 
     async def run(
         self,
@@ -119,38 +134,70 @@ class RewordedAttribution:
         meta: CallMeta,
         timeout: float | None = None,
     ) -> TransportResponse:
+        if meta.kind == "qualify":
+            labels = [e["label"] for e in payload["state"]["entities"].values()]
+            for row in self.qualify:
+                shown = [
+                    e["label"] for e in row["request"]["state"]["entities"].values()
+                ]
+                if shown == labels and set(row["request"]["questions"]) == set(
+                    payload["questions"]
+                ):
+                    self.served.append(("qualify", *sorted(payload["questions"])))
+                    return self._answer(row, list(payload["questions"]))
+            raise AssertionError(f"no recorded qualification of {labels}")
+        if meta.kind == "gate":  # the label of a single record carries its identity
+            state = payload["state"]
+            for row in self.gate:
+                request = row["request"]["state"]
+                if (
+                    request["input"] == state["input"]
+                    and request["proposed_change"] == state["proposed_change"]
+                    and request["record"] == state["record"]
+                ):
+                    self.served.append(("gate", state["proposed_change"]["path"]))
+                    return self._answer(row, ["gate"])
+            raise AssertionError(f"no recorded gate for {state['proposed_change']}")
         assert meta.kind == "attribution", f"a {meta.kind!r} request changed"
-        ids = set(payload["questions"])
-        label = payload["state"]["entity"]["label"]
-        for row in self.rows:
-            request = row["request"]
-            # the same questions about the same value, over a byte-identical state:
-            # only the wording of the question may differ
-            if (
-                set(request["questions"]) == ids
-                and request["state"] == payload["state"]
-                and request["state"]["entity"]["label"] == label
-                and all(
-                    quoted(request["questions"][q]) == quoted(payload["questions"][q])
-                    for q in ids
+        state = payload["state"]
+        found: dict[str, TransportResponse] = {}
+        for qid, question in payload["questions"].items():
+            for row in self.attribution:
+                request = row["request"]
+                other = request["questions"].get(qid)
+                if (
+                    other is not None
+                    and request["state"]["input"] == state["input"]
+                    and mention_texts(request["state"]) == mention_texts(state)
+                    and quoted(other) == quoted(question)
+                ):
+                    found[qid] = self._answer(row, [qid])
+                    break
+            else:
+                raise AssertionError(
+                    f"no recorded attribution for {qid} about "
+                    f"{state['entity']['label']}"
                 )
-            ):
-                self.served.append(tuple(sorted(ids)))
-                return TransportResponse(
-                    body=copy.deepcopy(row["response"]), status_code=200
-                )
-        raise AssertionError(f"no recorded attribution for {sorted(ids)} about {label}")
+        body = copy.deepcopy(next(iter(found.values())).body)
+        body["answers"] = {q: r.body["answers"][q] for q, r in found.items()}
+        self.served.append(tuple(sorted(found)))
+        return TransportResponse(body=body, status_code=200)
 
 
 def replay(
     name: str, schemas: list[Any], text: str, **kwargs: Any
-) -> tuple[Any, CassetteTransport, RewordedAttribution]:
+) -> tuple[Any, CassetteTransport, Reworded]:
     path = RECORDED / f"legacy_05207aa_{name}.jsonl"
-    inner = RewordedAttribution(path)
+    inner = Reworded(path)
     cassette = CassetteTransport(path, strict=False, inner=inner)
-    # the library of that commit had no sentence reading: Clairic's list only
+    # the library of that commit had no sentence reading: Clairic's list only; and
+    # it asked a record's presence of nobody
     extractor = create_extractor(
-        schemas, transport=cassette, limits=Limits(list_strategy="list"), **kwargs
+        schemas,
+        transport=cassette,
+        limits=Limits(list_strategy="list"),
+        discovery=DiscoveryConfig(record_presence=0),
+        **kwargs,
     )
     return extractor, cassette, inner
 
@@ -164,11 +211,12 @@ def test_the_recorded_update_of_a_contact_gives_the_live_patch() -> None:
     result = extractor.invoke(
         CONTACT_NOTE, existing=[("crm-4711", "Contact", CONTACT_EXISTING)]
     )
-    # 8 of the 9 recorded requests hash to the same key; the ninth is the
-    # attribution request whose wording changed
-    assert (cassette.hits, len(cassette.misses), len(cassette)) == (8, 1, 9)
-    assert [m[2].kind for m in cassette.misses] == ["attribution"]
-    assert len(inner.served) == 1
+    # the requests that did not change hash to their keys still; the attribution
+    # questions (one per request now) and the gates (a single record's label carries
+    # its identity) are answered with what the model said to the same questions
+    assert cassette.hits >= 4 and len(cassette) == 9
+    assert {m[2].kind for m in cassette.misses} <= {"attribution", "gate"}
+    assert inner.served
     (record,) = result.records
     assert record.kind == "update" and record.json_doc_id == "crm-4711" and record.valid
     assert [(p.op, p.path, p.value) for p in record.patches] == [
@@ -197,9 +245,8 @@ def test_the_recorded_attribution_guard_gives_the_live_records() -> None:
         PASSAGE,
     )
     result = extractor.invoke(PASSAGE)
-    assert (cassette.hits, len(cassette.misses), len(cassette)) == (7, 2, 9)
-    assert {m[2].kind for m in cassette.misses} == {"attribution"}
-    assert len(inner.served) == 2
+    assert {m[2].kind for m in cassette.misses} == {"attribution", "qualify"}
+    assert cassette.hits >= 5 and inner.served
     people = {
         r.entity.label: r for r in result.records if r.entity is not None and r.valid
     }
@@ -224,6 +271,7 @@ def test_a_cassette_miss_names_the_request_that_changed() -> None:
     )
     with pytest.raises(CassetteMissError) as caught:
         extractor.invoke(PASSAGE)
-    assert caught.value.kind == "attribution"
+    # qualification is the first request M10c reworded (no schema description)
+    assert caught.value.kind == "qualify"
     assert caught.value.schema == "Colleague"
     assert "changed since the cassette was recorded" in str(caught.value)

@@ -434,17 +434,18 @@ schema title: "Person").
    models in the same order.
 7. **Attribution (default on):** Clef `noul` per non-null value and per list element. A scalar: "Does
    `input` state that {desc} of `entity.label` is '{value}', or does it follow by simple
-   arithmetic or date math from figures the input states about `entity.label`?" ("state or ask for
-   {desc} of `entity.label` to be '{value}'" for a number: "add two more of the blue mugs" asks for a
-   quantity of 2 that no sentence states; live 0.34 for "states", 0.80 to 0.89 for "asks for", and 0.06
-   to 0.12 for a 3). A list element names its field: "According to `input`, is '{value}' one of the {desc}
-   of `entity.label`? Something the input asks to include counts." with the plain criteria "Yes."/"No."
-   (without the field a non-contact scored higher than a contact). Scalars (true: the
-   input states it about the entity, or it follows by simple arithmetic or date math from
-   figures stated about the entity; false: the input does not state it about `entity.label`,
-   or it concerns another entity. A computed value such as a total stated only as its parts is
-   a legitimate answer, a figure of somebody else is not; an integral float is shown as `1080`,
-   not `1080.0`)
+   arithmetic or date math from figures the input states about `entity.label`?" A QUANTITY (a number
+   whose description names units, a count or a number of something) is asked as "Does `input` ask for
+   {value} of `entity.label` (as the {desc})?": "add two more of the blue mugs" asks for a quantity of 2
+   that no sentence states (live 0.34 for the "states" wording; this one 0.78 to 0.86 for 2, 0.02 to 0.04
+   for 3, 0.92 to 0.98 for a stated 1). A total is not asked this way: "state or ask for" took a derived
+   total from 0.88 to 0.52. A list element names its field: "According to `input`, is '{value}' one of
+   the {desc} of `entity.label`? Something the input asks to include counts." with the plain criteria
+   "Yes."/"No." (without the field a non-contact scored higher than a contact). The scalar criteria:
+   true: the input states it about the entity, or it follows by simple arithmetic or date math from
+   figures stated about the entity; false: the input does not state it about `entity.label`, or it
+   concerns another entity. A computed value such as a total stated only as its parts is a legitimate
+   answer, a figure of somebody else is not; an integral float is shown as `1080`, not `1080.0`.
    `entity.label` of a single record being updated carries what it is called ("the Bill INV-2291": its
    identity values, else its id when short and with a letter): a figure the input gives for another invoice
    is then not attributed to this one (0.88 became 0.015). Clairic's instructions keep the plain label.

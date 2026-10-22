@@ -1650,6 +1650,10 @@ class FakeWorld:
                 question["instructions"],
                 re.S,
             )
+            if found is None:  # "Does `input` ask for 2 of `entity.label` (as ...)?"
+                found = re.search(
+                    r"ask for (.*?) of `entity\.label`", question["instructions"]
+                )
             text = found.group(1) if found else ""
             answers[qid] = noul(_ATTR_YES if self._belongs(element, text) else _ATTR_NO)
         return clef_response(answers, model=payload["model"])

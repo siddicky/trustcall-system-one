@@ -1922,13 +1922,25 @@ def _plural(description: str) -> str:
     return text or "the things the field asks for"
 
 
-def _requestable(spec: FieldSpec) -> bool:
-    """Whether the input may ask for the field's value instead of stating it.
+_QUANTITY = re.compile(
+    r"\b(?:quantit\w*|units?|how many|pieces?|copies|count|number of)\b", re.IGNORECASE
+)
 
-    A number can be requested ("add two more of the blue mugs": a quantity of 2
-    that no sentence states); a name, a place or a date is stated.
+
+def _requestable(spec: FieldSpec) -> bool:
+    """Whether the input may ASK for the field's value instead of stating it.
+
+    A quantity can be requested ("add two more of the blue mugs": a quantity of 2
+    that no sentence states). A total, a price, a name, a place or a date is
+    stated: asking "state or ask for" about a derived total made Clef less sure of
+    it (0.88 became 0.52), so only a number whose description names a quantity is
+    asked this way.
     """
-    return spec.clairic is not None and spec.clairic.type == "number"
+    return (
+        spec.clairic is not None
+        and spec.clairic.type == "number"
+        and _QUANTITY.search(spec.description) is not None
+    )
 
 
 def _attribution_question(
@@ -1939,8 +1951,8 @@ def _attribution_question(
     A list element is asked as "is X one of the <field> of the entity?": the
     field is named, since the element alone says nothing about what it is for
     (live: a non-contact scored higher than a contact when it was not). The answers
-    are plain yes and no. A number the input may request rather than state (a
-    quantity in an order) is asked as "states or asks for".
+    are plain yes and no. A quantity the input may request rather than state (an
+    order's "add two more") is asked as "does the input ask for it".
     """
     text = display(value)
     if element:
@@ -1952,19 +1964,18 @@ def _attribution_question(
             ),
             criteria=NoulCriteria(true=_YES, false=_NO),
         )
-    tail = (
-        "or does it follow by simple arithmetic or date math from figures the "
-        "input states about `entity.label`?"
-    )
     if ask_for:
+        # "Does the input ask for 2 of the entity (as the number of units ordered)?"
+        # is the shape that told 2 (0.78 to 0.86) from 3 (0.02 to 0.04) and kept a
+        # stated 1 (0.92 to 0.98); the longer "state or ask for X to be V" did not
         instructions = (
-            f"Does `input` state or ask for {description} of `entity.label` to be "
-            f'"{text}", {tail}'
+            f"Does `input` ask for {text} of `entity.label` (as the {description})?"
         )
     else:
         instructions = (
             f'Does `input` state that {description} of `entity.label` is "{text}", '
-            f"{tail}"
+            "or does it follow by simple arithmetic or date math from figures the "
+            "input states about `entity.label`?"
         )
     return NoulQuestion(
         type="noul",

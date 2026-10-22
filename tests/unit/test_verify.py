@@ -1067,9 +1067,9 @@ async def test_attribution_accepts_what_the_input_directly_implies() -> None:
     (call,) = script.calls("attribution")
     question = call[1]["questions"]["attr.total"]
     assert question["instructions"] == (
-        "Does `input` state or ask for the amount due including shipping of "
-        '`entity.label` to be "1080", or does it follow by simple arithmetic or '
-        "date math from figures the input states about `entity.label`?"
+        "Does `input` state that the amount due including shipping of "
+        '`entity.label` is "1080", or does it follow by simple arithmetic or date '
+        "math from figures the input states about `entity.label`?"
     )
     assert "simple arithmetic or date math" in question["criteria"]["true"]
     assert "concerns another entity" in question["criteria"]["false"]

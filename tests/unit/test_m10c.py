@@ -224,22 +224,27 @@ async def test_a_list_element_is_asked_as_one_of_the_fields_values() -> None:
     assert question["criteria"] == {"true": "Yes.", "false": "No."}
 
 
-async def test_only_a_number_may_be_asked_for() -> None:
+async def test_only_a_quantity_may_be_asked_for() -> None:
     class Line(BaseModel):
         name: str
         quantity: int = Field(description="number of units ordered")
+        total: float = Field(description="the amount due")
 
     world = Script()
     world.clairic = {
         "name": ca("text", "blue mugs", find="blue mugs"),
         "quantity": ca("number", 2),
+        "total": ca("number", 20),
     }
-    await make_extractor([Line], world).ainvoke("Please add two more blue mugs.")
+    await make_extractor([Line], world).ainvoke("Please add two more blue mugs, 20.")
     (call,) = world.calls("attribution")
     questions = call[1]["questions"]
-    assert questions["attr.quantity"]["instructions"].startswith(
-        "Does `input` state or ask for number of units ordered of `entity.label` to be "
-        '"2"'
+    assert questions["attr.quantity"]["instructions"] == (
+        "Does `input` ask for 2 of `entity.label` (as the number of units ordered)?"
+    )
+    # a total is stated, not asked for; a name is stated
+    assert questions["attr.total"]["instructions"].startswith(
+        "Does `input` state that the amount due of `entity.label` is"
     )
     assert questions["attr.name"]["instructions"].startswith(
         "Does `input` state that name of `entity.label` is"
