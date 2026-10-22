@@ -94,6 +94,25 @@ PRONOUNS = frozenset(
 """English closed-class words that are never a mention of an entity."""
 
 _NOT_NAMES = PRONOUNS | {"the", "a", "an"}
+_CONNECTORS = frozenset(
+    {
+        "and",
+        "or",
+        "nor",
+        "but",
+        "of",
+        "in",
+        "on",
+        "at",
+        "to",
+        "for",
+        "with",
+        "from",
+        "by",
+    }
+    | {"vs", "versus", "et", "und", "y"}
+)
+"""Words that join two names into a list or a phrase, never part of one name."""
 _DETERMINER = re.compile(r"^(?:the|an|a|this|that|these|those)\s+", re.IGNORECASE)
 _POSSESSIVE = re.compile("['\u2019]s$", re.IGNORECASE)
 _EDGE = " \t\r\n\"'\u201c\u201d\u2018\u2019`,;:.!?()[]{}"
@@ -258,31 +277,47 @@ def _overlap(first: Span, second: Span) -> bool:
     return first[0] < second[1] and second[0] < first[1]
 
 
-def _name_gap(gap: str) -> bool:
+def _name_gap(gap: str, *, words: bool) -> bool:
     """Whether the text between two parts of a name is name material.
 
-    Spaces, punctuation, initials and capitalised words (a middle name) are; a
-    lower-case word or a possessive ("'s brother") makes it a phrase instead.
+    Spaces, hyphens inside a hyphenated name, initials ("J.") and, when ``words``
+    allows it, capitalised words (a middle name) are. A separator (``, ; : & /``, a
+    line break, the word "and"), a lower-case word and a possessive ("'s brother")
+    are not: they set one mention apart from the next, or make a phrase.
     """
-    return all(
-        not token or token[0].isupper() for token in re.split(r"[\s.,;:&\-]+", gap)
-    )
+    if re.search(r"[,;:&/\n\r]", gap):
+        return False
+    for token in re.split(r"[ \t\u00a0\-]+", gap):
+        if not token or (len(token) <= 2 and token[0].isupper() and token[1:] in "."):
+            continue
+        plain = token.replace("'", "").replace("\u2019", "")
+        if not (words and token[0].isupper() and plain.isalnum()):
+            return False
+        if token.casefold() in _NOT_NAMES or token.casefold() in _CONNECTORS:
+            return False
+    return True
 
 
 def _one_name(source: str, whole: Span, parts: Sequence[Span]) -> bool:
     """Whether ``whole`` is ONE name that ``parts`` (inside it) merely quote.
 
-    The text between the parts, and before and after them, may be only spaces,
-    punctuation, initials and capitalised words ("Mary Ann Smith" over "Mary" and
-    "Smith"). Lower-case or possessive words, such as "'s brother", make it a phrase
-    that bridges separate mentions instead.
+    Only when at most one part is itself a multi-token name (two make a list of
+    people: "Emma Thompson Michael Chen"), and the text between the parts, and
+    before and after them, is only spaces, hyphens and initials. Capitalised words
+    ("Mary Ann Smith" over "Mary" and "Smith") also count when every part is a
+    single token. Separators and lower-case or possessive words ("'s brother")
+    make a phrase that bridges separate mentions instead.
     """
+    single = [len(source[start:end].split()) == 1 for start, end in parts]
+    if single.count(False) > 1:
+        return False
+    words = all(single)
     cursor = whole[0]
     for start, end in sorted(parts):
-        if not _name_gap(source[cursor:start]):
+        if not _name_gap(source[cursor:start], words=words):
             return False
         cursor = end
-    return _name_gap(source[cursor : whole[1]])
+    return _name_gap(source[cursor : whole[1]], words=words)
 
 
 def _resolve_overlaps(mentions: Sequence[Mention], source: str) -> list[Mention]:

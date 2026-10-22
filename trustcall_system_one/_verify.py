@@ -50,6 +50,7 @@ from trustcall_system_one._render import (
     RenderedState,
     mention_windows,
     narrow_text,
+    narrowed_spans,
     render_clairic,
 )
 from trustcall_system_one._run import Answer, Question, Run, gather
@@ -335,6 +336,7 @@ class Ctx:
         entity: bool = True,
         record: Any = None,
         proposed_change: Any = None,
+        windows: Sequence[Span] | None = None,
     ) -> dict[str, Any]:
         """A Clef state about this entity, kept under the Clef budget.
 
@@ -346,15 +348,25 @@ class Ctx:
 
         Args:
             text: The input as it goes into the state; the whole input by default.
+                Nothing anchors a text given like this.
             spans: Further spans worth keeping when the state is narrowed.
+            windows: Windows of the whole input to show (``narrow_text``); the
+                spans and the entity's mentions are re-based into the narrowed
+                text, and if that is still over budget it is cut around them
+                rather than at its start.
             entity: Whether to include ``entity`` at all.
             record: An existing record (updates).
             proposed_change: A change under review (updates).
         """
-        shown = self.text if text is None else text
-        # spans are offsets in the whole input: there is nothing to anchor on in a
-        # text that was narrowed already
-        anchors = [*(spans or ()), *self.mention_spans()] if shown == self.text else []
+        whole = [*(spans or ()), *self.mention_spans()]
+        if windows:
+            shown = narrow_text(self.text, windows)
+            anchors = narrowed_spans(len(self.text), windows, whole)
+        else:
+            shown = self.text if text is None else text
+            # spans are offsets in the whole input: there is nothing to anchor on
+            # in a text that was narrowed already
+            anchors = whole if shown == self.text else []
         state = self.run.clef_state(
             shown,
             entity=self.entity_dict() if entity else None,
@@ -408,7 +420,7 @@ class Ctx:
             return self.fitted(spans=anchors)
         keep = [*narrow_to, *self._nearest_mentions(narrow_to)]
         windows = mention_windows(len(self.text), keep, self.run.verify.window_chars)
-        return self.fitted(narrow_text(self.text, windows))
+        return self.fitted(windows=windows)
 
 
 # --------------------------------------------------------------------------- #

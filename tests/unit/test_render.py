@@ -11,6 +11,7 @@ from trustcall_system_one._render import (
     fit_clef_state,
     mention_windows,
     narrow_text,
+    narrowed_spans,
     reanchor,
     render_clairic,
 )
@@ -404,3 +405,16 @@ def test_a_clef_state_takes_extra_keys() -> None:
     state = clef_state(TEXT, extra={"mentions": {"m0": {"text": "Ada"}}})
     assert state == {"input": TEXT, "mentions": {"m0": {"text": "Ada"}}}
     assert clef_state(TEXT, extra={}) == {"input": TEXT}
+
+
+def test_narrowed_spans_follow_the_windows() -> None:
+    text = "".join(f"{i % 10}" for i in range(100))
+    windows = [(10, 20), (50, 60)]
+    narrowed = narrow_text(text, windows)
+    spans = [(12, 15), (52, 58), (30, 32), (18, 55)]
+    moved = narrowed_spans(len(text), windows, spans)
+    assert [narrowed[a:b] for a, b in moved] == [text[12:15], text[52:58]]
+    # a text narrowed from its very start has no leading ellipsis
+    head = [(0, 10)]
+    assert narrowed_spans(100, head, [(2, 4)]) == [(2, 4)]
+    assert narrowed_spans(100, [], [(2, 4)]) == [(2, 4)]

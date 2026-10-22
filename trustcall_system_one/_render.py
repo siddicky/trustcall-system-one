@@ -16,7 +16,7 @@ an offset in the ORIGINAL input, and a span that lands outside the input block
 """
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,6 +31,7 @@ __all__ = [
     "fit_clef_state",
     "mention_windows",
     "narrow_text",
+    "narrowed_spans",
     "reanchor",
     "render_clairic",
 ]
@@ -142,6 +143,36 @@ def narrow_text(text: str, windows: Sequence[Span]) -> str:
     lead = f"{ELLIPSIS}\n" if windows[0][0] > 0 else ""
     trail = f"\n{ELLIPSIS}" if windows[-1][1] < len(text) else ""
     return f"{lead}{body}{trail}"
+
+
+def narrowed_spans(
+    length: int, windows: Sequence[Span], spans: Iterable[Span]
+) -> list[Span]:
+    """Where spans of a text fall in ``narrow_text(text, windows)``.
+
+    Args:
+        length: Length of the whole text.
+        windows: The windows ``narrow_text`` is given (disjoint, increasing).
+        spans: ``(start, end)`` spans in the whole text.
+
+    Returns:
+        The spans that lie inside one window, re-based into the narrowed text, in
+        the order given; the others are left out.
+    """
+    if not windows:
+        return list(spans)
+    offset = len(f"{ELLIPSIS}\n") if windows[0][0] > 0 else 0
+    starts: list[tuple[int, int, int]] = []
+    for start, end in windows:
+        starts.append((start, end, offset))
+        offset += (end - start) + len(_SEPARATOR)
+    found: list[Span] = []
+    for first, last in spans:
+        for start, end, base in starts:
+            if start <= first and last <= end:
+                found.append((base + first - start, base + last - start))
+                break
+    return found
 
 
 def entity_focus(

@@ -509,11 +509,15 @@ class RepairConfig:
             )
 
 
-def _check_int(name: str, value: object, floor: int) -> None:
+def _check_int(
+    name: str, value: object, floor: int, ceiling: int | None = None
+) -> None:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{name} must be an int, got {value!r}")
     if value < floor:
         raise ValueError(f"{name} must be at least {floor}, got {value}")
+    if ceiling is not None and value > ceiling:
+        raise ValueError(f"{name} must be at most {ceiling}, got {value}")
 
 
 @dataclass(frozen=True)
@@ -528,9 +532,11 @@ class DiscoveryConfig:
         presence_present: Probability at or above which the entities are surely
             there. Between the two the run goes on only if discovery found
             mentions.
-        count_trust_max: The count of entities is trusted up to this many; a
-            mismatch between the count and the entities found only warns when
-            either number is larger (counting is a weak spot of the model).
+        count_trust_max: The count of entities is trusted up to this many (1 to
+            30); a mismatch between the count and the entities found only warns
+            when either number is larger (counting is a weak spot of the model).
+            It bounds the work of a count-driven merge: at most ``k * (k - 1) / 2``
+            single-question merge checks for ``k`` clusters, so 435 at 30.
         broaden_on_count_mismatch: Act on a mismatch: when the count exceeds the
             entities found, discover again with a broader question (descriptive
             references such as "my cousin"); when it falls short, check whether
@@ -548,7 +554,7 @@ class DiscoveryConfig:
         _check_unit("presence_present", self.presence_present)
         if self.presence_absent > self.presence_present:
             raise ValueError("presence_absent must not exceed presence_present")
-        _check_int("count_trust_max", self.count_trust_max, 1)
+        _check_int("count_trust_max", self.count_trust_max, 1, 30)
         _check_flag("broaden_on_count_mismatch", self.broaden_on_count_mismatch)
 
 

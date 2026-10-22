@@ -258,7 +258,7 @@ every entity: a `Many(S)` WITH existing records of S raises `NotImplementedError
 (before any request; list-form `existing` of a schema without a wrapper implies `Many`, so it
 does too); an `"__any__"` record is never claimed by a `Many` (it stays in `untouched`, with a
 warning). Settings: `DiscoveryConfig(presence_absent=0.2, presence_present=0.5,
-count_trust_max=10, broaden_on_count_mismatch=True)` and `CorefConfig(strategy="auto",
+count_trust_max=10 (1 to 30), broaden_on_count_mismatch=True)` and `CorefConfig(strategy="auto",
 merge_threshold=0.5, max_pairwise_mentions=60, context_chars=120,
 all_pairs_below=24)`, passed to
 `create_extractor(discovery=, coref=)`. `Many.label` is what prompts call an entity (default the
@@ -294,10 +294,13 @@ schema title: "Person").
      common phrase ("The cousin"): before a capitalised name it is part of it ("The Hague", "An
      Nguyen", "This Is Us"); a descriptive "my cousin" stays. Of two overlapping mentions the
      longer wins when it contains exactly one of them, or when it is ONE name that several of them
-     quote (only whitespace, punctuation, initials or capitalised words between the parts: "Emma
-     Thompson" over "Emma" and "Thompson", "Mary Ann Smith" over "Mary" and "Smith"); a span that
-     bridges separate mentions through lower-case or possessive words ("Emma's brother Tom" over
-     "Emma" and "Tom") replaces neither. Result: `Mention(text, span)` in input
+     quote: at most one of the parts is itself a multi-token name, and only whitespace, hyphens
+     and initials lie between them ("Emma Thompson" over "Emma" and "Thompson"), or capitalised
+     words too when every part is a single token ("Mary Ann Smith" over "Mary" and "Smith").
+     Separators (`, ; : & /`, a line break, "and"), lower-case words and possessives never join:
+     "Attendees: Emma Thompson Michael Chen", "Emma, Michael", "Emma & Michael" and "Emma's
+     brother Tom" stay separate mentions (up to `all_pairs_below` mentions coreference still
+     joins a name that was wrongly kept apart, as every pair is asked). Result: `Mention(text, span)` in input
      order;
    * count, Clairic `number` with `integer: true` (kind `count`, field `count`, same state): "How
      many distinct {Person}s does the input mention?". A truncated or null answer means "no
@@ -346,7 +349,8 @@ schema title: "Person").
    qualifies. Qualification runs BEFORE the count comparison, so "k" is the number of entities
    that qualify.
 5. **Count reconciliation** (count `n` against `k` qualifying entities; acted on only when
-   `broaden_on_count_mismatch` and `max(n, k) ≤ count_trust_max`, else the mismatch only warns):
+   `broaden_on_count_mismatch` and `max(n, k) ≤ count_trust_max`, else the mismatch only warns;
+   `count_trust_max` is validated to at most 30, so a merge asks at most 30·29/2 = 435 pair checks):
    * `n > k`: ONE broadened re-discovery (the same question plus "Also include descriptive
      references such as 'my cousin' when no name is given."), whose mentions are only ADDED to the
      first list where they overlap none of its mentions (a broadened "Emma's brother Tom" never

@@ -1936,6 +1936,85 @@ def test_words_between_the_parts_make_a_bridge_not_a_name() -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    ("text", "items", "kept"),
+    [
+        (
+            "Attendees: Emma Thompson Michael Chen",
+            ["Emma Thompson", "Michael Chen", "Emma Thompson Michael Chen"],
+            ["Emma Thompson", "Michael Chen"],
+        ),
+        (
+            "Paris Hilton Tom Ford Dine Together",
+            ["Paris Hilton", "Tom Ford", "Paris Hilton Tom Ford"],
+            ["Paris Hilton", "Tom Ford"],
+        ),
+        (
+            "Invited: Emma, Michael.",
+            ["Emma", "Michael", "Emma, Michael"],
+            ["Emma", "Michael"],
+        ),
+        (
+            "Emma & Michael came.",
+            ["Emma", "Michael", "Emma & Michael"],
+            ["Emma", "Michael"],
+        ),
+        (
+            "Emma / Michael came.",
+            ["Emma", "Michael", "Emma / Michael"],
+            ["Emma", "Michael"],
+        ),
+        (
+            "Emma; Tom; Sarah were there.",
+            ["Emma", "Tom", "Sarah", "Emma; Tom; Sarah"],
+            ["Emma", "Tom", "Sarah"],
+        ),
+        ("Emma\nTom\n", ["Emma", "Tom", "Emma\nTom"], ["Emma", "Tom"]),
+        ("Emma and Tom came.", ["Emma", "Tom", "Emma and Tom"], ["Emma", "Tom"]),
+        ("Emma And Tom Came.", ["Emma", "Tom", "Emma And Tom"], ["Emma", "Tom"]),
+        (
+            "Emma's Brother Tom Visits",
+            ["Emma", "Tom", "Emma's Brother Tom"],
+            ["Emma", "Tom"],
+        ),
+        ("Emma In Tom", ["Emma", "Tom", "Emma In Tom"], ["Emma", "Tom"]),
+    ],
+)
+def test_separators_never_join_two_names_into_one_mention(
+    text: str, items: list[str], kept: list[str]
+) -> None:
+    answer = ClairicAnswer(type="list", value=items)
+    assert [m.text for m in parse_mentions(text, answer, None)] == kept
+
+
+@pytest.mark.parametrize(
+    ("text", "items", "whole"),
+    [
+        (
+            "Emma Thompson arrived.",
+            ["Emma Thompson", "Emma", "Thompson"],
+            "Emma Thompson",
+        ),
+        (
+            "Mary Ann Smith arrived.",
+            ["Mary Ann Smith", "Mary", "Smith"],
+            "Mary Ann Smith",
+        ),
+        (
+            "Anne-Marie Roe came.",
+            ["Anne-Marie Roe", "Anne", "Marie", "Roe"],
+            "Anne-Marie Roe",
+        ),
+        ("John R. Smith left.", ["John R. Smith", "John", "Smith"], "John R. Smith"),
+    ],
+)
+def test_a_name_with_its_own_parts_is_still_one_name(
+    text: str, items: list[str], whole: str
+) -> None:
+    answer = ClairicAnswer(type="list", value=items)
+    assert [m.text for m in parse_mentions(text, answer, None)] == [whole]
+
+
 async def test_a_discovery_that_lists_a_name_with_its_parts_gives_one_record() -> None:
     text = "Emma Thompson arrived. Bob Roe waved."
     world = FakeWorld(text)
@@ -2098,6 +2177,34 @@ def test_a_state_given_as_narrowed_text_is_not_anchored_on_whole_input_spans() -
     # the whole input is cut around the mentions instead
     cut = ctx.fitted()
     assert "Emma Thompson came." in cut["input"] and "Emma left." in cut["input"]
+
+
+def test_a_narrowed_state_still_over_budget_is_cut_around_the_mentions() -> None:
+    from trustcall_system_one import VerifyConfig, compile_schema
+    from trustcall_system_one._types import EntityInfo
+    from trustcall_system_one._verify import Ctx
+
+    filler = "x " * 6000
+    text = f"Emma met Bob. {filler} Emma is vegan. {filler} Emma left."
+    middle = text.index("Emma is")
+    info = EntityInfo(
+        key="e0",
+        label="Emma",
+        mentions=(Mention("Emma", (0, 4)), Mention("Emma", (middle, middle + 4))),
+    )
+    run = Run(
+        transport=FakeTransport(lambda *a: None),
+        limits=Limits(clef_state_token_budget=1000),
+        verify=VerifyConfig(window_chars=3000),
+    )
+    ctx = Ctx(run=run, plan=compile_schema(Person), text=text, label="Emma", info=info)
+    value = (text.index("vegan"), text.index("vegan") + 5)
+    state = ctx.entity_state(narrow_to=[value])
+    # the isolated windows (about 6k characters) do not fit the budget: the cut goes
+    # on around the re-based mentions instead of keeping only the start
+    assert "Emma is vegan" in state["input"]
+    assert len(state["input"]) < 6000
+    assert any("clef_state_narrowed" in w for w in run.warnings)
 
 
 def test_an_isolated_recheck_keeps_only_the_mention_nearest_the_value() -> None:

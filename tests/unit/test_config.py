@@ -335,6 +335,7 @@ def test_discovery_defaults_and_value_semantics() -> None:
         {"presence_absent": 0.6, "presence_present": 0.5},
         {"presence_absent": True},
         {"count_trust_max": 0},
+        {"count_trust_max": 31},
         {"count_trust_max": 2.5},
         {"count_trust_max": True},
         {"broaden_on_count_mismatch": "yes"},
@@ -349,6 +350,7 @@ def test_discovery_accepts_the_boundaries() -> None:
     DiscoveryConfig(presence_absent=0.0, presence_present=0.5)
     DiscoveryConfig(presence_absent=0.5, presence_present=0.5)
     DiscoveryConfig(count_trust_max=1, broaden_on_count_mismatch=False)
+    DiscoveryConfig(count_trust_max=30)
 
 
 def test_coref_defaults_and_value_semantics() -> None:
