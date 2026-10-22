@@ -104,6 +104,10 @@ def test_mode_selection() -> None:
 
     both = {"CLOUDFLARE_ACCOUNT_ID": "acct", "CLOUDFLARE_API_TOKEN": "token"}
     assert live_available(both) is True
+    assert (
+        live_available({"CLOUDFLARE_ACCOUNT_ID": "a", "CLOUDFLARE_AUTH_TOKEN": "t"})
+        is True
+    )
     assert live_available({"CLOUDFLARE_ACCOUNT_ID": "acct"}) is False
     assert live_available({}) is False
     assert resolve_offline(False, both) is False  # live: credentials, no flag

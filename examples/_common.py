@@ -63,7 +63,6 @@ __all__ = [
     "snippet",
 ]
 
-LIVE_VARIABLES = ("CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN")
 Span = tuple[int, int]
 
 
