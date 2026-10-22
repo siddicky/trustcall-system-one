@@ -230,6 +230,42 @@ def _fallback_provider(answer: Any) -> str | None:
     return str(provider) if provider else None
 
 
+def _partitions(response: ClairicResponse) -> list[dict[str, Any]]:
+    """What each provider answered, for a response that was merged from several.
+
+    A ``FieldTypeRoutingTransport`` puts ``routing.partitions`` in the body it
+    returns (so a recording and its replay carry it too). Anything that does not look
+    like that is ignored: the response is then logged as one call.
+    """
+    routing = (response.model_extra or {}).get("routing")
+    found = routing.get("partitions") if isinstance(routing, dict) else None
+    if not isinstance(found, list) or len(found) < 2:
+        return []
+    parts: list[dict[str, Any]] = []
+    for item in found:
+        if not isinstance(item, dict) or not isinstance(item.get("usage"), dict):
+            return []
+        usage = item["usage"]
+        if not all(
+            isinstance(usage.get(k), int) and not isinstance(usage.get(k), bool)
+            for k in ("input_tokens", "output_tokens")
+        ):
+            return []
+        parts.append(
+            {
+                "provider": item.get("provider"),
+                "served_model": item.get("served_model"),
+                "fields": item["fields"] if isinstance(item.get("fields"), int) else 0,
+                "usage": usage,
+                "duration_ms": float(item.get("duration_ms") or 0.0),
+                "retries": int(item.get("retries") or 0),
+                "status_code": item.get("status_code"),
+                "request_id": item.get("request_id"),
+            }
+        )
+    return parts
+
+
 def _is_hard(answer: Any) -> bool:
     """Whether the answer came without probabilities (a fallback's bare pick)."""
     return bool((getattr(answer, "model_extra", None) or {}).get("hard"))
@@ -690,6 +726,25 @@ class Run:
         except Exception as exc:
             self._unparsable(self.clairic_model, meta, len(fields), sent, exc)
             raise
+        partitions = _partitions(response)
+        if partitions:
+            # several providers answered (a split by field type): each one's tokens
+            # are filed under its own model and provider, and they add up to the
+            # merged response's usage
+            for part in partitions:
+                self._record(
+                    part["served_model"] or self.clairic_model,
+                    meta,
+                    part["fields"],
+                    usage=ClairicUsage.model_validate(part["usage"]),
+                    duration_ms=part["duration_ms"],
+                    retries=part["retries"],
+                    status_code=part["status_code"],
+                    request_id=part["request_id"],
+                    provider=part["provider"],
+                    fallback_from=sent.fallback_from,
+                )
+            return response
         # a stand-in provider's calls are filed under the model that answered
         self._record(
             sent.served_model or self.clairic_model,

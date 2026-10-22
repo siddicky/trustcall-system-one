@@ -745,6 +745,55 @@ decisions`), and Jev for both (`--provider typesafe`, which refuses `--clef-prov
 `decisions` labels; a replay of cassettes sends nothing and says what they were recorded on
 (`replay (recorded on typesafe jev)`).
 
+### Mixing providers per call kind and field type
+
+To find which provider is best for what, name each one in a **combination spec**: the extraction
+provider per field type, the decision provider per call kind, and optional calibration shifts and
+extractor knobs. Naming a provider is the opt-in to send text to it (a key in the environment never
+selects one), and every provider is only given what it serves:
+
+```python
+from trustcall_system_one import create_extractor
+from trustcall_system_one.combos import ComboSpec, build_combo_transport
+
+spec = ComboSpec.model_validate(
+    {
+        "name": "jev-dates",
+        "extraction": "cloudflare",  # Clairic: cloudflare | typesafe
+        "extraction_by_type": {"date": "typesafe", "datetime": "typesafe"},
+        "decision": "cloudflare",  # Clef: any of the four providers
+        "by_kind": {"attribution": "decisions", "gate": "typesafe"},
+        "calibration": {
+            "decisions": {"attribution": 0.5}
+        },  # logit shift of its probabilities
+        "options": {"verify.attribution_keep": 0.7},
+    }
+)
+extractor = create_extractor(
+    [Person], transport=build_combo_transport(spec), **spec.extractor_options()
+)
+```
+
+The providers are `cloudflare`, `experiential-clef`, `decisions` (the Decisions API, which is OpenAI behind
+Experiential Labs) and `typesafe`; `spec.companies()` says who will see the text. The same spec in a
+JSON file (YAML too if PyYAML is installed) runs on the evals, and a greedy search finds the best one:
+
+```bash
+uv run python -m evals combo --spec spec.json --live --record cassettes --tag jev-dates
+uv run python -m evals combo --spec spec.json --suite holdout       # evals/holdout_cases.py
+uv run python -m evals search --base spec.json --live --providers cloudflare,typesafe,decisions \
+    --price cloudflare=IN:OUT --price typesafe=IN:OUT --price decisions=IN:OUT --budget-usd 5 --calibrate
+```
+
+`--price` is USD per million input and output tokens of a provider (a `--budget-usd` needs one for each).
+`search` walks the decision kinds in groups and the field types, keeps a provider when more cases pass
+(then op F1, then value accuracy, then fewer bleed and wrong deletes; a rise in either is a veto), never
+retries a failed case, and prints a leaderboard of every spec it tried (dev suite only; check the winner
+on the holdout). The building blocks are public too: `KindRoutingTransport({"attribution": ...,
+"gate": ...}, default=...)`, `FieldTypeRoutingTransport({"date": ...}, default=...)` and
+`CalibratedTransport(inner, {"attribution": 0.5})`. See [`docs/DESIGN.md`](https://github.com/siddicky/trustcall-system-one/blob/main/docs/DESIGN.md)
+("Mixing providers per call kind and field type") for the rules.
+
 ## Extract one record
 
 Schemas are plain pydantic models (also `TypedDict`s, JSON Schemas or annotated

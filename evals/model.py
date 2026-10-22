@@ -332,6 +332,10 @@ class CaseResult:
             connection, a 5xx) and calls cancelled after they may have been sent.
         reported_cost_usd: The cost in USD that responses reported (Experiential
             Labs reports one per call); it covers the calls that answered.
+        output_tokens: Output tokens over all requests.
+        by_provider: Requests and tokens per provider that answered (``requests``,
+            ``input_tokens``, ``output_tokens``), from the call log (failed calls
+            included), so that a combination's cost can be estimated from prices.
         probabilities: The attribution and change-gate probabilities behind the
             result, keyed ``"<record> <field> attribution"`` / ``"... gate"``
             (a list field has one attribution per element). These are the margins
@@ -365,6 +369,8 @@ class CaseResult:
     rejections_found: int = 0
     unknown_outcomes: int = 0
     reported_cost_usd: float = 0.0
+    output_tokens: int = 0
+    by_provider: dict[str, dict[str, int]] = field(default_factory=dict)
 
     @property
     def precision(self) -> float:

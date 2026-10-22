@@ -4,7 +4,7 @@ import asyncio
 import os
 import re
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -21,9 +21,22 @@ from trustcall_system_one import (
     provider_from_env,
     system_one_transport,
 )
+from trustcall_system_one.combos import (
+    ComboSpec,
+    build_combo_transport,
+    calibrate_transport,
+)
 from trustcall_system_one.testing import CassetteTransport, RecordingTransport, scrub
 
-__all__ = ["Settings", "SuiteResult", "aggregate", "run_suite"]
+__all__ = [
+    "Settings",
+    "SuiteResult",
+    "aggregate",
+    "combo_labels",
+    "missing_credentials",
+    "run_suite",
+    "usage_by_provider",
+]
 
 _SAFE = re.compile(r"[^A-Za-z0-9_.-]+")
 
@@ -58,6 +71,15 @@ class Settings:
             ``unavailable``, ``uncertain`` and ``bad_response``); ``None`` reads
             ``TRUSTCALL_S1_CLEF_FALLBACK_ON``, by default ``unavailable`` only.
             ``uncertain`` can mean two charges for one question.
+        combo: A combination of providers (``trustcall_system_one.combos``) that
+            answers instead of the provider settings above (which must then be
+            left unset). Live, the providers it names are created (and need their
+            credentials); offline each provider is a scripted world.
+        members: Offline, with ``combo``: builds the transport of each provider the
+            combination names for a case (default: the case's scripted world for
+            every provider). Lets a test make one provider better at one kind.
+        suite: The name of the case suite, recorded in the results.
+        tag: A label of the run, recorded in the results.
     """
 
     overrides: Mapping[str, Any] = field(default_factory=dict)
@@ -69,6 +91,10 @@ class Settings:
     clef_provider: Literal["cloudflare", "experiential", "decisions"] | None = None
     clef_fallback: Literal["decisions", "none"] | None = None
     clef_fallback_on: frozenset[str] | None = None
+    combo: ComboSpec | None = None
+    members: Callable[[Case], Mapping[str, Transport]] | None = None
+    suite: str = "default"
+    tag: str = ""
 
 
 @dataclass
@@ -93,6 +119,10 @@ class SuiteResult:
             clef``, ``experiential clef``, ``experiential decisions
             (gpt-6-luna-decisions, hard cap 0.8)`` (plus ``+ fallback decisions``),
             ``typesafe jev`` or ``scripted world``.
+        combo: The combination of providers that answered (``None`` for the usual
+            provider settings); it is written, with its labels, to ``results.json``.
+        suite: The case suite (``default`` or ``holdout``).
+        tag: The label of the run.
     """
 
     config: str
@@ -105,6 +135,9 @@ class SuiteResult:
     provider: str = ""
     extraction: str = ""
     decisions: str = ""
+    combo: ComboSpec | None = None
+    suite: str = "default"
+    tag: str = ""
 
 
 def combination(
@@ -121,6 +154,74 @@ def combination(
     if clef_fallback == "decisions":
         decisions += " + fallback decisions"
     return "cloudflare clairic", decisions
+
+
+_PROVIDER_LABELS = {
+    "cloudflare": ("cloudflare clairic", "cloudflare clef"),
+    "typesafe": ("typesafe jev", "typesafe jev"),
+    "experiential-clef": ("", "experiential clef"),
+    "decisions": ("", "experiential decisions (gpt-6-luna-decisions, hard cap 0.8)"),
+}
+
+
+def combo_labels(spec: ComboSpec) -> tuple[str, str]:
+    """The labels of what answers extraction and what answers decisions in a combo.
+
+    For example ``cloudflare clairic (date, datetime: typesafe jev)`` and
+    ``cloudflare clef (attribution: experiential decisions ...)``.
+    """
+    spec = spec.canonical()
+    extraction = _PROVIDER_LABELS[spec.extraction][0]
+    types = sorted(spec.extraction_by_type.items())
+    if types:
+        extraction += (
+            " (" + "; ".join(f"{t}: {_PROVIDER_LABELS[p][0]}" for t, p in types) + ")"
+        )
+    decisions = _PROVIDER_LABELS[spec.decision][1]
+    kinds = sorted(spec.by_kind.items())
+    if kinds:
+        decisions += (
+            " (" + "; ".join(f"{k}: {_PROVIDER_LABELS[p][1]}" for k, p in kinds) + ")"
+        )
+    return extraction, decisions
+
+
+def missing_credentials(spec: ComboSpec) -> list[str]:
+    """The environment variables a combination's live run needs and does not have.
+
+    Names only, never values.
+    """
+    named = spec.providers()
+    missing: list[str] = []
+    if "cloudflare" in named:
+        if not os.environ.get("CLOUDFLARE_ACCOUNT_ID"):
+            missing.append("CLOUDFLARE_ACCOUNT_ID")
+        if not (
+            os.environ.get("CLOUDFLARE_API_TOKEN")
+            or os.environ.get("CLOUDFLARE_AUTH_TOKEN")
+        ):
+            missing.append("CLOUDFLARE_API_TOKEN")
+    if ("experiential-clef" in named or "decisions" in named) and not (
+        os.environ.get("EXPERIENTIAL_API_KEY") or ""
+    ).strip():
+        missing.append("EXPERIENTIAL_API_KEY")
+    if "typesafe" in named and not (os.environ.get("TYPESAFE_API_KEY") or "").strip():
+        missing.append("TYPESAFE_API_KEY")
+    return missing
+
+
+def usage_by_provider(calls: Sequence[Any]) -> dict[str, dict[str, int]]:
+    """Requests and tokens per provider, from a call log (failed calls included)."""
+    out: dict[str, dict[str, int]] = {}
+    for call in calls:
+        row = out.setdefault(
+            str(call.provider or "unknown"),
+            {"requests": 0, "input_tokens": 0, "output_tokens": 0},
+        )
+        row["requests"] += 1
+        row["input_tokens"] += int(call.usage.get("input_tokens", 0))
+        row["output_tokens"] += int(call.usage.get("output_tokens", 0))
+    return out
 
 
 _RECORDED_ON = {
@@ -225,10 +326,20 @@ async def _run_case(
     snapshot: CassetteTransport | None = None,
 ) -> CaseResult:
     options = build_options(settings.overrides, case.options)
+    spec = settings.combo.canonical() if settings.combo is not None else None
     base: Transport
     if settings.live:
         assert live is not None
         base = live
+    elif spec is not None:
+        assert case.world is not None
+        scripted = settings.members(case) if settings.members is not None else None
+        base = build_combo_transport(
+            spec,
+            providers=scripted
+            or {p: case.world().transport() for p in spec.providers()},
+            calibrate=False,
+        )
     else:
         assert case.world is not None
         base = case.world().transport()
@@ -245,6 +356,10 @@ async def _run_case(
             strict=not settings.live, inner=base if settings.live else None
         )
         transport = cassette
+    if spec is not None:
+        # outside the recorder and the cassette, which keep each provider's raw
+        # answers: a recording made under one calibration replays under another
+        transport = calibrate_transport(spec, transport)
     started = time.perf_counter()
     secrets: tuple[str, ...] = ()
     sensitive = getattr(live, "sensitive_values", None)
@@ -260,6 +375,8 @@ async def _run_case(
         failed.unknown_outcomes = count_unknown_outcomes(getattr(exc, "calls", ()))
         spent = getattr(exc, "usage", None)
         failed.reported_cost_usd = getattr(spent, "reported_cost_usd", 0.0)
+        failed.output_tokens = getattr(spent, "output_tokens", 0)
+        failed.by_provider = usage_by_provider(getattr(exc, "calls", ()))
         # an error message can carry the request URL, and with it the account id
         failed.error = scrub(f"{type(exc).__name__}: {str(exc)[:300]}", secrets)
         failed.wall_s = time.perf_counter() - started
@@ -271,6 +388,8 @@ async def _run_case(
     scored = score(case, result)
     scored.unknown_outcomes = count_unknown_outcomes(result.calls)
     scored.reported_cost_usd = result.usage.reported_cost_usd
+    scored.output_tokens = result.usage.output_tokens
+    scored.by_provider = usage_by_provider(result.calls)
     scored.warnings = [scrub(w, secrets) for w in scored.warnings]
     scored.wall_s = time.perf_counter() - started
     if cassette is not None:
@@ -292,8 +411,12 @@ async def run_suite(
         The scores, in case order.
 
     Raises:
-        RuntimeError: If ``live`` is set without Cloudflare credentials.
+        RuntimeError: If ``live`` is set without the credentials of the providers.
+        ValueError: If a combination is given together with the provider settings,
+            or the provider settings contradict each other.
     """
+    if settings.combo is not None:
+        return await _run_combo(cases, settings, config)
     if _main_provider(settings) == "typesafe" and (
         _provider(settings) != "cloudflare" or _fallback(settings) != "none"
     ):  # Jev answers Clef itself: nothing else may be asked for
@@ -375,6 +498,76 @@ async def run_suite(
         main,
         extraction,
         decisions,
+        suite=settings.suite,
+        tag=settings.tag,
+    )
+
+
+async def _run_combo(
+    cases: Sequence[Case], settings: Settings, config: str
+) -> SuiteResult:
+    """Run the cases on a combination of providers (``Settings.combo``).
+
+    The spec is the opt-in: it names every provider, and nothing in the environment
+    (``TRUSTCALL_S1_PROVIDER`` and the like) is read or changes it.
+    """
+    assert settings.combo is not None
+    if (
+        settings.provider
+        or settings.clef_provider
+        or settings.clef_fallback
+        or settings.clef_fallback_on
+    ):
+        raise ValueError(
+            "a combination names its own providers: do not combine it with "
+            "--provider, --clef-provider, --clef-fallback or --clef-fallback-on"
+        )
+    spec = settings.combo.canonical()
+    runnable = [c for c in cases if settings.live or c.world is not None]
+    skipped = [c.id for c in cases if c not in runnable]
+    if settings.live:
+        missing = missing_credentials(spec)
+        if missing:
+            raise RuntimeError(
+                f"--live with this combination ({', '.join(spec.providers())}) needs "
+                f"{', '.join(missing)} in the environment"
+            )
+    if settings.record is not None:
+        settings.record.mkdir(parents=True, exist_ok=True)
+    gate = asyncio.Semaphore(max(1, settings.concurrency))
+    live = build_combo_transport(spec, calibrate=False) if settings.live else None
+    snapshot = CassetteTransport(settings.replay) if settings.replay else None
+    if snapshot is not None and not settings.live:
+        extraction, decisions = recorded_labels(snapshot)
+    else:
+        extraction, decisions = combo_labels(spec)
+        if not settings.live and settings.replay is None:
+            extraction, decisions = (
+                f"{extraction} (scripted)",
+                f"{decisions} (scripted)",
+            )
+
+    async def one(case: Case) -> CaseResult:
+        async with gate:
+            return await _run_case(case, settings, live, snapshot)
+
+    try:
+        results = list(await asyncio.gather(*(one(c) for c in runnable)))
+    finally:
+        closer = getattr(live, "aclose", None)
+        if callable(closer):
+            await closer()
+    return SuiteResult(
+        config,
+        dict(settings.overrides),
+        results,
+        skipped,
+        mode_of(settings),
+        extraction=extraction,
+        decisions=decisions,
+        combo=settings.combo,
+        suite=settings.suite,
+        tag=settings.tag,
     )
 
 
@@ -382,11 +575,12 @@ def aggregate(results: Sequence[CaseResult]) -> dict[str, Any]:
     """Totals and rates over a suite (micro-averaged over operations and values).
 
     Returns:
-        ``op_precision``, ``op_recall``, ``value_accuracy`` (``None`` without
-        expected values), ``notes_recall`` (the expected notes that were
-        produced), ``bleed`` and ``wrong_deletes`` (violations by kind),
-        ``violations``, ``valid_rate``, ``requests``, ``input_tokens``,
-        ``wall_s``, ``cases``, ``passed``, ``errors`` and ``forwarded``.
+        ``op_precision``, ``op_recall``, ``op_f1`` (their harmonic mean),
+        ``value_accuracy`` (``None`` without expected values), ``notes_recall`` (the
+        expected notes that were produced), ``bleed`` and ``wrong_deletes``
+        (violations by kind), ``violations``, ``valid_rate``, ``requests``,
+        ``input_tokens``, ``output_tokens``, ``wall_s``, ``cases``, ``passed``,
+        ``errors`` and ``forwarded``.
     """
 
     def ratio(num: int, den: int) -> float | None:
@@ -397,6 +591,9 @@ def aggregate(results: Sequence[CaseResult]) -> dict[str, Any]:
     values = sum(r.n_values for r in results)
     records = sum(r.n_records for r in results)
     categories = [c for r in results for c, _ in r.violations]
+    precision = sum(r.matched_actual for r in results) / produced if produced else 1.0
+    recall = sum(r.matched_expected for r in results) / expected if expected else 1.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
     return {
         "cases": len(results),
         "passed": sum(1 for r in results if r.passed),
@@ -416,7 +613,9 @@ def aggregate(results: Sequence[CaseResult]) -> dict[str, Any]:
         "violations": len(categories),
         "valid_rate": ratio(sum(r.valid for r in results), records),
         "requests": sum(r.requests for r in results),
+        "op_f1": f1,
         "input_tokens": sum(r.input_tokens for r in results),
+        "output_tokens": sum(r.output_tokens for r in results),
         "wall_s": round(sum(r.wall_s for r in results), 2),
         "forwarded": sum(r.forwarded for r in results),
         "unknown_outcomes": sum(r.unknown_outcomes for r in results),

@@ -354,6 +354,28 @@ To tabulate the three combinations (Cloudflare, Cloudflare Clairic + Decisions C
 sections 3, 4d and 4e into separate `--out` directories and compare `aggregate` (`passed`, `requests`,
 `input_tokens`, `wall_s`) and the `extraction` / `decisions` labels of each `results.json`.
 
+## 4f. Mixing providers per call kind and field type
+
+Everything in this section is opt-in and names its providers: a spec file says which provider
+extracts which field type and answers which call kind (`docs/DESIGN.md`, "Mixing providers per call kind
+and field type"). Offline first (scripted worlds, nothing is sent), then live:
+
+```bash
+uv run python -m evals combo --spec spec.json --quiet                    # offline
+uv run python -m evals combo --spec spec.json --live --record evals/cassettes --tag NAME \
+    --out evals/results/combo-NAME            # cassettes go to evals/cassettes/NAME
+uv run python -m evals search --base spec.json --live --providers cloudflare,typesafe,decisions \
+    --price cloudflare=P:P --price typesafe=P:P --price decisions=P:P --max-runs 40 --budget-usd 10 \
+    --record evals/cassettes --out evals/results/search     # dev suite only
+uv run python -m evals search --base evals/results/search/best.json --calibrate --replay evals/cassettes/BEST \
+    --live --providers cloudflare,typesafe,decisions --out evals/results/search-cal
+uv run python -m evals combo --spec evals/results/search/best.json --suite holdout --live
+```
+
+A failed case is reported, never retried; a trial that raises is a row in the leaderboard and the search
+goes on; `--resume DIR` reuses every combination already evaluated there. Hand back `leaderboard.md`,
+`best.json` and the holdout result of the winner.
+
 ## 5. What to hand back
 
 1. The commit hash, the date, and whether the working tree was clean.

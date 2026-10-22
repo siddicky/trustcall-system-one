@@ -13,15 +13,32 @@ import math
 import os
 import random
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import timezone
 from email.utils import parsedate_to_datetime
-from typing import Any, Literal, Protocol, TypeVar, Union, cast, runtime_checkable
+from typing import (
+    Any,
+    Literal,
+    Protocol,
+    TypeVar,
+    Union,
+    cast,
+    get_args,
+    runtime_checkable,
+)
 
 import httpx
 
+from trustcall_system_one._calibrate import calibrate_body
 from trustcall_system_one._config import ConcurrencyConfig
 from trustcall_system_one._decisions import (
     DECISIONS_MODEL,
@@ -40,6 +57,12 @@ from trustcall_system_one._errors import (
     TrustcallSystemOneError,
     UncertainOutcomeError,
     may_have_run,
+)
+from trustcall_system_one._partition import (
+    merge_bodies,
+    partition_fields,
+    route_keys,
+    sum_usage,
 )
 from trustcall_system_one._types import CallKind
 from trustcall_system_one._typesafe import (
@@ -64,9 +87,13 @@ from trustcall_system_one._wire import (
 )
 
 __all__ = [
+    "CALL_KINDS",
+    "CLAIRIC_KINDS",
+    "CLEF_KINDS",
     "DEFAULT_FALLBACK_ON",
     "DEFAULT_MAX_QUESTIONS",
     "AdaptiveLimiter",
+    "CalibratedTransport",
     "CallKind",
     "CallMeta",
     "CloudflareTransport",
@@ -75,6 +102,8 @@ __all__ = [
     "EscalationRequest",
     "ExperientialTransport",
     "FallbackTransport",
+    "FieldTypeRoutingTransport",
+    "KindRoutingTransport",
     "RoutingTransport",
     "Transport",
     "TransportResponse",
@@ -88,6 +117,16 @@ __all__ = [
     "state_token_budget",
     "system_one_transport",
 ]
+
+CALL_KINDS: tuple[str, ...] = get_args(CallKind)
+"""Every ``CallMeta.kind``."""
+CLAIRIC_KINDS: frozenset[str] = frozenset(
+    {"discover", "count", "extract", "crosscheck", "reask"}
+)
+"""The call kinds that are always Clairic requests (typed extraction)."""
+CLEF_KINDS: frozenset[str] = frozenset(CALL_KINDS) - CLAIRIC_KINDS - {"repair", "raw"}
+"""The call kinds that are always Clef requests (decisions). ``repair`` and ``raw``
+are both: a Clef question or a Clairic field, depending on the call."""
 
 DEFAULT_MAX_QUESTIONS = 64
 """Questions one Clef request may carry when a transport does not say otherwise
@@ -2784,6 +2823,748 @@ class RoutingTransport:
             if callable(closer):
                 with contextlib.suppress(Exception):
                     closer()
+
+
+# --------------------------------------------------------------------------- #
+# Routing by call kind and field type, and calibration
+# --------------------------------------------------------------------------- #
+
+
+def _can_serve(
+    transport: object, model: str, payload: Mapping[str, Any] | None = None
+) -> bool:
+    """Whether a transport says it can serve a request (one that says nothing can)."""
+    serves = getattr(transport, "serves", None)
+    return bool(serves(model, payload)) if callable(serves) else True
+
+
+def _unique(transports: Iterable[Transport]) -> list[Transport]:
+    members: list[Transport] = []
+    for transport in transports:
+        if not any(transport is seen for seen in members):
+            members.append(transport)
+    return members
+
+
+def _sensitive_of(members: Iterable[Transport]) -> tuple[str, ...]:
+    values: list[str] = []
+    for transport in members:
+        getter = getattr(transport, "sensitive_values", None)
+        if callable(getter):
+            values.extend(getter())
+    return tuple(dict.fromkeys(values))
+
+
+async def _aclose_all(members: Iterable[Transport]) -> None:
+    """Close every member, even if one fails; the first error is raised afterwards."""
+    first: Exception | None = None
+    for transport in members:
+        closer = getattr(transport, "aclose", None)
+        if callable(closer):
+            try:
+                await closer()
+            except Exception as exc:
+                first = first or exc
+    if first is not None:
+        raise first
+
+
+def _close_all(members: Iterable[Transport]) -> None:
+    for transport in members:
+        closer = getattr(transport, "close", None)
+        if callable(closer):
+            with contextlib.suppress(Exception):
+                closer()
+
+
+def _mark(exc: BaseException, transport: object) -> None:
+    """Say which routed transport raised ``exc`` (the innermost one wins).
+
+    The provider is set as ``FallbackTransport`` sets it, and the transport itself is
+    kept so that ``classify_failure`` can ask the one that knows the error.
+    """
+    _tag(exc, _provider_name(transport))
+    if getattr(exc, "_routed_through", None) is None:
+        exc._routed_through = transport  # type: ignore[attr-defined]
+
+
+def _classify_through(exc: Exception) -> str | None:
+    """The category of a failure, asked of the transport that raised it."""
+    source = getattr(exc, "_routed_through", None)
+    classify = getattr(source, "classify_failure", None)
+    if callable(classify):
+        return cast("str | None", classify(exc))
+    return classify_failure(exc)
+
+
+def _choose(
+    route: Transport, default: Transport, model: str, payload: Mapping[str, Any]
+) -> tuple[Transport, str | None]:
+    """The routed transport, or the default for a request with images it cannot take.
+
+    Only images move a request (the Decisions API and Jev take text only), and only to
+    a default that can serve it; every other request the routed transport cannot
+    serve is refused by it, locally, instead of the text going to another company
+    without being asked.
+    """
+    if (
+        route is not default
+        and payload.get("images")
+        and not _can_serve(route, model, payload)
+        and _can_serve(default, model, payload)
+    ):
+        return default, _provider_name(route)
+    return route, None
+
+
+async def _run_marked(
+    route: Transport,
+    model: str,
+    payload: Mapping[str, Any],
+    meta: CallMeta,
+    timeout: float | None,
+) -> TransportResponse:
+    try:
+        return await route.run(model, payload, meta=meta, timeout=timeout)
+    except BaseException as exc:
+        _mark(exc, route)
+        raise
+
+
+class _Wrapping:
+    """What a wrapper around one transport forwards to it.
+
+    The engine reads ``max_questions``, ``state_token_budget``, ``serves``,
+    ``classify_failure`` and ``sensitive_values`` off the transport it is given, and
+    closes it with ``aclose`` or ``close``; a wrapper that did not forward them would
+    hide the limits and the failure categories of the transport behind it.
+    """
+
+    _inner: Transport
+
+    @property
+    def provider(self) -> str | None:
+        """The provider of the wrapped transport, if it names one."""
+        found = getattr(self._inner, "provider", None)
+        return str(found) if found else None
+
+    def max_questions(self, model: str) -> int:
+        """Questions one request may carry: the wrapped transport's limit."""
+        return max_questions(self._inner, model)
+
+    def state_token_budget(self, model: str) -> int | None:
+        """The wrapped transport's state budget (``None``: it says none)."""
+        return state_token_budget(self._inner, model)
+
+    def serves(self, model: str, payload: Mapping[str, Any] | None = None) -> bool:
+        """Whether the wrapped transport can serve the request."""
+        return _can_serve(self._inner, model, payload)
+
+    def classify_failure(self, exc: Exception) -> str | None:
+        """The wrapped transport's category of a failure."""
+        classify = getattr(self._inner, "classify_failure", None)
+        return (
+            cast("str | None", classify(exc))
+            if callable(classify)
+            else classify_failure(exc)
+        )
+
+    def sensitive_values(self) -> tuple[str, ...]:
+        """The credentials passed explicitly to the wrapped transport."""
+        return _sensitive_of([self._inner])
+
+    async def __aenter__(self) -> Any:
+        """Enter the async context."""
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        """Close the wrapped transport on exit."""
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        """Close the wrapped transport."""
+        await _aclose_all([self._inner])
+
+    def close(self) -> None:
+        """Close the wrapped transport from synchronous code, best effort."""
+        _close_all([self._inner])
+
+
+def _parse_route_key(key: str) -> tuple[str | None, str | None]:
+    """``(kind, model)`` of a ``KindRoutingTransport`` key.
+
+    ``"attribution"`` is ``("attribution", None)``, ``"clef"`` is ``(None, "clef")``
+    and ``"repair@clairic"`` is ``("repair", "clairic")``.
+    """
+    kind: str | None
+    model: str | None
+    if key.startswith("@"):  # a full model id
+        kind, model = None, key
+    elif "@" in key:
+        kind, _, model = key.partition("@")
+    elif key in CALL_KINDS:
+        kind, model = key, None
+    else:
+        kind, model = None, key
+    if kind is not None and kind not in CALL_KINDS:
+        raise ValueError(
+            f"cannot route {key!r}: {kind!r} is not a call kind (one of "
+            f"{sorted(CALL_KINDS)})"
+        )
+    if model is None:
+        return kind, None
+    try:
+        return kind, body_model(model)
+    except ValueError:
+        raise ValueError(
+            f"cannot route {key!r}: expected a call kind, a model (clairic, clef, "
+            "clef-flash) or kind@model"
+        ) from None
+
+
+class KindRoutingTransport:
+    """Sends each call to a transport chosen by its call kind and/or its model.
+
+    ``routes`` maps a key to a transport and ``default`` serves every call no key
+    matches. A key is:
+
+    * a call kind (``"attribution"``, ``"gate"``, ``"extract"``...: any
+      ``CallMeta.kind``);
+    * a model, as for ``RoutingTransport`` (``"clairic"``, ``"clef"``,
+      ``"clef-flash"`` or a full id; ``"clef"`` covers ``clef-flash`` unless that
+      has a route of its own);
+    * both, ``"repair@clairic"`` (a kind on one model: ``repair`` and ``raw`` are
+      asked of both).
+
+    **The most specific key wins**: ``kind@model``, then ``kind``, then ``model``,
+    then ``default``. The call is passed on unchanged, ``CallMeta`` included.
+
+    Example:
+        Decisions for the attribution questions, Jev for the change gates, Clairic
+        and every other question on Cloudflare::
+
+            transport = KindRoutingTransport(
+                {"attribution": DecisionsTransport(), "gate": TypeSafeTransport()},
+                default=CloudflareTransport(),
+            )
+
+    Naming a transport here is the opt-in to send the calls of that kind to its
+    provider; a key in the environment never routes anything. A request the routed
+    transport cannot serve is refused by it locally, and only one with *images* goes
+    to the default instead (and then only when the default can serve it): the text
+    never moves to a provider that was not named for it. A call that failed carries
+    the ``provider`` of the transport that raised it and the failure is classified by
+    that transport (``classify_failure``). Nothing is retried or resent here.
+
+    ``max_questions`` and ``state_token_budget`` are the smallest limits of the
+    transports that may be asked the model (the engine fits a request before it knows
+    its kind), ``serves`` is true for a request when every one of them can serve it,
+    and ``aclose`` and ``close`` close every transport once, so a transport shared
+    with other code should not be closed through it.
+    """
+
+    def __init__(self, routes: Mapping[str, Transport], default: Transport) -> None:
+        """Create a router.
+
+        Args:
+            routes: Key (call kind, model or ``kind@model``) to transport.
+            default: The transport of every call without a route.
+
+        Raises:
+            ValueError: If a key is neither, or two keys mean the same route.
+        """
+        table: dict[tuple[str | None, str | None], Transport] = {}
+        for key, transport in routes.items():
+            slot = _parse_route_key(key)
+            if slot in table:
+                raise ValueError(f"more than one route for {key!r}")
+            table[slot] = transport
+        self._table = table
+        self._default = default
+
+    def transport_for(self, model: str, kind: str | None = None) -> Transport:
+        """The transport that serves a call of ``kind`` to ``model``.
+
+        Args:
+            model: Full id or bare name of the model.
+            kind: The ``CallMeta.kind``; ``None`` looks at the model alone.
+        """
+        try:
+            name: str | None = body_model(model)
+        except ValueError:
+            name = None
+        models: list[str | None] = []
+        if name is not None:
+            models.append(name)
+            if _family(name) != name:
+                models.append(_family(name))
+        for slot in (
+            *((kind, m) for m in models),
+            (kind, None),
+            *((None, m) for m in models),
+        ):
+            if (kind is not None or slot[0] is None) and slot in self._table:
+                return self._table[slot]
+        return self._default
+
+    def _candidates(self, model: str) -> list[Transport]:
+        """The transports a call to ``model`` may be sent to, whatever its kind."""
+        try:
+            name: str | None = body_model(model)
+        except ValueError:
+            name = None
+        found: list[Transport] = []
+        for (kind, routed), transport in self._table.items():
+            if (
+                name is not None
+                and routed is not None
+                and routed
+                not in (
+                    name,
+                    _family(name),
+                )
+            ):
+                continue
+            if name == "clairic" and kind in CLEF_KINDS:
+                continue
+            if name in ("clef", "clef-flash") and kind in CLAIRIC_KINDS:
+                continue
+            found.append(transport)
+        return _unique([*found, self._default])
+
+    def max_questions(self, model: str) -> int:
+        """Questions one request may carry: the smallest limit of the candidates."""
+        serving = [t for t in self._candidates(model) if _can_serve(t, model)]
+        return min((max_questions(t, model) for t in serving), default=1) or 1
+
+    def state_token_budget(self, model: str) -> int | None:
+        """The smallest state budget of the candidates (``None``: none says one)."""
+        serving = [t for t in self._candidates(model) if _can_serve(t, model)]
+        known = [b for t in serving if (b := state_token_budget(t, model)) is not None]
+        return min(known) if known else None
+
+    def serves(self, model: str, payload: Mapping[str, Any] | None = None) -> bool:
+        """Whether the request can be served.
+
+        With a payload: every transport the call may be sent to can serve it (the
+        kind is not known here). Without one: at least one can serve the model.
+        """
+        candidates = self._candidates(model)
+        if payload is None:
+            return any(_can_serve(t, model) for t in candidates)
+        return all(_can_serve(t, model, payload) for t in candidates)
+
+    def classify_failure(self, exc: Exception) -> str | None:
+        """The category of a failure, as the transport that raised it says."""
+        return _classify_through(exc)
+
+    async def run(
+        self,
+        model: str,
+        payload: Mapping[str, Any],
+        *,
+        meta: CallMeta,
+        timeout: float | None = None,
+    ) -> TransportResponse:
+        """Run the call on the transport chosen for its kind and model.
+
+        An error comes out with ``provider`` set to the transport that raised it.
+        A request with images that the routed transport cannot take goes to the
+        default when that can serve it (``rerouted_from`` says so, and the engine
+        warns); anything else the routed transport cannot serve it refuses itself.
+        """
+        route, rerouted = _choose(
+            self.transport_for(model, meta.kind), self._default, model, payload
+        )
+        reply = await _run_marked(route, model, payload, meta, timeout)
+        if rerouted is not None:
+            reply = dataclasses.replace(reply, rerouted_from=rerouted)
+        return reply
+
+    def _members(self) -> list[Transport]:
+        return _unique([*self._table.values(), self._default])
+
+    def sensitive_values(self) -> tuple[str, ...]:
+        """The credentials passed explicitly to the transports it routes to."""
+        return _sensitive_of(self._members())
+
+    async def __aenter__(self) -> "KindRoutingTransport":
+        """Enter the async context."""
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        """Close the routed transports on exit."""
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        """Close every routed transport; the first error is raised afterwards."""
+        await _aclose_all(self._members())
+
+    def close(self) -> None:
+        """Close the routed transports from synchronous code, best effort."""
+        _close_all(self._members())
+
+
+class FieldTypeRoutingTransport:
+    """Splits a Clairic request by field type and routes each part to a provider.
+
+    ``routes`` maps a field type (``"text"``, ``"number"``, ``"date"``, ``"time"``,
+    ``"datetime"``, ``"duration"``, ``"list"``, ``"estimate"``, ``"forecast"``) or a
+    list of one kind of items (``"list:text"``, ``"list:number"``, ``"list:date"``) to
+    a transport; ``default`` serves every other type, and a Clef request, which is
+    never split. ``"list:date"`` beats ``"list"``. Example: dates on Jev, the rest on
+    Clairic::
+
+        FieldTypeRoutingTransport(
+            {"date": TypeSafeTransport(), "datetime": TypeSafeTransport()},
+            default=CloudflareTransport(),
+        )
+
+    A request whose fields all go to one transport is passed on unchanged. Otherwise
+    each partition (the fields of the transports, in the order asked) is one request
+    with **the same ``state``**, images, reference date and options, so every
+    provider's spans index the same text and stay exact; the partitions run
+    concurrently and the answers are merged **in field order**. ``usage`` is summed
+    (the merged body's ``routing.partitions`` keeps what each provider used, and the
+    engine logs one ``CallRecord`` per partition under its own provider and model),
+    ``truncated`` is true when any partition's is, and ``state_text`` is the one the
+    partitions share (the shortest, when one read only the beginning of the input:
+    spans beyond it are then unknown, which the engine already handles, and it asks
+    again on chunks because ``truncated`` is set). Nothing is sent unless every
+    partition can be served (``serves``); a request with images that one of them
+    cannot take goes whole to the default when that can serve it.
+
+    **A failure in one partition after another answered, or while another was in
+    flight, is uncertain**: the error carries ``maybe_sent`` and ``partial_usage``
+    (what the answered partitions used, added to the failed one's own), so the engine
+    neither contains it nor sends the siblings again, and a ``FallbackTransport`` does
+    not fall back on it. Like TypeSafe's split Clef request, the engine logs the
+    other requests' errors and cancellations. Nothing is resent here.
+
+    ``aclose`` and ``close`` close every transport once. ``max_questions`` and
+    ``state_token_budget`` are the default's (Clef requests are not split).
+    """
+
+    def __init__(self, routes: Mapping[str, Transport], default: Transport) -> None:
+        """Create a router.
+
+        Args:
+            routes: Field type (or ``list:<items>``) to transport.
+            default: The transport of the other types.
+
+        Raises:
+            ValueError: If a key is not a field type.
+        """
+        known = route_keys()
+        for key in routes:
+            if key not in known:
+                raise ValueError(f"cannot route field type {key!r}; expected {known}")
+        self._routes = dict(routes)
+        self._default = default
+
+    def _members(self) -> list[Transport]:
+        return _unique([*self._routes.values(), self._default])
+
+    def max_questions(self, model: str) -> int:
+        """Questions one request may carry: the default's (Clef is not split)."""
+        return max_questions(self._default, model)
+
+    def state_token_budget(self, model: str) -> int | None:
+        """The default's state budget."""
+        return state_token_budget(self._default, model)
+
+    def _split(
+        self, model: str, payload: Mapping[str, Any]
+    ) -> list[tuple[Transport, list[str], Mapping[str, Any]]] | None:
+        """The partitions of a Clairic request, or ``None`` for any other request."""
+        try:
+            clairic = body_model(model) == "clairic"
+        except ValueError:
+            clairic = False
+        fields = payload.get("fields") if clairic else None
+        if not isinstance(fields, Mapping) or not fields:
+            return None
+        return [
+            (t, names, {**payload, "fields": {n: fields[n] for n in names}})
+            for t, names in partition_fields(fields, self._routes, self._default)
+        ]
+
+    def serves(self, model: str, payload: Mapping[str, Any] | None = None) -> bool:
+        """Whether every partition of the request can be served."""
+        parts = None if payload is None else self._split(model, payload)
+        if parts is None:
+            return _can_serve(self._default, model, payload)
+        return all(_can_serve(t, model, sub) for t, _, sub in parts)
+
+    def classify_failure(self, exc: Exception) -> str | None:
+        """The category of a failure, as the transport that raised it says."""
+        return _classify_through(exc)
+
+    async def run(
+        self,
+        model: str,
+        payload: Mapping[str, Any],
+        *,
+        meta: CallMeta,
+        timeout: float | None = None,
+    ) -> TransportResponse:
+        """Run the call: one request, or one per partition, merged.
+
+        Raises:
+            BadRequestError: If a partition's transport cannot serve its part (and
+                the request cannot go whole to the default); nothing was sent.
+            ModelResponseError: If a partition's answer is not a Clairic response.
+        """
+        parts = self._split(model, payload)
+        if parts is None:
+            return await _run_marked(self._default, model, payload, meta, timeout)
+        if len(parts) == 1:
+            route, rerouted = _choose(parts[0][0], self._default, model, payload)
+            reply = await _run_marked(route, model, payload, meta, timeout)
+            if rerouted is not None:
+                reply = dataclasses.replace(reply, rerouted_from=rerouted)
+            return reply
+        refusing = [t for t, _, sub in parts if not _can_serve(t, model, sub)]
+        if refusing:
+            if payload.get("images") and _can_serve(self._default, model, payload):
+                reply = await _run_marked(self._default, model, payload, meta, timeout)
+                return dataclasses.replace(
+                    reply, rerouted_from=_provider_name(refusing[0])
+                )
+            raise BadRequestError(
+                "FieldTypeRoutingTransport: "
+                f"{', '.join(dict.fromkeys(_provider_name(t) for t in refusing))} "
+                "cannot serve its part of this request; nothing was sent"
+            )
+        return await self._run_parts(model, payload, parts, meta, timeout)
+
+    async def _run_parts(
+        self,
+        model: str,
+        payload: Mapping[str, Any],
+        parts: Sequence[tuple[Transport, list[str], Mapping[str, Any]]],
+        meta: CallMeta,
+        timeout: float | None,
+    ) -> TransportResponse:
+        started = time.perf_counter()
+        answered: list[TransportResponse] = []
+
+        async def one(
+            transport: Transport, sub: Mapping[str, Any]
+        ) -> TransportResponse:
+            reply = await _run_marked(transport, model, sub, meta, timeout)
+            answered.append(reply)  # counted as it completes, whatever its siblings do
+            return reply
+
+        try:
+            sent = await gather_all(*(one(t, sub) for t, _, sub in parts))
+        except BaseException as exc:
+            error = _blame(exc)
+            siblings = int(getattr(error, "cancelled_siblings", 0))
+            if answered or siblings:
+                error.maybe_sent = True  # type: ignore[attr-defined]
+            if answered:  # those partitions were run, and charged
+                own = getattr(error, "partial_usage", None)
+                error.partial_usage = ClairicUsage(  # type: ignore[attr-defined]
+                    **sum_usage(
+                        [
+                            *(r.body.get("usage") for r in answered),
+                            own.model_dump() if own is not None else None,
+                        ]
+                    )
+                )
+                models = {r.served_model for r in answered}
+                known = getattr(error, "served_model", None)
+                if known:
+                    models.add(known)
+                error.served_model = (  # type: ignore[attr-defined]
+                    models.pop() if len(models) == 1 else None
+                )
+            _note_siblings(error, siblings)
+            if error is exc:
+                raise
+            raise error from exc
+        labels = [
+            {
+                "provider": r.provider or _provider_name(t),
+                "served_model": r.served_model,
+                "fields": len(names),
+                "usage": sum_usage([r.body.get("usage")]),
+                "retries": r.retries,
+                "duration_ms": round(r.duration_ms, 1),
+                "status_code": r.status_code,
+                "request_id": r.request_id,
+            }
+            for (t, names, _), r in zip(parts, sent, strict=True)
+        ]
+        body, notes = merge_bodies(
+            list(payload["fields"]),
+            [(names, r.body) for (_, names, _), r in zip(parts, sent, strict=True)],
+            labels,
+        )
+        providers = list(dict.fromkeys(str(label["provider"]) for label in labels))
+        served = {r.served_model for r in sent}
+        fell_back = next((r for r in sent if r.fallback_from is not None), None)
+        return TransportResponse(
+            body=body,
+            retries=sum(r.retries for r in sent),
+            duration_ms=(time.perf_counter() - started) * 1000,
+            status_code=sent[0].status_code,
+            request_id=next((r.request_id for r in sent if r.request_id), None),
+            provider="+".join(providers),
+            fallback_from=fell_back.fallback_from if fell_back else None,
+            fallback_error=fell_back.fallback_error if fell_back else None,
+            served_model=served.pop() if len(served) == 1 else None,
+            primary_error=fell_back.primary_error if fell_back else None,
+            rerouted_from=next(
+                (r.rerouted_from for r in sent if r.rerouted_from), None
+            ),
+            warnings=tuple(
+                dict.fromkeys([*(w for r in sent for w in r.warnings), *notes])
+            ),
+        )
+
+    def sensitive_values(self) -> tuple[str, ...]:
+        """The credentials passed explicitly to the transports it routes to."""
+        return _sensitive_of(self._members())
+
+    async def __aenter__(self) -> "FieldTypeRoutingTransport":
+        """Enter the async context."""
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        """Close the routed transports on exit."""
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        """Close every routed transport; the first error is raised afterwards."""
+        await _aclose_all(self._members())
+
+    def close(self) -> None:
+        """Close the routed transports from synchronous code, best effort."""
+        _close_all(self._members())
+
+
+MAX_SHIFT = 10.0
+"""The largest logit shift (either way) a ``CalibratedTransport`` accepts."""
+
+
+def _checked_shifts(shifts: Mapping[str, float], what: str) -> dict[str, float]:
+    checked: dict[str, float] = {}
+    for kind, shift in shifts.items():
+        if kind not in CALL_KINDS:
+            raise ValueError(
+                f"{what}: unknown call kind {kind!r}; expected one of "
+                f"{sorted(CALL_KINDS)}"
+            )
+        if (
+            isinstance(shift, bool)
+            or not isinstance(shift, (int, float))
+            or not math.isfinite(shift)
+            or abs(shift) > MAX_SHIFT
+        ):
+            raise ValueError(
+                f"{what}: the shift of {kind!r} must be a number within "
+                f"+-{MAX_SHIFT:g}, not {shift!r}"
+            )
+        checked[kind] = float(shift)
+    return checked
+
+
+class CalibratedTransport(_Wrapping):
+    """Moves the probabilities of the Clef answers of chosen call kinds.
+
+    Every threshold of the engine was tuned on one provider's probabilities. A
+    provider that is systematically sharper or shyer can be calibrated to them by a
+    **monotone logit shift** of its answers, without changing a threshold:
+    ``noul`` becomes ``sigmoid(logit(noul) + shift)`` (positive: yes is likelier);
+    for a ``choice`` or a ``score`` the shift moves the leading option, the others
+    keep their proportions and the probabilities are renormalised, ``choice`` and
+    ``confidence`` are recomputed from them and a score is the probability-weighted
+    level again (positive: surer of its pick). Details and what is left alone
+    (a probability of exactly 0 or 1, an answer flagged ``hard``) are in
+    ``trustcall_system_one._calibrate``.
+
+    The default is **no shift**: a kind without one, or with shift 0, is passed
+    through untouched (the same response object). Clairic answers are never touched.
+    A calibrated response carries the warning ``calibration_applied: <kind> logit
+    shift <+x>`` so that a result says it was calibrated (a warning is kept once,
+    however many calls it covers).
+
+    Example:
+        Jev's attributions are shyer than Cloudflare's::
+
+            CalibratedTransport(TypeSafeTransport(), {"attribution": 0.5})
+
+    A shift can also depend on who answered (``by_provider``: ``TransportResponse.
+    provider`` to kind to shift, which beats ``shifts``), so that one wrapper around
+    a router, or around a recorder or cassette that replays raw answers, calibrates
+    each provider separately.
+
+    Everything else (``max_questions``, ``state_token_budget``, ``serves``,
+    ``classify_failure``, ``sensitive_values``, ``aclose``, ``close``) is the wrapped
+    transport's; errors and ``served_model``/``provider`` pass through unchanged.
+    """
+
+    def __init__(
+        self,
+        inner: Transport,
+        shifts: Mapping[str, float] | None = None,
+        *,
+        by_provider: Mapping[str, Mapping[str, float]] | None = None,
+    ) -> None:
+        """Create a calibrating wrapper.
+
+        Args:
+            inner: The transport whose answers are shifted.
+            shifts: Call kind to logit shift.
+            by_provider: Provider (as the response names it) to call kind to shift.
+
+        Raises:
+            ValueError: If a kind is unknown or a shift is not a finite number
+                within +-``MAX_SHIFT``.
+        """
+        self._inner = inner
+        self._shifts = _checked_shifts(shifts or {}, "calibration")
+        self._by_provider = {
+            provider: _checked_shifts(table, f"calibration of {provider}")
+            for provider, table in (by_provider or {}).items()
+        }
+
+    def shift_for(self, kind: str, provider: str | None = None) -> float:
+        """The logit shift of a call kind (and provider); 0 when there is none."""
+        if provider is not None:
+            table = self._by_provider.get(provider)
+            if table is not None and kind in table:
+                return table[kind]
+        return self._shifts.get(kind, 0.0)
+
+    async def run(
+        self,
+        model: str,
+        payload: Mapping[str, Any],
+        *,
+        meta: CallMeta,
+        timeout: float | None = None,
+    ) -> TransportResponse:
+        """Run the call on the wrapped transport and shift a Clef answer's odds."""
+        reply = await self._inner.run(model, payload, meta=meta, timeout=timeout)
+        shift = self.shift_for(meta.kind, reply.provider)
+        try:
+            clef = body_model(model) != "clairic"
+        except ValueError:
+            clef = False
+        if not shift or not clef:
+            return reply
+        body, changed = calibrate_body(reply.body, shift)
+        if not changed:
+            return reply
+        note = f"calibration_applied: {meta.kind} logit shift {shift:+g}"
+        return dataclasses.replace(
+            reply,
+            body=dict(body),
+            warnings=tuple(dict.fromkeys([*reply.warnings, note])),
+        )
 
 
 ClefProvider = Literal["cloudflare", "experiential", "decisions"]

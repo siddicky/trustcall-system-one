@@ -6,22 +6,11 @@ An override names a field of one of the library's config dataclasses
 (``enable_inserts=true``).
 """
 
-import dataclasses
 import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from trustcall_system_one import (
-    CorefConfig,
-    DiscoveryConfig,
-    GateConfig,
-    Limits,
-    MatchConfig,
-    PassesConfig,
-    PresenceConfig,
-    RepairConfig,
-    VerifyConfig,
-)
+from trustcall_system_one.combos import OPTION_FLAGS, OPTION_GROUPS, extractor_options
 
 __all__ = [
     "GROUPS",
@@ -34,27 +23,8 @@ __all__ = [
     "parse_value",
 ]
 
-GROUPS: Mapping[str, type] = {
-    "verify": VerifyConfig,
-    "gates": GateConfig,
-    "limits": Limits,
-    "passes": PassesConfig,
-    "repair": RepairConfig,
-    "presence": PresenceConfig,
-    "discovery": DiscoveryConfig,
-    "coref": CorefConfig,
-    "match": MatchConfig,
-}
-_FLAGS = frozenset(
-    {
-        "enable_inserts",
-        "enable_updates",
-        "enable_deletes",
-        "enable_item_removals",
-        "strict",
-        "existing_schema_policy",
-    }
-)
+GROUPS: Mapping[str, type] = OPTION_GROUPS
+_FLAGS = OPTION_FLAGS
 
 PRESETS: Mapping[str, Mapping[str, Any]] = {
     "default": {},
@@ -193,6 +163,9 @@ def build_options(
 ) -> dict[str, Any]:
     """The ``create_extractor`` keyword arguments for a set of overrides.
 
+    The same function as ``trustcall_system_one.combos.extractor_options``, which
+    is what a combination's ``options`` go through.
+
     Args:
         overrides: ``group.field`` and top-level flag overrides.
         base: Keyword arguments the case brings (``enable_inserts`` ...); the
@@ -204,28 +177,4 @@ def build_options(
     Raises:
         ValueError: If a group or field is unknown or a value is invalid.
     """
-    options: dict[str, Any] = dict(base or {})
-    grouped: dict[str, dict[str, Any]] = {}
-    for key, value in overrides.items():
-        group, dot, name = key.partition(".")
-        if not dot:
-            if key not in _FLAGS:
-                raise ValueError(
-                    f"unknown option {key!r}; flags: {sorted(_FLAGS)}, or "
-                    f"group.field with a group of {sorted(GROUPS)}"
-                )
-            options[key] = value
-            continue
-        if group not in GROUPS:
-            raise ValueError(
-                f"unknown group {group!r} in {key!r}; groups: {sorted(GROUPS)}"
-            )
-        names = {f.name for f in dataclasses.fields(GROUPS[group])}
-        if name not in names:
-            raise ValueError(f"{group} has no field {name!r}; fields: {sorted(names)}")
-        grouped.setdefault(group, {})[name] = value
-    for group, values in grouped.items():
-        klass = GROUPS[group]
-        start = options.get(group) or klass()
-        options[group] = dataclasses.replace(start, **values)
-    return options
+    return extractor_options(overrides, base)
