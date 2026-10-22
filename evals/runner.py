@@ -15,6 +15,7 @@ from evals.scoring import score
 from trustcall_system_one import (
     Transport,
     clef_fallback_from_env,
+    clef_fallback_on_from_env,
     clef_provider_from_env,
     create_extractor,
     system_one_transport,
@@ -47,6 +48,10 @@ class Settings:
         clef_fallback: ``decisions`` adds the Decisions API as the fallback of
             Clef on live requests; ``None`` reads ``TRUSTCALL_S1_CLEF_FALLBACK``
             (no fallback when it is unset).
+        clef_fallback_on: Which failures of Clef trigger the fallback (a subset of
+            ``unavailable``, ``uncertain`` and ``bad_response``); ``None`` reads
+            ``TRUSTCALL_S1_CLEF_FALLBACK_ON``, by default ``unavailable`` only.
+            ``uncertain`` can mean two charges for one question.
     """
 
     overrides: Mapping[str, Any] = field(default_factory=dict)
@@ -56,6 +61,7 @@ class Settings:
     concurrency: int = 4
     clef_provider: Literal["cloudflare", "experiential"] | None = None
     clef_fallback: Literal["decisions", "none"] | None = None
+    clef_fallback_on: frozenset[str] | None = None
 
 
 @dataclass
@@ -69,7 +75,8 @@ class SuiteResult:
         skipped: Ids of cases that could not run (no offline world).
         mode: ``offline``, ``live``, ``replay`` or ``replay+live``.
         clef_provider: Who served the live Clef requests (empty without ``live``).
-        clef_fallback: ``decisions`` when the Decisions API was the fallback.
+        clef_fallback: ``decisions (on ...)`` when the Decisions API was the
+            fallback, with the failures that trigger it.
     """
 
     config: str
@@ -93,6 +100,11 @@ def _have_credentials(
     if needs_key and not (os.environ.get("EXPERIENTIAL_API_KEY") or "").strip():
         return False
     return bool(account and token)
+
+
+def _fallback_on(settings: Settings) -> frozenset[str]:
+    """The failures that trigger the fallback: the setting, else the environment."""
+    return settings.clef_fallback_on or clef_fallback_on_from_env()
 
 
 def _fallback(settings: Settings) -> Literal["decisions", "none"]:
@@ -226,7 +238,9 @@ async def run_suite(
         settings.record.mkdir(parents=True, exist_ok=True)
     gate = asyncio.Semaphore(max(1, settings.concurrency))
     live = (
-        system_one_transport(provider, clef_fallback=fallback)
+        system_one_transport(
+            provider, clef_fallback=fallback, clef_fallback_on=_fallback_on(settings)
+        )
         if settings.live and provider
         else None
     )
@@ -248,7 +262,9 @@ async def run_suite(
         skipped,
         mode_of(settings),
         provider,
-        fallback if provider and fallback != "none" else "",
+        f"{fallback} (on {','.join(sorted(_fallback_on(settings)))})"
+        if provider and fallback != "none"
+        else "",
     )
 
 

@@ -69,6 +69,7 @@ from trustcall_system_one.transport import (
     Transport,
     TransportResponse,
     clef_fallback_from_env,
+    clef_fallback_on_from_env,
     clef_provider_from_env,
     system_one_transport,
 )
@@ -132,6 +133,7 @@ __all__ = [
     "VerifyConfig",
     "__version__",
     "clef_fallback_from_env",
+    "clef_fallback_on_from_env",
     "clef_provider_from_env",
     "compile_schema",
     "create_extractor",

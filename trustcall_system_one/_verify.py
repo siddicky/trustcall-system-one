@@ -1609,7 +1609,32 @@ async def _choose_elements(
     return kept, spans_out, notes, positions, drops
 
 
+def _answered_by(answer: Answer | None) -> str | None:
+    """Who answered, when it was a fallback (the answer's ``provider`` extra)."""
+    provider = ((answer.model_extra if answer is not None else None) or {}).get(
+        "provider"
+    )
+    return str(provider) if provider else None
+
+
 def resolve_clef(spec: FieldSpec, answer: Answer | None, ctx: Ctx) -> Resolved:
+    """Turn a Clef answer into a value, apply the thresholds and note who answered.
+
+    The notes of a field answered by a fallback (``answered_by:decisions``, and
+    ``hard_answer`` for a bare pick without probabilities) end up in
+    ``FieldAnswer.warnings``; see ``_resolve_clef`` for the rest.
+    """
+    resolved = _resolve_clef(spec, answer, ctx)
+    provider = _answered_by(answer)
+    if provider is None:
+        return resolved
+    extra = (answer.model_extra if answer is not None else None) or {}
+    hard = bool(extra.get("hard"))
+    notes = (*resolved.notes, f"answered_by:{provider}", *(("hard_answer",) * hard))
+    return dataclasses.replace(resolved, notes=notes)
+
+
+def _resolve_clef(spec: FieldSpec, answer: Answer | None, ctx: Ctx) -> Resolved:
     """Turn a Clef answer into a value and apply the choice thresholds.
 
     Args:
@@ -2066,8 +2091,22 @@ async def _attribution(ctx: Ctx, targets: list[FieldState]) -> None:
     await gather(*(_judge(ctx, st, answers) for st in targets))
 
 
+def _note_attribution_provider(st: FieldState, answers: dict[str, Answer]) -> None:
+    """Say on the field when a fallback gave the attribution it was judged by."""
+    keys = (
+        [_attr_id(st, i) for i in range(len(st.resolved.value))]
+        if _is_list(st)
+        else [_attr_id(st, None)]
+    )
+    for key in keys:
+        provider = _answered_by(answers.get(key))
+        if provider and f"attribution_by:{provider}" not in st.notes:
+            st.notes.append(f"attribution_by:{provider}")
+
+
 async def _judge(ctx: Ctx, st: FieldState, answers: dict[str, Answer]) -> None:
     verify = ctx.run.verify
+    _note_attribution_provider(st, answers)
     if not _is_list(st):
         p = _p(answers, _attr_id(st, None))
         st.attribution_p = p

@@ -9,6 +9,7 @@ they are tested from what the translation documents.
 import asyncio
 import json
 import math
+import re
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -52,8 +53,11 @@ from trustcall_system_one._decisions import (
 )
 from trustcall_system_one._run import FALLBACK_WARNING, Run
 from trustcall_system_one._wire import ClefRequest, parse_clef
+from trustcall_system_one.transport import DEFAULT_FALLBACK_ON
 
 KEY = "xpl_" + "dc12ba34" * 5
+TOKEN = re.compile(r'<<<([0-9a-f]{16}) "')
+ALL = {"unavailable", "uncertain", "bad_response"}
 META = CallMeta(kind="gate", schema="Person", entity="Ada Lovelace")
 DECISIONS_URL = "https://api.experientiallabs.ai/v1/decisions"
 EXAMPLE: dict[str, Any] = json.loads(
@@ -233,23 +237,34 @@ def test_the_model_is_configurable() -> None:
     assert DECISIONS_MODEL == "gpt-6-luna-decisions"
 
 
-def test_a_structured_state_becomes_labelled_sections() -> None:
+def test_a_structured_state_becomes_fenced_sections() -> None:
     body, _ = to_decisions_request(MIXED)
     text = body["input"]
-    # the user's text is verbatim (real newlines, no JSON escaping) under its key
-    assert text.startswith("## input\nAda Lovelace wrote the first program.\nShe lived")
-    assert "\\n" not in text
-    # other values keep their structure as indented JSON
-    assert '## entity\n{\n  "label": "the Person",\n  "name": "Ada"\n}' in text
-    assert text.index("## input") < text.index("## entity")
+    token = TOKEN.search(text).group(1)  # type: ignore[union-attr]
+    # the user's text is verbatim (real newlines, no JSON escaping) in its section
+    assert (
+        f'<<<{token} "input">>>\nAda Lovelace wrote the first program.\n'
+        f"She lived in London.\n<<<END {token}>>>"
+    ) in text
+    assert (
+        f'<<<{token} "entity">>>\n{{\n  "label": "the Person",\n  "name": "Ada"\n}}\n'
+        f"<<<END {token}>>>"
+    ) in text
+    assert text.index('"input"') < text.index('"entity"')
+    assert text.startswith("The sections below are fenced")
+    # the same request is rendered the same way
+    assert to_decisions_request(MIXED)[0]["input"] == text
 
 
 def test_render_state_forms() -> None:
     assert render_state("plain") == "plain"
     assert render_state({}) == "{}"
-    assert render_state([1, "é"]) == '[\n  1,\n  "é"\n]'
+    assert render_state([1, "é"]) == '[\n  1,\n  "\u00e9"\n]'
     assert render_state(3) == "3"
-    assert render_state({"a": "x", "b": [1]}) == "## a\nx\n\n## b\n[\n  1\n]"
+    text = render_state({"a": "x", "b": [1]})
+    token = TOKEN.search(text).group(1)  # type: ignore[union-attr]
+    assert f'<<<{token} "a">>>\nx\n<<<END {token}>>>' in text
+    assert f'<<<{token} "b">>>\n[\n  1\n]\n<<<END {token}>>>' in text
 
 
 def test_questions_keep_their_order_and_ids() -> None:
@@ -279,9 +294,12 @@ def test_noul_becomes_yes_and_no() -> None:
 def test_choice_criteria_become_choices() -> None:
     body, plans = to_decisions_request(MIXED)
     choice = body["questions"][1]
-    assert choice["instructions"] == (
-        "## question\nWhere?\n\n## options_note\npick one"
+    # a structured instruction is fenced like a state
+    token = TOKEN.search(choice["instructions"]).group(1)  # type: ignore[union-attr]
+    assert (
+        f'<<<{token} "question">>>\nWhere?\n<<<END {token}>>>' in choice["instructions"]
     )
+    assert f'<<<{token} "options_note">>>\npick one\n<<<END' in choice["instructions"]
     assert choice["choices"] == [
         {"value": "london", "description": "London"},
         {"value": "paris"},  # no description to give
@@ -340,6 +358,7 @@ def test_the_observed_response_becomes_a_clef_choice_answer() -> None:
         "choice": "review",
         "probabilities": {"accept": 0.0, "review": 1.0},
         "confidence": 1.0,
+        "provider": "decisions",
     }
     assert clef["usage"] == {"input_tokens": 201, "output_tokens": 0, "cost": 0.0}
     assert (clef["provider"], clef["decisions_model"]) == ("decisions", DECISIONS_MODEL)
@@ -370,16 +389,19 @@ def test_noul_is_the_probability_of_yes() -> None:
     assert noul(choice="yes", probabilities=probs(yes=0.8, no=0.2)) == {
         "type": "noul",
         "noul": 0.8,
+        "provider": "decisions",
     }
-    # probabilities that do not sum to one are normalised over yes and no
-    assert noul(choice="no", probabilities=probs(yes=0.1, no=0.3))["noul"] == 0.25
-    # a missing option has probability 0
+    # probabilities that do not sum to one (beyond 0.02) are normalised
+    assert math.isclose(
+        noul(choice="no", probabilities=probs(yes=0.1, no=0.3))["noul"], 0.25
+    )
+    # a missing option has probability 0 (and the rest is normalised)
     assert noul(choice="yes", probabilities=probs(yes=0.6))["noul"] == 1.0
-    # nothing to normalise: the choice decides
-    assert noul(choice="no", probabilities=probs(yes=0.0, no=0.0))["noul"] == 0.0
+    # within 0.02 they are left alone
+    assert noul(choice="yes", probabilities=probs(yes=0.51, no=0.48))["noul"] == 0.51
 
 
-def test_an_answer_without_probabilities_is_hard_and_tagged() -> None:
+def test_an_answer_without_probabilities_is_hard_capped_and_tagged() -> None:
     payload = MIXED
     _, plans = to_decisions_request(payload)
     body = response_for(
@@ -395,16 +417,34 @@ def test_an_answer_without_probabilities_is_hard_and_tagged() -> None:
     validator("clef-output").validate(clef)
     assert clef["model"] == "clef-flash"
     answers = clef["answers"]
-    assert answers["z_last"] == {"type": "noul", "noul": 1.0, "hard": True}
-    assert answers["a_first"]["probabilities"] == {
-        "london": 0.0,
-        "paris": 1.0,
-        "rome": 0.0,
+    # a bare pick is never 1.0: the cap (0.9) shows in the numbers and in the tag
+    assert answers["z_last"] == {
+        "type": "noul",
+        "noul": 0.9,
+        "provider": "decisions",
+        "hard": True,
     }
-    assert answers["a_first"]["confidence"] == 1.0
-    assert answers["a_first"]["hard"] is True
-    assert answers["m_score"]["score"] == 2.0
-    assert answers["m_score"]["hard"] is True
+    assert answers["a_first"]["probabilities"] == {
+        "london": pytest.approx(0.05),
+        "paris": 0.9,
+        "rome": pytest.approx(0.05),
+    }
+    assert answers["a_first"]["confidence"] == 0.9
+    assert answers["m_score"]["score"] == pytest.approx(0.05 + 1.8)
+    assert all(a["hard"] is True for a in answers.values())
+    no = response_for(
+        payload,
+        [
+            {"type": "choice", "name": n, "choice": c}
+            for n, c in [("z_last", "no"), ("a_first", "london"), ("m_score", "0")]
+        ],
+    )
+    assert from_decisions_response(no, plans, clef_model="clef")["answers"]["z_last"][
+        "noul"
+    ] == pytest.approx(0.1)
+    # the cap is a knob; 1.0 gives a bare pick full weight
+    full = from_decisions_response(body, plans, clef_model="clef", hard_cap=1.0)
+    assert full["answers"]["z_last"]["noul"] == 1.0
 
 
 def test_a_score_is_the_probability_weighted_level_with_its_legend() -> None:
@@ -693,10 +733,14 @@ class Answers:
         self.closed.append("close")
 
 
+# nothing ran: the default triggers
 TRIGGERS: list[Exception] = [
     RateLimitError("429", status_code=429),
-    ServerError("502", status_code=502),
     TransportError("could not connect; the request was not sent"),
+]
+# the request may have run, or certainly did: opt-ins
+OPT_INS: list[Exception] = [
+    ServerError("502", status_code=502),
     UncertainOutcomeError("timed out; outcome unknown"),
     ModelResponseError("not a clef response"),
 ]
@@ -721,6 +765,26 @@ async def test_each_default_trigger_sends_the_request_to_the_fallback_once(
     assert result.fallback_error is not None
     assert result.fallback_error.startswith(type(error).__name__)
     assert result.request_id == "bk-1"
+
+
+@pytest.mark.parametrize("error", OPT_INS, ids=lambda e: type(e).__name__)
+async def test_uncertain_and_bad_responses_do_not_fall_back_by_default(
+    error: Exception,
+) -> None:
+    # "a timeout can leave a charged, unknown outcome; do not auto-retry": the
+    # fallback asks the same question again, so it needs an explicit opt-in
+    primary, backup = Raises(error), Answers()
+    with pytest.raises(type(error)) as info:
+        await FallbackTransport(primary, backup).run(CLEF, REVIEW, meta=META)
+    assert info.value is error
+    assert backup.calls == []
+    opted_in = FallbackTransport(Raises(error), backup, on=ALL)
+    assert (await opted_in.run(CLEF, REVIEW, meta=META)).provider == "backup"
+    assert len(backup.calls) == 1
+
+
+def test_the_default_trigger_is_unavailable_only() -> None:
+    assert frozenset({"unavailable"}) == DEFAULT_FALLBACK_ON
 
 
 @pytest.mark.parametrize("error", NON_TRIGGERS, ids=lambda e: type(e).__name__)
@@ -753,8 +817,8 @@ async def test_unavailable_only_leaves_out_uncertain_outcomes_and_bad_responses(
 ):
     for error, falls in [
         (RateLimitError("429"), True),
-        (ServerError("502"), True),
         (TransportError("not sent"), True),
+        (ServerError("502"), False),  # a 5xx may have run
         (UncertainOutcomeError("unknown"), False),
         (ModelResponseError("bad"), False),
     ]:
@@ -800,16 +864,18 @@ def test_invalid_triggers_are_rejected() -> None:
         FallbackTransport(Answers(), Answers(), on=[3])  # type: ignore[list-item]
 
 
-async def test_when_the_fallback_fails_too_its_error_is_raised_from_the_primarys() -> (
-    None
-):
+async def test_when_the_fallback_fails_too_its_error_carries_the_primarys() -> None:
     primary_error = UncertainOutcomeError("primary timed out")
+    root = ValueError("the fallback's own cause")
     fallback_error = ServerError("fallback down")
+    fallback_error.__cause__ = root
     primary, backup = Raises(primary_error), Raises(fallback_error, "backup")
     with pytest.raises(ServerError) as info:
-        await FallbackTransport(primary, backup).run(CLEF, REVIEW, meta=META)
+        await FallbackTransport(primary, backup, on=ALL).run(CLEF, REVIEW, meta=META)
     assert info.value is fallback_error
-    assert info.value.__cause__ is primary_error
+    assert info.value.primary_error is primary_error
+    assert info.value.__cause__ is root  # its own cause is not clobbered
+    assert (primary_error.provider, fallback_error.provider) == ("primary", "backup")
     assert len(primary.calls) == 1 and len(backup.calls) == 1  # no third attempt
 
 
@@ -828,7 +894,8 @@ async def test_a_fallback_that_cannot_serve_the_model_leaves_the_primarys_error(
 async def test_each_provider_sees_exactly_one_request() -> None:
     first, first_server = experiential(httpx.ReadTimeout("took too long"))
     second, second_server = decisions(httpx.Response(200, json=EXAMPLE))
-    result = await FallbackTransport(first, second).run(CLEF, REVIEW, meta=META)
+    # a timeout is an uncertain outcome: the fallback is an explicit opt-in
+    result = await FallbackTransport(first, second, on=ALL).run(CLEF, REVIEW, meta=META)
     assert len(first_server.requests) == 1
     assert len(second_server.requests) == 1
     assert first_server.delays == second_server.delays == []
@@ -836,26 +903,82 @@ async def test_each_provider_sees_exactly_one_request() -> None:
     assert result.fallback_error is not None
     assert "UncertainOutcomeError" in result.fallback_error
     assert parse_clef(result.body).answers["review"].type == "choice"
+    assert result.served_model == DECISIONS_MODEL
 
 
 async def test_a_5xx_primary_and_a_5xx_fallback_make_two_requests_not_more() -> None:
     first, first_server = experiential(httpx.Response(503, json={"error": "down"}))
     second, second_server = decisions(httpx.Response(502, json={"error": "down"}))
+    with pytest.raises(UncertainOutcomeError) as info:
+        await FallbackTransport(first, second, on=ALL).run(CLEF, REVIEW, meta=META)
+    assert (len(first_server.requests), len(second_server.requests)) == (1, 1)
+    assert isinstance(info.value.primary_error, UncertainOutcomeError)
+    # and by default a 5xx of the primary is not a reason to ask again
+    first, first_server = experiential(httpx.Response(503, json={"error": "down"}))
+    second, second_server = decisions()
     with pytest.raises(UncertainOutcomeError):
         await FallbackTransport(first, second).run(CLEF, REVIEW, meta=META)
-    assert (len(first_server.requests), len(second_server.requests)) == (1, 1)
+    assert second_server.requests == []
 
 
-async def test_cloudflare_as_the_primary_falls_back_on_its_server_errors() -> None:
-    server = Server(httpx.Response(500, json={"errors": [{"message": "boom"}]}))
-    client = httpx.AsyncClient(transport=httpx.MockTransport(server))
-    cloudflare = CloudflareTransport(
-        account_id="acct", api_token="tok", client=client, max_retries=0
-    )
+async def test_cloudflare_as_the_primary_is_classified_per_failure() -> None:
+    """Only a failure where nothing could have run falls back by default."""
+
+    def cloudflare(*responses: httpx.Response | Exception) -> tuple[Any, Server]:
+        server = Server(*responses)
+        client = httpx.AsyncClient(transport=httpx.MockTransport(server))
+        return (
+            CloudflareTransport(
+                account_id="acct",
+                api_token="tok",
+                client=client,
+                max_retries=1,
+                sleep=server.sleep,
+            ),
+            server,
+        )
+
+    sent_and_lost = [
+        httpx.ReadTimeout("slow"),  # sent, no answer
+        httpx.ReadError("reset"),  # dropped after sending
+        httpx.RemoteProtocolError("closed"),
+    ]
+    for error in sent_and_lost:
+        primary, server = cloudflare(error)
+        backup, backup_server = decisions()
+        with pytest.raises(TransportError):
+            await FallbackTransport(primary, backup).run(CLEF, REVIEW, meta=META)
+        assert backup_server.requests == [], type(error).__name__
+        assert len(server.requests) == 2  # Cloudflare's own retry
+    for response in (
+        httpx.Response(500, json={"errors": [{"message": "boom"}]}),
+        httpx.Response(408, json={"errors": [{"message": "timeout"}]}),
+    ):
+        primary, _ = cloudflare(response)
+        backup, backup_server = decisions()
+        with pytest.raises(TransportError):
+            await FallbackTransport(primary, backup).run(CLEF, REVIEW, meta=META)
+        assert backup_server.requests == [], response.status_code
+    # nothing ran: the connection failed, or the request was refused
+    for error2 in (
+        httpx.ConnectError("refused"),
+        httpx.ConnectTimeout("handshake"),
+        httpx.Response(
+            429, json={"errors": [{"message": "limit"}]}, headers={"Retry-After": "1"}
+        ),
+    ):
+        primary, _ = cloudflare(error2)
+        backup, backup_server = decisions()
+        result = await FallbackTransport(primary, backup).run(CLEF, REVIEW, meta=META)
+        assert result.fallback_from == "cloudflare"
+        assert len(backup_server.requests) == 1
+    # with the opt-in, a lost request falls back too
+    primary, _ = cloudflare(httpx.ReadTimeout("slow"))
     backup, backup_server = decisions()
-    result = await FallbackTransport(cloudflare, backup).run(CLEF, REVIEW, meta=META)
-    assert result.fallback_from == "cloudflare"
-    assert len(server.requests) == 1 and len(backup_server.requests) == 1
+    result = await FallbackTransport(primary, backup, on={"uncertain"}).run(
+        CLEF, REVIEW, meta=META
+    )
+    assert result.provider == "decisions" and len(backup_server.requests) == 1
 
 
 async def test_the_pair_exposes_credentials_and_closes_both() -> None:
@@ -873,7 +996,7 @@ async def test_the_pair_exposes_credentials_and_closes_both() -> None:
 async def test_it_combines_with_routing() -> None:
     cloudflare, backup = Answers(), Answers()
     router = RoutingTransport(
-        {"clef": FallbackTransport(Raises(ServerError("5")), backup)},
+        {"clef": FallbackTransport(Raises(RateLimitError("429")), backup)},
         default=cloudflare,
     )
     clef = await router.run(CLEF, REVIEW, meta=META)
@@ -894,7 +1017,7 @@ def review_questions() -> Any:
 async def test_the_call_log_names_the_provider_and_the_fallback() -> None:
     first, _ = experiential(httpx.Response(504, json={"error": "gateway"}))
     second, _ = decisions(httpx.Response(200, json=EXAMPLE))
-    run = Run(transport=FallbackTransport(first, second))
+    run = Run(transport=FallbackTransport(first, second, on=ALL))
     answers = await run.call_clef(review_questions(), REVIEW["state"], meta=META)
     assert answers["review"].type == "choice"
     primary_attempt, answered = run.calls
@@ -903,6 +1026,7 @@ async def test_the_call_log_names_the_provider_and_the_fallback() -> None:
     assert primary_attempt.error.startswith("UncertainOutcomeError")
     assert answered.error is None
     assert (answered.provider, answered.fallback_from) == ("decisions", "experiential")
+    assert answered.model == DECISIONS_MODEL  # accounted under the model that answered
     assert answered.cost_usd == 0.0
     assert (
         run.usage.requests == 1
@@ -911,12 +1035,13 @@ async def test_the_call_log_names_the_provider_and_the_fallback() -> None:
     (warning,) = run.warnings
     assert warning.startswith(f"{FALLBACK_WARNING}: 1 Clef request(s)")
     assert "decisions" in warning and "experiential" in warning
+    assert "used for: gate:Person" in warning
 
 
 async def test_the_warning_counts_and_stays_one_line() -> None:
     first, _ = experiential(httpx.Response(503, json={"error": "down"}))
     second, _ = decisions()
-    run = Run(transport=FallbackTransport(first, second))
+    run = Run(transport=FallbackTransport(first, second, on=ALL))
     for i in range(3):
         questions = ClefRequest.model_validate(
             {**REVIEW, "questions": {f"q{i}": REVIEW["questions"]["review"]}}

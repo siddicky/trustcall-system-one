@@ -34,6 +34,17 @@ class TrustcallSystemOneError(Exception):
     usage: Any = None
     cost: Any = None
 
+    # What a transport knows about the failed request (set by the transports and read
+    # by the engine's call log; ``None`` when nothing is known).
+    provider: str | None = None
+    """Who raised it (``cloudflare``, ``experiential`` or ``decisions``)."""
+    primary_error: BaseException | None = None
+    """When a fallback also failed, the error of the primary that came first."""
+    reported_cost: float | None = None
+    """The cost in USD that a response reported although it could not be used."""
+    served_model: str | None = None
+    """The model that was asked, when it is not the one the request named."""
+
 
 class TransportError(TrustcallSystemOneError):
     """Base class for HTTP and transport failures.

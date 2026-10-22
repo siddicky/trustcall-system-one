@@ -248,14 +248,21 @@ run `grep -rnE "xpl_[A-Za-z0-9_-]{16,}" . --exclude-dir=.git`: it must find noth
 `DecisionsTransport` answers Clef requests with the Decisions API
 (`POST https://api.experientiallabs.ai/v1/decisions`, model `gpt-6-luna-decisions`, the same
 `EXPERIENTIAL_API_KEY`), and `FallbackTransport` uses it when the Clef provider (Experiential or
-Cloudflare) could not answer. It sends text to Experiential Labs, so it is opt-in:
+Cloudflare) could not answer. The Decisions API is served by OpenAI through Experiential
+Labs, so the fallback sends text to both: it is opt-in:
 
 ```bash
 export EXPERIENTIAL_API_KEY=...                  # from the environment only
 export TRUSTCALL_S1_CLEF_FALLBACK=decisions      # required: a key alone enables nothing
+# default: fall back only when the primary certainly ran nothing (a 429, a failed
+# connection). A timeout or 5xx may have been charged, and the fallback asks the same
+# question again, so it is a separate opt-in (the question can be paid for twice):
+# export TRUSTCALL_S1_CLEF_FALLBACK_ON=unavailable,uncertain,bad_response
 make smoke 2>&1 | tee /tmp/smoke-fallback.txt
 uv run python -m evals run --live --clef-provider experiential --clef-fallback decisions \
     --config default --out evals/results/fallback-default
+# with the uncertain outcomes too (read the second bullet below first):
+#   ... --clef-fallback decisions --clef-fallback-on unavailable,uncertain
 ```
 
 How to read it:
@@ -264,11 +271,17 @@ How to read it:
   record, the result carries the warning `clef_fallback_used: N Clef request(s) ...`, and
   `summary.md` prints "Clef provider: experiential + fallback decisions". Report N per case. A
   run with a clean primary should have none; every one is a primary failure to explain.
-- The primary's failed attempt is a record of its own. If it was an `UncertainOutcomeError` it
-  counts in `unknown_outcomes` (the primary may have been charged, and the fallback is charged as
-  well). To fall back only when the primary certainly did not process the request, set the
-  triggers in code (`FallbackTransport(..., on={"unavailable"})`); the environment switch uses the
-  default (all three categories).
+- The primary's failed attempt is a record of its own, with its provider, and so is the
+  fallback's when it fails too (error, cost, cancellation): `unknown_outcomes` counts a primary
+  timeout plus a fallback timeout as 2, a primary timeout plus a bad charged response as 1, and a
+  primary timeout plus a cancelled fallback as 2. By default the fallback is used only when the
+  primary certainly ran nothing, so a clean default run has no uncertain primary records; if
+  you opted in to `uncertain` each one of them may be a second charge for the same question.
+  Fallback calls are filed under `gpt-6-luna-decisions` in `usage.by_model` (its reported cost is
+  in `reported_cost_usd`; Clef's pricing is not applied to them).
+- A field the fallback answered has `provider` `decisions` and the note `answered_by:decisions`
+  (`hard_answer` for a bare pick), and a Clairic field it checked has `attribution_by:decisions`
+  in `warnings`; the `clef_fallback_used` warning lists up to 8 uses.
 - The fallback is a different model: its answers are not Clef's. Observed probabilities were
   saturated (0.0 and 1.0, confidence 1.0), so the thresholds' re-ask bands do not fire on it.
   Compare the quality of a fallback run against a normal one before relying on it; a case that

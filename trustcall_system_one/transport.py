@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import dataclasses
+import functools
 import json
 import math
 import os
@@ -13,13 +14,15 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import timezone
 from email.utils import parsedate_to_datetime
-from typing import Any, Literal, Protocol, TypeVar, Union, runtime_checkable
+from typing import Any, Literal, Protocol, TypeVar, Union, cast, runtime_checkable
 
 import httpx
 
 from trustcall_system_one._config import ConcurrencyConfig
 from trustcall_system_one._decisions import (
     DECISIONS_MODEL,
+    DEFAULT_HARD_CAP,
+    _reported_cost,
     from_decisions_response,
     to_decisions_request,
 )
@@ -30,6 +33,7 @@ from trustcall_system_one._errors import (
     RateLimitError,
     ServerError,
     TransportError,
+    TrustcallSystemOneError,
     UncertainOutcomeError,
 )
 from trustcall_system_one._types import CallKind
@@ -37,6 +41,7 @@ from trustcall_system_one._version import __version__
 from trustcall_system_one._wire import body_model, normalize_model_id, parse_clef
 
 __all__ = [
+    "DEFAULT_FALLBACK_ON",
     "AdaptiveLimiter",
     "CallKind",
     "CallMeta",
@@ -48,6 +53,7 @@ __all__ = [
     "Transport",
     "TransportResponse",
     "clef_fallback_from_env",
+    "clef_fallback_on_from_env",
     "clef_provider_from_env",
     "system_one_transport",
 ]
@@ -84,6 +90,9 @@ class TransportResponse:
         fallback_from: When a ``FallbackTransport`` had to use its fallback, the
             provider that failed.
         fallback_error: ... and how it failed (error class and message).
+        served_model: The model that answered when it is not the one the request
+            named (the Decisions model of a fallback), so that calls are
+            accounted under the model that was used.
     """
 
     body: dict[str, Any]
@@ -94,6 +103,7 @@ class TransportResponse:
     provider: str | None = None
     fallback_from: str | None = None
     fallback_error: str | None = None
+    served_model: str | None = None
 
 
 @runtime_checkable
@@ -397,6 +407,25 @@ def _error_for_status(
 
 
 _T = TypeVar("_T", bound="_HttpTransport")
+_F = TypeVar("_F", bound=Callable[..., Awaitable[Any]])
+
+
+def _tagged(run: _F) -> _F:
+    """Mark every error (and cancellation) a ``run`` raises with its provider.
+
+    The engine logs a failed call with the provider that failed, and a fallback
+    needs to say which of its two providers an error came from.
+    """
+
+    @functools.wraps(run)
+    async def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return await run(self, *args, **kwargs)
+        except (asyncio.CancelledError, TrustcallSystemOneError) as exc:
+            _tag(exc, self.provider)
+            raise
+
+    return cast(_F, wrapper)
 
 
 class _HttpTransport:
@@ -597,6 +626,40 @@ class CloudflareTransport(_HttpTransport):
 
     provider = "cloudflare"
 
+    def classify_failure(self, exc: Exception) -> str | None:
+        """Say whether a failure of ``run`` means that nothing was run.
+
+        Used by ``FallbackTransport``. This transport retries timeouts, dropped
+        connections, 408 and 5xx and raises the last failure, so after its retries
+        a plain ``TransportError`` can be a failed connection (``"unavailable"``:
+        nothing was sent) or a request that was sent and not answered
+        (``"uncertain"``: it may have run). The error and its causes are looked at:
+        a ``ServerError``, a 408, an ``UncertainOutcomeError`` or an httpx error
+        that is not a failure to connect is ``"uncertain"``; a ``RateLimitError``
+        and a failure to connect are ``"unavailable"``.
+        """
+        if isinstance(exc, _NEVER_FALL_BACK):
+            return None
+        if isinstance(exc, ModelResponseError):
+            return "bad_response"
+        chain: list[BaseException] = []
+        link: BaseException | None = exc
+        while link is not None and link not in chain:
+            chain.append(link)
+            link = link.__cause__
+        for link in chain:
+            if isinstance(link, (UncertainOutcomeError, ServerError)):
+                return "uncertain"
+            if isinstance(link, TransportError) and link.status_code == 408:
+                return "uncertain"
+            if isinstance(link, _SlotTimeout):
+                continue
+            if isinstance(link, (httpx.HTTPError, asyncio.TimeoutError)) and not (
+                isinstance(link, (*_PRE_SEND_RETRYABLE, *_PRE_SEND_FATAL))
+            ):
+                return "uncertain"
+        return "unavailable" if isinstance(exc, TransportError) else None
+
     def __init__(
         self,
         *,
@@ -737,6 +800,7 @@ class CloudflareTransport(_HttpTransport):
         headers.update(self._extra_headers)
         return headers
 
+    @_tagged
     async def run(
         self,
         model: str,
@@ -947,6 +1011,17 @@ def _tag_request_id(
         exc.args = (f"{exc.args[0]} (correlation id {request_id})", *exc.args[1:])
 
 
+def _tag_charge(
+    exc: TrustcallSystemOneError, response: httpx.Response, model: str | None
+) -> None:
+    """Put the cost a response reported on the error it caused (it was charged)."""
+    if exc.reported_cost is None:
+        with contextlib.suppress(ValueError):
+            exc.reported_cost = _reported_cost(response.json())
+    if exc.served_model is None:
+        exc.served_model = model
+
+
 class ExperientialTransport(_HttpTransport):
     """Calls Clef through Experiential Labs (``POST /v1/systemone``).
 
@@ -1082,12 +1157,16 @@ class ExperientialTransport(_HttpTransport):
     provider = "experiential"
     _api_name = "Experiential Labs API"
 
-    def serves(self, model: str) -> bool:
+    def serves(self, model: str, payload: Mapping[str, Any] | None = None) -> bool:
         """Whether this transport can answer ``model`` (Clef only)."""
         try:
             return body_model(model) in _EXPERIENTIAL_MODELS
         except ValueError:
             return False
+
+    def _served_model(self, body: Mapping[str, Any]) -> str | None:
+        """The model that answered, when it is not the one asked (a fallback)."""
+        return None
 
     def _prepare(self, payload: Mapping[str, Any]) -> tuple[Mapping[str, Any], Any]:
         """The body to send and what is needed to read the answer back."""
@@ -1134,6 +1213,7 @@ class ExperientialTransport(_HttpTransport):
                 "other models elsewhere (see RoutingTransport)"
             )
 
+    @_tagged
     async def run(
         self,
         model: str,
@@ -1234,6 +1314,7 @@ class ExperientialTransport(_HttpTransport):
                                 if isinstance(exc, TransportError):
                                     exc.retries = retries
                                 _tag_request_id(exc, request_id)
+                                _tag_charge(exc, response, self._served_model({}))
                                 raise
                             self.limiter.on_success(model)
                             return TransportResponse(
@@ -1243,6 +1324,7 @@ class ExperientialTransport(_HttpTransport):
                                 status_code=status,
                                 request_id=request_id,
                                 provider=self.provider,
+                                served_model=self._served_model(body),
                             )
                         retry_after = _parse_retry_after(
                             response.headers.get("Retry-After")
@@ -1404,6 +1486,7 @@ class DecisionsTransport(ExperientialTransport):
         *,
         decisions_model: str = DECISIONS_MODEL,
         base_url: str = DECISIONS_URL,
+        decisions_hard_cap: float = DEFAULT_HARD_CAP,
         **kwargs: Any,
     ) -> None:
         """Create a transport.
@@ -1411,6 +1494,11 @@ class DecisionsTransport(ExperientialTransport):
         Args:
             decisions_model: The Decisions model to ask.
             base_url: The endpoint that receives the POST.
+            decisions_hard_cap: The most probability (and confidence) an answer
+                without probabilities is given, in ``(0.5, 1]``. The default 0.9
+                passes the 0.85 remove/set-null gates and the 0.75 attribution
+                keep, but shows in the numbers that the answer is a bare pick and
+                is tagged ``"hard"``; 1.0 gives the answer full weight.
             **kwargs: The other settings of ``ExperientialTransport`` (``api_key``,
                 ``client``, ``timeout``, ``max_retries``, ``call_deadline``,
                 ``min_attempt_budget``, ...).
@@ -1421,7 +1509,29 @@ class DecisionsTransport(ExperientialTransport):
         super().__init__(base_url=base_url, **kwargs)
         if not decisions_model.strip():
             raise ValueError("decisions_model must not be empty")
+        if not (0.5 < decisions_hard_cap <= 1.0):
+            raise ValueError("decisions_hard_cap must be in (0.5, 1]")
         self._decisions_model = decisions_model
+        self._hard_cap = decisions_hard_cap
+
+    def serves(self, model: str, payload: Mapping[str, Any] | None = None) -> bool:
+        """Whether the request can be answered.
+
+        That is Clef only, and nothing that has no Decisions equivalent (images)
+        or would not translate.
+        """
+        if not super().serves(model):
+            return False
+        if payload is None:
+            return True
+        try:
+            to_decisions_request(payload, model=self._decisions_model)
+        except BadRequestError:
+            return False
+        return True
+
+    def _served_model(self, body: Mapping[str, Any]) -> str | None:
+        return str(body.get("decisions_model") or self._decisions_model)
 
     def _prepare(self, payload: Mapping[str, Any]) -> tuple[Mapping[str, Any], Any]:
         body, plans = to_decisions_request(payload, model=self._decisions_model)
@@ -1444,34 +1554,59 @@ class DecisionsTransport(ExperientialTransport):
                 body=body,
                 cf_errors=[body["error"]] if _is_error_object(body) else [],
             )
-        return from_decisions_response(body, plans, clef_model=clef_model)
+        return from_decisions_response(
+            body, plans, clef_model=clef_model, hard_cap=self._hard_cap
+        )
 
 
 # --------------------------------------------------------------------------- #
 # Fallback
 # --------------------------------------------------------------------------- #
 
-
-class _Unsent(Exception):
-    """Marker: a plain ``TransportError`` (nothing was run) triggers the fallback."""
-
-
+FALLBACK_CATEGORIES: tuple[str, ...] = ("unavailable", "uncertain", "bad_response")
+"""What a failure of the primary can be, for ``FallbackTransport(on=...)``."""
+DEFAULT_FALLBACK_ON: frozenset[str] = frozenset({"unavailable"})
+"""The categories that trigger the fallback by default: only a primary that
+certainly ran nothing. ``uncertain`` (the request may have been run and charged) and
+``bad_response`` (it certainly was) are opt-ins: the fallback is a second request to
+the same vendor, which is what "do not auto-retry" is about."""
 FallbackTrigger = Union[str, "type[Exception]"]
-FALLBACK_CATEGORIES: Mapping[str, tuple[type[Exception], ...]] = {
-    # no answer, and the request was refused or never sent (a plain TransportError,
-    # such as a failed connection or a deadline, is added in FallbackTransport)
-    "unavailable": (RateLimitError, ServerError, _Unsent),
-    # the request may have been run, and charged
-    "uncertain": (UncertainOutcomeError,),
-    # an answer that is not one
-    "bad_response": (ModelResponseError,),
-}
-DEFAULT_FALLBACK_ON: frozenset[str] = frozenset(FALLBACK_CATEGORIES)
 _NEVER_FALL_BACK = (AuthError, BadRequestError)
+
+
+def classify_failure(exc: Exception) -> str | None:
+    """The category of a transport failure, as far as the type says.
+
+    * ``"uncertain"``: ``UncertainOutcomeError`` and ``ServerError``: the request
+      may have been run (and charged).
+    * ``"bad_response"``: ``ModelResponseError``: it was run, and answered badly.
+    * ``"unavailable"``: ``RateLimitError`` and a plain ``TransportError``: a
+      request that was refused, never sent or never connected.
+    * ``None``: anything else (``AuthError``, ``BadRequestError``, a bug).
+
+    A transport that knows more says so with its own ``classify_failure(exc)``
+    (``CloudflareTransport`` does: its failures after retries include timeouts and
+    dropped connections that are not "nothing ran").
+    """
+    if isinstance(exc, (UncertainOutcomeError, ServerError)):
+        return "uncertain"
+    if isinstance(exc, ModelResponseError):
+        return "bad_response"
+    if isinstance(exc, _NEVER_FALL_BACK):
+        return None
+    if isinstance(exc, TransportError):  # RateLimitError, or nothing was sent
+        return "unavailable"
+    return None
 
 
 def _provider_name(transport: object) -> str:
     return str(getattr(transport, "provider", None) or type(transport).__name__.lower())
+
+
+def _tag(exc: BaseException, provider: str) -> None:
+    """Say who raised an error (the first to say it wins)."""
+    if getattr(exc, "provider", None) is None:
+        exc.provider = provider  # type: ignore[attr-defined]
 
 
 class FallbackTransport:
@@ -1481,29 +1616,30 @@ class FallbackTransport:
     request goes to ``fallback`` exactly once and its answer is returned, with
     ``provider`` and ``fallback_from`` / ``fallback_error`` set on the response so
     the call log shows who answered. Neither transport is resent by this class,
-    and the built-in ones never resend a request that may have arrived, so every
-    provider sees a request at most once (plus the retries of a failed connection
-    or a 429 inside it).
+    and the built-in ones never resend a request that may have arrived.
 
-    ``on`` is a set of categories and exception classes. The categories:
+    ``on`` is a set of categories and exception classes. The categories, which the
+    primary decides for its own errors (``classify_failure``):
 
-    * ``"unavailable"``: no answer and nothing was run: ``RateLimitError`` (after the
-      bounded retries), ``ServerError``, and a plain ``TransportError`` (a failed
-      connection, a request that was not sent, a deadline).
-    * ``"uncertain"``: ``UncertainOutcomeError``, a timeout, a dropped connection
-      after the request was sent, a 408 or 5xx of Experiential Labs. **The primary
-      may have run the request and charged for it, so falling back can mean two
-      charges.** Leave this category out (``on={"unavailable", "bad_response"}``,
-      or ``on={"unavailable"}``) to fall back only when the primary certainly did
-      not process the request.
-    * ``"bad_response"``: ``ModelResponseError``, an answer that is not valid.
+    * ``"unavailable"`` (**the default**): nothing was run: a refused request
+      (``RateLimitError`` after the bounded retries), a failed connection, a request
+      that was not sent. Falling back cannot cost a second charge.
+    * ``"uncertain"`` (opt-in): the request may have been run and charged: a
+      timeout, a dropped connection after sending, a 408 or 5xx
+      (``UncertainOutcomeError``, ``ServerError``, and for ``CloudflareTransport`` a
+      failure after the request was sent). **The same question then goes to the
+      fallback, a vendor that may be the same one, so the user may pay twice and
+      "do not auto-retry after a timeout" no longer holds.**
+    * ``"bad_response"`` (opt-in): ``ModelResponseError``: the primary certainly ran
+      and charged, and its answer was unusable.
 
-    The default is all three. ``AuthError`` and ``BadRequestError`` never fall back
-    (a rejected key or a request we built wrongly would fail the same way), and
-    listing them is a ``ValueError``. A cancellation is never caught. If the
-    fallback fails too, its error is raised, chained (``__cause__``) to the
-    primary's. A fallback that cannot serve the model (``serves``) is not tried and
-    the primary's error is raised.
+    ``AuthError`` and ``BadRequestError`` never fall back (a rejected key or a
+    request we built wrongly would fail the same way), and listing them is a
+    ``ValueError``. So is ``FallbackTransport(p, p)``. A cancellation is never
+    caught. If the fallback fails too, its error is raised with the primary's in
+    ``primary_error`` (the engine logs both calls). A fallback that cannot serve the
+    request (``serves``: not Clef, or images the Decisions API cannot take) is not
+    tried, and it is the primary's error that is raised.
     """
 
     def __init__(
@@ -1519,21 +1655,29 @@ class FallbackTransport:
             primary: The transport tried first.
             fallback: The transport that gets the request if the primary fails.
             on: Categories (``"unavailable"``, ``"uncertain"``, ``"bad_response"``)
-                and/or exception classes that trigger the fallback.
+                and/or exception classes that trigger the fallback; by default only
+                ``"unavailable"``.
 
         Raises:
             ValueError: If ``on`` names an unknown category or ``AuthError`` /
-                ``BadRequestError`` (or a subclass), or selects nothing.
+                ``BadRequestError`` (or a subclass), selects nothing, or if
+                ``primary`` and ``fallback`` are the same transport.
         """
-        triggers: list[type[Exception]] = []
+        if primary is fallback:
+            raise ValueError(
+                "primary and fallback are the same transport: a fallback is a "
+                "different provider, not a resend"
+            )
+        categories: set[str] = set()
+        classes: list[type[Exception]] = []
         for item in (on,) if isinstance(on, (str, type)) else on:
             if isinstance(item, str):
                 if item not in FALLBACK_CATEGORIES:
                     raise ValueError(
                         f"unknown fallback trigger {item!r}; expected one of "
-                        f"{sorted(FALLBACK_CATEGORIES)} or an exception class"
+                        f"{list(FALLBACK_CATEGORIES)} or an exception class"
                     )
-                triggers.extend(FALLBACK_CATEGORIES[item])
+                categories.add(item)
             elif isinstance(item, type) and issubclass(item, Exception):
                 if issubclass(item, _NEVER_FALL_BACK) or any(
                     issubclass(never, item) for never in _NEVER_FALL_BACK
@@ -1541,27 +1685,24 @@ class FallbackTransport:
                     raise ValueError(
                         f"{item.__name__} never falls back: it would fail the same way"
                     )
-                triggers.append(item)
+                classes.append(item)
             else:
                 raise ValueError(f"not a fallback trigger: {item!r}")
-        if not triggers:
+        if not categories and not classes:
             raise ValueError("on selects no error")
-        self._triggers = tuple(triggers)
+        self._categories = frozenset(categories)
+        self._classes = tuple(classes)
         self._primary = primary
         self._fallback = fallback
 
     def _falls_back_on(self, exc: Exception) -> bool:
         if isinstance(exc, _NEVER_FALL_BACK):
             return False
-        for trigger in self._triggers:
-            if trigger is _Unsent:
-                # a plain TransportError: a connection that failed, a request that
-                # was not sent, a deadline; not one of its more specific subclasses
-                if type(exc) is TransportError:
-                    return True
-            elif isinstance(exc, trigger):
-                return True
-        return False
+        classify = getattr(self._primary, "classify_failure", None)
+        category = classify(exc) if callable(classify) else classify_failure(exc)
+        if category is not None and category in self._categories:
+            return True
+        return isinstance(exc, self._classes)
 
     async def run(
         self,
@@ -1575,17 +1716,24 @@ class FallbackTransport:
         try:
             return await self._primary.run(model, payload, meta=meta, timeout=timeout)
         except Exception as primary_error:
+            _tag(primary_error, _provider_name(self._primary))
             if not self._falls_back_on(primary_error):
                 raise
             serves = getattr(self._fallback, "serves", None)
-            if callable(serves) and not serves(model):
+            if callable(serves) and not serves(model, payload):
                 raise
             try:
                 answered = await self._fallback.run(
                     model, payload, meta=meta, timeout=timeout
                 )
+            except asyncio.CancelledError as cancelled:
+                _tag(cancelled, _provider_name(self._fallback))
+                cancelled.primary_error = primary_error  # type: ignore[attr-defined]
+                raise
             except Exception as fallback_error:
-                raise fallback_error from primary_error
+                _tag(fallback_error, _provider_name(self._fallback))
+                fallback_error.primary_error = primary_error  # type: ignore[attr-defined]
+                raise
             failure = f"{type(primary_error).__name__}: {primary_error}"
         return dataclasses.replace(
             answered,
@@ -1825,10 +1973,46 @@ def clef_fallback_from_env(environ: Mapping[str, str] | None = None) -> ClefFall
     )
 
 
+def clef_fallback_on_from_env(
+    environ: Mapping[str, str] | None = None,
+) -> frozenset[str]:
+    """Which failures of Clef trigger the fallback, from the environment.
+
+    ``TRUSTCALL_S1_CLEF_FALLBACK_ON`` is a comma-separated list of
+    ``unavailable``, ``uncertain`` and ``bad_response`` (see ``FallbackTransport``).
+    Unset or empty means ``unavailable`` only: the fallback is used when the
+    primary certainly ran nothing. ``uncertain`` (a timeout or 5xx: the primary may
+    have run and charged) and ``bad_response`` (it certainly did) send the same
+    question to a second request, so they are opt-ins.
+
+    Args:
+        environ: The environment to read; defaults to ``os.environ``.
+
+    Returns:
+        The categories.
+
+    Raises:
+        ValueError: If the variable names anything else.
+    """
+    env = os.environ if environ is None else environ
+    raw = env.get("TRUSTCALL_S1_CLEF_FALLBACK_ON") or ""
+    names = {part.strip().lower() for part in raw.split(",") if part.strip()}
+    if not names:
+        return DEFAULT_FALLBACK_ON
+    unknown = sorted(names - set(FALLBACK_CATEGORIES))
+    if unknown:
+        raise ValueError(
+            f"TRUSTCALL_S1_CLEF_FALLBACK_ON must list {list(FALLBACK_CATEGORIES)}, "
+            f"not {unknown}"
+        )
+    return frozenset(names)
+
+
 def system_one_transport(
     clef: ClefProvider | None = None,
     *,
     clef_fallback: ClefFallback | None = None,
+    clef_fallback_on: Iterable[FallbackTrigger] | str | None = None,
     cloudflare: CloudflareTransport | None = None,
     experiential: ExperientialTransport | None = None,
     decisions: DecisionsTransport | None = None,
@@ -1845,6 +2029,10 @@ def system_one_transport(
             sends text to Experiential Labs when the primary fails, also if Clef
             itself is on Cloudflare. ``"none"`` adds nothing. ``None`` decides from
             the environment (see ``clef_fallback_from_env``).
+        clef_fallback_on: Which failures of Clef trigger the fallback: categories
+            and/or exception classes (see ``FallbackTransport``). ``None`` reads
+            ``TRUSTCALL_S1_CLEF_FALLBACK_ON`` (see ``clef_fallback_on_from_env``);
+            the default is ``unavailable`` only.
         cloudflare: The Cloudflare transport to use; by default a new one.
         experiential: The Experiential transport to use; by default a new one.
         decisions: The Decisions transport to use; by default a new one.
@@ -1876,7 +2064,14 @@ def system_one_transport(
         else experiential or ExperientialTransport(concurrency=concurrency)
     )
     if fallback == "decisions":
+        triggers = (
+            clef_fallback_on_from_env()
+            if clef_fallback_on is None
+            else clef_fallback_on
+        )
         clef_transport = FallbackTransport(
-            clef_transport, decisions or DecisionsTransport(concurrency=concurrency)
+            clef_transport,
+            decisions or DecisionsTransport(concurrency=concurrency),
+            on=triggers,
         )
     return RoutingTransport({"clef": clef_transport}, default=base)

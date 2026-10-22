@@ -24,6 +24,7 @@ def _no_provider_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TRUSTCALL_S1_CLEF_PROVIDER", raising=False)
     monkeypatch.delenv("EXPERIENTIAL_API_KEY", raising=False)
     monkeypatch.delenv("TRUSTCALL_S1_CLEF_FALLBACK", raising=False)
+    monkeypatch.delenv("TRUSTCALL_S1_CLEF_FALLBACK_ON", raising=False)
 
 
 @pytest.fixture(autouse=True)

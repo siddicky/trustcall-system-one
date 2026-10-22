@@ -166,6 +166,7 @@ class Prices:
         unpriced: set[str] = set()
         for model, used in usage.by_model.items():
             if used.input_tokens == 0:
+                reported += used.reported_cost_usd  # spent on unusable responses
                 continue
             all_reported = used.requests > 0 and used.reported_requests == used.requests
             if all_reported:

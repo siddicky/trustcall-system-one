@@ -678,10 +678,15 @@ only a failed connection and a 429 with `Retry-After` are retried. Experiential 
 of each call: see `result.usage.reported_cost_usd` and `result.cost.reported_usd`.
 
 As a fallback for Clef you can also opt in to Experiential's Decisions API
-(`TRUSTCALL_S1_CLEF_FALLBACK=decisions`, or `system_one_transport(clef_fallback="decisions")`):
-a Clef request that its provider could not answer is sent once to the Decisions API (a
-different model; after a timeout both may have been charged), and the result carries the
-warning `clef_fallback_used`.
+(`TRUSTCALL_S1_CLEF_FALLBACK=decisions`, or `system_one_transport(clef_fallback="decisions")`).
+**The Decisions API is served by OpenAI through Experiential Labs, so opting in sends your text
+to OpenAI as well.** A Clef request that its provider certainly did not process (refused with a
+429, or the connection failed) is sent once to it, as a different model; the answers are marked
+(`FieldAnswer.provider`) and the result carries the warning `clef_fallback_used`. After a
+timeout or a 5xx the primary may already have run and been charged, so the same question is
+*not* sent again unless you also opt in to that
+(`TRUSTCALL_S1_CLEF_FALLBACK_ON=unavailable,uncertain`): then it can be paid for twice.
+With Clef on Cloudflare the default falls back only for a 429 or a failed connection.
 
 ## Extract one record
 

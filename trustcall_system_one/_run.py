@@ -55,6 +55,7 @@ __all__ = [
     "gather",
 ]
 
+_FALLBACK_FIELDS_SHOWN = 8
 FALLBACK_WARNING = "clef_fallback_used"
 """Start of the warning that says a fallback answered."""
 
@@ -149,6 +150,18 @@ async def gather(*awaitables: Awaitable[T]) -> list[T]:
     return [t.result() for t in tasks]
 
 
+def _fallback_provider(answer: Any) -> str | None:
+    """Who answered, when it was a fallback (``provider`` is an extra key)."""
+    extra = getattr(answer, "model_extra", None) or {}
+    provider = extra.get("provider")
+    return str(provider) if provider else None
+
+
+def _is_hard(answer: Any) -> bool:
+    """Whether the answer came without probabilities (a fallback's bare pick)."""
+    return bool((getattr(answer, "model_extra", None) or {}).get("hard"))
+
+
 @dataclass(frozen=True)
 class _Sent:
     """A successful transport response with its timing."""
@@ -161,6 +174,7 @@ class _Sent:
     provider: str | None = None
     fallback_from: str | None = None
     fallback_error: str | None = None
+    served_model: str | None = None
 
 
 @dataclass
@@ -200,6 +214,11 @@ class Run:
             byte-identical request is answered from here, not sent again.
         fallback_used: How many requests a fallback transport answered after
             its primary failed (also reported as the ``clef_fallback_used`` warning).
+        fallback_hard: How many of those answers had no probabilities.
+        fallback_fields: What the fallback's answers were used for (the call
+            kind, schema and field), also when an answer is replayed from
+            ``clef_memo``.
+        fallback_route: ``(fallback provider, primary provider)`` of the warning.
     """
 
     transport: Transport
@@ -228,6 +247,9 @@ class Run:
     )
     clef_memo: "dict[str, dict[str, Answer]]" = field(default_factory=dict)
     fallback_used: int = 0
+    fallback_hard: int = 0
+    fallback_fields: dict[str, None] = field(default_factory=dict)
+    fallback_route: tuple[str, str] | None = None
 
     def warn(self, message: str) -> None:
         """Record a warning once."""
@@ -252,10 +274,11 @@ class Run:
         request_id: str | None = None,
         provider: str | None = None,
         fallback_from: str | None = None,
+        cost: float | None = None,
     ) -> None:
         """Append one ``CallRecord`` (and the usage, for a successful call)."""
         counted: dict[str, int] = {}
-        cost_usd: float | None = None
+        cost_usd: float | None = cost
         if usage is not None:
             self.usage.add_call(model, meta.kind, usage)
             counted = {
@@ -285,6 +308,29 @@ class Run:
             )
         )
 
+    def _record_primary(
+        self, model: str, meta: CallMeta, n_items: int, exc: BaseException
+    ) -> None:
+        """Log the primary's failure that came before a failed fallback.
+
+        A ``FallbackTransport`` whose fallback fails too attaches the primary's
+        error to it (``primary_error``): both calls reached a provider, and either
+        may have been charged, so both are logged, each with its provider.
+        """
+        primary = getattr(exc, "primary_error", None)
+        if primary is None:
+            return
+        self._record(
+            model,
+            meta,
+            n_items,
+            retries=getattr(primary, "retries", 0),
+            status_code=getattr(primary, "status_code", None),
+            error=f"{type(primary).__name__}: {primary}",
+            request_id=getattr(primary, "request_id", None),
+            provider=getattr(primary, "provider", None),
+        )
+
     async def _send(
         self,
         model: str,
@@ -296,23 +342,29 @@ class Run:
 
         A request that is cancelled (a sibling failed, or the caller gave up) may
         already have been sent, and charged, so it is logged too, as
-        ``CANCELLED_AFTER_SEND``, before the cancellation goes on.
+        ``CANCELLED_AFTER_SEND``, before the cancellation goes on. When a fallback
+        was in use, the primary's failure is logged as well.
         """
         started = time.perf_counter()
         try:
             response = await self.transport.run(model, payload, meta=meta)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancelled:
+            self._record_primary(model, meta, n_items, cancelled)
             self._record(
-                model,
+                getattr(cancelled, "served_model", None) or model,
                 meta,
                 n_items,
                 duration_ms=(time.perf_counter() - started) * 1000,
                 error=CANCELLED_AFTER_SEND,
+                provider=getattr(cancelled, "provider", None),
             )
             raise
         except Exception as exc:
+            self._record_primary(model, meta, n_items, exc)
+            charged_model = getattr(exc, "served_model", None) or model
+            spent = getattr(exc, "reported_cost", None)
             self._record(
-                model,
+                charged_model,
                 meta,
                 n_items,
                 duration_ms=(time.perf_counter() - started) * 1000,
@@ -320,7 +372,11 @@ class Run:
                 status_code=getattr(exc, "status_code", None),
                 error=f"{type(exc).__name__}: {exc}",
                 request_id=getattr(exc, "request_id", None),
+                provider=getattr(exc, "provider", None),
+                cost=spent,
             )
+            if spent is not None:  # charged for a response that could not be used
+                self.usage.add_spend(charged_model, meta.kind, spent)
             raise
         if response.fallback_from is not None:
             self._note_fallback(model, meta, n_items, response, started)
@@ -333,6 +389,7 @@ class Run:
             provider=response.provider,
             fallback_from=response.fallback_from,
             fallback_error=response.fallback_error,
+            served_model=response.served_model,
         )
 
     def _note_fallback(
@@ -351,6 +408,7 @@ class Run:
         fallback answered.
         """
         self.fallback_used += 1
+        self.fallback_route = (str(response.provider), str(response.fallback_from))
         self._record(
             model,
             meta,
@@ -359,11 +417,30 @@ class Run:
             error=response.fallback_error,
             provider=response.fallback_from,
         )
+        self._note_fallback_use(meta)
+
+    def _note_fallback_use(self, meta: CallMeta) -> None:
+        """Remember what a fallback answer was used for and refresh the warning."""
+        where = ".".join(part for part in (meta.schema, meta.field) if part)
+        self.fallback_fields[f"{meta.kind}:{where}" if where else meta.kind] = None
+        self._refresh_fallback_warning()
+
+    def _refresh_fallback_warning(self) -> None:
+        provider, origin = self.fallback_route or ("the fallback", "the primary")
         message = (
             f"{FALLBACK_WARNING}: {self.fallback_used} Clef request(s) were answered "
-            f"by the fallback ({response.provider}) because {response.fallback_from} "
-            "could not answer them"
+            f"by the fallback ({provider}) because {origin} could not answer them"
         )
+        if self.fallback_hard:
+            message += (
+                f"; {self.fallback_hard} answer(s) came without probabilities "
+                "(hard picks, confidence capped)"
+            )
+        fields = list(self.fallback_fields)
+        if fields:
+            shown = ", ".join(fields[:_FALLBACK_FIELDS_SHOWN])
+            more = len(fields) - _FALLBACK_FIELDS_SHOWN
+            message += f"; used for: {shown}" + (f", +{more} more" if more > 0 else "")
         self.warnings[:] = [
             w for w in self.warnings if not w.startswith(FALLBACK_WARNING)
         ]
@@ -531,6 +608,9 @@ class Run:
         key = json.dumps([model, payload], sort_keys=True, default=str)
         known = self.clef_memo.get(key)
         if known is not None:
+            # an answer keeps where it came from (its ``provider``), also here
+            if any(_fallback_provider(a) for a in known.values()):
+                self._note_fallback_use(meta)
             return dict(known)
         answers = await self._clef_send(model, chunk, payload, meta)
         self.clef_memo[key] = answers
@@ -544,13 +624,15 @@ class Run:
         meta: CallMeta,
     ) -> dict[str, Answer]:
         sent = await self._send(model, payload, meta, len(chunk))
+        # a fallback's calls are accounted under the model that answered
+        accounted = sent.served_model or model
         try:
             response = parse_clef(sent.body)
         except Exception as exc:
-            self._unparsable(model, meta, len(chunk), sent, exc)
+            self._unparsable(accounted, meta, len(chunk), sent, exc)
             raise
         self._record(
-            model,
+            accounted,
             meta,
             len(chunk),
             usage=response.usage,
@@ -561,7 +643,16 @@ class Run:
             provider=sent.provider,
             fallback_from=sent.fallback_from,
         )
-        if response.usage.input_tokens >= _TRUNCATION_RATIO * _CLEF_CONTEXT_TOKENS:
+        for note in (response.model_extra or {}).get("decisions_notes", ()):
+            self.warn(str(note))
+        wanted = [qid for qid, _ in chunk if qid in response.answers]
+        hard = sum(1 for qid in wanted if _is_hard(response.answers[qid]))
+        if hard:
+            self.fallback_hard += hard
+            self._refresh_fallback_warning()
+        if sent.served_model is not None:
+            pass  # another model's tokens say nothing about Clef's context
+        elif response.usage.input_tokens >= _TRUNCATION_RATIO * _CLEF_CONTEXT_TOKENS:
             self.warn(
                 "clef_state_possibly_truncated: a Clef request used "
                 f"{response.usage.input_tokens} input tokens, close to the "

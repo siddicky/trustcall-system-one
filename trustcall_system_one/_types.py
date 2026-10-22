@@ -161,6 +161,19 @@ class Usage:
         self.by_model.setdefault(normalize_model_id(model), Usage())._add_totals(call)
         self.by_kind.setdefault(kind, Usage())._add_totals(call)
 
+    def add_spend(self, model: str, kind: str, cost: float) -> None:
+        """Add a cost that a response reported although it could not be used.
+
+        The money was spent, but there is no successful call to count: only
+        ``reported_cost_usd`` grows.
+        """
+        if not (math.isfinite(cost) and cost >= 0):
+            return
+        spent = Usage(reported_cost_usd=float(cost))
+        self._add_totals(spent)
+        self.by_model.setdefault(normalize_model_id(model), Usage())._add_totals(spent)
+        self.by_kind.setdefault(kind, Usage())._add_totals(spent)
+
     def merge(self, other: "Usage") -> None:
         """Add ``other`` (totals and breakdowns) into this instance in place."""
         self._add_totals(other)
@@ -312,6 +325,10 @@ class FieldAnswer:
             element that got no answer, never NaN).
         gate_p: Probability from the change gate (updates).
         crosscheck_agree: Whether the input-only cross-check agreed (updates).
+        provider: Who answered a Clef question when it was not the primary
+            provider (``decisions``, the fallback); ``None`` otherwise. A Clairic
+            field whose attribution came from the fallback has an
+            ``attribution_by:<provider>`` note in ``warnings``.
         reask: Whether a re-ask contributed to the value.
         repaired: Whether the value comes from the validation repair loop (the
             first answer failed validation and a narrow re-ask replaced it).
@@ -335,6 +352,7 @@ class FieldAnswer:
     attribution_p: float | tuple[float | None, ...] | None = None
     gate_p: float | None = None
     crosscheck_agree: bool | None = None
+    provider: str | None = None
     reask: bool = False
     repaired: bool = False
     rejected_reason: str | None = None

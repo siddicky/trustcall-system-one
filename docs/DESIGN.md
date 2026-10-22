@@ -1172,50 +1172,105 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
   answers: [{type, name, choice, probabilities: [{value, probability}], confidence}], usage
   {input_tokens, output_tokens, cost, ...}, provider}` (a live probe is saved as
   `docs/schemas/experiential-decisions-response.example.json`; `model` is
-  `gpt-6-luna-decisions`, configurable). Only the `choice` question type has been observed, so
-  `DecisionsTransport` (a subclass of `ExperientialTransport`: same key, limiter, deadline and
-  **same no-retry policy**) sends every Clef question as one and translates the answer back to a
-  Clef-shaped response that `parse_clef` accepts (`_decisions.py`, validated both ways: the
-  Clef request, the Decisions request, the Decisions response and the Clef result):
-  `state` becomes `input`: a string as it is, an object as one `## key` section per key (strings
-  verbatim, other values as indented JSON), because the questions refer to the keys (`input`,
-  `entity`, `record`, `proposed_change`) and the user's text should stay unescaped; `questions`
-  become a list in the same order with `name` = the question id; `choice` criteria become
-  `choices` (id kept, description a string or rendered JSON, none when null); **`noul`** becomes
-  two choices `yes`/`no` and `noul = P(yes)` (normalised over the two, 1/0 by the choice when
-  both are 0); **`score`** becomes one choice per level (`"0"`...) and `score` is the
-  probability-weighted level with the legend from the rubric. An answer that arrives without
-  probabilities is hard (1.0 on the choice) and carries `"hard": true`; the observed ones had
-  them, but they were saturated (0.0/1.0, confidence 1.0), so thresholds written for graded Clef
-  answers (keep at 0.75, drop under 0.4, a re-ask between) behave like yes/no on this fallback.
-  `images` are refused (`BadRequestError`) before sending. Response keys: `provider:
-  "decisions"`, `decisions_model`, `usage.cost` (the reported price, which is 0.0 in the probe).
-- `FallbackTransport(primary, fallback, *, on={"unavailable", "uncertain", "bad_response"})`:
-  when the primary raises an error selected by `on`, the same request goes to the fallback
-  **once**, and the response comes back with `provider`, `fallback_from` and `fallback_error`
-  set. Categories: `unavailable` (`RateLimitError` after its bounded retries, `ServerError`, a
-  plain `TransportError` such as a failed connection or a deadline), `uncertain`
-  (`UncertainOutcomeError`: a timeout, a 408 or 5xx of Experiential Labs, a connection dropped
-  after sending; **the primary may have charged for the request and the fallback is charged
-  too**, so `on={"unavailable", "bad_response"}` excludes it), `bad_response`
-  (`ModelResponseError`); exception classes may be listed too. `AuthError` and `BadRequestError`
-  never fall back (listing them is a `ValueError`), nor does a cancellation. A fallback is a
-  different request to a different model, not a resend of the primary's: the primary and the
-  fallback each see at most one request (plus a failed connection or a 429 with `Retry-After`
-  inside it), and a fallback that fails too raises its own error chained to the primary's. A
-  fallback that cannot serve the model (`serves()`, Clef only) leaves the primary's error. The
-  call log: `CallRecord.provider` (who answered) and `fallback_from`; the primary's failed
-  attempt is logged as a record of its own (its error, `provider` of the primary) so an uncertain
-  outcome is counted (`unknown_outcomes`); `Run.fallback_used` and the warning
-  `clef_fallback_used: N Clef request(s) were answered by the fallback (...)`.
-  Setup: `system_one_transport(clef=..., clef_fallback="decisions"|"none"|None)` builds
-  `RoutingTransport({"clef": FallbackTransport(<Experiential or Cloudflare>,
-  DecisionsTransport())}, default=CloudflareTransport())`; `None` reads
+  `gpt-6-luna-decisions`, configurable). **Disclosure: the Decisions API is served by OpenAI
+  through Experiential Labs (the probe's response says `"provider": "openai"`), so opting in
+  sends the user's text to OpenAI as well as to Experiential Labs.** Only the `choice` question
+  type has been observed, so `DecisionsTransport` (a subclass of `ExperientialTransport`: same
+  key, limiter, deadline and **same no-retry policy**) sends every Clef question as one and
+  translates the answer back to a Clef-shaped response that `parse_clef` accepts
+  (`_decisions.py`, validated both ways: the Clef request, the Decisions request, the Decisions
+  response and the Clef result).
+  - `state` becomes `input`: a string as it is, an object as one **fenced** section per key
+    (`<<<TOKEN "key">>>`, the value, `<<<END TOKEN>>>`; strings verbatim, other values as
+    indented JSON; the key JSON-encoded). The questions refer to the keys (`input`, `entity`,
+    `record`, `proposed_change`) and the user's text should stay unescaped, but a plain
+    `## record` header could be forged by that text (a note that contains `\n## record\n...`
+    would pass for the record); the fence token is a hash of the whole state, so it is
+    reproducible, no text of the state contains it and its author cannot know it. Structured
+    `instructions` are fenced the same way.
+  - `questions` become a list in the same order with `name` = the question id; `choice` criteria
+    become `choices` (id kept, description a string or rendered JSON, none when null);
+    **`noul`** becomes two choices `yes`/`no` and `noul = P(yes)`; **`score`** becomes one choice
+    per level (`"0"`...) and `score` is the probability-weighted level with the legend from the
+    rubric. Every answer carries `provider: "decisions"`.
+  - Probabilities are checked: they must be non-negative and sum to 1 within 0.02, else they
+    are normalised and the run gets a `decisions_probabilities_normalised` warning (all zero is a
+    `ModelResponseError`), and `choice` must be the most probable option (a tie is fine), else
+    `ModelResponseError`. An answer that arrives without probabilities is a hard pick: it carries
+    `"hard": true` and its probability and confidence are capped at `decisions_hard_cap`
+    (default 0.9, range (0.5, 1]; 1.0 gives it full weight). 0.9 passes the 0.85 remove/set-null
+    gates and the 0.75 attribution keep but is visibly not certainty, and the warning counts
+    them. The observed answers had probabilities, but saturated (0.0/1.0, confidence 1.0), so
+    thresholds written for graded Clef answers (keep at 0.75, drop under 0.4, a re-ask between)
+    behave like yes/no on this fallback; those numbers are the API's own and are not capped.
+  - `images` are refused (`BadRequestError`) before sending, and `serves(model, payload)` is
+    false for them (and for a payload that does not translate), so the primary's error is what
+    comes out. Response keys: `provider: "decisions"`, `decisions_model`, `usage.cost` (the
+    reported price, 0.0 in the probe).
+- `FallbackTransport(primary, fallback, *, on={"unavailable"})`: when the primary raises an
+  error that `on` selects, the same request goes to the fallback **once**, and the response comes
+  back with `provider`, `fallback_from`, `fallback_error` and `served_model` set.
+  - **The default is `unavailable` only: the primary certainly ran nothing.** The fallback is a
+    second request to the same vendor, which is what "a timeout can leave a charged, unknown
+    outcome; do not auto-retry" forbids when the outcome is unknown. `uncertain` and
+    `bad_response` are explicit opt-ins: in code (`on=...`, `system_one_transport(
+    clef_fallback_on=...)`), `TRUSTCALL_S1_CLEF_FALLBACK_ON=unavailable,uncertain,bad_response`
+    (`clef_fallback_on_from_env()`, validated when the extractor is created) and `--clef-fallback-on`
+    in the evals. (An earlier revision defaulted to all three; it no longer does.)
+  - Categories, which **the primary classifies for its own errors** (`classify_failure(exc)`; the
+    module function `classify_failure` is the default): `unavailable` = a refused request
+    (`RateLimitError` after its bounded retries), a failed connection, a request that was not
+    sent; `uncertain` = the request may have been run and charged (`UncertainOutcomeError`, a
+    timeout, a dropped connection after sending, a 408, a 5xx); `bad_response` =
+    `ModelResponseError`: the primary certainly ran and charged and its answer was unusable.
+    `ExperientialTransport` raises the right type for each. `CloudflareTransport` retries
+    timeouts, dropped connections, 408 and 5xx and raises the last failure, so after its retries
+    a plain `TransportError` can be either a failed connection (`unavailable`) or a request that
+    was sent and lost (`uncertain`); its `classify_failure` looks at the error and its causes. So
+    `system_one_transport(clef="cloudflare", clef_fallback="decisions")` with the default only
+    falls back when nothing could have run (a 429, a failed connection), not after a read
+    timeout or a 5xx. An unknown transport is classified by type (`ServerError` is `uncertain`).
+    Exception classes may be listed in `on` too. **With `uncertain` the question can be paid for
+    twice** (the primary may have charged and the fallback is charged too).
+  - `AuthError` and `BadRequestError` never fall back (listing them, or `Exception`, is a
+    `ValueError`), nor does a cancellation; `FallbackTransport(p, p)` is a `ValueError`. The
+    primary and the fallback each see at most one request (plus a failed connection or a 429
+    with `Retry-After` inside it). A fallback that cannot serve the request (`serves()`: not
+    Clef, images, a payload that does not translate) is not tried and the primary's error comes
+    out.
+  - A fallback that fails too raises *its own* error (its `__cause__` is untouched) with the
+    primary's in `primary_error`; a fallback cancelled in flight carries it too. Transports
+    mark the errors they raise with their `provider`. The engine logs **both calls**, each with
+    its provider, whatever the outcome: the primary's failure and the fallback's answer, error
+    or cancellation. So `unknown_outcomes` counts a primary timeout followed by a fallback
+    timeout as 2, a primary timeout followed by a bad (charged) response as 1, and a primary
+    timeout followed by a cancelled fallback as 2.
+- **Accounting by the model that answered.** A fallback's calls are filed under the model that
+  answered (`TransportResponse.served_model`: `gpt-6-luna-decisions`, also on the `CallRecord`
+  and in `Usage.by_model`), never under Clef's: Clef's token price (`Prices`) is not applied to
+  GPT tokens, the Decisions cost shows up in `reported_usd` (a model whose every call reported
+  one counts as priced), and the tokens of the fallback do not feed the Clef truncation warning.
+  A response that was charged (`usage.cost`) but could not be used is a failed call with
+  `cost_usd` set, and its cost is added to `Usage.reported_cost_usd` (`Usage.add_spend`).
+- **Provenance of the answers.** Every answer of the fallback carries `provider: "decisions"`
+  (and `hard`) as extra keys, so the memo replays them with their provenance. `FieldAnswer.provider`
+  is `decisions` for a field the fallback answered, with the notes `answered_by:decisions` and
+  `hard_answer` in `warnings`; a Clairic field whose attribution check came from the fallback has
+  `attribution_by:decisions` in its `warnings`. The change gates and the isolated re-asks are not
+  marked per decision; the call log (`CallRecord.provider`, `fallback_from`) and the warning cover
+  them. The warning `clef_fallback_used: N Clef request(s) were answered by the fallback (...)
+  because <primary> could not answer them; H answer(s) came without probabilities; used for:
+  <kind>:<Schema>.<field>, ...` lists up to 8 uses (also uses of a memoised answer), counts hard
+  answers and never names an entity.
+- Setup: `system_one_transport(clef=..., clef_fallback="decisions"|"none"|None,
+  clef_fallback_on=None)` builds `RoutingTransport({"clef": FallbackTransport(<Experiential or
+  Cloudflare>, DecisionsTransport(), on=...)}, default=CloudflareTransport())`; `None` reads
   `TRUSTCALL_S1_CLEF_FALLBACK=decisions|none` (`clef_fallback_from_env()`; unset is none, a bad
   value is a `ValueError` when the extractor is created). **Opt-in only**, like the provider: the
-  fallback sends the text to Experiential Labs, so a key in the environment never enables it;
-  that also applies when Clef itself stays on Cloudflare. The evals take `--clef-fallback
-  decisions|none`, recorded as `clef_fallback`.
+  fallback sends the text to Experiential Labs and OpenAI, so a key in the environment never
+  enables it; that also applies when Clef itself stays on Cloudflare. The evals take
+  `--clef-fallback decisions|none` and `--clef-fallback-on`, recorded as `clef_fallback`
+  (`decisions (on unavailable)`).
 - Two transports mean two limiters: `RoutingTransport` does not share one, so the in-flight caps
   (64 per transport, 32 per model) apply to Cloudflare and to Experiential separately, and a 429
   from one lowers only that provider's limit. Pass `concurrency=` to lower both.
@@ -1241,7 +1296,9 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
   `Authorization` headers and `xpl_` keys in its `before_send` hook (or use
   `trustcall_system_one.testing.scrub` on text).
 - Concurrency: 64 in flight per transport per event loop (shared across invokes and batch),
-  32 per model, adaptive (halve on 429, at most once per generation so a burst of 429s halves
+  32 per model (each transport has its own limiter: with a `RoutingTransport` or a
+  `FallbackTransport` the caps apply to every provider separately, so up to 64 per provider in
+  all), adaptive (halve on 429, at most once per generation so a burst of 429s halves
   once, +1 per 20 successes). The slot is released while a retry backs off. Limiter state and
   the httpx client are kept per event loop. Sync `invoke` runs `ainvoke` on a private
   event-loop thread.

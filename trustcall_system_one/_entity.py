@@ -857,6 +857,12 @@ def _clairic_answer(
     return answer, rejected
 
 
+def _provider_of(raw: Any) -> str | None:
+    """Who answered a Clef question, if a fallback (a key of the raw answer)."""
+    provider = raw.get("provider") if isinstance(raw, dict) else None
+    return str(provider) if provider else None
+
+
 def _clef_answer(
     spec: FieldSpec, resolved: Resolved, where: str | None = None
 ) -> tuple[FieldAnswer, list[RejectedOp]]:
@@ -882,6 +888,7 @@ def _clef_answer(
         raw=resolved.raw,
         confidence=resolved.confidence,
         source=_source(spec, value),
+        provider=_provider_of(resolved.raw),
         repaired=resolved.repaired and reason is None,
         rejected_reason=reason,
         warnings=_unique(list(resolved.notes)),
@@ -1297,6 +1304,7 @@ def _note_answer(note: _Note, value: Any) -> FieldAnswer:
         raw=note.raw,
         confidence=note.confidence,
         source="clef" if note.present else "default",
+        provider=_provider_of(note.raw),
         rejected_reason=note.reason,
     )
 

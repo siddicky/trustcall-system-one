@@ -46,6 +46,17 @@ def select_cases(
     return chosen
 
 
+def _triggers(text: str) -> frozenset[str]:
+    """Parse ``--clef-fallback-on``."""
+    names = frozenset(part.strip().lower() for part in text.split(",") if part.strip())
+    allowed = {"unavailable", "uncertain", "bad_response"}
+    if not names or not names <= allowed:
+        raise argparse.ArgumentTypeError(
+            f"expected a comma-separated list of {sorted(allowed)}, got {text!r}"
+        )
+    return names
+
+
 def _split(values: Sequence[str] | None) -> list[str]:
     return [p for v in values or () for p in v.split(",") if p]
 
@@ -67,6 +78,17 @@ def _common(parser: argparse.ArgumentParser) -> None:
         "not answer with the Decisions API (same key; may be charged twice "
         "after an uncertain outcome); default: TRUSTCALL_S1_CLEF_FALLBACK, "
         "else none",
+    )
+    parser.add_argument(
+        "--clef-fallback-on",
+        type=_triggers,
+        default=None,
+        metavar="LIST",
+        help="which failures of Clef use the fallback: a comma-separated list of "
+        "unavailable (nothing ran), uncertain (a timeout or 5xx: the primary may "
+        "have run and charged, so the question can be paid for twice) and "
+        "bad_response (the primary ran and charged, and answered badly); default: "
+        "TRUSTCALL_S1_CLEF_FALLBACK_ON, else unavailable",
     )
     parser.add_argument(
         "--clef-provider",
@@ -136,9 +158,11 @@ def _out_dir(args: argparse.Namespace, name: str) -> Path:
 
 
 def _settings(args: argparse.Namespace, overrides: dict[str, Any]) -> Settings:
-    if (args.clef_provider or args.clef_fallback) and not args.live:
+    given = args.clef_provider or args.clef_fallback or args.clef_fallback_on
+    if given and not args.live:
         print(
-            "note: --clef-provider and --clef-fallback have no effect without "
+            "note: --clef-provider, --clef-fallback and --clef-fallback-on have "
+            "no effect without "
             "--live: nothing is sent, requests are answered offline or from the "
             "cassettes",
             file=sys.stderr,
@@ -151,6 +175,7 @@ def _settings(args: argparse.Namespace, overrides: dict[str, Any]) -> Settings:
         concurrency=args.concurrency,
         clef_provider=args.clef_provider,
         clef_fallback=args.clef_fallback,
+        clef_fallback_on=args.clef_fallback_on,
     )
 
 
