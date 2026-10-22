@@ -2,11 +2,12 @@
 
 Every request goes to ``httpx.MockTransport``. The test key below is made up.
 
-What is known about the live API comes from one 401 probe: the error body is
-``{"error": {"message", "type", "param", "code"}}`` and the response carries an
-``x-correlation-id`` header. No successful response has been observed yet, so the
-success bodies here are built from the published Clef schema (``clef_response``),
-bare and inside a ``{success, result}`` envelope; see docs/DESIGN.md.
+What is known about the live API comes from two probes. A request without a key got
+a 401 whose body is ``{"error": {"message", "type", "param", "code"}}`` and which
+carries an ``x-correlation-id`` header. A valid request got a 200 whose body is the
+bare Clef response plus ``id``, ``provider`` and ``usage.cost``/``usage.is_byok``
+(``docs/schemas/experiential-clef-response.example.json``, used as ``BODY``). The
+``{success, result}`` / ``{data}`` envelopes are defensive and built around it.
 """
 
 import json
@@ -43,11 +44,9 @@ from trustcall_system_one import (
     create_extractor,
     system_one_transport,
 )
-from trustcall_system_one._wire import parse_clef
+from trustcall_system_one._wire import ChoiceAnswer, parse_clef
 from trustcall_system_one.testing import (
     RecordingTransport,
-    choice,
-    clef_response,
     scrub,
 )
 
@@ -71,8 +70,11 @@ PAYLOAD: dict[str, Any] = {
         }
     },
 }
-BODY = clef_response(
-    {"review": choice("review", {"accept": 0.2, "review": 0.8})}, input_tokens=137
+BODY: dict[str, Any] = json.loads(
+    (
+        Path(__file__).resolve().parents[2]
+        / "docs/schemas/experiential-clef-response.example.json"
+    ).read_text()
 )
 OBSERVED_401 = {
     "error": {
@@ -153,6 +155,33 @@ async def test_one_post_with_the_bearer_key_and_the_unchanged_payload() -> None:
     assert (result.retries, result.status_code) == (0, 200)
     assert result.duration_ms >= 0
     parse_clef(result.body)  # the library's own Clef parsing accepts it
+
+
+async def test_the_observed_live_response_is_returned_bare_with_its_extra_keys() -> (
+    None
+):
+    assert set(BODY) == {"id", "model", "answers", "usage", "provider"}
+    transport, _ = make(
+        httpx.Response(
+            200,
+            json=BODY,
+            headers={"x-request-id": "r-1", "x-correlation-id": "c-1"},
+        )
+    )
+    result = await call(transport)
+    assert result.body == BODY
+    answer = parse_clef(result.body).answers["review"]
+    assert isinstance(answer, ChoiceAnswer)
+    assert answer.choice == "accept"
+    assert set(answer.probabilities) == {"accept", "review"}
+    usage = parse_clef(result.body).usage
+    assert (usage.input_tokens, usage.output_tokens) == (221, 0)
+
+
+def test_the_observed_live_response_matches_the_published_clef_schema() -> None:
+    from tests.unit.schema_helpers import validator
+
+    validator("clef-output").validate(BODY)
 
 
 async def test_nothing_about_the_call_is_sent_but_the_payload() -> None:

@@ -1118,13 +1118,17 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
   is unwrapped (a bare `{model, answers, usage}`, or the same inside a `{success, result}` /
   `{data}` envelope; `success: false` or an `error` object is a `BadRequestError`), validated with
   `parse_clef` (`ModelResponseError` on a mismatch) and returned as the bare dict the Clef parsing
-  already expects. Answers are read by question id (`answers["review"]`). **Observed so far:** an
-  error is `{"error": {"message", "type", "param", "code"}}` (OpenAI style, shown in the exception
-  message) with an `x-correlation-id` response header, which is put in error messages so a charge
-  can be disputed. The shape of a successful response has not been recorded yet: the bare shape
-  above is the published Clef schema and the envelope handling is defensive. Re-check it against
-  the first live run and save the scrubbed body as
-  `docs/schemas/experiential-clef-response.example.json`.
+  already expects. Answers are read by question id (`answers["review"]`). **Observed
+  live:** a 200 is the *bare* Clef response with no `success`/`result` envelope: `{id, model,
+  answers, usage, provider}`, where `answers.<question id>` is the usual Clef answer
+  (`{type: "choice", choice, confidence, probabilities}`), `usage` is `{input_tokens,
+  output_tokens, cost, is_byok}` (`cost` is in USD, presumably) and `id` / `provider` are extra
+  keys that the response models tolerate and that are passed through. Responses carry
+  `x-request-id` and `x-correlation-id` headers (the latter is put in error messages so a charge
+  can be disputed) and several `x-gateway-*` headers. The scrubbed body is
+  `docs/schemas/experiential-clef-response.example.json`, which the tests use. An error is
+  `{"error": {"message", "type", "param", "code"}}` (OpenAI style; a 401 is `invalid_key`), shown
+  in the exception message. The envelope unwrapping stays as a defensive fallback.
 - **Retry policy of `ExperientialTransport` (deliberately unlike Cloudflare's).** A request that
   may have reached the server is never retried: a timeout can leave a call that was run and
   charged with the result lost. Timeouts (read, write), read/write/protocol errors, a connection

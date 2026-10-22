@@ -1,0 +1,22 @@
+{
+    "id": "decision_5166bf45468cef1a45355ba464adc06c",
+    "model": "clef",
+    "answers": {
+        "review": {
+            "type": "choice",
+            "choice": "accept",
+            "confidence": 0.8469578427551037,
+            "probabilities": {
+                "accept": 0.8469578427551037,
+                "review": 0.15304215724489628
+            }
+        }
+    },
+    "usage": {
+        "input_tokens": 221,
+        "output_tokens": 0,
+        "cost": 2.652e-05,
+        "is_byok": false
+    },
+    "provider": "experiential_cloud"
+}

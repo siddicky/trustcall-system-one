@@ -222,10 +222,11 @@ request, and that call may have been charged. In the report:
   appear as `retries` in the call log only;
 - start with `--concurrency 2` and raise it only while there is no 429.
 
-Before the first full run, send one request and check the response shape (see
-`docs/DESIGN.md`, Transport): the success body has not been recorded yet. Save the scrubbed
-body as `docs/schemas/experiential-clef-response.example.json` (a response holds no credential,
-but run `grep -rn "xpl_" . --exclude-dir=.git` before committing).
+The response shape was confirmed by a live probe and is saved in
+`docs/schemas/experiential-clef-response.example.json` (see `docs/DESIGN.md`, Transport): a bare
+Clef response plus `id`, `provider` and `usage.cost`. `usage.cost` is the price of the call as
+Experiential Labs reports it; `Prices` in the library does not read it. Before committing
+anything, run `grep -rn "xpl_" . --exclude-dir=.git`: it must find nothing.
 
 ## 5. What to hand back
 
@@ -234,7 +235,8 @@ but run `grep -rn "xpl_" . --exclude-dir=.git` before committing).
 3. The baseline table and the three strategy tables (section 3), with the failing cases.
 4. The sweep tables (section 4) and the recommendations for the defaults above.
 5. If Clef ran on Experiential Labs (section 4b): the provider, the count of uncertain
-   outcomes with their messages and correlation ids, and the response shape.
+   outcomes with their messages and correlation ids, and any response that differs from the
+   saved example.
 6. The paths of `evals/results/*` and `evals/cassettes/` (not committed) and of
    `tests/recorded/smoke_*.jsonl`.
 7. Anything that surprised you: an HTTP error, a rate limit, a warning that appears in every run,
