@@ -259,7 +259,7 @@ every entity: a `Many(S)` WITH existing records of S raises `NotImplementedError
 does too); an `"__any__"` record is never claimed by a `Many` (it stays in `untouched`, with a
 warning). Settings: `DiscoveryConfig(presence_absent=0.2, presence_present=0.5,
 count_trust_max=10, broaden_on_count_mismatch=True)` and `CorefConfig(strategy="auto",
-merge_threshold=0.5, max_pairwise_mentions=150, context_chars=120)`, passed to
+merge_threshold=0.5, max_pairwise_mentions=60, context_chars=120)`, passed to
 `create_extractor(discovery=, coref=)`. `Many.label` is what prompts call an entity (default the
 schema title: "Person").
 
@@ -282,51 +282,73 @@ schema title: "Person").
      exact words the input uses." A truncated answer goes through the usual chunking
      (`ask_clairic`). In code each item is located in the ORIGINAL input (the span mapped out of
      the rendered state, else a search after the previous mention; an item that is not in the
-     input is dropped with a `mention_not_in_input` warning), pronoun-only items are dropped
-     (English closed-class stoplist `_collection.PRONOUNS`), a leading article or demonstrative
-     (the/a/an/this/that/these/those) and a trailing possessive (`'s`) are stripped with the span
-     (a descriptive "my cousin" stays), of two overlapping mentions the longer wins. Result:
-     `Mention(text, span)` in input order;
+     input is dropped with a `mention_not_in_input` warning; an item without a span takes the
+     next unused occurrence of its text, so repeated mentions survive), pronoun-only items are
+     dropped (English closed-class stoplist `_collection.PRONOUNS`; an all-caps word such as "US"
+     or "IT" is an acronym and stays, as does a name made of function words, "The Who"), a trailing
+     possessive (`'s`) is stripped with the span, and so is a leading lower-case article or
+     demonstrative (the/a/an/this/that/these/those), or a capitalised one when what follows is a
+     common phrase ("The cousin"): before a capitalised name it is part of it ("The Hague", "An
+     Nguyen", "This Is Us"); a descriptive "my cousin" stays. Of two overlapping mentions the
+     longer wins only if it contains exactly one of them: a span that bridges two mentions ("Emma's
+     brother Tom" over "Emma" and "Tom") replaces neither. Result: `Mention(text, span)` in input
+     order;
    * count, Clairic `number` with `integer: true` (kind `count`, field `count`, same state): "How
      many distinct {Person}s does the input mention?". A truncated or null answer means "no
      count" (`count_unreliable` warning when truncated).
 3. **Coreference (`_coref.py`):** unit is the mention, not the surface form. Strategy
-   `pairwise`: one Clef `noul` per mention pair (kind `coref`, id `pair.m{i}.m{j}`, i < j,
-   "Do `mentions.m{i}` and `mentions.m{j}` refer to the same {Person}?", criteria true/false),
-   ALL pairs sharing one structured state `{"input", "mentions": {"m0": {"text", "span",
-   "context"}, …}}` (context = ±`context_chars` of the input; the input is narrowed to windows
-   around the mentions when over the Clef budget), at most 64 questions per request, the
-   requests concurrent. Average-linkage agglomerative clustering at `merge_threshold` (inclusive):
+   `pairwise`: one Clef `noul` per PLAUSIBLE mention pair (kind `coref`, id `pair.m{i}.m{j}`,
+   i < j, "Do `mentions.m{i}` and `mentions.m{j}` refer to the same {Person}?", criteria
+   true/false). A pair is plausible when the mentions share a name token, one token starts another
+   ("Ann", "Anne"), one is the initials of the other ("JS", "J. Smith"), or either side is a
+   description with no name ("my cousin"); every other pair ("Emma Thompson", "Michael Chen") is
+   taken as 0 without asking (a debug log counts them), which is also why a nickname that shares
+   nothing with the name ("Bob" for "Robert Smith") is never joined by coreference. At most 64
+   questions per request, the requests concurrent, each with its own structured state
+   `{"input", "mentions": {"m0": {"text", "span", "context"}, …}}` that holds only the mentions its
+   questions name (context = ±`context_chars` of the input; the input is narrowed to windows
+   around the mentions when over the Clef budget). Average-linkage agglomerative clustering at `merge_threshold` (inclusive):
    the two clusters with the highest average pairwise probability merge first, ties go to the
    lowest first-mention index, so A~B 0.9, B~C 0.9, A~C 0.05 gives {A, B}, {C}. Strategy
-   `incremental`: the mentions are walked in order, each (after the first) assigned with one
-   Clef `choice` (id `assign.m{k}`, state `{"input", "mention": {…}}`) over the clusters so far
-   (`c{n}`: "Emma Thompson: mentioned as "Emma Thompson" (0-13), …") plus `__new__`; the answer
-   joins a cluster only if its option has probability ≥ `merge_threshold`, else it starts one;
-   more than 254 clusters show the most recent 254 (`coref_options_capped` warning).
-   `strategy="auto"` is pairwise up to `max_pairwise_mentions` mentions and incremental above;
-   `"pairwise"` and `"incremental"` force it. Canonical label = the mention with the most tokens →
-   the most frequent normalised form → the earliest; the label is only framing, the stored
-   identity value is extracted like any field. Pair probabilities are cached, so the broadened
-   re-discovery asks only about pairs that involve a new mention.
-4. **Qualification:** one Clef `noul` per entity (kind `qualify`, id `qualify`; one request per
-   entity because each has its own state) over `{"input", "entity": {"label", "mentions":
-   [{"text", "span"}]}}`: "Is `entity.label` a {Person} ({description})?". `< 0.5` →
+   `incremental`: the mentions after the first are walked in order in batches of 16; a batch is ONE
+   request of Clef `choice` questions (id `assign.m{k}`, state `{"input", "mentions": {"m{k}": …}}`
+   with the batch's mentions) over the clusters as they were when the batch started (`c{n}`:
+   "Emma Thompson: mentioned as "Emma Thompson" (0-13), …") plus `__new__`, all questions with the same
+   options; a mention joins a cluster only if its option has probability ≥ `merge_threshold`, else it
+   starts one, and the mentions of one batch that started clusters are then compared with each other
+   pairwise (the same plausible-pair questions). More than 254 clusters show the 254 most recently
+   MENTIONED (`coref_options_capped` warning). `strategy="auto"` is pairwise up to
+   `max_pairwise_mentions` (60) mentions and incremental above; `"pairwise"` and `"incremental"`
+   force it. Canonical label: a name beats a description (`name_part`: a capitalised start; a
+   mention led by a possessive is a description, and "her cousin Olivia Davis" is called "Olivia
+   Davis"), then the most tokens, the most frequent normalised form, the earliest; the label is only
+   framing, the stored identity value is extracted like any field. Pair probabilities are cached, so
+   the broadened re-discovery asks only about pairs that involve a new mention.
+4. **Qualification:** one Clef `noul` per entity (kind `qualify`, id `qualify.e{n}`), all entities in
+   ONE request per schema (at most 64 questions per request) over the shared state `{"input",
+   "entities": {"e0": {"label", "mentions": [{"text", "span"}]}, …}}` (the spans are left out of a
+   state whose input was narrowed); the call carries no entity key, since the numbering changes
+   with a broadened discovery or a merge: "Is `entities.e{n}.label` a {Person} ({description})?". `< 0.5` →
    `SkippedEntity(reason="not_qualified")` ("Sunny", a dog, for `Person`); a missing answer
    qualifies. Qualification runs BEFORE the count comparison, so "k" is the number of entities
    that qualify.
 5. **Count reconciliation** (count `n` against `k` qualifying entities; acted on only when
    `broaden_on_count_mismatch` and `max(n, k) ≤ count_trust_max`, else the mismatch only warns):
    * `n > k`: ONE broadened re-discovery (the same question plus "Also include descriptive
-     references such as 'my cousin' when no name is given."), united with the first list
-     (the longer span wins an overlap), re-clustered (cached pairs) and re-qualified for the new
-     clusters; if `n > k` still, warning `count_exceeds_discovered` (an entity is never invented);
+     references such as 'my cousin' when no name is given."), whose mentions are only ADDED to the
+     first list where they overlap none of its mentions (a broadened "Emma's brother Tom" never
+     takes the place of, or joins, "Emma" and "Tom"), re-clustered (cached pairs) and re-qualified
+     for the new clusters; if `n > k` still, warning `count_exceeds_discovered` (an entity is never
+     invented);
    * `n < k`: cluster-level merge checks for every pair of qualifying clusters whose best
      pairwise probability is ≥ 0.2 (needs the pairwise strategy): one Clef `noul` each (kind
      `coref`, id `merge`, state `{"input", "a": {"label", "mentions"}, "b": {…}}`, "Do `a` and
-     `b` refer to the same {Person}?"), run together; pairs at ≥ `merge_threshold` merge, the
-     highest probability first, until `k == n`; if `n < k` still, warning
-     `count_below_discovered`.
+     `b` refer to the same {Person}?"), run together; pairs at ≥ `merge_threshold` are approved, and
+     the highest probability first two sets of clusters are joined, until `k == n`, only if EVERY
+     pair of clusters across the two sets has passed a check (A~B and B~C never join A and C by
+     themselves; a pair not yet checked is asked for before the join); if `n < k` still, warning
+     `count_below_discovered`. A count of 0 while entities qualify is not acted on (never merge
+     toward 0), it only warns.
    Entities are then ordered by first mention and keyed `e0, e1, …` over ALL entities, skipped
    ones included, so a skipped entity keeps its number (Sunny is `e1`, Michael `e2`).
 6. **Per-entity extraction:** every qualifying entity runs the single-entity insert pipeline
@@ -336,10 +358,14 @@ schema title: "Person").
    `<focus schema="Person" entity="Emma Thompson">` / "Answer each field for Emma Thompson
    only. Ignore facts about any other person." / `The input mentions Emma Thompson as: "Emma
    Thompson" at characters 11-24, "Emma" at characters 131-135.` Instructions are templated with
-   the label ("Emma Thompson's full name"). Every Clef state about the entity (attribution, null
-   check, typed fields, sub-model presence, repair) is `{"input", "entity": {"label",
-   "mentions": [{"text", "span"}]}}`, mentions with spans so that two entities with the same label
-   stay apart. Chosen over packing `person.0.x, person.1.x` because disambiguation lives in the
+   the label ("Emma Thompson's full name"). The offsets are those of the whole input, so a request
+   whose state holds only windows of it names the mentions without offsets. Every Clef state about
+   the entity (attribution, null check, typed fields, sub-model presence, repair) is `{"input",
+   "entity": {"label", "mentions": [{"text", "span", "context"}]}}`, mentions with spans and a short
+   context so that two entities with the same label stay apart. An over-budget input is narrowed to
+   windows around the entity's own mentions (and the values being checked), never cut to its start,
+   and the spans, which would point at nothing in a narrowed input, are then left out. A run
+   warning about one entity starts with its label and key (`Emma Thompson (e0): …`). Chosen over packing `person.0.x, person.1.x` because disambiguation lives in the
    state not an index, server-side pass splitting would separate an entity's fields, records
    stay isolated (no cross-record echo), and failures stay per-entity.
    **Result:** one `ResultRecord(kind="insert", json_doc_id=None, entity=EntityInfo(key, label,
@@ -680,9 +706,13 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
   `str.find` over the rendered state. `FakeWorld(text)`, `.entity(label, schema=, mentions=,
   fields=, matches=, descriptive=)`, `.non_entity(label, schema=, mentions=)`, `.bleed(entity,
   field, value)`, `.low_confidence(entity, field, confidence)`, `.coref(a, b, p)`,
-  `.count(schema, n)`, `.handler` (to wrap one kind of answer) and `.transport()`. The focused
-  entity is read from the `<focus … entity="…">` header (Clairic) or `state.entity` (Clef):
-  mention spans first, then the label, then "the only entity of the schema" (the `One` path).
+  `.count(schema, n)`, `.noise(pronouns=, determiners=, possessives=, missing_span=, shuffle=)`,
+  `.handler` (to wrap one kind of answer) and `.transport()`. The focused
+  entity is read from the `<focus … entity="…">` header (Clairic) or `state.entity` (Clef): the
+  label first, the mention spans (or contexts) settling which of several entities share it, then
+  "the only entity of the schema" (the `One` path). The world fails loudly on a label that names
+  one entity while the spans belong to another, and (`check_state`, on by default) on a Clef state
+  whose input holds none of the entity's mentions.
   Every request shape it relies on is listed in the `FakeWorld` docstring. `matches=` is stored
   for M8 and `match` calls are answered `__new__`.
 - Unit tests (`pytest --disable-socket --allow-unix-socket`): `test_wire`, `test_compile` (one

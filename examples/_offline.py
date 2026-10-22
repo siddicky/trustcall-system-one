@@ -27,8 +27,9 @@ at the bottom of this file answer exactly those:
 * ``count`` (Clairic): field ``count``, an integer ``number``, same state.
 * ``coref`` (Clef): ONE structured state ``{"input", "mentions": {"m0": {"text",
   "span", "context"}, ...}}`` and one question per pair, id ``pair.m0.m1``.
-* ``qualify`` (Clef): state ``{"input", "entity": {"label", "mentions"}}``, one
-  question, id ``qualify``.
+* ``qualify`` (Clef): ONE request for all entities, state ``{"input", "entities":
+  {"e0": {"label", "mentions"}, ...}}`` and one question per entity, id
+  ``qualify.e0``.
 * ``extract`` and the verification calls about one entity carry
   ``<focus schema="..." entity="Emma Thompson">`` (Clairic) or ``state.entity.label``
   (Clef), which is what ``"<label>::<wire name>"`` keys are matched against.
@@ -657,15 +658,26 @@ def pair_coreference(entity_of: Mapping[str, str]) -> Handler:
 def qualifier(table: Mapping[str, float], default: float = 0.97) -> Handler:
     """Clef ``noul`` for "is this entity really a <Schema>?".
 
+    The engine asks about every entity in one request: ``state["entities"]`` maps
+    ``e0``, ``e1`` ... to ``{"label", "mentions"}`` and each question is
+    ``qualify.e<n>``.
+
     Args:
         table: Part of an entity label (case-insensitive) to P(yes).
         default: P(yes) for every other entity.
     """
 
     def handler(call: Call) -> Mapping[str, Any]:
-        label = (call.label or "").lower()
-        p = next((p for part, p in table.items() if part.lower() in label), default)
-        return {qid: p for qid in call.ids}
+        state = call.state
+        entities = state.get("entities", {}) if isinstance(state, dict) else {}
+        answers: dict[str, Any] = {}
+        for qid in call.ids:
+            label = str(entities.get(qid.removeprefix("qualify."), {}).get("label", ""))
+            answers[qid] = next(
+                (p for part, p in table.items() if part.lower() in label.lower()),
+                default,
+            )
+        return answers
 
     return handler
 

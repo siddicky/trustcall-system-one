@@ -98,10 +98,6 @@ def threshold(gates: GateConfig, change: Change) -> float:
     return gates.add_threshold if change.op == "add" else gates.replace_threshold
 
 
-def _entity(ctx: Ctx) -> dict[str, Any]:
-    return ctx.entity_dict()
-
-
 def _gate_question(change: Change) -> NoulQuestion:
     if change.removes:
         what = f"`{change.field_path}`"
@@ -140,12 +136,8 @@ def gate_state(ctx: Ctx, record: dict[str, Any], change: Change) -> dict[str, An
         "from": change.old,
         "to": change.value,
     }
-    return ctx.run.clef_state(
-        ctx.text,
-        entity=_entity(ctx),
-        record=record,
-        proposed_change=proposed,
-        spans=list(change.spans) or None,
+    return ctx.fitted(
+        spans=list(change.spans) or None, record=record, proposed_change=proposed
     )
 
 
@@ -224,9 +216,7 @@ async def dedup_elements(
     spans = [span for change in changes if change.near for span in change.spans]
     answers = await ctx.run.call_clef(
         questions,
-        ctx.run.clef_state(
-            ctx.text, entity=_entity(ctx), record=record, spans=spans or None
-        ),
+        ctx.fitted(spans=spans or None, record=record),
         meta=ctx.meta(
             "list_dedup",
             field=",".join(sorted({changes[i].field_path for i in others})),

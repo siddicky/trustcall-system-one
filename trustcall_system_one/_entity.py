@@ -532,7 +532,6 @@ async def _run_union(
     ctx: Ctx, union: UnionGroup, answer: Answer | None
 ) -> _UnionResult:
     """Resolve a union's choice and ask for the chosen member (or all of them)."""
-    run = ctx.run
     where = union.spec.pretty
     if union.spec.clef is None:  # a single option: nothing to ask
         only = union.members[0]
@@ -555,13 +554,13 @@ async def _run_union(
     if resolved.ok:  # the choice says the input does not state the union
         return result
     if union.optional:
-        run.warn(
+        ctx.warn(
             f"{ctx.plan.name}.{where}: the choice between "
             f"{', '.join(m.label for m in union.members)} was not confident "
             f"({resolved.reason}); the field is treated as unstated"
         )
         return result
-    run.warn(
+    ctx.warn(
         f"{ctx.plan.name}.{where}: the choice between "
         f"{', '.join(m.label for m in union.members)} was not confident "
         f"({resolved.reason}); every member was extracted and the one with the "
@@ -901,7 +900,7 @@ def _validated(
                     None,
                 )
             )
-            ctx.run.warn(
+            ctx.warn(
                 f"{ctx.plan.name}.{label}: the {what} failed validation "
                 f"({'; '.join(errors)}); it is treated as absent"
             )
@@ -1385,6 +1384,7 @@ async def insert_one(
     presence: float | None = None,
     entity: EntityInfo | None = None,
     focus: Focus | None = None,
+    focus_plain: Focus | None = None,
 ) -> InsertOutcome:
     """Extract one entity of a schema from ``text``.
 
@@ -1405,6 +1405,8 @@ async def insert_one(
             is its name); its key and mentions go into the prompts and the
             record. The presence gate is not asked for it.
         focus: The focus header of the Clairic requests (a collection entity's).
+        focus_plain: The same without offsets, for requests that carry only
+            windows of the input.
 
     Returns:
         The outcome: no record when the gate finds no entity, else an insert
@@ -1427,6 +1429,7 @@ async def insert_one(
             mentions=tuple(dict.fromkeys(m.text for m in entity.mentions)),
             info=entity,
             focus=focus,
+            focus_plain=focus_plain,
         )
         skip_presence = True
     _note_unsupported(run, plan)

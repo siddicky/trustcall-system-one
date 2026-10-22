@@ -575,7 +575,7 @@ class CorefConfig:
 
     strategy: Literal["pairwise", "incremental", "auto"] = "auto"
     merge_threshold: float = 0.5
-    max_pairwise_mentions: int = 150
+    max_pairwise_mentions: int = 60
     context_chars: int = 120
 
     def __post_init__(self) -> None:

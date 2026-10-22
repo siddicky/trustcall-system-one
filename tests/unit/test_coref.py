@@ -1,7 +1,6 @@
 """Mention clustering: average linkage, the 64-question split, incremental mode."""
 
 import asyncio
-import json
 import re
 from collections.abc import Callable
 from typing import Any
@@ -14,8 +13,11 @@ from trustcall_system_one._coref import (
     agglomerate,
     canonical_label,
     cluster_mentions,
+    name_part,
     normalise,
     ordered_pair,
+    plausible,
+    plural,
 )
 from trustcall_system_one._run import Run
 from trustcall_system_one.testing import (
@@ -53,6 +55,75 @@ def test_among_equal_counts_and_frequencies_the_earliest_wins() -> None:
 def test_a_cluster_needs_a_mention() -> None:
     with pytest.raises(ValueError, match="at least one"):
         canonical_label([])
+
+
+def test_a_name_beats_a_description_in_the_label() -> None:
+    assert canonical_label(["Emma", "My old college roommate"]) == "Emma"
+    assert canonical_label(["my cousin", "Kim"]) == "Kim"
+    assert canonical_label(["Emma", "My old college roommate", "Emma"]) == "Emma"
+
+
+def test_the_name_inside_a_descriptive_mention_is_the_label() -> None:
+    assert canonical_label(["her cousin Olivia Davis"]) == "Olivia Davis"
+    assert canonical_label(["Olivia", "her cousin Olivia Davis"]) == "Olivia Davis"
+    assert canonical_label(["Dr. Who", "the doctor"]) == "Dr. Who"
+
+
+def test_a_cluster_of_only_descriptions_is_called_by_the_longest() -> None:
+    assert canonical_label(["my cousin", "my old college roommate"]) == (
+        "my old college roommate"
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "name"),
+    [
+        ("Emma", "Emma"),
+        ("The Hague", "The Hague"),
+        ("her cousin Olivia Davis", "Olivia Davis"),
+        ("my neighbour", None),
+        ("My old college roommate", None),
+        ("cousin", None),
+        ("", None),
+    ],
+)
+def test_name_part(text: str, name: str | None) -> None:
+    assert name_part(text) == name
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "asked"),
+    [
+        ("Emma Thompson", "Emma", True),  # a shared token
+        ("Ann", "Anne Lee", True),  # the start of a token
+        ("JS", "John Smith", True),  # initials
+        ("J. Smith", "John Smith", True),
+        ("my cousin", "Michael Chen", True),  # a description could be anyone
+        ("Emma Thompson", "Michael Chen", False),
+        ("Sarah", "Olivia Davis", False),
+        ("Ann", "Bob", False),
+    ],
+)
+def test_only_plausible_pairs_are_asked(first: str, second: str, asked: bool) -> None:
+    assert plausible(first, second) is asked
+    assert plausible(second, first) is asked
+
+
+@pytest.mark.parametrize(
+    ("noun", "plural_"),
+    [
+        ("Person", "Persons"),
+        ("Class", "Classes"),
+        ("Company", "Companies"),
+        ("Day", "Days"),
+        ("Box", "Boxes"),
+        ("Match", "Matches"),
+        ("Wish", "Wishes"),
+        ("Quiz", "Quizes"),
+    ],
+)
+def test_plural(noun: str, plural_: str) -> None:
+    assert plural(noun) == plural_
 
 
 def table(values: dict[tuple[int, int], float]) -> Callable[[int, int], float]:
@@ -123,40 +194,52 @@ def by_span(
     return handler
 
 
-async def test_the_pairs_share_one_structured_state_and_ids() -> None:
-    mentions = mentions_of(SOURCE, "Ann", "Bob", "Ann", "Cy", "Bob")
-    ann, bob = {0, 2}, {1, 4}
-
-    def who(span: tuple[int, int]) -> str:
-        index = next(i for i, m in enumerate(mentions) if m.span == span)
-        return "ann" if index in ann else "bob" if index in bob else "cy"
-
-    handler = by_span(lambda a, b: 0.96 if who(a) == who(b) else 0.03)
-    run = run_with(handler)
-    clustering = await cluster_mentions(
-        run, source=SOURCE, mentions=mentions, noun="Person", schema="Person"
+async def test_a_request_holds_only_the_mentions_its_questions_name() -> None:
+    text = "Ann Lee met Ann. Anne Lee saw Bob Roe."
+    mentions = mentions_of(text, "Ann Lee", "Ann", "Anne Lee", "Bob Roe")
+    truth = {0: "a", 1: "a", 2: "a", 3: "b"}
+    index = {m.span: i for i, m in enumerate(mentions)}
+    run = run_with(
+        by_span(lambda x, y: 0.96 if truth[index[x]] == truth[index[y]] else 0.03)
     )
-    assert clustering.clusters == ((0, 2), (1, 4), (3,))
+    clustering = await cluster_mentions(
+        run, source=text, mentions=mentions, noun="Person", schema="Person"
+    )
+    assert clustering.clusters == ((0, 1, 2), (3,))
     assert clustering.strategy == "pairwise"
     transport = run.transport
     assert isinstance(transport, FakeTransport)
-    ((_, payload, meta),) = transport.calls  # 10 pairs: one request
+    ((_, payload, meta),) = transport.calls  # the Bob Roe pairs are not asked
     assert meta == CallMeta(kind="coref", schema="Person")
-    assert sorted(payload["questions"]) == sorted(
-        f"pair.m{i}.m{j}" for i in range(5) for j in range(i + 1, 5)
-    )
+    assert sorted(payload["questions"]) == ["pair.m0.m1", "pair.m0.m2", "pair.m1.m2"]
     state = payload["state"]
-    assert state["input"] == SOURCE
-    assert sorted(state["mentions"]) == ["m0", "m1", "m2", "m3", "m4"]
-    assert state["mentions"]["m2"]["text"] == "Ann"
-    assert state["mentions"]["m2"]["span"] == [13, 16]
-    assert state["mentions"]["m2"]["context"] == SOURCE[0 : 16 + 120]
-    first = payload["questions"]["pair.m0.m2"]
+    assert state["input"] == text
+    assert sorted(state["mentions"]) == ["m0", "m1", "m2"]  # not m3
+    assert state["mentions"]["m1"] == {
+        "text": "Ann",
+        "span": [12, 15],
+        "context": text[0 : 15 + 120],
+    }
+    first = payload["questions"]["pair.m0.m1"]
     assert first["instructions"] == (
-        "Do `mentions.m0` and `mentions.m2` refer to the same Person?"
+        "Do `mentions.m0` and `mentions.m1` refer to the same Person?"
     )
     assert set(first["criteria"]) == {"true", "false"}
-    assert clustering.pairs[(0, 2)] == 0.96 and clustering.pairs[(0, 1)] == 0.03
+    assert clustering.pairs[(0, 1)] == 0.96
+    assert clustering.pairs[(0, 3)] == 0.0  # not asked: nothing in common
+
+
+async def test_pairs_that_cannot_be_the_same_entity_are_not_asked() -> None:
+    mentions = mentions_of(SOURCE, "Ann", "Bob", "Ann", "Cy", "Bob")
+    run = run_with(by_span(lambda a, b: 0.96))
+    clustering = await cluster_mentions(
+        run, source=SOURCE, mentions=mentions, noun="Person", schema="Person"
+    )
+    transport = run.transport
+    assert isinstance(transport, FakeTransport)
+    ((_, payload, _),) = transport.calls
+    assert sorted(payload["questions"]) == ["pair.m0.m2", "pair.m1.m4"]
+    assert clustering.clusters == ((0, 2), (1, 4), (3,))
 
 
 async def test_the_context_is_limited_to_context_chars_each_side() -> None:
@@ -204,9 +287,8 @@ async def test_two_distinct_emmas_stay_two_entities_despite_the_same_text() -> N
 
 
 async def test_more_than_64_questions_are_split_and_run_concurrently() -> None:
-    names = [f"Pn{i:02d}" for i in range(12)]  # 66 pairs
-    text = " ".join(names)
-    mentions = mentions_of(text, *names)
+    text = " ".join(["Ann"] * 12)  # 66 pairs, every one plausible
+    mentions = [Mention("Ann", (4 * i, 4 * i + 3)) for i in range(12)]
     in_flight = 0
     peak = 0
 
@@ -230,14 +312,12 @@ async def test_more_than_64_questions_are_split_and_run_concurrently() -> None:
     sizes = sorted(len(payload["questions"]) for _, payload, _ in transport.calls)
     assert sizes == [2, 64]
     assert peak == 2  # both requests were in flight together
-    states = [json_state(payload) for _, payload, _ in transport.calls]
-    assert states[0] == states[1]  # one shared structured state
+    by_size = {len(p["questions"]): p for _, p, _ in transport.calls}
+    assert len(by_size[64]["state"]["mentions"]) == 12
+    # the small request holds only the three mentions its two questions name
+    assert sorted(by_size[2]["state"]["mentions"]) == ["m10", "m11", "m9"]
     ids = [qid for _, payload, _ in transport.calls for qid in payload["questions"]]
     assert len(set(ids)) == 66
-
-
-def json_state(payload: Body) -> str:
-    return json.dumps(payload["state"], sort_keys=True)
 
 
 async def test_pairs_already_asked_are_not_asked_again() -> None:
@@ -263,11 +343,9 @@ async def test_pairs_already_asked_are_not_asked_again() -> None:
     )
     transport = run.transport
     assert isinstance(transport, FakeTransport)
-    second = sorted(transport.calls[1][1]["questions"])
-    # only the pairs that involve the two new mentions (m3 and m4)
-    assert second == sorted(
-        f"pair.m{i}.m{j}" for i in range(5) for j in range(i + 1, 5) if j >= 3
-    )
+    assert sorted(transport.calls[0][1]["questions"]) == ["pair.m0.m2"]
+    # only the new plausible pair, the two Bobs
+    assert sorted(transport.calls[1][1]["questions"]) == ["pair.m1.m4"]
     assert ordered_pair(mentions[2], mentions[0]) == (mentions[0], mentions[2])
 
 
@@ -297,32 +375,43 @@ async def test_zero_and_one_mention_cost_no_request() -> None:
 def assigner(
     truth: dict[tuple[int, int], str], p: float = 0.95
 ) -> Callable[[str, Body, CallMeta], Any]:
-    """An ``assign`` handler: the cluster that already holds the same person."""
+    """A handler for ``assign`` batches (and, within a batch, ``pair`` questions)."""
 
     def handler(model: str, payload: Body, meta: CallMeta) -> Any:
         assert meta.kind == "coref"
-        ((qid, question),) = payload["questions"].items()
-        assert qid.startswith("assign.m")
-        mention = payload["state"]["mention"]
-        who = truth[tuple(mention["span"])]
-        options = list(question["criteria"])
-        picked = NEW
-        for option, text in question["criteria"].items():
-            if option == NEW:
+        mentions = payload["state"]["mentions"]
+        answers = {}
+        for qid, question in payload["questions"].items():
+            if qid.startswith("pair."):
+                a, b = re.findall(r"m\d+", qid)
+                same = (
+                    truth[tuple(mentions[a]["span"])]
+                    == truth[tuple(mentions[b]["span"])]
+                )
+                answers[qid] = noul(0.96 if same else 0.03)
                 continue
-            spans = [(int(a), int(b)) for a, b in re.findall(r"\((\d+)-(\d+)\)", text)]
-            if any(truth[s] == who for s in spans):
-                picked = option
-        rest = (1 - p) / (len(options) - 1)
-        probabilities = {o: (p if o == picked else rest) for o in options}
-        return clef_response(
-            {qid: choice(picked, probabilities)}, model=payload["model"]
-        )
+            assert qid.startswith("assign.m")
+            who = truth[tuple(mentions[qid.removeprefix("assign.")]["span"])]
+            options = list(question["criteria"])
+            picked = NEW
+            for option, text in question["criteria"].items():
+                if option == NEW:
+                    continue
+                spans = [
+                    (int(a), int(b)) for a, b in re.findall(r"\((\d+)-(\d+)\)", text)
+                ]
+                if any(truth[s] == who for s in spans):
+                    picked = option
+            rest = (1 - p) / (len(options) - 1)
+            answers[qid] = choice(
+                picked, {o: (p if o == picked else rest) for o in options}
+            )
+        return clef_response(answers, model=payload["model"])
 
     return handler
 
 
-async def test_above_the_threshold_the_mentions_are_assigned_one_by_one() -> None:
+async def test_above_the_threshold_the_mentions_are_assigned_in_batches() -> None:
     mentions = mentions_of(SOURCE, "Ann", "Bob", "Ann", "Cy", "Bob")
     truth = {
         m.span: who
@@ -338,20 +427,40 @@ async def test_above_the_threshold_the_mentions_are_assigned_one_by_one() -> Non
     assert clustering.pairs == {}
     transport = run.transport
     assert isinstance(transport, FakeTransport)
-    metas = [meta for _, _, meta in transport.calls]
-    assert [m.field for m in metas] == ["m1", "m2", "m3", "m4"]  # in order
-    payload = transport.calls[3][1]  # the last mention, against three clusters
-    assert list(payload["questions"]["assign.m4"]["criteria"]) == [
-        "c0",
-        "c1",
-        "c2",
-        NEW,
-    ]
-    assert payload["state"]["mention"]["text"] == "Bob"
-    assert "Ann" in payload["questions"]["assign.m4"]["criteria"]["c0"]
-    assert payload["questions"]["assign.m4"]["instructions"].startswith(
-        "Which Person does `mention` refer to?"
+    # ONE request assigns mentions 1 to 4 against the cluster of mention 0 ...
+    first = transport.calls[0][1]
+    assert transport.calls[0][2].field == "m1-m4"
+    assert sorted(first["questions"]) == [f"assign.m{k}" for k in (1, 2, 3, 4)]
+    assert list(first["questions"]["assign.m1"]["criteria"]) == ["c0", NEW]
+    assert sorted(first["state"]["mentions"]) == ["m1", "m2", "m3", "m4"]
+    assert first["state"]["mentions"]["m4"]["text"] == "Bob"
+    assert "Ann" in first["questions"]["assign.m1"]["criteria"]["c0"]
+    assert first["questions"]["assign.m1"]["instructions"].startswith(
+        "Which Person does `mentions.m1` refer to?"
     )
+    # ... and the mentions that started new clusters are then compared pairwise
+    second = transport.calls[1][1]
+    assert sorted(second["questions"]) == ["pair.m0.m2"]  # the two Bobs (m1, m4)
+    assert second["state"]["mentions"]["m0"]["text"] == "Bob"
+    assert len(transport.calls) == 2
+
+
+async def test_each_batch_sees_the_clusters_the_earlier_ones_made() -> None:
+    names = [f"Qq{chr(97 + i // 26)}{chr(97 + i % 26)}" for i in range(20)]
+    text = " ".join(names)
+    mentions = mentions_of(text, *names)
+    truth = {m.span: m.text for m in mentions if m.span}
+    run = run_with(assigner(truth), strategy="incremental")
+    result = await cluster_mentions(
+        run, source=text, mentions=mentions, noun="Person", schema="Person"
+    )
+    assert len(result.clusters) == 20
+    transport = run.transport
+    assert isinstance(transport, FakeTransport)
+    fields = [meta.field for _, _, meta in transport.calls]
+    assert fields == ["m1-m16", "m17-m19"]  # 16 mentions per request, in order
+    second = transport.calls[1][1]["questions"]["assign.m17"]["criteria"]
+    assert list(second) == [f"c{i}" for i in range(17)] + [NEW]
 
 
 async def test_the_strategy_can_be_forced_either_way() -> None:
@@ -390,23 +499,26 @@ async def test_an_assignment_below_the_threshold_starts_a_new_cluster() -> None:
     assert result.clusters == ((0,), (1,))
 
 
-async def test_the_options_are_capped_at_255_with_a_warning() -> None:
+async def test_the_options_are_capped_at_255_with_the_latest_mentioned() -> None:
     names = [f"Q{i:03d}" for i in range(258)]
     text = " ".join(names)
     mentions = mentions_of(text, *names)
-    sizes: list[int] = []
+    seen: list[list[str]] = []
 
     def handler(model: str, payload: Body, meta: CallMeta) -> Any:
-        ((qid, question),) = payload["questions"].items()
-        options = list(question["criteria"])
-        sizes.append(len(options))
-        answer = choice(NEW, {o: (1.0 if o == NEW else 0.0) for o in options})
-        return clef_response({qid: answer}, model=payload["model"])
+        answers = {}
+        for qid, question in payload["questions"].items():
+            options = list(question["criteria"])
+            seen.append(options)
+            answers[qid] = choice(NEW, {o: (1.0 if o == NEW else 0.0) for o in options})
+        return clef_response(answers, model=payload["model"])
 
     run = run_with(handler, strategy="incremental")
     result = await cluster_mentions(
         run, source=text, mentions=mentions, noun="Person", schema="Person"
     )
     assert len(result.clusters) == 258  # every mention is a new entity
-    assert max(sizes) == 255  # 254 clusters and __new__
+    assert max(len(options) for options in seen) == 255  # 254 clusters and __new__
+    last = seen[-1]
+    assert "c256" in last and "c0" not in last  # the oldest mention dropped out
     assert any("coref_options_capped" in w for w in run.warnings)

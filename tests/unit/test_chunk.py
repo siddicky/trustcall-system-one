@@ -347,6 +347,27 @@ def test_lists_without_spans_dedupe_by_text_and_follow_chunk_order() -> None:
     assert merged.spans is None
 
 
+def test_one_element_without_a_span_does_not_drop_the_others_spans() -> None:
+    merged = merge_parts([part(["Ann", "Bob", "Ann"], 0, spans=[[0, 3], [], [10, 13]])])
+    assert merged is not None
+    assert merged.value == ["Ann", "Bob", "Ann"]
+    assert merged.spans == [[0, 3], [], [10, 13]]  # an empty pair marks the gap
+
+
+def test_a_repeated_element_without_a_span_is_kept_within_one_answer() -> None:
+    merged = merge_parts([part(["Emma", "Emma", "Emma"], 0)])
+    assert merged is not None and merged.value == ["Emma", "Emma", "Emma"]
+    # but the overlap of two chunks reading it again is still one element
+    twice = merge_parts([part(["Emma"], 0), part(["Emma"], 500)])
+    assert twice is not None and twice.value == ["Emma"]
+
+
+def test_a_span_less_element_is_replaced_by_the_same_text_with_a_span() -> None:
+    merged = merge_parts([part(["Emma"], 0), part(["Emma"], 500, spans=[[520, 524]])])
+    assert merged is not None
+    assert merged.value == ["Emma"] and merged.spans == [[520, 524]]
+
+
 def test_a_null_chunk_does_not_hide_the_others_list() -> None:
     merged = merge_parts([part(None, p_null=0.99), part(["x"], 10, spans=[[12, 13]])])
     assert merged is not None and merged.value == ["x"]

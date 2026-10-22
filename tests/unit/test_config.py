@@ -354,7 +354,7 @@ def test_discovery_accepts_the_boundaries() -> None:
 def test_coref_defaults_and_value_semantics() -> None:
     config = CorefConfig()
     assert config.strategy == "auto" and config.merge_threshold == 0.5
-    assert config.max_pairwise_mentions == 150 and config.context_chars == 120
+    assert config.max_pairwise_mentions == 60 and config.context_chars == 120
     with pytest.raises(dataclasses.FrozenInstanceError):
         config.strategy = "pairwise"  # type: ignore[misc]
     assert hash(config) == hash(CorefConfig())

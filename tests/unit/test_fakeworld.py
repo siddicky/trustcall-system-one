@@ -283,52 +283,69 @@ async def test_an_assignment_picks_the_cluster_of_the_same_entity() -> None:
         "c1": 'Michael Chen: mentioned as "Michael Chen" (58-70)',
         "__new__": "none of them",
     }
-    state = {"input": TEXT, "mention": mention_entry("Emma")}
+    # one request assigns a batch of mentions, which share one state
+    state = {
+        "input": TEXT,
+        "mentions": {"m2": mention_entry("Emma"), "m3": mention_entry("Sunny")},
+    }
     answers = await ask(
         world,
         "coref",
         state=state,
-        questions={"assign.m2": question("which?", "choice", criteria=options)},
+        questions={
+            "assign.m2": question("which?", "choice", criteria=options),
+            "assign.m3": question("which?", "choice", criteria=options),
+        },
     )
     assert answers["assign.m2"]["choice"] == "c0"
     # a mention of nobody the options hold starts a new cluster
-    state = {"input": TEXT, "mention": mention_entry("Sunny")}
-    answers = await ask(
-        world,
-        "coref",
-        state=state,
-        questions={"assign.m3": question("which?", "choice", criteria=options)},
-    )
     assert answers["assign.m3"]["choice"] == "__new__"
 
 
-async def test_a_merge_check_compares_the_owners_of_the_two_sides() -> None:
+async def test_a_merge_check_looks_at_every_mention_of_both_sides() -> None:
     world = people()
-    state = {
+    same = {
         "input": TEXT,
         "a": {"mentions": [mention_entry("Emma Thompson")]},
         "b": {"mentions": [mention_entry("Emma")]},
     }
     answers = await ask(
-        world, "coref", state=state, questions={"merge": question("same?")}
+        world, "coref", state=same, questions={"merge": question("same?")}
     )
     assert answers["merge"]["noul"] == 0.96
+    # the first mention of each side is one person; a later one is not
+    mixed = {
+        "input": TEXT,
+        "a": {"mentions": [mention_entry("Emma Thompson")]},
+        "b": {"mentions": [mention_entry("Emma"), mention_entry("Michael Chen")]},
+    }
+    answers = await ask(
+        world, "coref", state=mixed, questions={"merge": question("same?")}
+    )
+    assert answers["merge"]["noul"] == 0.03
 
 
-async def test_qualification_says_yes_to_an_entity_and_no_to_a_non_entity() -> None:
+async def test_qualification_answers_every_entity_of_one_request() -> None:
     world = people()
-    for label, span, p in (
-        ("Emma Thompson", mention_entry("Emma Thompson")["span"], 0.97),
-        ("Sunny", mention_entry("Sunny")["span"], 0.03),
-    ):
-        state = {
-            "input": TEXT,
-            "entity": {"label": label, "mentions": [{"text": label, "span": span}]},
-        }
-        answers = await ask(
-            world, "qualify", state=state, questions={"qualify": question("is it?")}
-        )
-        assert answers["qualify"]["noul"] == p
+    emma, sunny = mention_entry("Emma Thompson")["span"], mention_entry("Sunny")["span"]
+    state = {
+        "input": TEXT,
+        "entities": {
+            "e0": {
+                "label": "Emma Thompson",
+                "mentions": [{"text": "Emma Thompson", "span": emma}],
+            },
+            "e1": {"label": "Sunny", "mentions": [{"text": "Sunny", "span": sunny}]},
+        },
+    }
+    answers = await ask(
+        world,
+        "qualify",
+        state=state,
+        questions={"qualify.e0": question("is it?"), "qualify.e1": question("is it?")},
+    )
+    assert answers["qualify.e0"]["noul"] == 0.97  # an entity
+    assert answers["qualify.e1"]["noul"] == 0.03  # a non-entity
 
 
 async def test_presence_follows_whether_the_schema_has_an_entity() -> None:
@@ -800,7 +817,7 @@ async def test_the_handler_can_be_wrapped_to_override_one_kind() -> None:
     other = await transport.run(
         CLEF,
         {"model": "clef", "state": {"input": TEXT}, "questions": {"q": question("?")}},
-        meta=CallMeta(kind="qualify", schema="Person"),
+        meta=CallMeta(kind="delete", schema="Person"),
     )
     assert "q" in other.body["answers"]
 
@@ -893,3 +910,128 @@ async def test_many_schemas_run_on_the_same_world_as_one_schemas() -> None:
         "Emma Thompson",
         "Michael Chen",
     ]
+
+
+# --------------------------------------------------------------------------- #
+# The world is strict about the requests it is sent
+# --------------------------------------------------------------------------- #
+
+
+async def test_the_world_resolves_the_label_first_and_refuses_a_mismatch() -> None:
+    world = people()
+    fields = {"name": {"type": "text"}}
+    # the label and the spans agree: fine
+    emma = TEXT.index("Emma Thompson")
+    state = focus(
+        "Emma Thompson", TEXT, f'"Emma Thompson" at characters {emma}-{emma + 13}'
+    )
+    answers = await ask(world, "extract", clairic=True, state=state, fields=fields)
+    assert answers["name"]["value"] == "Emma Thompson"
+    # the label names Emma, the spans are Michael's: that is a bug in the request
+    michael = TEXT.index("Michael Chen")
+    state = focus(
+        "Emma Thompson", TEXT, f'"Michael Chen" at characters {michael}-{michael + 12}'
+    )
+    with pytest.raises(AssertionError, match="belong to 'Michael Chen'"):
+        await ask(world, "extract", clairic=True, state=state, fields=fields)
+
+
+async def test_two_entities_with_one_label_need_spans_to_be_told_apart() -> None:
+    text = "Emma sings. Emma dances."
+    world = FakeWorld(text)
+    world.entity(
+        "Emma", schema=Person, mentions=[("Emma", 0)], fields={"name": "sings"}
+    )
+    world.entity(
+        "Emma", schema=Person, mentions=[("Emma", 1)], fields={"name": "dances"}
+    )
+    with pytest.raises(AssertionError, match="2 entities are called 'Emma'"):
+        await ask(
+            world,
+            "extract",
+            clairic=True,
+            state=focus("Emma", text),
+            fields={"name": {"type": "text"}},
+        )
+
+
+async def test_a_clef_state_without_the_entitys_mentions_is_refused() -> None:
+    world = people()
+    state = {
+        "input": "Nothing about anybody here.",
+        "entity": {
+            "label": "Emma Thompson",
+            "mentions": [{"text": "Emma Thompson", "span": [10, 23]}],
+        },
+    }
+    with pytest.raises(AssertionError, match="narrowed away from the entity"):
+        await ask(
+            world,
+            "null_check",
+            state=state,
+            questions={"nullcheck.name": question("?")},
+        )
+    # switched off, the world answers anyway
+    lax = FakeWorld(TEXT, check_state=False)
+    lax.entity(
+        "Emma Thompson", schema=Person, mentions=["Emma Thompson"], fields={"name": "x"}
+    )
+    answers = await ask(
+        lax, "null_check", state=state, questions={"nullcheck.name": question("?")}
+    )
+    assert answers["nullcheck.name"]["noul"] == 0.95
+
+
+async def test_a_narrowed_state_finds_its_entity_by_the_context() -> None:
+    text = "Emma sings. " + "x " * 50 + "Emma dances."
+    world = FakeWorld(text)
+    world.entity(
+        "Emma", schema=Person, mentions=[("Emma", 0)], fields={"name": "sings"}
+    )
+    world.entity(
+        "Emma", schema=Person, mentions=[("Emma", 1)], fields={"name": "dances"}
+    )
+    late = text.rindex("Emma")
+    state = {
+        "input": "…\nEmma dances.",
+        "entity": {
+            "label": "Emma",
+            "mentions": [{"text": "Emma", "context": text[late - 20 :]}],  # no span
+        },
+    }
+    answers = await ask(
+        world, "null_check", state=state, questions={"nullcheck.name": question("?")}
+    )
+    assert answers["nullcheck.name"]["noul"] == 0.95  # resolved, not ambiguous
+
+
+async def test_discovery_noise_makes_the_answers_messy_and_spans_still_map() -> None:
+    text = "We met the Smiths. Sarah's kids waved. She left. Bob came."
+    world = FakeWorld(text)
+    world.entity("Smiths", schema=Person, mentions=["Smiths"])
+    world.entity("Sarah", schema=Person, mentions=["Sarah"])
+    world.entity("Bob", schema=Person, mentions=["Bob"])
+    state = render_clairic(text, label="Person").text
+
+    async def listed() -> Body:
+        answers = await ask(
+            world, "discover", clairic=True, state=state, fields=DISCOVER
+        )
+        mentions: Body = answers["mentions"]
+        return mentions
+
+    assert (await listed())["value"] == ["Smiths", "Sarah", "Bob"]
+    world.noise(determiners=True)
+    assert (await listed())["value"] == ["the Smiths", "Sarah", "Bob"]
+    world.noise(possessives=True)
+    assert (await listed())["value"] == ["Smiths", "Sarah's", "Bob"]
+    world.noise(pronouns=True)
+    assert (await listed())["value"] == ["Smiths", "Sarah", "She", "Bob"]
+    world.noise(shuffle=True)
+    assert (await listed())["value"] == ["Bob", "Sarah", "Smiths"]
+    world.noise(missing_span=True)
+    answer = await listed()
+    assert answer["spans"][1] == [] and len(answer["spans"]) == 3
+    assert answer["spans"][0] != []
+    world.noise()  # all off again
+    assert (await listed())["value"] == ["Smiths", "Sarah", "Bob"]

@@ -997,7 +997,7 @@ async def _ask_clef(
             "See `validation_errors` and `expected_schema`."
         }
     )
-    state = ctx.run.clef_state(ctx.text, entity=ctx.entity_dict())
+    state = ctx.fitted()
     answers = await ctx.run.call_clef(
         {wire: question},
         {**state, **blocks.clef_keys()},

@@ -36,6 +36,7 @@ from trustcall_system_one._coref import (
     cluster_mentions,
     mention_entry,
     ordered_pair,
+    plural,
 )
 from trustcall_system_one._entity import InsertOutcome, insert_one
 from trustcall_system_one._render import RenderedState, discovery_focus, entity_focus
@@ -178,14 +179,38 @@ class CollectionResult:
 # --------------------------------------------------------------------------- #
 
 
+def _capitalised(word: str) -> bool:
+    return bool(word) and (word[0].isupper() or word[0].isdigit())
+
+
+def _only_function_words(words: Sequence[str]) -> bool:
+    """Whether every word is a pronoun or article, so the mention names nobody.
+
+    An all-capitals word of two letters or more ("US", "IT") is an acronym, never a
+    pronoun; and several capitalised words ("The Who") are a proper name even when
+    each one is a function word.
+    """
+    if len(words) > 1 and all(_capitalised(w) for w in words):
+        return False
+    return all(
+        not (w.isupper() and len(w) >= 2)
+        and w.strip("'\u2019").casefold() in _NOT_NAMES
+        for w in words
+    )
+
+
 def clean_mention(text: str, span: Span | None = None) -> Mention | None:
     """Make a discovered mention a clean one, or drop it.
 
     Surrounding punctuation, a trailing possessive (``Emma's``) and a leading
-    determiner (``the``, ``a``, ``this`` ...) are stripped, the span shrinking with
-    the text; a mention that is only pronouns ("she", "them", "someone") is
-    dropped. A possessive pronoun that makes a descriptive reference ("my
-    cousin") is not a determiner here and stays.
+    lower-case determiner (``the``, ``a``, ``this`` ...) are stripped, the span
+    shrinking with the text. A capitalised determiner is part of a proper name
+    when what follows is capitalised too ("The Hague", "An Nguyen", "This Is Us")
+    and stays; it goes when what follows is a common phrase ("The cousin"). A
+    mention that is only pronouns ("she", "them", "someone") is dropped, but an
+    acronym ("US", "IT") and a name made of function words ("The Who") are not. A
+    possessive pronoun that makes a descriptive reference ("my cousin") is not a
+    determiner here and stays.
 
     Args:
         text: The mention as Clairic returned it. When ``span`` is given the
@@ -214,15 +239,49 @@ def clean_mention(text: str, span: Span | None = None) -> Mention | None:
         trim()
     lead = _DETERMINER.match(current())
     if lead is not None and lead.end() < len(current()):
-        lo += lead.end()
-        trim()
+        rest = current()[lead.end() :].split()
+        name = lead.group(0)[0].isupper() and all(_capitalised(w) for w in rest)
+        if not name:
+            lo += lead.end()
+            trim()
     kept = current()
-    tokens = [t for t in re.split(r"[\s-]+", kept.casefold()) if t]
-    if not tokens or all(t.strip("'\u2019") in _NOT_NAMES for t in tokens):
+    words = [w for w in re.split(r"[\s-]+", kept) if w]
+    if not words or _only_function_words(words):
         return None
     if span is None:
         return Mention(kept)
     return Mention(kept, (span[0] + lo, span[0] + hi))
+
+
+def _overlap(first: Span, second: Span) -> bool:
+    return first[0] < second[1] and second[0] < first[1]
+
+
+def _resolve_overlaps(mentions: Sequence[Mention]) -> list[Mention]:
+    """Keep one reading where mentions overlap, never merging two mentions into one.
+
+    Shorter mentions are placed first. A longer one replaces an overlapping mention
+    only when it contains exactly that one ("Emma Thompson" for "Emma"); a span that
+    bridges two kept mentions ("Emma's brother Tom" over "Emma" and "Tom") replaces
+    neither, and is dropped, as is a mention inside a longer one or a repeat of a
+    span.
+    """
+    kept: list[Mention] = []
+    for mention in sorted(
+        mentions, key=lambda m: (m.span[1] - m.span[0]) if m.span else 0
+    ):
+        if mention.span is None:
+            kept.append(mention)
+            continue
+        clashes = [k for k in kept if k.span and _overlap(k.span, mention.span)]
+        if not clashes:
+            kept.append(mention)
+        elif len(clashes) == 1 and clashes[0].span:
+            old = clashes[0].span
+            new = mention.span
+            if new[0] <= old[0] and old[1] <= new[1] and new != old:
+                kept[kept.index(clashes[0])] = mention
+    return sorted(kept, key=lambda m: m.span or (0, 0))
 
 
 def _span_of(
@@ -234,6 +293,17 @@ def _span_of(
     if anchored is None:
         return None
     return anchored.to_original((spans[index][0], spans[index][1]))
+
+
+def _find_unused(source: str, text: str, cursor: int, used: set[Span]) -> int:
+    """The first occurrence of ``text`` after ``cursor`` that no item has, else any."""
+    for start in (cursor, 0):
+        at = source.find(text, start)
+        while at >= 0:
+            if (at, at + len(text)) not in used:
+                return at
+            at = source.find(text, at + 1)
+    return -1
 
 
 def parse_mentions(
@@ -249,7 +319,9 @@ def parse_mentions(
     the previous mention. An item that is not in the input is dropped (Clairic is
     extractive, so it can only be a slip). Pronoun-only mentions are dropped and
     determiners and possessives stripped (``clean_mention``). Of two overlapping
-    mentions the longer is kept, and two mentions never share a span.
+    mentions the longer is kept only if it contains exactly one of them (a span
+    that bridges two mentions replaces neither), and two mentions never share a
+    span.
 
     Args:
         source: The original input.
@@ -263,6 +335,11 @@ def parse_mentions(
     if answer is None or not isinstance(answer.value, list):
         return []
     found: list[Mention] = []
+    used: set[Span] = {
+        (pair[0], pair[1])
+        for index in range(len(answer.value))
+        if (pair := _span_of(answer, index, anchored)) is not None
+    }
     cursor = 0
     for index, item in enumerate(answer.value):
         text = str(item)
@@ -274,9 +351,7 @@ def parse_mentions(
             near = source.find(text, lo, hi)
             span = None if near < 0 else (near, near + len(text))
         if span is None:
-            at = source.find(text, cursor)
-            if at < 0:
-                at = source.find(text)
+            at = _find_unused(source, text, cursor, used)
             if at < 0:
                 if run is not None:
                     run.warn(
@@ -285,22 +360,13 @@ def parse_mentions(
                     )
                 continue
             span = (at, at + len(text))
+        used.add(span)
         cleaned = clean_mention(source[span[0] : span[1]], span)
         if cleaned is None or cleaned.span is None:
             continue
         found.append(cleaned)
-        cursor = cleaned.span[1]
-    found.sort(key=lambda m: m.span or (0, 0))
-    kept: list[Mention] = []
-    for mention in found:
-        if kept and mention.span and kept[-1].span:
-            (a0, a1), (b0, b1) = kept[-1].span, mention.span
-            if b0 < a1:  # overlap: keep the longer
-                if b1 - b0 > a1 - a0:
-                    kept[-1] = mention
-                continue
-        kept.append(mention)
-    return kept
+        cursor = span[1]
+    return _resolve_overlaps(found)
 
 
 # --------------------------------------------------------------------------- #
@@ -439,7 +505,7 @@ async def _count(run: Run, scope: Scope) -> int | None:
         type="number",
         integer=True,
         instructions=(
-            f"How many distinct {noun}s does the input mention? Count each "
+            f"How many distinct {plural(noun)} does the input mention? Count each "
             f"individual {noun} once, however many times they are mentioned."
         ),
     )
@@ -494,44 +560,63 @@ def _provisional(index: int) -> str:
     return f"e{index}"
 
 
-async def _qualify(run: Run, scope: Scope, group: _Group, index: int) -> float | None:
+async def _qualify(
+    run: Run, scope: Scope, items: Sequence[tuple[int, _Group]]
+) -> list[float | None]:
+    """Ask, in one request per 64 entities, whether each is really a ``<Schema>``.
+
+    The entities share one state ``{"input", "entities": {"e0": {"label",
+    "mentions"}, ...}}`` and each is a question ``qualify.e<n>`` (``n`` is the
+    entity's place in the list being resolved); the call has no entity of its own.
+    """
+    if not items:
+        return []
     plan = scope.plan
     described = _described(plan)
-    label = group.label
-    info = EntityInfo(
-        key=_provisional(index),
-        label=label,
-        mentions=group.mentions,
-        first_mention=group.mentions[0],
+
+    def entities(*, spans: bool) -> dict[str, Any]:
+        return {
+            _provisional(n): {
+                "label": group.label,
+                "mentions": [
+                    {"text": m.text, "span": list(m.span)}
+                    if spans and m.span
+                    else {"text": m.text}
+                    for m in group.mentions
+                ],
+            }
+            for n, group in items
+        }
+
+    anchors = [m.span for _, g in items for m in g.mentions if m.span is not None]
+    state = run.clef_state(
+        scope.source, spans=anchors, extra={"entities": entities(spans=True)}
     )
-    ctx = Ctx(
-        run=run,
-        plan=plan,
-        text=scope.source,
-        label=label,
-        key=info.key,
-        mentions=tuple(dict.fromkeys(m.text for m in group.mentions)),
-        info=info,
-    )
-    question = NoulQuestion(
-        type="noul",
-        instructions=(
-            f"Is `entity.label` a {scope.noun}"
-            + (f" ({described})" if described else "")
-            + "?"
-        ),
-        criteria=NoulCriteria(
-            true=f"The entity is a {scope.noun}.",
-            false=f"The entity is something else, not a {scope.noun}.",
-        ),
-    )
+    if state["input"] != scope.source:  # offsets no longer point into the input
+        state["entities"] = entities(spans=False)
+    questions = {
+        f"qualify.{_provisional(n)}": NoulQuestion(
+            type="noul",
+            instructions=(
+                f"Is `entities.{_provisional(n)}.label` a {scope.noun}"
+                + (f" ({described})" if described else "")
+                + "?"
+            ),
+            criteria=NoulCriteria(
+                true=f"The entity is a {scope.noun}.",
+                false=f"The entity is something else, not a {scope.noun}.",
+            ),
+        )
+        for n, _ in items
+    }
     answers = await run.call_clef(
-        {"qualify": question},
-        ctx.entity_state(anchors=[m.span for m in group.mentions if m.span]),
-        meta=ctx.meta("qualify"),
+        questions, state, meta=CallMeta(kind="qualify", schema=plan.name)
     )
-    answer = answers.get("qualify")
-    return answer.noul if isinstance(answer, NoulAnswer) else None
+    found: list[float | None] = []
+    for n, _ in items:
+        answer = answers.get(f"qualify.{_provisional(n)}")
+        found.append(answer.noul if isinstance(answer, NoulAnswer) else None)
+    return found
 
 
 async def _group(
@@ -554,8 +639,7 @@ async def _group(
         _Group(tuple(mentions[i] for i in cluster)) for cluster in clustering.clusters
     ]
     fresh = [(n, g) for n, g in enumerate(groups) if g.signature not in known]
-    answers = await gather(*(_qualify(run, scope, g, n) for n, g in fresh))
-    for (_, g), p in zip(fresh, answers, strict=True):
+    for (_, g), p in zip(fresh, await _qualify(run, scope, fresh), strict=True):
         known[g.signature] = p
     for g in groups:
         g.qualify_p = known[g.signature]
@@ -580,7 +664,7 @@ async def _merge_check(run: Run, scope: Scope, a: _Group, b: _Group) -> float | 
         instructions=f"Do `a` and `b` refer to the same {scope.noun}?",
         criteria=NoulCriteria(
             true=f"Both refer to one and the same {scope.noun}.",
-            false=f"They are two different {scope.noun}s.",
+            false=f"They are two different {plural(scope.noun)}.",
         ),
     )
 
@@ -612,49 +696,64 @@ async def _merge(
     count: int,
     cache: PairCache,
 ) -> list[_Group]:
-    """Merge qualifying clusters that are likely one entity, until the count fits."""
+    """Merge qualifying clusters that are one entity, until the count fits.
+
+    Every pair of clusters whose best pairwise probability is at least 0.2 gets a
+    merge check. Two sets of clusters are joined, strongest check first, only if
+    EVERY pair across them was checked and passed: A~B and B~C never make A and C
+    one entity by themselves (the missing check is asked for first).
+    """
     live = _qualified(groups)
+    threshold = run.coref.merge_threshold
+    checks: dict[tuple[int, int], float | None] = {}
+
+    async def check(pairs: Sequence[tuple[int, int]]) -> None:
+        answers = await gather(
+            *(_merge_check(run, scope, live[a], live[b]) for a, b in pairs)
+        )
+        checks.update(zip(pairs, answers, strict=True))
+
     candidates = [
-        (a, b, p)
-        for n, a in enumerate(live)
-        for b in live[n + 1 :]
-        if (p := _best_pair(a, b, cache)) >= MERGE_CANDIDATE_MIN
+        (a, b)
+        for a in range(len(live))
+        for b in range(a + 1, len(live))
+        if _best_pair(live[a], live[b], cache) >= MERGE_CANDIDATE_MIN
     ]
     if not candidates:
         return groups
-    answers = await gather(*(_merge_check(run, scope, a, b) for a, b, _ in candidates))
-    ranked = sorted(
-        (
-            (p, n)
-            for n, p in enumerate(answers)
-            if p is not None and p >= run.coref.merge_threshold
-        ),
-        key=lambda item: (-item[0], item[1]),
+    await check(candidates)
+
+    def passed(pair: tuple[int, int]) -> bool:
+        p = checks.get(pair)
+        return p is not None and p >= threshold
+
+    approved = sorted(
+        (pair for pair in candidates if passed(pair)),
+        key=lambda pair: (-(checks[pair] or 0.0), pair),
     )
-    remaining = len(live)
-    parent: dict[int, int] = {id(g): id(g) for g in live}
-
-    def root(key: int) -> int:
-        while parent[key] != key:
-            key = parent[key]
-        return key
-
-    by_id = {id(g): g for g in live}
-    for _, n in ranked:
-        if remaining <= count:
+    sets: dict[int, list[int]] = {i: [i] for i in range(len(live))}
+    owner = {i: i for i in range(len(live))}
+    for a, b in approved:
+        if len(sets) <= count:
             break
-        a, b, _p = candidates[n]
-        ra, rb = root(id(a)), root(id(b))
-        if ra != rb:
-            parent[rb] = ra
-            remaining -= 1
-    merged: dict[int, list[Mention]] = {}
-    for g in live:
-        merged.setdefault(root(id(g)), []).extend(g.mentions)
+        ra, rb = owner[a], owner[b]
+        if ra == rb:
+            continue
+        across = [(min(x, y), max(x, y)) for x in sets[ra] for y in sets[rb]]
+        missing = [pair for pair in across if pair not in checks]
+        if missing:
+            await check(missing)
+        if all(passed(pair) for pair in across):
+            for member in sets[rb]:
+                owner[member] = ra
+            sets[ra] = sorted(sets[ra] + sets.pop(rb))
     out: list[_Group] = []
-    for key, mentions in merged.items():
-        mentions.sort(key=lambda m: m.span or (0, 0))
-        out.append(_Group(tuple(mentions), by_id[key].qualify_p))
+    for members in sets.values():
+        mentions = sorted(
+            (m for i in members for m in live[i].mentions),
+            key=lambda m: m.span or (0, 0),
+        )
+        out.append(_Group(tuple(mentions), live[members[0]].qualify_p))
     # what did not qualify stays, as it was
     kept_ids = {id(g) for g in live}
     out.extend(g for g in groups if id(g) not in kept_ids)
@@ -662,22 +761,19 @@ async def _merge(
 
 
 def _union(first: Sequence[Mention], second: Sequence[Mention]) -> list[Mention]:
-    """Two lists of mentions of one input as one, a longer span winning an overlap."""
-    both = sorted([*first, *second], key=lambda m: (m.span or (0, 0), -len(m.text)))
-    kept: list[Mention] = []
-    for mention in both:
-        if (
-            kept
-            and mention.span
-            and kept[-1].span
-            and mention.span[0] < kept[-1].span[1]
-        ):
-            (a0, a1), (b0, b1) = kept[-1].span, mention.span
-            if b1 - b0 > a1 - a0:
-                kept[-1] = mention
-            continue
-        kept.append(mention)
-    return kept
+    """The first discovery's mentions plus what a broadened one found elsewhere.
+
+    A broadened mention only ADDS: one that overlaps a first-pass mention is left
+    out, so "Emma's brother Tom" can never take the place of (or merge) the
+    mentions "Emma" and "Tom" that were found first.
+    """
+    fresh = [
+        m
+        for m in second
+        if m.span is None
+        or not any(f.span is not None and _overlap(f.span, m.span) for f in first)
+    ]
+    return sorted([*first, *_resolve_overlaps(fresh)], key=lambda m: m.span or (0, 0))
 
 
 async def collect(
@@ -739,8 +835,8 @@ async def collect(
     if not mentions and not count:
         if presence is not None:
             warn(
-                f"no_mentions_found: the input seems to mention {scope.noun}s but "
-                "discovery found no mention of one"
+                "no_mentions_found: the input seems to mention "
+                f"{plural(scope.noun)} but discovery found no mention of one"
             )
         return empty()
 
@@ -753,6 +849,7 @@ async def collect(
         act = (
             config.broaden_on_count_mismatch
             and max(count, len(live)) <= config.count_trust_max
+            and not (count == 0 and live)  # "none" is no answer when entities qualify
         )
         if act and count > len(live):
             wider = await _discover(run, scope, phrase, broaden=True)
@@ -771,6 +868,9 @@ async def collect(
                 "; the count is not trusted above "
                 f"{config.count_trust_max} entities, so nothing was changed"
                 if max(count, len(live)) > config.count_trust_max
+                else "; a count of 0 is not trusted when entities qualify, so "
+                "nothing was changed"
+                if count == 0
                 else "; broadening is switched off, so nothing was changed"
             )
         )
@@ -861,6 +961,9 @@ async def insert_collection(
             info.label,
             [(m.text, m.span) for m in info.mentions],
         )
+        plain = entity_focus(
+            plan.name, scope.noun, info.label, [(m.text, None) for m in info.mentions]
+        )
         return await insert_one(
             run,
             plan,
@@ -868,6 +971,7 @@ async def insert_collection(
             label=info.label,
             entity=info,
             focus=focus,
+            focus_plain=plain,
         )
 
     done = await gather(*(extract(info) for info in outcome.entities))

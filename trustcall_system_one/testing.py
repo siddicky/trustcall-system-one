@@ -539,8 +539,10 @@ class FakeWorld:
 
     Faults are injected with ``bleed`` (a fact offered for the wrong entity),
     ``low_confidence`` (an answer the model is unsure of), ``coref`` (doubt that
-    two mention texts are one entity) and ``count`` (a miscount); ``handler`` is the
-    handler behind ``transport()`` for a test that overrides one kind of answer.
+    two mention texts are one entity), ``count`` (a miscount) and ``noise``
+    (discovery that lists pronouns, articles, possessives, an item without a span or
+    items out of order); ``handler`` is the handler behind ``transport()`` for a
+    test that overrides one kind of answer.
 
     Declaring::
 
@@ -567,8 +569,14 @@ class FakeWorld:
     How the focused entity is found: for Clairic the ``<focus ... entity="...">``
     header (``schema`` and ``entity`` attributes and the ``at characters a-b``
     spans of its mention line), for Clef ``state.entity`` (``label`` and the
-    ``mentions`` with spans); then the mention spans, the label, and finally "the
-    only entity of ``CallMeta.schema``" (the ``One`` path has no focus).
+    ``mentions`` with a ``span`` or, where the input was narrowed, a ``context``).
+    The label comes first (the entity's label or one of its mention texts); the
+    mention spans settle which of several entities share it, and a label that
+    names one entity while the spans belong to another is an ``AssertionError``, as
+    is a shared label with nothing to tell the entities apart. Without a label the
+    answer is "the only entity of ``CallMeta.schema``" (the ``One`` path has no
+    focus). With ``check_state`` (the default) a Clef request about an entity whose
+    input holds none of the entity's mentions is an ``AssertionError`` too.
 
     The request shapes every call kind is answered from (the shapes the library
     sends; ``CallMeta.kind`` selects the answer):
@@ -587,9 +595,12 @@ class FakeWorld:
     * ``coref`` (Clef): ``pair.m{i}.m{j}`` over ``state.mentions`` (each with a
       ``span``) is 0.96 if both mentions belong to one world entity, else 0.03;
       ``assign.m{k}`` (choice over ``c{n}`` clusters described with
-      ``(start-end)`` spans, plus ``__new__``) picks the cluster of the same
-      entity or ``__new__``; ``merge`` over ``state.a`` and ``state.b`` as pairs.
-    * ``qualify`` (Clef ``qualify``): 0.97 for an entity, 0.03 for a non-entity.
+      ``(start-end)`` spans, plus ``__new__``; the mention is
+      ``state.mentions.m{k}``, a request holds a batch of them) picks the cluster of
+      the same entity or ``__new__``; ``merge`` over ``state.a`` and ``state.b`` is
+      0.96 only if EVERY mention on both sides belongs to one entity, else 0.03.
+    * ``qualify`` (Clef): ``qualify.e{n}`` over ``state.entities.e{n}`` (``label``
+      and ``mentions`` with spans): 0.97 for an entity, 0.03 for a non-entity.
     * ``extract`` / ``crosscheck`` / ``reask`` / ``repair`` (Clairic, one field
       per wire name): the focused entity's value for that field; text and list
       answers carry spans (the occurrence of the value nearest to the entity's
@@ -617,13 +628,19 @@ class FakeWorld:
       given to ``entity()`` is only stored) and ``delete`` (0.03).
     """
 
-    def __init__(self, text: str) -> None:
+    def __init__(self, text: str, *, check_state: bool = True) -> None:
         """Start a world.
 
         Args:
             text: The input text every request will carry.
+            check_state: Make the world fail, with an ``AssertionError``, when a
+                Clef request about a focused entity carries an input that holds
+                none of the entity's mentions (a state the engine narrowed away
+                from the very entity it asks about). On by default.
         """
         self.text = text
+        self.check_state = check_state
+        self._noise: dict[str, bool] = {}
         self._items: list[WorldEntity] = []
         self._counts: dict[str, int] = {}
         self._doubts: list[tuple[str, str, float]] = []
@@ -762,6 +779,33 @@ class FakeWorld:
         self._doubts.append((_fold(first), _fold(second), p))
         return self
 
+    def noise(
+        self,
+        *,
+        pronouns: bool = False,
+        determiners: bool = False,
+        possessives: bool = False,
+        missing_span: bool = False,
+        shuffle: bool = False,
+    ) -> "FakeWorld":
+        """Make discovery answers messy, the way a real model's can be.
+
+        Args:
+            pronouns: Also list the pronouns of the text ("she", "them").
+            determiners: Start a mention with the article before it ("the Smiths").
+            possessives: End a mention with the possessive after it ("Sarah's").
+            missing_span: Give the second item no span.
+            shuffle: List the items out of order.
+        """
+        self._noise = {
+            "pronouns": pronouns,
+            "determiners": determiners,
+            "possessives": possessives,
+            "missing_span": missing_span,
+            "shuffle": shuffle,
+        }
+        return self
+
     def count(self, schema: Any, n: int) -> "FakeWorld":
         """Override the count Clairic gives for a schema (a miscounting model)."""
         self._counts[self._name(schema)] = n
@@ -842,23 +886,59 @@ class FakeWorld:
                     return element
         return None
 
+    def _from_context(self, entry: Mapping[str, Any]) -> Span | None:
+        """Where a mention without a span is, found from the context around it."""
+        context, text = str(entry.get("context", "")), str(entry.get("text", ""))
+        at = self.text.find(context) if context else -1
+        if at < 0 or text not in context:
+            return None
+        middle = (len(context) - len(text)) / 2
+        found = [m.start() for m in re.finditer(re.escape(text), context)]
+        start = at + min(found, key=lambda i: abs(i - middle))
+        return (start, start + len(text))
+
     def _resolve(
-        self, schema: str, label: str | None, spans: Sequence[Span]
+        self,
+        schema: str,
+        label: str | None,
+        spans: Sequence[Span],
     ) -> WorldEntity | None:
-        """The focused element: by span, then label, then the only entity."""
+        """The focused element: by label, settled by spans, else the only entity.
+
+        A label that names an element and spans that belong to another one are a
+        bug in whoever built the request: that fails loudly.
+        """
         self._finalise()
-        for span in spans:
-            owner = self._owner(span)
-            if owner is not None and owner.schema == schema:
-                return owner
         pool = [e for e in self._items if e.schema == schema]
+        named: list[WorldEntity] = []
         if label:
-            for element in pool:
-                if _fold(element.label) == _fold(label):
-                    return element
-            for element in pool:
-                if any(_fold(label) == _fold(m) for m, _ in element.mentions):
-                    return element
+            named = [e for e in pool if _fold(e.label) == _fold(label)] or [
+                e
+                for e in pool
+                if any(
+                    _fold(label) == _fold(m) for m, _ in (*e.mentions, *e.descriptive)
+                )
+            ]
+        owner: WorldEntity | None = None
+        for span in spans:
+            found = self._owner(span)
+            if found is not None and found.schema == schema:
+                owner = found
+                break
+        if owner is not None:
+            if named and owner not in named:
+                raise AssertionError(
+                    f"FakeWorld: the request is about {label!r} but its mention "
+                    f"spans {list(spans)} belong to {owner.label!r}"
+                )
+            return owner
+        if len(named) == 1:
+            return named[0]
+        if len(named) > 1:
+            raise AssertionError(
+                f"FakeWorld: {len(named)} entities are called {label!r} and the "
+                "request carries no mention spans to tell them apart"
+            )
         real = [e for e in pool if e.real]
         if len(real) == 1 and not (label and len(pool) > 1):
             return real[0]
@@ -872,22 +952,41 @@ class FakeWorld:
             found = re.search(r'<focus[^>]*\bentity="([^"]*)"', state)
             label = found.group(1) if found else None
             line = re.search(r"The input mentions [^\n]*? as: ([^\n]*)", state)
-            spans = [
+            cited = [
                 (int(a), int(b))
                 for a, b in re.findall(
                     r"at characters (\d+)-(\d+)", line.group(1) if line else ""
                 )
             ]
-            return self._resolve(meta.schema, label, spans)
+            return self._resolve(meta.schema, label, cited)
         entity = state.get("entity") if isinstance(state, dict) else None
         if not isinstance(entity, dict):
             return self._resolve(meta.schema, None, [])
-        spans = [
-            (m["span"][0], m["span"][1])
-            for m in entity.get("mentions", [])
-            if isinstance(m, dict) and "span" in m
-        ]
-        return self._resolve(meta.schema, entity.get("label"), spans)
+        spans: list[Span] = []
+        for m in entity.get("mentions", []):
+            if not isinstance(m, dict):
+                continue
+            if "span" in m:
+                spans.append((m["span"][0], m["span"][1]))
+            elif (placed := self._from_context(m)) is not None:
+                spans.append(placed)
+        element = self._resolve(meta.schema, entity.get("label"), spans)
+        if entity.get("mentions"):
+            self._check_mentions(element, str(state.get("input", "")))
+        return element
+
+    def _check_mentions(self, element: WorldEntity | None, shown: str) -> None:
+        """Fail if a Clef input holds none of the entity's mentions."""
+        if not self.check_state or element is None:
+            return
+        self._finalise()
+        texts = {self.text[a:b] for a, b in element.spans}
+        if texts and not any(text in shown for text in texts):
+            raise AssertionError(
+                f"FakeWorld: the Clef state about {element.label!r} does not "
+                f"contain any of its mentions ({sorted(texts)}): the input was "
+                "narrowed away from the entity the question is about"
+            )
 
     @staticmethod
     def _keys(wire: str) -> list[str]:
@@ -992,17 +1091,45 @@ class FakeWorld:
             "descriptive references" in str(spec.get("instructions", ""))
             for spec in payload["fields"].values()
         )
-        for span, _ in self._occurrences(meta.schema, broadened=wide):
+        found = [span for span, _ in self._occurrences(meta.schema, broadened=wide)]
+        found = self._noisy(found)
+        for index, span in enumerate(found):
             mapped = view.to_state(span)
             if mapped is not None:
                 values.append(self.text[span[0] : span[1]])
-                spans.append(list(mapped))
+                gap = self._noise.get("missing_span") and index == 1
+                spans.append([] if gap else list(mapped))
         answer = clairic_answer(
             "list", values, spans=spans, p_null=0.01, confidence=0.93
         )
         return clairic_response(
             {name: answer for name in payload["fields"]}, state_text=payload["state"]
         )
+
+    def _noisy(self, spans: list[Span]) -> list[Span]:
+        """The listed spans after the noise of ``noise()``."""
+        noise = self._noise
+        out: list[Span] = []
+        for start, end in spans:
+            if noise.get("determiners"):
+                before = re.search(r"\b(the|a|an|this|that) $", self.text[:start], re.I)
+                if before:
+                    start -= len(before.group(0))
+            if noise.get("possessives") and re.match(
+                "['\u2019]s", self.text[end : end + 2]
+            ):
+                end += 2
+            out.append((start, end))
+        if noise.get("pronouns"):
+            for m in re.finditer(
+                r"\b(she|he|they|her|him|them|his|hers|their)\b", self.text, re.I
+            ):
+                if not any(a < m.end() and m.start() < b for a, b in out):
+                    out.append(m.span())
+        out.sort()
+        if noise.get("shuffle"):
+            out.reverse()
+        return out
 
     def _count(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
         n = self._counts.get(
@@ -1038,7 +1165,9 @@ class FakeWorld:
                     if pair == {a, b}:
                         answers[qid] = noul(p)
             elif qid.startswith("assign."):
-                owner = self._owner_of_entry(state["mention"])
+                owner = self._owner_of_entry(
+                    state["mentions"][qid.removeprefix("assign.")]
+                )
                 options = dict(question["criteria"])
                 chosen = "__new__"
                 for option, text in options.items():
@@ -1052,21 +1181,30 @@ class FakeWorld:
                         break
                 answers[qid] = _pick(chosen, list(options), 0.95)
             elif qid == "merge":
-                a = state["a"]["mentions"][0]
-                b = state["b"]["mentions"][0]
-                same = self._owner_of_entry(a) is self._owner_of_entry(b)
+                owners = [
+                    self._owner_of_entry(m)
+                    for side in ("a", "b")
+                    for m in state[side]["mentions"]
+                ]
+                same = all(owner is owners[0] for owner in owners)
                 answers[qid] = noul(_YES if same else _NO)
             else:
                 raise AssertionError(f"FakeWorld: unknown coref question {qid!r}")
         return clef_response(answers, model=payload["model"])
 
     def _qualify(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
-        element = self._focus(payload, meta)
-        real = element is not None and element.real
-        return clef_response(
-            {qid: noul(0.97 if real else 0.03) for qid in payload["questions"]},
-            model=payload["model"],
-        )
+        state = payload["state"]
+        answers = {}
+        for qid in payload["questions"]:
+            entry = state["entities"][qid.removeprefix("qualify.")]
+            spans = [
+                (m["span"][0], m["span"][1]) for m in entry["mentions"] if "span" in m
+            ]
+            element = self._resolve(meta.schema, entry["label"], spans)
+            self._check_mentions(element, str(state.get("input", "")))
+            real = element is not None and element.real
+            answers[qid] = noul(0.97 if real else 0.03)
+        return clef_response(answers, model=payload["model"])
 
     # extraction ----------------------------------------------------------- #
 

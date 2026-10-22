@@ -206,6 +206,7 @@ class _Element:
     span: Span | None
     start: int
     confidence: float
+    part: int = 0
 
     def replaces(self, other: "_Element") -> bool:
         """Whether this element replaces the one it overlaps.
@@ -224,26 +225,33 @@ class _Element:
 
 def _merge_lists(parts: list[Part]) -> ClairicAnswer:
     elements: list[_Element] = []
-    for part in parts:
+    for number, part in enumerate(parts):
         for index, value in enumerate(part.answer.value):
             span = (
                 part.spans[index]
                 if part.spans is not None and index < len(part.spans)
                 else None
             )
-            new = _Element(value, span, part.start, _confidence(part))
+            new = _Element(value, span, part.start, _confidence(part), number)
+
+            def same(
+                kept: _Element, value: object = value, number: int = number
+            ) -> bool:
+                # an element without a span can only be told from another by its
+                # text, and only across chunks (the overlap of two windows reads
+                # it twice); within one answer a repeated text is a repeated
+                # element, not a duplicate
+                return kept.part != number and _norm(kept.value) == _norm(value)
+
             if span is None:
-                if not any(
-                    kept.span is None and _norm(kept.value) == _norm(value)
-                    for kept in elements
-                ):
+                if not any(kept.span is None and same(kept) for kept in elements):
                     elements.append(new)
                 continue
             clashes = [
                 kept
                 for kept in elements
                 if (kept.span is not None and _overlap(span, kept.span))
-                or (kept.span is None and _norm(kept.value) == _norm(value))
+                or (kept.span is None and same(kept))
             ]
             if not clashes:
                 elements.append(new)
@@ -265,9 +273,11 @@ def _merge_lists(parts: list[Part]) -> ClairicAnswer:
     return best.answer.model_copy(
         update={
             "value": [item.value for item in elements],
+            # an element whose span is unknown keeps its place with an empty pair,
+            # so the others keep theirs
             "spans": (
-                [[s[0], s[1]] for s in spans if s is not None]
-                if all(s is not None for s in spans) and spans
+                [[s[0], s[1]] if s is not None else [] for s in spans]
+                if any(s is not None for s in spans)
                 else None
             ),
             "span": None,

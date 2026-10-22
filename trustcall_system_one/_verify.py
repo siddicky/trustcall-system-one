@@ -148,7 +148,9 @@ class Ctx:
             share a label stay apart, and its record reports it.
         focus: The focus header of every Clairic request of this context, when it
             is not the default one (a collection entity's names the schema, the
-            entity and its mentions).
+            entity and its mentions with their offsets).
+        focus_plain: The same header without offsets, used when the state holds
+            only windows of the input (the offsets would not match it).
     """
 
     run: Run
@@ -167,6 +169,7 @@ class Ctx:
     trailer: str = ""
     info: EntityInfo | None = None
     focus: Focus | None = None
+    focus_plain: Focus | None = None
 
     def input_only(self) -> "Ctx":
         """The same context without the record: every request is about the input.
@@ -265,6 +268,9 @@ class Ctx:
                 len(self.text), spans, self.run.verify.window_chars
             )
         existing = self.existing
+        # offsets in the focus header are offsets in the whole input: with only
+        # parts of it in the state they would point at the wrong text
+        partial = bool(windows) and list(windows or ()) != [(0, len(self.text))]
         return render_clairic(
             self.text,
             label=self.label,
@@ -274,23 +280,86 @@ class Ctx:
             existing_schema=existing.schema_name if existing is not None else None,
             windows=windows or None,
             trailer=self.trailer,
-            focus=self.focus,
+            focus=self.focus_plain if partial and self.focus_plain else self.focus,
         )
 
-    def entity_dict(self) -> dict[str, Any]:
+    def warn(self, message: str) -> None:
+        """Record a run warning; one about a collection entity names the entity."""
+        if self.info is not None:
+            message = f"{self.info.label} ({self.info.key}): {message}"
+        self.run.warn(message)
+
+    def mention_spans(self) -> list[Span]:
+        """Where the input mentions a collection entity (empty for a ``One``)."""
+        if self.info is None:
+            return []
+        return [m.span for m in self.info.mentions if m.span is not None]
+
+    def entity_dict(self, *, spans: bool = True) -> dict[str, Any]:
         """The ``entity`` of a Clef state: ``{"label", "mentions"}``.
 
         The mentions are the texts the input uses; for a collection entity each
-        is an object with its span in the input, so two entities that share a
-        label (two people called Emma) can still be told apart.
+        is an object with its text, its span in the input and a short context
+        around it (as coreference states have), so two entities that share a label
+        (two people called Emma) can still be told apart.
+
+        Args:
+            spans: Include the spans. They are offsets in the whole input, so a
+                state whose input was narrowed leaves them out (the context
+                still places the mention).
         """
         mentions: list[Any] = list(self.mentions)
         if self.info is not None and self.info.mentions:
-            mentions = [
-                {"text": m.text, "span": list(m.span)} if m.span else {"text": m.text}
-                for m in self.info.mentions
-            ]
+            context = self.run.coref.context_chars
+            mentions = []
+            for m in self.info.mentions:
+                entry: dict[str, Any] = {"text": m.text}
+                if m.span is not None:
+                    if spans:
+                        entry["span"] = list(m.span)
+                    start, end = m.span
+                    entry["context"] = self.text[
+                        max(0, start - context) : end + context
+                    ]
+                mentions.append(entry)
         return {"label": self.label, "mentions": mentions}
+
+    def fitted(
+        self,
+        text: str | None = None,
+        spans: Sequence[Span] | None = None,
+        *,
+        entity: bool = True,
+        record: Any = None,
+        proposed_change: Any = None,
+    ) -> dict[str, Any]:
+        """A Clef state about this entity, kept under the Clef budget.
+
+        When the input is over budget it is narrowed to windows around ``spans``
+        and around the entity's own mentions, so the question can still see who
+        it is about. The entity's spans are offsets in the whole input and are
+        left out of a state whose input was narrowed (or was given already
+        narrowed as ``text``).
+
+        Args:
+            text: The input as it goes into the state; the whole input by default.
+            spans: Further spans worth keeping when the state is narrowed.
+            entity: Whether to include ``entity`` at all.
+            record: An existing record (updates).
+            proposed_change: A change under review (updates).
+        """
+        shown = self.text if text is None else text
+        anchors = [*(spans or ()), *self.mention_spans()]
+        state = self.run.clef_state(
+            shown,
+            entity=self.entity_dict() if entity else None,
+            record=record,
+            proposed_change=proposed_change,
+            spans=list(dict.fromkeys(anchors)) or None,
+        )
+        if entity and state["input"] != self.text:
+            state["entity"] = self.entity_dict(spans=False)
+        return state
 
     def state(self, spans: list[Span] | None = None) -> dict[str, Any]:
         """The Clef state of a question about the input: ``{input}``.
@@ -300,10 +369,10 @@ class Ctx:
         which one it is about. Everything else (a ``One``) stays ``{input}``.
 
         Args:
-            spans: Spans to keep if the input is over the Clef budget.
+            spans: Spans to keep if the input is over the Clef budget (the
+                entity's own mentions are kept as well).
         """
-        entity = self.entity_dict() if self.info is not None else None
-        return self.run.clef_state(self.text, entity=entity, spans=spans)
+        return self.fitted(spans=spans, entity=self.info is not None)
 
     def entity_state(
         self,
@@ -315,20 +384,14 @@ class Ctx:
 
         Args:
             narrow_to: Cut ``input`` to windows around these spans (an isolated
-                check).
+                check; the entity's own mentions keep their windows too).
             anchors: Spans to keep if the full input is over the Clef budget.
         """
-        text = self.text
-        if narrow_to:
-            windows = mention_windows(
-                len(text), narrow_to, self.run.verify.window_chars
-            )
-            text = narrow_text(text, windows)
-        return self.run.clef_state(
-            text,
-            entity=self.entity_dict(),
-            spans=None if narrow_to else anchors,
-        )
+        if not narrow_to:
+            return self.fitted(spans=anchors)
+        keep = [*narrow_to, *self.mention_spans()]
+        windows = mention_windows(len(self.text), keep, self.run.verify.window_chars)
+        return self.fitted(narrow_text(self.text, windows))
 
 
 # --------------------------------------------------------------------------- #
@@ -454,7 +517,7 @@ async def ask_clairic(
     if _record_is_the_problem(ctx, rendered, response, anchored, covered):
         compact = compact_block(ctx, fields)
         if compact is not None:
-            run.warn(
+            ctx.warn(
                 f"record_compacted: the existing record of {ctx.plan.name} did not "
                 "fit the Clairic request with the input; it was cut down to its "
                 "identity and the fields being asked"
@@ -498,7 +561,7 @@ async def ask_clairic(
             break
         size = shrunk
     if responses:
-        run.warn(
+        ctx.warn(
             f"clairic_chunked: the input of {ctx.plan.name} did not fit one "
             f"Clairic request and was split into {len(responses)} overlapping "
             "chunks whose answers were merged"
@@ -510,7 +573,7 @@ async def ask_clairic(
         )
         if run.strict:
             raise StateTruncatedError(message)
-        run.warn(f"clairic_truncated: {message}")
+        ctx.warn(f"clairic_truncated: {message}")
     if not responses:  # could not split: use what the full request returned
         return {name: (response.answers.get(name), anchored) for name in fields}
     responses = [
@@ -608,11 +671,11 @@ async def _settle_all(
             and p >= run.verify.adjudicate_min
         ):
             if verdict.choice in _LETTERS[: len(shown[name])]:
-                run.warn(f"chunk_conflict: {where} ({values}); adjudicated")
+                ctx.warn(f"chunk_conflict: {where} ({values}); adjudicated")
                 result[name] = settled(shown[name][_LETTERS.index(verdict.choice)])
                 continue
             if verdict.choice == "neither" and merged.answer is not None:
-                run.warn(
+                ctx.warn(
                     f"chunk_conflict: {where} ({values}); the input states none "
                     "of them, so the field is null"
                 )
@@ -654,7 +717,7 @@ async def _settle_all(
             for i, part in enumerate(merged.candidates):
                 p = _p(checks, f"attr.{name}.{i}")
                 if p is not None and p >= run.verify.attribution_keep:
-                    run.warn(
+                    ctx.warn(
                         f"chunk_conflict: the chunks of {ctx.plan.name} gave "
                         f"different values for {name} ({values}); the first that "
                         "is stated about the entity was kept"
@@ -667,7 +730,7 @@ async def _settle_all(
     for name, merged in pending.items():
         if name not in passed:
             values = ", ".join(display(part.answer.value) for part in merged.candidates)
-            run.warn(
+            ctx.warn(
                 f"chunk_conflict: the chunks of {ctx.plan.name} gave different "
                 f"values for {name} ({values}) and no check settled it; the most "
                 "confident one was kept"
