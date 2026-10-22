@@ -16,6 +16,7 @@ __all__ = [
     "PassesConfig",
     "PresenceConfig",
     "Prices",
+    "RepairConfig",
     "VerifyConfig",
 ]
 
@@ -458,4 +459,49 @@ class PassesConfig:
         if self.split not in ("entity", "submodel", "field"):
             raise ValueError(
                 f"split must be 'entity', 'submodel' or 'field', got {self.split!r}"
+            )
+
+
+@dataclass(frozen=True)
+class RepairConfig:
+    """Settings of the validation repair loop.
+
+    When the assembled record fails pydantic validation, each failing field is
+    asked again, alone, with the error in hand (see ``docs/DESIGN.md``). All
+    failing fields of one pass go out together and count as ONE attempt. The
+    instance is immutable and hashable.
+
+    Attributes:
+        enabled: Run the loop. Off, a record that fails validation is dropped to
+            what it is without any further request (updates drop the operations
+            that fail, inserts become invalid).
+        max_attempts: Most repair rounds per record. It is a guard against a
+            loop that never ends, not a cost cap: ``ExtractionResult.attempts``
+            counts the extraction round plus the repair rounds, so at most
+            ``1 + max_attempts``.
+        stop_on_repeat: Stop when a round leaves the same set of
+            ``(path, error type)`` pairs as an earlier one: asking again would
+            not change anything.
+        allow_pattern_reask: Allow ONE re-ask for a field that failed its regex
+            ``pattern`` (or another format check) when the input holds text that
+            could satisfy it. Clairic only quotes the input, so it cannot
+            reformat; without this switch such a field is never asked again.
+    """
+
+    enabled: bool = True
+    max_attempts: int = 5
+    stop_on_repeat: bool = True
+    allow_pattern_reask: bool = True
+
+    def __post_init__(self) -> None:
+        """Validate every setting."""
+        for name in ("enabled", "stop_on_repeat", "allow_pattern_reask"):
+            _check_flag(name, getattr(self, name))
+        if isinstance(self.max_attempts, bool) or not isinstance(
+            self.max_attempts, int
+        ):
+            raise ValueError(f"max_attempts must be an int, got {self.max_attempts!r}")
+        if self.max_attempts < 1:
+            raise ValueError(
+                f"max_attempts must be at least 1, got {self.max_attempts}"
             )

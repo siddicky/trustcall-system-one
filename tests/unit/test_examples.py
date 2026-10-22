@@ -265,27 +265,45 @@ def test_03_update_contact_calls_follow_the_update_pipeline(
     assert len(kinds) == 9
 
 
-def test_04_repair_has_no_repair_loop_yet(capsys: pytest.CaptureFixture[str]) -> None:
-    """Pins the M6 gap. M6 (the repair loop) must replace this test.
-
-    Today the first extraction fails validation and nothing repairs it: one round,
-    no ``repair`` call, an invalid record. When M6 lands this fails; replace it with:
-
-    * ``record.valid`` and ``(name, postcode, age) == ("Katarina Vogel", "10115", 34)``
-    * ``result.attempts == 2``
-    * the ``repair`` calls' fields sorted are ``["age", "postcode"]``
-    """
-    result = run("04_repair", capsys)
+def test_04_repair(capsys: pytest.CaptureFixture[str]) -> None:
+    """Two fields fail validation; one repair round (two re-asks) fixes both."""
+    result = run("04_repair", capsys, keep_output=True)
     (record,) = result.records
-    assert not record.valid
-    assert sorted(record.errors) == [
-        "age: Input should be a valid integer",
-        "postcode: String should match pattern '^\\d{5}$'",
+    assert record.valid, record.errors
+    applicant = record.value
+    assert (applicant.name, applicant.postcode, applicant.age) == (
+        "Katarina Vogel",
+        "10115",
+        34,
+    )
+    # one extraction round and ONE repair round, however many fields it re-asked
+    assert result.attempts == 2
+    repairs = [call for call in result.calls if call.kind == "repair"]
+    assert sorted(call.field or "" for call in repairs) == ["age", "postcode"]
+    assert [call.kind for call in result.calls] == [
+        "presence",
+        "extract",
+        "attribution",  # the age 1990 is refused here, so the age is missing
+        "repair",
+        "repair",
+        "attribution",  # the repaired values are attributed like any answer
     ]
-    assert result.attempts == 1
-    assert not [call for call in result.calls if call.kind == "repair"]
-    # the age was dropped by the attribution check, not by validation
-    assert [(r.path, r.reason) for r in record.rejected] == [("/age", "attribution")]
+    # the repaired fields say so, with their history; the others do not
+    assert record.fields["postcode"].repaired and record.fields["age"].repaired
+    assert not record.fields["name"].repaired
+    assert record.fields["postcode"].warnings == (
+        "repair[1] (format): 'Berlin 10115' -> '10115'",
+    )
+    assert record.fields["age"].warnings == (
+        "repair[1] (missing): None -> 34",
+        # the wrong age (1990) never became a value: attribution refused it first
+        "the first answer had been rejected (attribution) before the repair",
+    )
+    assert result.skipped == () and record.rejected == ()
+    # a repair request as the library sent it
+    out = capsys.readouterr().out
+    for block in ("<previous_attempt>", "<validation_errors>", "<expected_schema>"):
+        assert block in out
 
 
 @pytest.mark.xfail(raises=NotImplementedError, strict=True, reason="needs M8")

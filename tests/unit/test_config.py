@@ -4,12 +4,14 @@ import dataclasses
 from typing import Any
 
 import pytest
+from pydantic import BaseModel
 
 from trustcall_system_one import (
     GateConfig,
     Limits,
     PassesConfig,
     PresenceConfig,
+    RepairConfig,
     VerifyConfig,
 )
 
@@ -248,3 +250,59 @@ def test_clef_stated_min_defaults_to_0_7_and_is_a_probability() -> None:
         VerifyConfig(clef_stated_min=0)
     with pytest.raises(ValueError, match="clef_stated_min"):
         VerifyConfig(clef_stated_min=1.5)
+
+
+# --------------------------------------------------------------------------- #
+# RepairConfig
+# --------------------------------------------------------------------------- #
+
+
+def test_repair_defaults() -> None:
+    repair = RepairConfig()
+    assert repair.enabled is True
+    assert repair.max_attempts == 5
+    assert repair.stop_on_repeat is True
+    assert repair.allow_pattern_reask is True
+
+
+def test_repair_is_frozen_hashable_and_comparable() -> None:
+    repair = RepairConfig()
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        repair.enabled = False  # type: ignore[misc]
+    assert hash(repair) == hash(RepairConfig())
+    assert repair == RepairConfig()
+    assert repair != RepairConfig(max_attempts=2)
+    assert len({repair, RepairConfig(), RepairConfig(enabled=False)}) == 2
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"max_attempts": 0},
+        {"max_attempts": -1},
+        {"max_attempts": 2.5},
+        {"max_attempts": True},
+        {"max_attempts": "3"},
+        {"enabled": 1},
+        {"stop_on_repeat": "yes"},
+        {"allow_pattern_reask": None},
+    ],
+)
+def test_repair_rejects_bad_values(kwargs: dict[str, Any]) -> None:
+    with pytest.raises(ValueError):
+        RepairConfig(**kwargs)
+
+
+def test_repair_is_wired_into_the_extractor() -> None:
+    from trustcall_system_one import create_extractor
+
+    class Thing(BaseModel):
+        name: str
+
+    assert create_extractor([Thing]).repair == RepairConfig()
+    off = RepairConfig(enabled=False)
+    extractor = create_extractor([Thing], repair=off)
+    assert extractor.repair is off
+    assert extractor.with_options(repair=RepairConfig(max_attempts=2)).repair == (
+        RepairConfig(max_attempts=2)
+    )

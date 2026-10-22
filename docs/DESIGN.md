@@ -187,7 +187,8 @@ class Extractor:  # frozen; per-invoke state lives in _Run
 - **`s1_field(...)`** → `Field(json_schema_extra={"trustcall_system_one": {...}})` with
   `instructions, null_threshold, min_confidence, clairic_type, unit, decimals, integer,
   identity, skip, clef, criteria`.
-- **Result:** `ExtractionResult{records, responses, skipped, untouched, deleted, attempts,
+- **Result:** `ExtractionResult{records, responses, skipped, untouched, deleted, attempts (the
+  extraction round plus the repair rounds),
   usage, cost_usd, calls, warnings}` + a trustcall-compatible `response_metadata` property.
   `ResultRecord{schema_name, json_doc_id (None for inserts), kind insert|update|delete,
   value, before, after, patches, rejected, fields: {path: FieldAnswer}, entity: EntityInfo,
@@ -295,7 +296,7 @@ vs ops inside the parent's patch list such as `add /pets/-`), and removal flag
 | --- | --- | --- |
 | Answer-level thresholds | on | reject if `p_null > null_threshold`, `confidence < 0.5`, span inside `<existing>`, Clef choice < 0.55 |
 | Attribution | on | above |
-| Input-only cross-check (updates) | on (`verify.input_only_crosscheck`) | second Clairic pass per group (call kind `crosscheck`) with the same fields and NO `<existing>` block. For a change the primary pass proposed: the raw cross-check value agrees (normalised equality; text similarity ≥ 0.9 only for free text; its own confidence does not matter) → proceed; null there → reject `echo_crosscheck`; two different values → Clef `choice{a: primary, b: cross-check, neither}` (kind `adjudicate`) at ≥ `verify.adjudicate_min`: `a` keeps, `b` takes the input-only value (if it passes the answer thresholds), anything else rejects `crosscheck_disagree`; a list element must have an agreeing cross-check element or is dropped `echo_crosscheck`. Where the primary pass gave nothing new (null, an `echo_span`, or the record's own value) and the cross-check reads a usable different value, that value is taken and goes on through the ladder and the gate. Covers number/date answers that carry no span |
+| Input-only cross-check (updates) | on (`verify.input_only_crosscheck`) | second Clairic pass per group (call kind `crosscheck`) with the same fields and NO `<existing>` block. For a change the primary pass proposed: the raw cross-check value agrees (normalised equality; text similarity ≥ 0.9 only for free text; its own confidence does not matter) → proceed; null there → reject `echo_crosscheck`; two different values → Clef `choice{a: primary, b: cross-check, neither}` (kind `adjudicate`) at ≥ `verify.adjudicate_min`: `a` keeps, `b` takes the input-only value (if it passes the answer thresholds), anything else rejects `crosscheck_disagree`; a list element must have an agreeing cross-check element or is dropped `echo_crosscheck`. Where the primary pass gave nothing new and no span in the input (null, an `echo_span`, or the record's own value without a span) and the cross-check reads a usable different value, that value is taken and goes on through the ladder and the gate (covers number/date answers, which carry no span); where the primary pass read the record's own value WITH a span in the input, the two are adjudicated and only a decisive win of the cross-check takes over |
 | Low-confidence re-ask | on (< 0.85) | isolated single-field request on mention windows; disagreement → Clef adjudication |
 | Borderline-null | on (`p_null` 0.25–0.75) | Clef `noul` "does the input state it?" → re-ask or null |
 | List near-duplicate dedup | on | difflib 0.6–0.9 vs record elements → Clef `noul` "same fact?" |
@@ -330,10 +331,18 @@ dict or a model (dumped by alias, JSON mode, so `before`/`after`/patch values ar
 JSON-compatible); ids are non-empty strings, unique per schema. `existing_schema_policy`:
 `True` raises `ValueError` for an unknown schema name; `False` keeps the record as opaque
 context (never shown to a model, never patched, a warning, listed in
-`ExtractionResult.untouched`); `"ignore"` drops it (debug log). `"__any__"` is always known; it is claimed by at most ONE
-schema among those without a record of their own: the only schema whose model validates it, else
-the one with the highest presence (the presence of every candidate is asked first, in parallel,
-and not asked again), with a warning naming the claimant; the others insert as if no record existed. Record keys are normalised to the keys the schema
+`ExtractionResult.untouched`); `"ignore"` drops it (debug log). `"__any__"` is always known; claims are ONE-TO-ONE. Among the
+schemas without a record of their own (and without a claim yet) the presence of every candidate is
+asked first, in parallel, and not asked again; only a schema whose presence reaches
+`presence.threshold_absent` can claim (validating is never a way around presence: an all-optional
+schema "validates" almost any record, and a record meant for a schema whose required field is not
+held yet must not go to one the input is not about). Of the present candidates the only one whose
+model validates the record claims it, else the most present one, with a warning naming the
+claimant. Once a schema has claimed a record it leaves the candidate set (a `One` takes one
+record), a record nobody is left to claim stays untouched (listed in `untouched`, with a warning;
+nothing raises after calls were spent), and a schema that loses a claim takes the insert path as if
+no record existed, so the same text can update one schema's record and insert another schema's
+record. Record keys are normalised to the keys the schema
 validates (alias where there is one) at every level of sub-models and unions, so diffs,
 patches and validation talk about the same keys. Cardinality: dict form → `One(S)`; an explicit
 `One(S)` with exactly one list-form record of S → that record; several → `ValueError`
@@ -355,9 +364,14 @@ patches and validation talk about the same keys. Cardinality: dict form → `One
    the record is compacted to its identity and the fields being asked, with a `record_compacted`
    warning, and the request is repeated once.
 4. Candidate changes (a non-null answer that differs from the record) are cross-checked;
-   answers equal to the record are not. Where the primary answer is null, an echo or equal to
-   the record and the cross-check reads a usable different value, the cross-check value is
-   taken (`adopted_from_crosscheck` in the field's warnings). In parallel, every Clef-typed answer
+   answers equal to the record are not. Where the primary answer has no span in the input (null, an echo
+   of the record, or a span-less value equal to the record: numbers, dates) and the cross-check
+   reads a usable different value, the cross-check value is taken (`adopted_from_crosscheck` in
+   the field's warnings). Where the primary answer equals the record WITH a span in the input (a
+   genuine reading, not an echo) the two are adjudicated instead (Clef `choice{a: primary, b:
+   cross-check, neither}`, kind `adjudicate`): only a decisive `b` takes the cross-check value
+   (`adjudicated_to_crosscheck`), anything else leaves the field as the record has it
+   (`crosscheck_overruled`). In parallel, every Clef-typed answer
    (`bool`, `Literal`, `Enum`) that would change or add to the record is asked about with one
    Clef `noul` per group (call kind `stated`, "Does `input` state <field>?"): below
    `verify.clef_stated_min` (0.7) it is made a null (`not_stated`, reported `not_mentioned`),
@@ -411,8 +425,9 @@ field below it, which is dropped, and errors of members the update did not choos
 operations whose paths lie on the line of an error (one path a prefix of the other;
 `/list/-` stands for `/list`; a location-less model-wide error implicates none) are dropped
 (`validation`) and the record is validated once more; still failing → `valid=False`,
-`value=None` (the repair loop is M6; `strict` raises `ExtractionValidationError`); each remaining error is also a
-`RejectedOp(op=None, path, reason="validation")`.
+`value=None` (`strict` raises `ExtractionValidationError`); each remaining error is also a
+`RejectedOp(op=None, path, reason="validation")`. Before any operation is dropped the repair loop
+(below) gets its turn: a failing patched record first re-asks the fields its own operations touched.
 
 **Result.** `ResultRecord(kind="update", json_doc_id=<record id>, before=<normalised record>,
 after=<patched document>, patches=<applied operations in applied order>, rejected, fields,
@@ -433,15 +448,82 @@ operation): `identity_subset`, `duplicate`, `required_field`, `gate_noul`, `gate
 
 ## Repair loop (`_repair.py`)
 
-`model_validate` → map each error `loc` to the longest known path → **one narrow Clairic
-re-ask per failing field**, in parallel, with `<previous_attempt>`, `<validation_errors>` and
-a `$defs`-resolved schema excerpt in `state`, and the spec adapted to the error (parsing →
-`number`/`date`; `enum`/`literal_error` → Clef `choice`; `bool_parsing` → Clef `noul`;
-collection length → re-run discovery with the limit stated). Re-asked values go through the
-full verification ladder. One round = one attempt; `repair.max_attempts = 5` (termination
-only); stop early when the error signature repeats. Terminal: drop still-failing ops and
-re-validate; then `strict` raises `ExtractionValidationError`, otherwise the record is
-`valid=False` / `SkippedEntity(validation_failed)` and kept out of `responses`.
+Replaces trustcall's `PatchFunctionErrors`. It runs for inserts and updates of `One` schemas (the
+multi-entity engine reuses it per entity) and is configured by `RepairConfig(enabled=True,
+max_attempts=5, stop_on_repeat=True, allow_pattern_reask=True)`.
+
+**Loop.** After assembly the candidate (insert) or the patched record (update) is validated with
+`model_validate`. On success the record is done. On a `ValidationError`:
+
+1. Each error `loc` becomes a document path (`_diff.document_path`: the union member segment is
+   dropped, errors of members that were not chosen are ignored) and then the field of the plan it
+   implicates, the longest known prefix (a list index stays with its list). A model-level error
+   (`loc == ()`, a `model_validator`) implicates every leaf of that (sub-)model; a `missing` error,
+   and the type error that a null gets (`int_type`, `string_type`, ...: a required leaf with no
+   value), implicates that leaf. Errors inside an optional sub-model or union member that was
+   dropped as absent are repaired too, before the group is given up. An update re-asks only a
+   field that one of its own operations touched (or a missing required one): an error the record
+   already had is not the update's to repair.
+2. ONE narrow request per implicated field, all in parallel (call kind `repair`, `CallMeta.field`
+   the wire name): a Clairic request with that one field, whose `state` is the focus header, the
+   `<input>` (input only: never the existing record, so a repair cannot echo it) and the blocks
+   `<previous_attempt>` (just that field's rejected value), `<validation_errors>` (pydantic
+   message, type and input) and `<expected_schema>` (the `$defs`-resolved JSON-schema excerpt of
+   the path), or a Clef question when the field is adapted to Clef (its structured state carries
+   the same three things as keys). The instructions are the field's rendered instructions plus
+   "Must satisfy: {constraint}. The previous answer {old!r} was rejected because: {message}". An
+   answer whose span lands in one of the three blocks (a copy of the rejected attempt) is not used.
+3. What comes back goes through the full verification ladder (`run_ladder`: low-confidence re-ask,
+   borderline null, attribution, one request for all fields of the round); a value the ladder
+   throws away is not used and the field keeps its old (failing) value. On an update the repaired
+   value then goes through the diff, the near-duplicate check and the change gate again (only the
+   operations the new value changed are judged anew; a Clef answer also gets the `stated` check).
+   The input-only cross-check is not needed: a repair state never contains the record.
+4. One repair ROUND (every failing field, in parallel) is ONE attempt, like trustcall's fan-out of
+   repairs. `ExtractionResult.attempts` is 1 plus the rounds of the record that needed the most.
+   The loop stops when the record validates, when `max_attempts` rounds are used (a guard against
+   a loop that never ends, not a cost cap), when the error signature `frozenset((path, error
+   type))` repeats (`stop_on_repeat`), or when every field that is left is out of reach.
+
+| error type | re-asked as |
+| --- | --- |
+| `missing`, or a null that got a type error (a required field with no value) | the same field with `null_threshold=0.95` and "The input states this; quote it." |
+| `int_parsing`, `float_parsing`, `decimal_parsing` (a field that was asked as text) | Clairic `number` (+`integer` for an `int`) |
+| `date_parsing`, `datetime_parsing`, `time_parsing` | Clairic `date`, `datetime`, `time` |
+| `enum`, `literal_error` | Clef `choice` over the allowed values (no Clairic; an `unstated` option when the field is optional) |
+| `bool_parsing` | Clef `noul` |
+| `greater_than*`, `less_than*`, `multiple_of` | the same type, the bounds in prose |
+| `string_too_short/long`, `too_short/long` (lists) | the same type, the length budget in prose |
+| `string_pattern_mismatch` and the other format errors (`url_*`, `uuid_*`, `ip_*`) | the pattern rule below |
+| a model-level error | the same spec of every leaf of the model, the error in the state |
+| anything else | the same spec, the error in the state |
+
+**Pattern rule.** Clairic only quotes the input, so it cannot turn "Berlin 10115" into "10115" by
+reformatting; it can only find another quote. A field that failed a `pattern` (or another format
+check) is therefore re-asked ONCE, with the pattern in prose, and only if `allow_pattern_reask`
+and a verbatim piece of the input could satisfy it: for a regex, any match of the pattern in the
+input (its `^`/`$` anchors aside); for another format, a whitespace-separated token of the input
+that the field's own validation accepts. The answer is accepted only if its span is in the input
+and it meets the format. Otherwise the field fails fast: no request is made (or no second one),
+the reason is in the field's warnings, and the other failing fields go on without it. Vocabularies
+belong in a `Literal`, where Clef chooses among the allowed values and no error arises.
+
+**Terminal failure.** Updates: the operations on the paths that still fail are dropped
+(`RejectedOp(reason="validation")`) and the record is validated once more (the M5 rule). Inserts:
+an optional field that still fails goes back to its default (or null) with `RejectedOp(op=None,
+path, reason="validation")` and the record is validated again; if a required field still fails the
+record is `valid=False` (`value=None`, kept out of `responses`) with `SkippedEntity(reason=
+"validation_failed", detail=<the errors>)`; `strict=True` raises `ExtractionValidationError` (with
+the record and the call log, repair calls included). An optional sub-model or union member that
+cannot be repaired is dropped as absent, as before (`invalid_optional_group`). With
+`repair.enabled=False` none of the insert rules applies: the record is validated once and is
+simply invalid when it fails, as before M6 (no optional drop, no `SkippedEntity`).
+
+**Result.** Repair calls are in `calls` with kind `repair`. A field the loop replaced has
+`FieldAnswer.repaired=True`; the history of every attempt on a field (`repair[1] (number): '34
+years' -> 34`, or why it failed) is in its `warnings`, and an earlier rejection of the first answer
+is noted there too. A repaired field that was a Clairic field and became a Clef choice reports
+`engine="clef"`.
 
 ## Transport and wire (`transport.py`, `_wire.py`)
 
@@ -570,6 +652,14 @@ library's logic.
 * Gate state keys are `input`, `entity`, `record`, `proposed_change`; paths are JSON Pointers
   with the schema's validation keys (`/name`, `/notes/-`).
 * The input-only cross-check, not the span, is what catches an echoed number or date.
+* M6, pattern and format errors: Clairic only quotes the input, so a field that failed a regex
+  `pattern` (or another format check) is re-asked ONCE, with the pattern stated in prose, and only
+  if `repair.allow_pattern_reask` and a verbatim piece of the input could satisfy it (a regex match
+  of the pattern in the input); the answer is accepted only with a span in the input that meets the
+  format, else the field fails fast. Repair fixes extraction mistakes, it does not normalise.
+* M6, attempts: one repair round (every failing field in parallel) is one attempt;
+  `repair.max_attempts` is a termination guard, not a cost cap; `ExtractionResult.attempts` counts
+  the extraction round too.
 
 ### Branch, packaging, tooling
 

@@ -5,7 +5,12 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from trustcall_system_one import CallMeta, Extractor, create_extractor
+from trustcall_system_one import (
+    CallMeta,
+    Extractor,
+    RepairConfig,
+    create_extractor,
+)
 from trustcall_system_one._wire import CLAIRIC
 from trustcall_system_one.testing import (
     FakeTransport,
@@ -89,6 +94,10 @@ class Script:
             answers the rest.
         reask: Clairic answers by wire name for ``reask`` calls (a list is
             consumed one call at a time).
+        repair: Answers by wire name for ``repair`` calls (the narrow re-asks that
+            follow a validation error): a Clairic answer (see ``ca``) for a Clairic
+            request, a Clef answer (see ``pick`` and ``testing.noul``) for a Clef
+            one; a list is consumed one call at a time, the last item repeating.
         null_check: Probability by question id for ``null_check`` calls.
         adjudicate: Choice answers by field wire name for ``adjudicate`` calls.
         cross: Clairic answers by wire name for ``crosscheck`` calls (updates); a
@@ -118,6 +127,7 @@ class Script:
     reask: dict[str, dict[str, Any] | list[dict[str, Any]]] = field(
         default_factory=dict
     )
+    repair: dict[str, Any] = field(default_factory=dict)
     null_check: dict[str, float] = field(default_factory=dict)
     adjudicate: dict[str, dict[str, Any]] = field(default_factory=dict)
     cross: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -142,6 +152,7 @@ class Script:
                 clef_fields=self._clef_fields,
                 attribution=self._attribution,
                 reask=self._reask,
+                repair=self._repair,
                 null_check=self._null_check,
                 adjudicate=self._adjudicate,
                 crosscheck=self._crosscheck,
@@ -223,6 +234,27 @@ class Script:
             answers[name] = _build(chosen, state)
         return clairic_response(answers, truncated=cut, state_text=state)
 
+    def _repair(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
+        """Answer a repair request: Clairic from its state, Clef as scripted."""
+
+        def chosen(name: str) -> Any:
+            spec = self.repair[name]
+            if isinstance(spec, list):
+                item = spec[0]
+                if len(spec) > 1:
+                    spec.pop(0)
+                return item
+            return spec
+
+        if model != CLAIRIC:
+            return clef_response(
+                {qid: chosen(qid) for qid in payload["questions"]},
+                model=payload["model"],
+            )
+        state, cut = self._read(payload["state"])
+        answers = {name: _build(chosen(name), state) for name in payload["fields"]}
+        return clairic_response(answers, truncated=cut, state_text=state)
+
     def _null_check(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
         return clef_response(
             {qid: noul(self.null_check[qid]) for qid in payload["questions"]}
@@ -296,5 +328,12 @@ def kind_counts(transport: FakeTransport) -> Counter[str]:
 
 
 def make_extractor(schemas: list[Any], script: Script, **kwargs: Any) -> Extractor:
-    """Create an extractor on the script's fake transport."""
+    """Create an extractor on the script's fake transport.
+
+    The repair loop is OFF unless ``repair=`` is given: most tests here are about
+    what happens to a record that fails validation *without* a re-ask (the answers
+    of a script are fixed, so a repair request would have to be scripted too).
+    ``tests/unit/test_repair.py`` turns it on.
+    """
+    kwargs.setdefault("repair", RepairConfig(enabled=False))
     return create_extractor(schemas, transport=script.transport, **kwargs)

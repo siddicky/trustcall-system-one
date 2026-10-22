@@ -59,6 +59,7 @@ __all__ = [
     "SchemaPlan",
     "UnionGroup",
     "UnionMember",
+    "choice_for",
     "compile_schema",
     "render_instructions",
     "s1_field",
@@ -1210,6 +1211,53 @@ def _choice_kind(ctx: _Ctx, candidates: list[_Candidate]) -> _Kind:
         options=options,
         key_map={option.id: option.value for option in options},
     )
+
+
+def choice_for(
+    annotation: Any,
+    description: str,
+    *,
+    prefix: str = "",
+    required: bool = True,
+    limit: int = 600,
+) -> tuple[ChoiceQuestion, dict[str, Any]] | None:
+    """The Clef choice that picks a ``Literal`` or ``Enum`` value, if the type is one.
+
+    The repair loop uses this to re-ask a field whose value is not an allowed one
+    as a choice over the allowed values, whatever engine the field used first.
+
+    Args:
+        annotation: The field's annotation (``Optional`` and ``Annotated`` layers
+            are removed).
+        description: What is asked for.
+        prefix: Parent context put in front of the question.
+        required: Whether the field must have a value. If not, an ``unstated``
+            option is added, as for a compiled field.
+        limit: Longest instruction text.
+
+    Returns:
+        The question and its option id to value map, or ``None`` when the type
+        is not a ``Literal`` or ``Enum`` with two to 254 values.
+    """
+    shape = _strip(annotation)
+    base = shape.base
+    if shape.members is not None:
+        return None
+    if not (typing_extensions.get_origin(base) in _LITERAL_ORIGINS or _is_enum(base)):
+        return None
+    options = _options_for(_candidates(base))
+    if not 2 <= len(options) <= _MAX_CHOICE_OPTIONS - 1:
+        return None
+    if not required:
+        options.append(_unstated_option(options))
+    question = ChoiceQuestion(
+        type="choice",
+        instructions=render_instructions(
+            "choice", description, prefix=prefix, limit=limit
+        ),
+        criteria={option.id: option.criterion for option in options},
+    )
+    return question, {option.id: option.value for option in options}
 
 
 def _bool_kind(ctx: _Ctx) -> _Kind:

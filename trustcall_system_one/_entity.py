@@ -26,7 +26,7 @@ import asyncio
 import contextlib
 import dataclasses
 import json
-from collections.abc import Iterator, Mapping
+from collections.abc import Collection, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -42,7 +42,9 @@ from trustcall_system_one._compile import (
 )
 from trustcall_system_one._diff import (
     MISSING,
+    ApplyResult,
     Change,
+    DiffResult,
     GroupNode,
     LeafNode,
     UnionNode,
@@ -53,6 +55,7 @@ from trustcall_system_one._diff import (
     jsonable,
     leaves_with_old,
     list_paths,
+    lookup,
     new_positions,
     ops_for_errors,
     pointer,
@@ -63,6 +66,17 @@ from trustcall_system_one._existing import ExistingRecord, normalise_record
 from trustcall_system_one._gates import dedup_elements, gate_changes
 from trustcall_system_one._names import Path
 from trustcall_system_one._render import RenderedState
+from trustcall_system_one._repair import (
+    Hit,
+    Outcome,
+    Pending,
+    Problem,
+    RepairState,
+    Target,
+    locate,
+    problems_of,
+    repair_loop,
+)
 from trustcall_system_one._run import Answer, Run, gather
 from trustcall_system_one._types import (
     EntityInfo,
@@ -81,6 +95,7 @@ from trustcall_system_one._verify import (
     accept,
     adopt_cross,
     ask_clairic,
+    contest_cross,
     crosscheck,
     resolve,
     resolve_clef,
@@ -116,10 +131,16 @@ class InsertOutcome:
     Attributes:
         record: The record, or ``None`` when the presence gate found no entity.
         extracted: Whether any extraction request was made.
+        attempts: Extraction rounds: 0 when nothing was extracted, else 1 plus
+            the repair rounds.
+        skipped: The skipped entity (``validation_failed``) when the record is
+            invalid.
     """
 
     record: ResultRecord | None
     extracted: bool
+    attempts: int = 0
+    skipped: SkippedEntity | None = None
 
 
 def _note_unsupported(run: Run, plan: SchemaPlan, *, updating: bool = False) -> None:
@@ -699,6 +720,7 @@ def _clairic_answer(
         attribution_p=state.attribution_p,
         crosscheck_agree=state.crosscheck_agree,
         reask=state.reask,
+        repaired=resolved.repaired and not state.reject,
         rejected_reason=state.reject,
         warnings=_unique([*resolved.notes, *state.notes]),
     )
@@ -730,6 +752,7 @@ def _clef_answer(
         raw=resolved.raw,
         confidence=resolved.confidence,
         source=_source(spec, value),
+        repaired=resolved.repaired and reason is None,
         rejected_reason=reason,
         warnings=_unique(list(resolved.notes)),
     )
@@ -792,15 +815,23 @@ class _Assembly:
     dropped: list[Path] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     fatal: set[tuple[Any, ...]] = field(default_factory=set)
+    problems: list[Problem] = field(default_factory=list)
+    swallowed: list[Problem] = field(default_factory=list)
 
-    def mark(self) -> tuple[int, frozenset[tuple[Any, ...]]]:
+    def mark(self) -> tuple[int, frozenset[tuple[Any, ...]], int]:
         """Where the errors stand, to undo what a dropped fragment added."""
-        return len(self.errors), frozenset(self.fatal)
+        return len(self.errors), frozenset(self.fatal), len(self.problems)
 
-    def rollback(self, mark: tuple[int, frozenset[tuple[Any, ...]]]) -> None:
-        """Forget the errors a fragment raised once it is dropped."""
+    def rollback(self, mark: tuple[int, frozenset[tuple[Any, ...]], int]) -> None:
+        """Forget the errors a fragment raised once it is dropped.
+
+        The errors are not lost for the repair loop: a fragment that is dropped
+        can still be repaired, so what was wrong inside it moves to ``swallowed``.
+        """
         del self.errors[mark[0] :]
         self.fatal = set(mark[1])
+        self.swallowed.extend(self.problems[mark[2] :])
+        del self.problems[mark[2] :]
 
 
 def _key(spec: FieldSpec | FieldGroup | UnionGroup) -> str:
@@ -842,19 +873,24 @@ def _validated(
     *,
     what: str,
     optional: bool,
+    trail: tuple[str, ...],
 ) -> BaseModel | None:
     """Validate a sub-document on its own, so the instance is what the parent gets.
 
     A sub-model that is optional and invalid is dropped (it is absent, with a
     warning and a rejected op); a required one reports its errors under its own
-    path and the record is invalid.
+    path and the record is invalid. Either way the errors are kept as ``Problem``
+    objects, located by ``trail`` (the document keys down to the sub-document),
+    for the repair loop.
     """
     try:
         return model.model_validate(document)
     except ValidationError as exc:
         label = ".".join(str(part) for part in path)
         errors = _error_strings(exc, label)
+        problems = problems_of(exc, trail)
         if optional:
+            out.swallowed.extend(problems)
             out.dropped.append(path)
             out.rejected.append(
                 RejectedOp(
@@ -871,6 +907,7 @@ def _validated(
             )
         else:
             out.errors.extend(errors)
+            out.problems.extend(problems)
         return None
 
 
@@ -913,6 +950,7 @@ def _fragment(
                 out,
                 what="optional sub-model",
                 optional=True,
+                trail=(*trail, _key(child.group)),
             )
             if instance is None:
                 out.rollback(mark)  # what was wrong inside it goes with it
@@ -993,6 +1031,7 @@ def _place_union(
         out,
         what=f"{chosen.label} member",
         optional=union.optional,
+        trail=(*trail, _key(union)),
     )
     if instance is not None:
         # a TypedDict member is a plain dict to its parent, not an instance
@@ -1046,10 +1085,63 @@ def _note_answer(note: _Note, value: Any) -> FieldAnswer:
     )
 
 
-def _assemble(ctx: Ctx, root: _GroupResult, qualify_p: float | None) -> ResultRecord:
+@dataclass
+class _Built:
+    """A candidate record: the document, whether it validates and what is wrong.
+
+    Attributes:
+        out: What walking the results produced (answers, rejections, notes).
+        document: The nested document that was validated.
+        model: The validated model, ``None`` when it did not validate.
+        errors: The error strings of what failed.
+        blocking: The errors that make the record invalid (the root's, and those
+            of a required union member).
+        swallowed: The errors of optional sub-models and union members that were
+            dropped as absent: the record validates without them, but the repair
+            loop can still fix what was wrong inside.
+    """
+
+    out: _Assembly
+    document: dict[str, Any]
+    model: BaseModel | None
+    errors: list[str]
+    blocking: list[Problem]
+    swallowed: list[Problem]
+
+    @property
+    def failed(self) -> bool:
+        """Whether the record is invalid."""
+        return self.model is None or bool(self.out.fatal) or bool(self.errors)
+
+    @property
+    def problems(self) -> list[Problem]:
+        """Everything the repair loop may try to fix."""
+        return [*self.blocking, *self.swallowed]
+
+
+def _build(ctx: Ctx, root: _GroupResult) -> _Built:
+    """Build the document the answers make and validate it."""
     plan = ctx.plan
     out = _Assembly()
     document = _fragment(ctx, root, out, ()) or {}
+    errors = list(out.errors)
+    blocking = list(out.problems)
+    model: BaseModel | None = None
+    try:
+        model = plan.schema.model_validate(document)
+    except ValidationError as exc:
+        errors.extend(_error_strings(exc, skip=out.fatal))
+        blocking.extend(
+            p
+            for p in problems_of(exc)
+            if not (p.type == "missing" and p.loc in out.fatal)
+        )
+    return _Built(out, document, model, errors, blocking, list(out.swallowed))
+
+
+def _record(ctx: Ctx, built: _Built, qualify_p: float | None) -> ResultRecord:
+    """The result record of a built candidate (valid or not)."""
+    plan, out = ctx.plan, built.out
     entity = EntityInfo(key=ctx.key, label=ctx.label, qualify_p=qualify_p)
     # what was dropped for failing validation is reported as dropped
     answers: dict[str, FieldAnswer] = {}
@@ -1062,13 +1154,8 @@ def _assemble(ctx: Ctx, root: _GroupResult, qualify_p: float | None) -> ResultRe
                 rejected_reason=answer.rejected_reason or "invalid_optional_group",
             )
         answers[key] = answer
-    errors = list(out.errors)
-    model: BaseModel | None = None
-    try:
-        model = plan.schema.model_validate(document)
-    except ValidationError as exc:
-        errors.extend(_error_strings(exc, skip=out.fatal))
-    if model is None or out.fatal or errors:
+    model = built.model
+    if built.failed or model is None:
         fields = {
             **answers,
             **{
@@ -1076,26 +1163,18 @@ def _assemble(ctx: Ctx, root: _GroupResult, qualify_p: float | None) -> ResultRe
                 for note in out.notes.values()
             },
         }
-        record = ResultRecord(
+        return ResultRecord(
             schema_name=plan.name,
             json_doc_id=None,
             kind="insert",
             value=None,
-            after=_plain(document),
+            after=_plain(built.document),
             rejected=tuple(out.rejected),
             fields=fields,
             entity=entity,
             valid=False,
-            errors=tuple(errors),
+            errors=tuple(built.errors),
         )
-        if ctx.run.strict:
-            raise ExtractionValidationError(
-                f"{plan.name} failed validation: " + "; ".join(errors),
-                errors=errors,
-                record=record,
-                calls=tuple(ctx.run.calls),
-            )
-        return record
     # Report the values as the model holds them (enums, sets, nested models, ...).
     final: dict[str, FieldAnswer] = {}
     for key, answer in answers.items():
@@ -1120,6 +1199,158 @@ def _assemble(ctx: Ctx, root: _GroupResult, qualify_p: float | None) -> ResultRe
         entity=entity,
         valid=True,
     )
+
+
+def _all_leaves(result: _GroupResult) -> Iterator[_Leaf]:
+    """Every leaf below a group, every union member that was asked included."""
+    yield from result.leaves
+    for child in result.children:
+        yield from _all_leaves(child)
+    for union in result.unions:
+        for member in union.members.values():
+            yield from _all_leaves(member)
+
+
+def _chosen_of(result: _GroupResult, base: tuple[str, ...]) -> dict[str, str]:
+    """The document pointer of every union that stands, to the member chosen."""
+    found: dict[str, str] = {}
+    if not result.present:
+        return found
+    for union in result.unions:
+        at = (*base, _key(union.union))
+        if union.chosen is not None:
+            found[pointer(at)] = union.chosen.label
+            found.update(_chosen_of(union.members[union.chosen.label], at))
+    for child in result.children:
+        found.update(_chosen_of(child, (*base, _key(child.group))))
+    return found
+
+
+def _note_leaf(leaf: _Leaf, text: str) -> None:
+    """Add a line to the history of a field's answer."""
+    if leaf.state is not None:
+        leaf.state.notes.append(text)
+    elif leaf.resolved is not None:
+        leaf.resolved = dataclasses.replace(
+            leaf.resolved, notes=(*leaf.resolved.notes, text)
+        )
+
+
+def _install(leaf: _Leaf, outcome: Outcome) -> bool:
+    """Put a repair outcome into a leaf. Returns whether a new value went in."""
+    if outcome.state is not None:
+        earlier = leaf.state
+        if earlier is not None and earlier.reject:
+            outcome.state.notes.append(
+                f"the first answer had been rejected ({earlier.reject}) before "
+                "the repair"
+            )
+        leaf.spec, leaf.state, leaf.resolved = outcome.spec, outcome.state, None
+        return True
+    if outcome.resolved is not None:
+        leaf.spec, leaf.state, leaf.resolved = outcome.spec, None, outcome.resolved
+        return True
+    _note_leaf(leaf, outcome.note)
+    return False
+
+
+def _drop_leaf(leaf: _Leaf, detail: str) -> None:
+    """Give up on a field's value: it is null (or its default) from now on."""
+    if leaf.state is not None:
+        leaf.state.set_reject("validation", detail)
+    elif leaf.resolved is not None:
+        leaf.resolved = dataclasses.replace(
+            leaf.resolved, ok=False, reason="validation", detail=detail
+        )
+
+
+def _problem_text(problems: list[Problem]) -> str:
+    return "; ".join(
+        f"{'.'.join(str(part) for part in p.loc)}: {p.msg}" if p.loc else p.msg
+        for p in problems
+    )
+
+
+async def _finish_insert(
+    ctx: Ctx, root: _GroupResult, qualify_p: float | None
+) -> tuple[ResultRecord, SkippedEntity | None, int]:
+    """Assemble, validate and (if needed) repair the candidate of an insert.
+
+    Returns:
+        The record, the skipped entity when the record is invalid (only with
+        the repair loop on), and the number of repair rounds that were used.
+
+    Raises:
+        ExtractionValidationError: In strict mode, if the record stays invalid.
+    """
+    run, plan = ctx.run, ctx.plan
+    state = RepairState()
+    built = _build(ctx, root)
+    chosen = _chosen_of(root, ())
+    leaves = {
+        leaf.spec.wire_name: leaf
+        for leaf in _all_leaves(root)
+        if not leaf.filled and (leaf.state is not None or leaf.resolved is not None)
+    }
+    if run.repair.enabled and built.problems:
+
+        def target_for(hit: Hit) -> Target | None:
+            leaf = leaves.get(hit.entry.spec.wire_name)
+            if leaf is None:
+                return None
+            kind = leaf.state.type_answer if leaf.state is not None else None
+            return Target(hit, leaf.spec, leaf.final(), kind)
+
+        async def apply(outcomes: list[Outcome]) -> None:
+            for outcome in outcomes:
+                leaf = leaves.get(outcome.target.wire)
+                if leaf is not None:
+                    _install(leaf, outcome)
+
+        async def refresh() -> Pending:
+            nonlocal built
+            built = _build(ctx, root)
+            return Pending(built.problems, chosen)
+
+        await repair_loop(
+            ctx,
+            state,
+            Pending(built.problems, chosen),
+            refresh=refresh,
+            target_for=target_for,
+            apply=apply,
+        )
+        if built.failed:
+            # an optional field that still fails goes back to its default (or null)
+            for hit in locate(plan, built.blocking, chosen):
+                leaf = leaves.get(hit.entry.spec.wire_name)
+                if leaf is None or not hit.direct or leaf.spec.required:
+                    continue
+                _drop_leaf(leaf, _problem_text(hit.problems))
+        # the answers now carry what the loop noted and dropped
+        built = _build(ctx, root)
+    record = _record(ctx, built, qualify_p)
+    if record.valid:
+        return record, None, state.rounds
+    # with the loop off the record is just invalid, as it was before M6
+    skipped = (
+        SkippedEntity(
+            plan.name,
+            record.entity or EntityInfo(key=ctx.key, label=ctx.label),
+            "validation_failed",
+            "; ".join(record.errors),
+        )
+        if run.repair.enabled
+        else None
+    )
+    if run.strict:
+        raise ExtractionValidationError(
+            f"{plan.name} failed validation: " + "; ".join(record.errors),
+            errors=list(record.errors),
+            record=record,
+            calls=tuple(run.calls),
+        )
+    return record, skipped, state.rounds
 
 
 async def insert_one(
@@ -1167,7 +1398,8 @@ async def insert_one(
     root = await _run_unit(ctx, plan.root)
     await run_ladder(ctx, list(_leaf_states(root)))
     _settle(root)
-    return InsertOutcome(_assemble(ctx, root, qualify_p), extracted=True)
+    record, skipped, rounds = await _finish_insert(ctx, root, qualify_p)
+    return InsertOutcome(record, True, 1 + rounds, skipped)
 
 
 # --------------------------------------------------------------------------- #
@@ -1188,12 +1420,15 @@ class UpdateOutcome:
             dealt with (updated or skipped; the schema name is ``"__any__"`` for
             such a record); ``None`` when it stays untouched.
         extracted: Whether any extraction request was made.
+        attempts: Extraction rounds: 0 when nothing was extracted, else 1 plus
+            the repair rounds.
     """
 
     record: ResultRecord | None
     skipped: SkippedEntity | None
     handled: tuple[str, str] | None
     extracted: bool
+    attempts: int = 0
 
 
 def _json_default(model: type[BaseModel], spec: FieldSpec) -> Any:
@@ -1325,10 +1560,12 @@ class _Verdict:
     change: Change
     reason: str | None = None  # why it was not applied
     p: float | None = None  # the change gate's probability, if it was asked
+    rejection: RejectedOp | None = None  # how it is reported, if it was thrown away
+    stage: int = 0  # 0: the near-duplicate check, 1: the change gate
 
 
 async def _judge_changes(
-    ctx: Ctx, before: dict[str, Any], changes: list[Change], out: list[RejectedOp]
+    ctx: Ctx, before: dict[str, Any], changes: list[Change]
 ) -> list[_Verdict]:
     """Run the near-duplicate check and the change gate over the operations."""
     verdicts = [_Verdict(change) for change in changes]
@@ -1339,14 +1576,12 @@ async def _judge_changes(
             verdict.reason = "duplicate"
             verdict.p = found.p
             change = verdict.change
-            out.append(
-                RejectedOp(
-                    change.op,
-                    change.path,
-                    "duplicate",
-                    f"{change.value!r} is the same fact as {found.other!r}",
-                    found.p,
-                )
+            verdict.rejection = RejectedOp(
+                change.op,
+                change.path,
+                "duplicate",
+                f"{change.value!r} is the same fact as {found.other!r}",
+                found.p,
             )
     live = [v for v in verdicts if v.reason is None]
     gated = await gate_changes(ctx, before, [v.change for v in live])
@@ -1364,7 +1599,10 @@ async def _judge_changes(
                 f"the input does not support the change (p={answer.p:.2f} < "
                 f"{answer.needed})"
             )
-        out.append(RejectedOp(change.op, change.path, verdict.reason, detail, answer.p))
+        verdict.stage = 1
+        verdict.rejection = RejectedOp(
+            change.op, change.path, verdict.reason, detail, answer.p
+        )
     return verdicts
 
 
@@ -1412,34 +1650,202 @@ def _owner(changes: list[Change], op: PatchOp) -> Change | None:
     return next((c for c in changes if c.path == path), None)
 
 
+@dataclass
+class _Eval:
+    """One evaluation of an update: its operations, applied and validated.
+
+    Attributes:
+        diff: What the diff found.
+        verdicts: The verdict on every computed operation, in diff order.
+        ordered: The operations that passed, in the order they are applied.
+        lists: Pointers of the list fields (for ``apply_ops``).
+        applied: The result of applying them.
+        reasons: Why an operation (by ``id``) did not make it, when apply said so.
+        apply_rejected: The rejections of operations that could not be applied.
+        chosen: The union members the update decided, by union pointer.
+        model: The validated patched record (``None`` if it is invalid).
+        failure: The validation error, if there is one.
+    """
+
+    diff: DiffResult
+    verdicts: list[_Verdict]
+    ordered: list[Change]
+    lists: frozenset[str]
+    applied: ApplyResult
+    reasons: dict[int, str]
+    apply_rejected: list[RejectedOp]
+    chosen: dict[str, str]
+    model: BaseModel | None
+    failure: ValidationError | None
+
+
+def _change_key(change: Change) -> tuple[str, str, str]:
+    """What identifies an operation across evaluations (its kind, place, value)."""
+    return (
+        change.op,
+        change.path,
+        json.dumps(change.value, sort_keys=True, default=str),
+    )
+
+
+async def _evaluate(
+    ctx: Ctx,
+    root: _GroupResult,
+    before: dict[str, Any],
+    cache: dict[tuple[str, str, str], _Verdict],
+) -> _Eval:
+    """Diff the answers against the record, judge, apply and validate.
+
+    ``cache`` holds the verdicts of the operations that were judged already, so a
+    repair round only pays for the operations its new answers produced.
+    """
+    run, plan = ctx.run, ctx.plan
+    nodes = _group_node(root, "")
+    diff = diff_group(nodes, before, allow_null_removals=run.gates.allow_null_removals)
+    fresh = [c for c in diff.changes if _change_key(c) not in cache]
+    if fresh:
+        for verdict in await _judge_changes(ctx, before, fresh):
+            cache[_change_key(verdict.change)] = verdict
+    verdicts = [cache[_change_key(c)] for c in diff.changes]
+    passed = [v.change for v in verdicts if v.reason is None]
+    ordered = sort_changes(passed)
+    lists = list_paths(nodes)
+    applied = apply_ops(before, [change.as_op() for change in ordered], lists=lists)
+    reasons: dict[int, str] = {}
+    apply_rejected: list[RejectedOp] = []
+    for op, error in applied.failed:
+        change = next(
+            (c for c in ordered if c.path == op.path and c.value == op.value), None
+        )
+        apply_rejected.append(RejectedOp(op.op, op.path, "apply_failed", error, None))
+        if change is not None:
+            reasons[id(change)] = "apply_failed"
+    model, failure = _validate_document(plan, applied.doc)
+    return _Eval(
+        diff,
+        verdicts,
+        ordered,
+        lists,
+        applied,
+        reasons,
+        apply_rejected,
+        _chosen_members(nodes, ()),
+        model,
+        failure,
+    )
+
+
+async def _repair_update(
+    ctx: Ctx,
+    root: _GroupResult,
+    before: dict[str, Any],
+    cache: dict[tuple[str, str, str], _Verdict],
+    ev: _Eval,
+) -> tuple[_Eval, int]:
+    """Re-ask the fields an update's validation errors implicate.
+
+    A field is re-asked when an operation of this update touches it (the error
+    is the update's own) or a required value is missing; an error that the
+    record already had is left alone. The re-asked value goes through the
+    ladder (``run_round``), then the diff, the near-duplicate check and the
+    change gate again (only the operations it changed are judged anew).
+
+    Returns:
+        The last evaluation and the number of repair rounds used.
+    """
+    state = RepairState()
+    leaves = {
+        leaf.spec.wire_name: leaf
+        for leaf in _all_leaves(root)
+        if not leaf.filled and (leaf.state is not None or leaf.resolved is not None)
+    }
+
+    def pending() -> Pending:
+        problems = problems_of(ev.failure) if ev.failure is not None else []
+        return Pending(problems, ev.chosen)
+
+    def target_for(hit: Hit) -> Target | None:
+        leaf = leaves.get(hit.entry.spec.wire_name)
+        if leaf is None:
+            return None
+        touched = bool(ops_for_errors(ev.applied.applied, [hit.entry.path]))
+        if not touched and not any(p.type == "missing" for p in hit.problems):
+            return None
+        current = lookup(ev.applied.doc, hit.entry.path)
+        previous = leaf.final() if current is MISSING else current
+        kind = leaf.state.type_answer if leaf.state is not None else None
+        return Target(hit, leaf.spec, previous, kind)
+
+    async def apply(outcomes: list[Outcome]) -> None:
+        installed: list[_Leaf] = []
+        for outcome in outcomes:
+            leaf = leaves.get(outcome.target.wire)
+            if leaf is not None and _install(leaf, outcome):
+                installed.append(leaf)
+        clef = [leaf for leaf in installed if leaf.resolved is not None]
+        if not clef:
+            return
+        # a Clef answer always resolves: ask whether the input states it
+        await _check_stated(
+            ctx, _group_node(root, ""), before, only={id(leaf) for leaf in clef}
+        )
+        for leaf in clef:
+            resolved = leaf.resolved
+            if resolved is not None and resolved.value is None:
+                leaf.resolved = dataclasses.replace(
+                    resolved,
+                    repaired=False,
+                    notes=(*resolved.notes, "the input does not state it"),
+                )
+
+    async def refresh() -> Pending:
+        nonlocal ev
+        ev = await _evaluate(ctx, root, before, cache)
+        return pending()
+
+    await repair_loop(
+        ctx,
+        state,
+        pending(),
+        refresh=refresh,
+        target_for=target_for,
+        apply=apply,
+    )
+    return ev, state.rounds
+
+
 async def _finish_update(
     ctx: Ctx,
     root: _GroupResult,
     before: dict[str, Any],
     target: ExistingRecord,
     entity: EntityInfo,
-) -> ResultRecord:
+) -> tuple[ResultRecord, int]:
+    """Diff, judge, apply and validate an update; repair what fails validation.
+
+    Returns:
+        The record and the number of repair rounds that were used.
+    """
     run, plan = ctx.run, ctx.plan
+    cache: dict[tuple[str, str, str], _Verdict] = {}
+    ev = await _evaluate(ctx, root, before, cache)
+    rounds = 0
+    if run.repair.enabled and ev.failure is not None:
+        ev, rounds = await _repair_update(ctx, root, before, cache, ev)
     out = _Assembly()
     _answers(root, out, ())
-    nodes = _group_node(root, "")
-    diff = diff_group(nodes, before, allow_null_removals=run.gates.allow_null_removals)
-    rejected = [*out.rejected, *diff.rejected]
-    verdicts = await _judge_changes(ctx, before, diff.changes, rejected)
-    passed = [v.change for v in verdicts if v.reason is None]
-    ordered = sort_changes(passed)
-    lists = list_paths(nodes)
-    applied = apply_ops(before, [change.as_op() for change in ordered], lists=lists)
-    reasons: dict[int, str] = {}
-    for op, error in applied.failed:
-        change = next(
-            (c for c in ordered if c.path == op.path and c.value == op.value), None
-        )
-        rejected.append(RejectedOp(op.op, op.path, "apply_failed", error, None))
-        if change is not None:
-            reasons[id(change)] = "apply_failed"
-    chosen = _chosen_members(nodes, ())
-    model, failure = _validate_document(plan, applied.doc)
+    judged = sorted(
+        (v for v in ev.verdicts if v.rejection is not None), key=lambda v: v.stage
+    )
+    rejected = [
+        *out.rejected,
+        *ev.diff.rejected,
+        *(v.rejection for v in judged if v.rejection is not None),
+        *ev.apply_rejected,
+    ]
+    verdicts, ordered, lists, chosen = ev.verdicts, ev.ordered, ev.lists, ev.chosen
+    applied, reasons = ev.applied, dict(ev.reasons)
+    model, failure = ev.model, ev.failure
     if failure is not None:
         problems = _problems(plan, failure, chosen)
         # which error is about which operation
@@ -1517,7 +1923,7 @@ async def _finish_update(
             record=record,
             calls=tuple(run.calls),
         )
-    return record
+    return record, rounds
 
 
 def _has_cross_answer(ctx: Ctx, st: FieldState) -> bool:
@@ -1526,7 +1932,12 @@ def _has_cross_answer(ctx: Ctx, st: FieldState) -> bool:
     return pair is not None and pair[0] is not None and pair[0].value is not None
 
 
-async def _check_stated(ctx: Ctx, nodes: GroupNode, before: dict[str, Any]) -> None:
+async def _check_stated(
+    ctx: Ctx,
+    nodes: GroupNode,
+    before: dict[str, Any],
+    only: Collection[int] | None = None,
+) -> None:
     """Ask whether the input states each Clef answer that would change the record.
 
     A ``bool``, ``Literal`` or ``Enum`` answer always resolves, whether or not the
@@ -1535,11 +1946,14 @@ async def _check_stated(ctx: Ctx, nodes: GroupNode, before: dict[str, Any]) -> N
     record, one Clef ``noul`` per group (call kind ``stated``) asks "Does
     ``input`` state <the field>?"; below ``verify.clef_stated_min`` the answer is
     made a null (noted ``not_stated``), so it is reported as ``not_mentioned``.
+    With ``only`` (the ``id`` of leaves) just those answers are checked.
     """
     groups: dict[tuple[Any, ...], list[_Leaf]] = {}
     for node, old in leaves_with_old(nodes, before):
         leaf = node.ref
         if not isinstance(leaf, _Leaf) or leaf.filled or leaf.resolved is None:
+            continue
+        if only is not None and id(leaf) not in only:
             continue
         resolved = leaf.resolved
         if not resolved.ok or resolved.value is None or leaf.spec.engine != "clef":
@@ -1707,6 +2121,15 @@ async def update_one(
             }
             await gather(*(_load_cross(plain, st) for st in wanted.values()))
             await crosscheck(plain, candidates, new_at)
+
+            async def take(st: FieldState, leaf: LeafNode, *, contested: bool) -> None:
+                adopted = (
+                    await contest_cross(plain, st) if contested else adopt_cross(st)
+                )
+                if adopted:
+                    unchanged.discard(leaf.spec.wire_name)
+
+            takes = []
             for st, old, leaf in adoptable:
                 found = usable_cross(st)
                 if found is None:
@@ -1715,13 +2138,19 @@ async def update_one(
                     changes = bool(new_positions(leaf.spec, found.value, old))
                 else:
                     changes = is_change(leaf.spec, found.value, old, leaf.default)
-                if changes and adopt_cross(st):
-                    unchanged.discard(leaf.spec.wire_name)
+                if not changes:
+                    continue
+                # the primary pass read the record's own value AND pointed at the
+                # input for it: a genuine reading, so the two are adjudicated; a
+                # null, an echo or a span-less value is simply given way to
+                contested = leaf.spec.wire_name in unchanged and bool(st.spans)
+                takes.append(take(st, leaf, contested=contested))
+            await gather(*takes)
         await run_ladder(
             plain, [st for st in states if st.spec.wire_name not in unchanged]
         )
 
     await gather(verify_clairic(), _check_stated(plain, nodes, before))
     _settle(root)
-    record = await _finish_update(plain, root, before, target, entity)
-    return UpdateOutcome(record, None, handle, True)
+    record, rounds = await _finish_update(plain, root, before, target, entity)
+    return UpdateOutcome(record, None, handle, True, 1 + rounds)

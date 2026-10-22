@@ -11,6 +11,7 @@ from trustcall_system_one._config import (
     Limits,
     PassesConfig,
     PresenceConfig,
+    RepairConfig,
     VerifyConfig,
 )
 from trustcall_system_one._render import (
@@ -153,6 +154,7 @@ class Run:
         presence: Presence-gate thresholds.
         gates: Answer-level thresholds.
         passes: How Clairic fields are grouped into requests.
+        repair: Settings of the validation repair loop.
         limits: Structural limits (including the Clef state budget).
         images: Images sent with every request that carries the user's input.
             Each request model validates the documented size limits before it is
@@ -172,6 +174,7 @@ class Run:
     presence: PresenceConfig = field(default_factory=PresenceConfig)
     gates: GateConfig = field(default_factory=GateConfig)
     passes: PassesConfig = field(default_factory=PassesConfig)
+    repair: RepairConfig = field(default_factory=RepairConfig)
     limits: Limits = field(default_factory=Limits)
     images: Sequence[Any] | None = None
     reference_date: str | None = None

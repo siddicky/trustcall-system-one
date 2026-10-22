@@ -75,6 +75,7 @@ __all__ = [
     "agree",
     "ask_clairic",
     "compact_block",
+    "contest_cross",
     "crosscheck",
     "display",
     "resolve",
@@ -139,6 +140,8 @@ class Ctx:
             their spans with.
         echoes: Notes by wire name about chunked answers that were thrown away
             because their span lay in the existing record.
+        trailer: Blocks written after the input in every Clairic request of this
+            context (the repair loop's description of a rejected answer).
     """
 
     run: Run
@@ -154,6 +157,7 @@ class Ctx:
         default_factory=dict
     )
     echoes: dict[str, list[str]] = field(default_factory=dict)
+    trailer: str = ""
 
     def input_only(self) -> "Ctx":
         """The same context without the record: every request is about the input.
@@ -260,6 +264,7 @@ class Ctx:
             existing_id=existing.record_id if existing is not None else None,
             existing_schema=existing.schema_name if existing is not None else None,
             windows=windows or None,
+            trailer=self.trailer,
         )
 
     def entity_state(
@@ -423,7 +428,9 @@ async def ask_clairic(
                 windows=windows,
                 descriptions=descriptions,
             )
-    reserved = len(ctx.existing.text) if ctx.existing is not None else 0
+    reserved = (len(ctx.existing.text) if ctx.existing is not None else 0) + len(
+        ctx.trailer
+    )
     size = chunk_size(
         _room(_chars_read(rendered, response, anchored), reserved), covered, overlap
     )
@@ -757,6 +764,7 @@ class Resolved:
     notes: tuple[str, ...] = ()
     origin: tuple[int, ...] | None = None
     lost: tuple[tuple[int, str, str], ...] = ()
+    repaired: bool = False
 
 
 @dataclass
@@ -1642,6 +1650,38 @@ def adopt_cross(st: FieldState) -> bool:
     st.crosscheck_agree = False
     st.notes.append("adopted_from_crosscheck")
     return True
+
+
+async def contest_cross(ctx: Ctx, st: FieldState) -> bool:
+    """Settle a primary reading that equals the record against a different one.
+
+    The primary pass read the record's own value and pointed at text in the
+    input for it (a genuine reading, not an echo), while the input-only pass
+    reads something else. Neither is taken on faith: Clef is asked which of the
+    two the input states (call kind ``adjudicate``, the same question as for two
+    disagreeing values). Only a decisive win of the input-only value takes it
+    over (see ``adopt_cross``); anything else leaves the field as the record
+    has it.
+
+    Args:
+        ctx: The entity context (the input-only one, for an update).
+        st: The field; its primary answer equals the record's value.
+
+    Returns:
+        Whether the input-only reading was adopted.
+    """
+    found = usable_cross(st)
+    if found is None:
+        return False
+    verdict, _ = await _adjudicate(ctx, st, st.resolved.value, found.value)
+    if verdict == "b" and adopt_cross(st):
+        st.notes.append("adjudicated_to_crosscheck")
+        return True
+    st.notes.append(
+        "crosscheck_overruled: the input-only reading differs, but the input was "
+        "not shown to state it rather than the record's value"
+    )
+    return False
 
 
 def _cross_list(st: FieldState, new: list[int] | None) -> None:

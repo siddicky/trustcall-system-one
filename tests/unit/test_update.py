@@ -25,6 +25,7 @@ from trustcall_system_one import (
     SchemaInstance,
     VerifyConfig,
 )
+from trustcall_system_one.testing import choice
 
 TEXT = (
     "Dana moved to Berlin last month. Her mobile is now +49 30 5555 0198. "
@@ -1177,6 +1178,64 @@ async def test_an_input_only_reading_equal_to_the_record_changes_nothing() -> No
     assert not world.calls("gate")
 
 
+CONTESTED_TEXT = "Dana lived in Austin once, and moved to Berlin. She is 41 now."
+
+
+def contested_script(verdict: str) -> Script:
+    """The primary reading is the record's city, WITH a span in the input."""
+    world = plain_script()
+    world.clairic["city"] = ca("text", "Austin", find="Austin")
+    world.adjudicate = {"city": pick(verdict, ["a", "b", "neither"], 0.9)}
+    return world
+
+
+async def run_contested(world: Script) -> ExtractionResult:
+    extractor = make_extractor([One(Plain)], world)
+    return await extractor.ainvoke(CONTESTED_TEXT, existing={"Plain": PLAIN_RECORD})
+
+
+async def test_a_genuine_primary_reading_is_adjudicated_not_overruled() -> None:
+    # "Austin" equals the record AND points at the input: a genuine reading. The
+    # input-only pass says "Berlin": the two are adjudicated, and here Clef says b
+    world = contested_script("b")
+    record = only(await run_contested(world))
+    (call,) = world.calls("adjudicate")
+    assert call[2].field == "city"
+    criteria = call[1]["questions"]["adjudicate"]["criteria"]
+    assert (criteria["a"], criteria["b"]) == ("Austin", "Berlin")
+    assert ("replace", "/city") in ops(record)
+    assert record.after is not None and record.after["city"] == "Berlin"
+    assert "adjudicated_to_crosscheck" in record.fields["city"].warnings
+    # the age has no span at all (a number): the input-only reading is taken as is
+    assert [c[2].field for c in world.calls("adjudicate")] == ["city"]
+    assert ("replace", "/age") in ops(record)
+    # the taken value still goes through attribution and the gate
+    gated = {c[1]["state"]["proposed_change"]["path"] for c in world.calls("gate")}
+    assert gated == {"/city", "/age"}
+
+
+@pytest.mark.parametrize("verdict", ["a", "neither"])
+async def test_a_genuine_primary_reading_stays_unless_the_other_wins(
+    verdict: str,
+) -> None:
+    world = contested_script(verdict)
+    record = only(await run_contested(world))
+    assert ops(record) == [("replace", "/age")]
+    assert record.after is not None and record.after["city"] == "Austin"
+    assert any(
+        w.startswith("crosscheck_overruled") for w in record.fields["city"].warnings
+    )
+    gated = {c[1]["state"]["proposed_change"]["path"] for c in world.calls("gate")}
+    assert gated == {"/age"}
+
+
+async def test_an_indecisive_adjudication_leaves_the_record_alone() -> None:
+    world = contested_script("b")
+    world.adjudicate = {"city": choice("b", {"a": 0.35, "b": 0.4, "neither": 0.25})}
+    record = only(await run_contested(world))
+    assert record.after is not None and record.after["city"] == "Austin"
+
+
 # --------------------------------------------------------------------------- #
 # An "__any__" record belongs to one schema
 # --------------------------------------------------------------------------- #
@@ -1271,6 +1330,115 @@ async def test_untouched_is_keyed_by_schema_and_id() -> None:
     )
     assert [r.schema_name for r in result.records] == ["Drifter"]
     assert result.untouched == ("same",)  # the Sailor's record, same id
+
+
+async def test_two_any_records_are_claimed_one_to_one() -> None:
+    world = any_script()
+    world.presence_by_schema = {"Drifter": 0.9, "Sailor": 0.6}
+    extractor = make_extractor([One(Drifter), One(Sailor)], world)
+    result = await extractor.ainvoke(
+        "Sam moved to Oslo, aboard the Maud.",
+        existing=[
+            ("any-1", "__any__", {"name": "Sam", "city": "Rome"}),
+            ("any-2", "__any__", {"name": "Sam"}),
+        ],
+    )  # both records fit both schemas: this used to raise mid-invoke
+    by_schema = {r.schema_name: r for r in result.records}
+    assert (by_schema["Drifter"].kind, by_schema["Drifter"].json_doc_id) == (
+        "update",
+        "any-1",
+    )
+    assert (by_schema["Sailor"].kind, by_schema["Sailor"].json_doc_id) == (
+        "update",
+        "any-2",
+    )
+    assert result.untouched == ()
+    assert len([w for w in result.warnings if "'__any__'" in w]) == 2
+    assert len([c for c in result.calls if c.kind == "presence"]) == 2  # asked once
+
+
+async def test_an_any_record_nobody_is_left_to_claim_stays_untouched() -> None:
+    world = any_script()
+    extractor = make_extractor([One(Drifter), One(Sailor)], world)
+    result = await extractor.ainvoke(
+        "Sam moved to Oslo, aboard the Maud.",
+        existing=[
+            ("any-1", "__any__", {"name": "Sam"}),
+            ("any-2", "__any__", {"name": "Sam"}),
+            ("any-3", "__any__", {"name": "Sam"}),
+        ],
+    )
+    assert sorted(
+        r.json_doc_id or "" for r in result.records if r.kind == "update"
+    ) == [
+        "any-1",
+        "any-2",
+    ]
+    assert result.untouched == ("any-3",)
+    assert any("any-3" in w and "no schema" in w for w in result.warnings)
+
+
+async def test_one_schema_takes_one_any_record_and_leaves_the_rest() -> None:
+    world = any_script()
+    extractor = make_extractor([One(Drifter)], world)
+    result = await extractor.ainvoke(
+        "Sam moved to Oslo.",
+        existing=[
+            ("any-1", "__any__", {"name": "Sam", "city": "Rome"}),
+            ("any-2", "__any__", {"name": "Sam", "city": "Rome"}),
+        ],
+    )
+    (record,) = result.records
+    assert (record.kind, record.json_doc_id) == ("update", "any-1")
+    assert result.untouched == ("any-2",)
+
+
+async def test_validating_a_record_does_not_bypass_presence() -> None:
+    # Drifter is all-optional, so it "validates" almost any record; Owner2 needs a
+    # pet the record does not hold yet. The text is about Owner2's pet, not about
+    # drifting: Drifter is absent, so it must not take the record.
+    world = any_script()
+    world.clairic["pet"] = ca("text", "Rex", find="Rex")
+    world.presence_by_schema = {"Drifter": 0.02, "Owner2": 0.9}
+    extractor = make_extractor([One(Drifter), One(Owner2)], world)
+    result = await extractor.ainvoke(
+        "Sam got a dog called Rex.", existing={"__any__": {"name": "Sam"}}
+    )
+    (record,) = result.records
+    assert (record.schema_name, record.kind, record.json_doc_id) == (
+        "Owner2",
+        "update",
+        "__any__",
+    )
+    assert ops(record) == [("add", "/pet")]
+    assert any("Owner2" in w and "most present" in w for w in result.warnings)
+    assert result.untouched == ()
+
+
+async def test_an_any_record_no_present_schema_can_take_stays_untouched() -> None:
+    world = any_script()
+    world.presence_by_schema = {"Drifter": 0.02, "Sailor": 0.05}
+    extractor = make_extractor([One(Drifter), One(Sailor)], world)
+    result = await extractor.ainvoke(
+        "Nothing about Sam here.", existing={"__any__": {"name": "Sam"}}
+    )
+    assert result.records == ()
+    assert result.untouched == ("__any__",)
+    assert any("none of the candidates is present" in w for w in result.warnings)
+    assert not world.calls("extract")
+
+
+async def test_a_schema_that_loses_an_any_claim_takes_the_insert_path() -> None:
+    world = any_script()
+    world.presence_by_schema = {"Drifter": 0.9, "Sailor": 0.8}
+    extractor = make_extractor([One(Drifter), One(Sailor)], world)
+    result = await extractor.ainvoke(
+        "Sam moved to Oslo, aboard the Maud.",
+        existing={"__any__": {"name": "Sam", "city": "Rome"}},
+    )
+    by_schema = {r.schema_name: r for r in result.records}
+    assert by_schema["Drifter"].kind == "update"  # the same text updates one...
+    assert by_schema["Sailor"].kind == "insert"  # ...and inserts the other's record
 
 
 # --------------------------------------------------------------------------- #

@@ -18,6 +18,7 @@ from trustcall_system_one._config import (
     PassesConfig,
     PresenceConfig,
     Prices,
+    RepairConfig,
     VerifyConfig,
 )
 from trustcall_system_one._errors import (
@@ -91,6 +92,7 @@ __all__ = [
     "Prices",
     "RateLimitError",
     "RejectedOp",
+    "RepairConfig",
     "ResultRecord",
     "SchemaInstance",
     "SchemaPlan",

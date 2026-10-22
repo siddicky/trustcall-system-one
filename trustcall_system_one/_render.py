@@ -148,6 +148,7 @@ def render_clairic(
     existing_id: str | None = None,
     existing_schema: str | None = None,
     windows: Sequence[Span] | None = None,
+    trailer: str = "",
 ) -> RenderedState:
     """Lay out the Clairic state for one entity.
 
@@ -162,6 +163,10 @@ def render_clairic(
         existing_schema: The record's schema name (the ``schema`` attribute).
         windows: Ranges of ``text`` to keep instead of all of it; they must be
             disjoint and in increasing order (see ``mention_windows``).
+        trailer: Further blocks written after everything else (the repair
+            loop's ``<previous_attempt>``, ``<validation_errors>`` and
+            ``<expected_schema>``). They are context only: a span that lands in
+            them is outside the input, like one in ``<existing>``.
 
     Returns:
         The state and the map from state offsets back to ``text``.
@@ -174,6 +179,12 @@ def render_clairic(
         focus.append(
             "The existing record after the input is context only: answer from "
             "the input text, never from the existing record."
+        )
+    if trailer:
+        focus.append(
+            "The blocks after the input describe an earlier answer that was "
+            "rejected. They are context only: answer from the input text, never "
+            "from them."
         )
     focus.append("</focus>\n")
     head = "\n".join(focus)
@@ -212,6 +223,8 @@ def render_clairic(
         out += f"\n<existing{attrs}>\n"
         existing_span = (len(out), len(out) + len(existing))
         out += existing + "\n</existing>"
+    if trailer:
+        out += "\n" + trailer
     return RenderedState(
         text=out,
         input_span=input_span,

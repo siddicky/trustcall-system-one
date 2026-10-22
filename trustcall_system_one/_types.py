@@ -272,8 +272,11 @@ class FieldAnswer:
         gate_p: Probability from the change gate (updates).
         crosscheck_agree: Whether the input-only cross-check agreed (updates).
         reask: Whether a re-ask contributed to the value.
+        repaired: Whether the value comes from the validation repair loop (the
+            first answer failed validation and a narrow re-ask replaced it).
         rejected_reason: Why the answer was thrown away, if it was.
-        warnings: Short notes, such as ``span_outside_input``.
+        warnings: Short notes, such as ``span_outside_input``; for a field the
+            repair loop worked on, its repair history (``repair[1]: ...``).
     """
 
     path: Path
@@ -292,6 +295,7 @@ class FieldAnswer:
     gate_p: float | None = None
     crosscheck_agree: bool | None = None
     reask: bool = False
+    repaired: bool = False
     rejected_reason: str | None = None
     warnings: tuple[str, ...] = ()
 
@@ -416,7 +420,9 @@ class ExtractionResult:
             they belong to a schema that did not run, or they are opaque
             records kept by ``existing_schema_policy=False``.
         deleted: Ids of existing records that were deleted.
-        attempts: Extraction rounds that ran (0 when nothing was extracted).
+        attempts: Extraction rounds that ran: 0 when nothing was extracted, else
+            1 plus the repair rounds of the record that needed the most (one
+            repair round, however many fields it re-asks, is one attempt).
         usage: Token and request totals by model and by call kind.
         cost: Priced part of ``usage``.
         calls: One ``CallRecord`` per transport call, failed ones included.

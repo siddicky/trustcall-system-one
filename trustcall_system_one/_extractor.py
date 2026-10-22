@@ -32,6 +32,7 @@ from trustcall_system_one._config import (
     PassesConfig,
     PresenceConfig,
     Prices,
+    RepairConfig,
     VerifyConfig,
 )
 from trustcall_system_one._entity import ask_presence, insert_one, update_one
@@ -335,6 +336,7 @@ class _Done:
     skipped: SkippedEntity | None
     handled: tuple[str, str] | None
     extracted: bool
+    attempts: int = 0
 
 
 def _inner(item: Any) -> SchemaLike:
@@ -369,6 +371,7 @@ class Extractor:
         presence: Presence-gate thresholds.
         verify: Verification-ladder settings.
         gates: Answer-level thresholds.
+        repair: Validation repair loop settings.
         passes: How Clairic fields are grouped into requests.
         limits: Structural limits.
         concurrency: Concurrency limits of the default transport (no effect on
@@ -391,6 +394,7 @@ class Extractor:
     presence: PresenceConfig = field(default_factory=PresenceConfig)
     verify: VerifyConfig = field(default_factory=VerifyConfig)
     gates: GateConfig = field(default_factory=GateConfig)
+    repair: RepairConfig = field(default_factory=RepairConfig)
     passes: PassesConfig = field(default_factory=PassesConfig)
     limits: Limits = field(default_factory=Limits)
     concurrency: ConcurrencyConfig | None = None
@@ -585,6 +589,7 @@ class Extractor:
             presence=self.presence,
             gates=self.gates,
             passes=self.passes,
+            repair=self.repair,
             limits=self.limits,
             images=list(images) if images else None,
             reference_date=_iso_date(
@@ -662,7 +667,7 @@ class Extractor:
             ),
             skipped=tuple(o.skipped for o in outcomes if o.skipped is not None),
             untouched=records.untouched(handled),
-            attempts=1 if any(o.extracted for o in outcomes) else 0,
+            attempts=max((o.attempts for o in outcomes), default=0),
             usage=run.usage,
             cost=self.prices.cost(run.usage),
             calls=tuple(run.calls),
@@ -681,11 +686,21 @@ class Extractor:
         """Decide which schema each ``"__any__"`` record belongs to.
 
         A record that may be of any schema is updated by at most ONE schema, or
-        two schemas would write conflicting patches for it. Among the schemas
-        that have no record of their own: the only one whose model validates the
-        record claims it; else the most present in the input does (the
-        presence of every candidate is asked first, in parallel). The others
-        behave as if the record did not exist. A warning names the claimant.
+        two schemas would write conflicting patches for it, and a schema takes at
+        most ONE such record (it is a ``One``). Claims are one-to-one: once a
+        schema has claimed a record it leaves the candidates, and a record that
+        no schema is left to claim stays untouched (with a warning), so this
+        never raises after calls were spent.
+
+        Among the schemas that have no record of their own and no claim yet,
+        only those whose presence in the input passes the presence threshold
+        can claim: a schema the input is not about cannot take a record just
+        because its model happens to validate it (an all-optional schema
+        validates almost anything). Of the present ones, the only one whose
+        model validates the record claims it; when several or none validate, the
+        most present does. The presence of every candidate is asked first, in
+        parallel, and not asked again. A schema that loses the claim takes the
+        insert path. A warning names the claimant.
 
         Returns:
             The claimant's schema name by record id, and the presence
@@ -694,34 +709,59 @@ class Extractor:
         claims: dict[str, str] = {}
         presences: dict[str, float] = {}
         candidates = [e for e in entries if not records.named(e.plan.name)]
+        open_ = list(candidates)  # schemas that have not claimed a record yet
+        floor = run.presence.threshold_absent
         for record in records.named(ANY):
-            if len(candidates) <= 1:
+            if not open_:
                 if candidates:
-                    claims[record.record_id] = candidates[0].plan.name
+                    run.warn(
+                        f"the {ANY!r} record {record.record_id!r} was claimed by "
+                        "no schema (each candidate took another such record); it "
+                        "is left untouched"
+                    )
                 continue
-            fitting = [e for e in candidates if fits(e.plan, record)]
+            if len(candidates) <= 1:
+                claims[record.record_id] = open_.pop().plan.name
+                continue
+            missing = [e for e in open_ if e.plan.name not in presences]
+            if missing and not forced:
+                asked = await gather(
+                    *(ask_presence(run, e.plan, text, e.label) for e in missing)
+                )
+                presences.update(
+                    {e.plan.name: p for e, p in zip(missing, asked, strict=True)}
+                )
+            present = [
+                e for e in open_ if forced or presences.get(e.plan.name, 0.0) >= floor
+            ]
+            if not present:
+                run.warn(
+                    f"the {ANY!r} record {record.record_id!r} was claimed by no "
+                    "schema (none of the candidates is present in the input); it "
+                    "is left untouched"
+                )
+                continue
+            fitting = [e for e in present if fits(e.plan, record)]
             if len(fitting) == 1:
-                claim, how = fitting[0], "the only schema whose model validates it"
+                claim, how = (
+                    fitting[0],
+                    "the only present schema whose model validates it",
+                )
             else:
-                pool = fitting or candidates
-                missing = [e for e in pool if e.plan.name not in presences]
-                if missing and not forced:
-                    asked = await gather(
-                        *(ask_presence(run, e.plan, text, e.label) for e in missing)
-                    )
-                    presences.update(
-                        {e.plan.name: p for e, p in zip(missing, asked, strict=True)}
-                    )
-                claim = max(pool, key=lambda e: presences.get(e.plan.name, 0.0))
+                claim = max(
+                    fitting or present, key=lambda e: presences.get(e.plan.name, 0.0)
+                )
                 how = (
                     "the schema most present in the input "
                     f"(p={presences.get(claim.plan.name, 0.0):.2f})"
                 )
+            open_.remove(claim)
             claims[record.record_id] = claim.plan.name
             others = [e.plan.name for e in candidates if e is not claim]
             run.warn(
                 f"the {ANY!r} record {record.record_id!r} was given to "
-                f"{claim.plan.name} ({how}); {', '.join(others)} treat it as absent"
+                f"{claim.plan.name} ({how}); {', '.join(others)} take the insert "
+                "path unless they claim another such record"
             )
         return claims, presences
 
@@ -738,7 +778,13 @@ class Extractor:
         outcome = await insert_one(
             run, plan, text, label=label, skip_presence=skip, presence=presence
         )
-        return _Done(outcome.record, None, None, outcome.extracted)
+        return _Done(
+            outcome.record,
+            outcome.skipped,
+            None,
+            outcome.extracted,
+            outcome.attempts,
+        )
 
     async def _update(
         self,
@@ -762,7 +808,11 @@ class Extractor:
             presence=presence,
         )
         return _Done(
-            outcome.record, outcome.skipped, outcome.handled, outcome.extracted
+            outcome.record,
+            outcome.skipped,
+            outcome.handled,
+            outcome.extracted,
+            outcome.attempts,
         )
 
     @overload
@@ -953,6 +1003,7 @@ def create_extractor(
     presence: PresenceConfig | None = None,
     verify: VerifyConfig | None = None,
     gates: GateConfig | None = None,
+    repair: RepairConfig | None = None,
     passes: PassesConfig | None = None,
     limits: Limits | None = None,
     concurrency: ConcurrencyConfig | None = None,
@@ -983,6 +1034,8 @@ def create_extractor(
         presence: Presence-gate thresholds.
         verify: Verification-ladder settings.
         gates: Answer-level thresholds.
+        repair: Validation repair loop settings (on by default): a record that
+            fails validation gets one narrow re-ask per failing field.
         passes: How Clairic fields are grouped into requests.
         limits: Structural limits.
         concurrency: Concurrency limits of the default transport.
@@ -1013,6 +1066,7 @@ def create_extractor(
         presence=presence or PresenceConfig(),
         verify=verify or VerifyConfig(),
         gates=gates or GateConfig(),
+        repair=repair or RepairConfig(),
         passes=passes or PassesConfig(),
         limits=limits or Limits(),
         concurrency=concurrency,

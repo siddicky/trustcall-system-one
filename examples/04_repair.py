@@ -1,8 +1,6 @@
 """When validation fails, repair only the failing fields, with the error in hand.
 
-Needs milestone M6 (the repair loop). Until it lands the record simply comes back
-invalid and no repair request is made; the example prints that honestly, and
-``tests/unit/test_examples.py`` pins the gap so M6 has to update it.
+Needs milestone M6 (the repair loop), which this example is the demo of.
 ``uv run python examples/04_repair.py [--offline]``
 
 trustcall feeds validation errors back to the model so it can fix its tool call. Here
@@ -17,23 +15,28 @@ reason:
 
 * ``postcode`` must be five digits (``^\\d{5}$``) but the first answer is the whole
   address fragment "Berlin 10115", which is a verbatim span of the text and fails the
-  pattern. The re-ask sees the error and answers "10115": also a verbatim span.
+  pattern. Clairic only quotes the text, so the library re-asks ONCE, and only because
+  the text does hold something that matches ("10115"); the re-ask sees the pattern and
+  the error and answers "10115": also a verbatim span, which matches.
 * ``age`` must be 0..130. The text says "born in 1990" before it says "34 years old",
   and Clairic first answers 1990. The attribution check (Clef: "does the input say the
   age is 1990?") refuses it, so the required field is missing and validation fails with
-  "Field required". The re-ask answers 34.
+  "Field required". The re-ask (with a stricter null threshold, since the text does
+  state it) answers 34.
 
 Repair is for fixing *extraction* mistakes. Clairic is extractive, so a repaired value
 must be somewhere in the text; repair cannot turn "Germany" into an ISO code like "DE".
 To normalise to a vocabulary, make the field a ``Literal`` (or an ``Enum``): Clef then
 chooses among the allowed values and no validation error arises in the first place.
 
-Look at: the final valid record, the two ``repair`` calls (one per failing field,
-nothing else re-asked) and, offline, a repair request exactly as the library sent it,
-with the validation error in its state. Offline is the main mode: the answers are
-scripted so that the first attempt fails. Live, the models may well get both fields
-right first time, in which case no repair is needed and there is one extraction round;
-that is the feature working too.
+Look at: the final valid record, the two ``repair`` calls (one per failing field, in
+parallel, so the two together are ONE attempt: ``attempts`` is 2, the extraction plus
+one repair round; nothing else is re-asked) and, offline, a repair request exactly as
+the library sent it: the focus header, the input only (never an existing record), and
+the blocks ``<previous_attempt>``, ``<validation_errors>`` and ``<expected_schema>``.
+Offline is the main mode: the answers are scripted so that the first attempt fails.
+Live, the models may well get both fields right first time, in which case no repair is
+needed and there is one extraction round; that is the feature working too.
 """
 
 import sys
@@ -143,8 +146,11 @@ def main(offline: bool = False) -> ExtractionResult:
         "The application, with the spans the model pointed at", APPLICATION, record
     )
     repairs = [call for call in result.calls if call.kind == "repair"]
-    outcome = "valid" if record.valid else "INVALID (no repair was attempted)"
-    print(f"extraction rounds: {result.attempts}   final record: {outcome}")
+    outcome = "valid" if record.valid else "INVALID (the repair did not fix it)"
+    print(
+        f"attempts: {result.attempts} (1 extraction + {result.attempts - 1} repair "
+        f"round)   final record: {outcome}"
+    )
     for call in repairs:
         print(f"  repair call for field {call.field!r}")
     print()

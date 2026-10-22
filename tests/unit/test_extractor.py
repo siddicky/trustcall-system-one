@@ -1049,7 +1049,7 @@ async def test_validation_failure_is_an_invalid_record() -> None:
     assert record.fields["age"].value == 12
     assert result.responses == ()
     assert result.response_metadata == []
-    assert result.skipped == ()
+    assert result.skipped == ()  # (with the repair loop on there is an entry)
 
 
 async def test_strict_validation_failure_raises_with_the_record_and_calls() -> None:
@@ -1328,6 +1328,7 @@ def test_public_names_are_exported() -> None:
         "VerifyConfig",
         "PresenceConfig",
         "PassesConfig",
+        "RepairConfig",
         "ExtractionResult",
         "ResultRecord",
         "FieldAnswer",

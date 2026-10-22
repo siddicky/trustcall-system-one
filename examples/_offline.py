@@ -537,6 +537,18 @@ class OfflineScript:
         }
 
     def _repair(self, call: Call) -> Mapping[str, Any]:
+        """A narrow re-ask: one field, with the error and the input only."""
+        state = call.state
+        marker = (
+            "<validation_errors>" if isinstance(state, str) else "validation_errors"
+        )
+        if marker not in state:
+            raise ScriptError(
+                f"a repair request should carry the validation errors in its state "
+                f"(field {call.meta.field!r})"
+            )
+        if len(call.ids) != 1 or call.meta.field != call.ids[0]:
+            raise ScriptError("a repair request asks exactly one field, named in meta")
         return {
             name: _consume(_lookup(self.repair, call.label, name, "repair answer"))
             for name in call.ids
