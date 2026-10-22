@@ -96,8 +96,21 @@ def _build(entries: list[tuple[Path, Any]], depth: int, warnings: list[str]) -> 
     return [_build(groups[index], depth + 1, warnings) for index in indexes]
 
 
+def _validation_keys(doc: Mapping[str, Any], plan: "SchemaPlan") -> dict[str, Any]:
+    """Rename top-level keys to the keys ``model_validate`` accepts."""
+    keys = {
+        spec.path[0]: spec.alias
+        for spec in plan.specs
+        if len(spec.path) == 1 and spec.alias is not None
+    }
+    return {keys.get(key, key): value for key, value in doc.items()}
+
+
 def unflatten(
-    items: Mapping[Path, Any], warnings: list[str] | None = None
+    items: Mapping[Path, Any],
+    warnings: list[str] | None = None,
+    *,
+    plan: "SchemaPlan | None" = None,
 ) -> dict[str, Any]:
     """Rebuild a nested document from ``{path: leaf}``.
 
@@ -108,6 +121,9 @@ def unflatten(
     Args:
         items: Leaf values keyed by path.
         warnings: Optional list that receives one message per compacted list.
+        plan: When given, top-level keys of fields that have an ``alias`` (or a
+            string ``validation_alias``) are renamed to it, so the result is
+            accepted by ``model_validate`` even without ``populate_by_name``.
 
     Returns:
         The document. An empty mapping gives ``{}``.
@@ -125,7 +141,7 @@ def unflatten(
     document = _build(entries, 0, collected)
     if not isinstance(document, dict):
         raise ValueError("the top level of a document must be an object")
-    return document
+    return _validation_keys(document, plan) if plan is not None else document
 
 
 def prune_nulls(doc: Mapping[str, Any], plan: "SchemaPlan") -> dict[str, Any]:
@@ -136,7 +152,9 @@ def prune_nulls(doc: Mapping[str, Any], plan: "SchemaPlan") -> dict[str, Any]:
     ``None`` for a field without a default is kept, which is what an
     ``Optional`` field without a default needs to validate; for a required
     non-``Optional`` field it stays so validation reports the gap. Keys the
-    plan does not know are kept unchanged.
+    plan does not know are kept unchanged. Keys may be field names or their
+    aliases; the result is keyed by the validation key (the alias when the field
+    has one), so it can go straight to ``model_validate``.
 
     Args:
         doc: A top-level document.
@@ -145,11 +163,15 @@ def prune_nulls(doc: Mapping[str, Any], plan: "SchemaPlan") -> dict[str, Any]:
     Returns:
         A new dict without the prunable ``None`` values.
     """
-    defaulted = {
-        spec.path[0] for spec in plan.specs if len(spec.path) == 1 and spec.has_default
-    }
-    return {
+    defaulted: set[str] = set()
+    for spec in plan.specs:
+        if len(spec.path) == 1 and spec.has_default:
+            defaulted.add(str(spec.path[0]))
+            if spec.alias is not None:
+                defaulted.add(spec.alias)
+    pruned = {
         key: value
         for key, value in doc.items()
         if not (value is None and key in defaulted)
     }
+    return _validation_keys(pruned, plan)

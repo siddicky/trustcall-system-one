@@ -5,7 +5,7 @@ from typing import Any
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
-from pydantic import BaseModel
+from pydantic import AliasPath, BaseModel, ConfigDict, Field, ValidationError
 from typing_extensions import NotRequired, TypedDict
 
 from trustcall_system_one import compile_schema
@@ -173,3 +173,69 @@ class Item(TypedDict):
 def test_prune_nulls_drops_none_for_not_required_typed_dict_keys() -> None:
     plan = compile_schema(Item)
     assert prune_nulls({"id": 1, "note": None}, plan) == {"id": 1}
+
+
+# --------------------------------------------------------------------------- #
+# Aliases: documents must be accepted by model_validate
+# --------------------------------------------------------------------------- #
+
+
+class Aliased(BaseModel):
+    full_name: str = Field(alias="fullName")
+    nick: str | None = Field(default=None, alias="nickName")
+    age: int = Field(default=3, validation_alias="ageYears")
+    plain: str = "p"
+
+
+def test_unflatten_with_a_plan_uses_the_validation_keys() -> None:
+    plan = compile_schema(Aliased)
+    doc = unflatten({("full_name",): "Ada", ("age",): 40, ("plain",): "x"}, plan=plan)
+    assert doc == {"fullName": "Ada", "ageYears": 40, "plain": "x"}
+    assert Aliased.model_validate(doc) == Aliased(
+        fullName="Ada", ageYears=40, plain="x"
+    )
+
+
+def test_unflatten_without_a_plan_keeps_field_names() -> None:
+    assert unflatten({("full_name",): "Ada"}) == {"full_name": "Ada"}
+
+
+def test_aliased_documents_validate_without_populate_by_name() -> None:
+    assert Aliased.model_config.get("populate_by_name") in (None, False)
+    plan = compile_schema(Aliased)
+    with pytest.raises(ValidationError):
+        Aliased.model_validate({"full_name": "Ada"})
+    doc = prune_nulls(
+        unflatten({("full_name",): "Ada", ("nick",): None, ("age",): None}), plan
+    )
+    assert doc == {"fullName": "Ada"}
+    assert Aliased.model_validate(doc).age == 3
+
+
+def test_prune_nulls_accepts_alias_keys_too() -> None:
+    plan = compile_schema(Aliased)
+    doc = prune_nulls({"fullName": "Ada", "nickName": None, "ageYears": None}, plan)
+    assert doc == {"fullName": "Ada"}
+
+
+def test_populate_by_name_models_still_get_alias_keys() -> None:
+    class Both(BaseModel):
+        model_config = ConfigDict(populate_by_name=True)
+
+        full_name: str = Field(alias="fullName")
+
+    plan = compile_schema(Both)
+    doc = unflatten({("full_name",): "Ada"}, plan=plan)
+    assert doc == {"fullName": "Ada"}
+    assert Both.model_validate(doc).full_name == "Ada"
+
+
+def test_alias_path_falls_back_to_the_field_name() -> None:
+    class Pathy(BaseModel):
+        model_config = ConfigDict(populate_by_name=True)
+
+        a: str = Field(validation_alias=AliasPath("x", "y"))
+
+    plan = compile_schema(Pathy)
+    assert unflatten({("a",): "v"}, plan=plan) == {"a": "v"}
+    assert plan.spec(("a",)).warnings == ("alias_path",)

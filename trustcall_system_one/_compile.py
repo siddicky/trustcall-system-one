@@ -14,6 +14,7 @@ import inspect
 import ipaddress
 import pathlib
 import re
+import sys
 import types
 import typing
 import uuid
@@ -23,9 +24,11 @@ from decimal import Decimal
 from typing import Annotated, Any, Literal, Union
 
 import annotated_types
+import pydantic
+import pydantic.networks
 import pydantic_core
 import typing_extensions
-from pydantic import AnyUrl, BaseModel
+from pydantic import AliasChoices, AliasPath, BaseModel
 from pydantic.fields import FieldInfo
 
 from trustcall_system_one._config import GateConfig, Limits
@@ -36,6 +39,7 @@ from trustcall_system_one._names import (
     pretty,
 )
 from trustcall_system_one._schemas import SchemaLike, coerce_schema
+from trustcall_system_one._types import UNSTATED
 from trustcall_system_one._wire import (
     ChoiceQuestion,
     ClairicField,
@@ -69,8 +73,13 @@ Engine = Literal[
     "collection",
     "mapping",
     "union_models",
+    "const",
 ]
-"""Which part of the system answers a field."""
+"""Which part of the system answers a field.
+
+``const`` is a single-option ``Literal`` or ``Enum`` on a required field: its
+value is filled in by code and nothing is asked.
+"""
 
 _DEFERRED_ENGINES = frozenset({"submodel", "collection", "mapping", "union_models"})
 _CLAIRIC_TYPES = (
@@ -114,6 +123,7 @@ _IDENTITY_NAMES = (
     "sku",
 )
 _MAX_CHOICE_OPTIONS = 255
+_UNSTATED_TEXT = "The input does not state this."
 _MIN_SCORE_LEVELS, _MAX_SCORE_LEVELS = 2, 10
 _AGGREGATION_RE = re.compile(
     r"\b(?:total|sum|average|mean|count) of\b|\baggregate\b", re.IGNORECASE
@@ -148,6 +158,20 @@ _SET_ORIGINS: frozenset[Any] = frozenset({set, collections.abc.Set})
 _MAPPING_ORIGINS: frozenset[Any] = frozenset(
     {dict, collections.abc.Mapping, collections.abc.MutableMapping}
 )
+
+
+def _pydantic_types(*names: str) -> tuple[type[Any], ...]:
+    """Return the named pydantic classes that exist in the installed version."""
+    found: list[type[Any]] = []
+    for name in names:
+        candidate = getattr(pydantic, name, None) or getattr(
+            pydantic.networks, name, None
+        )
+        if isinstance(candidate, type):
+            found.append(candidate)
+    return tuple(found)
+
+
 _TEXT_LIKE: tuple[type[Any], ...] = (
     str,
     uuid.UUID,
@@ -157,8 +181,28 @@ _TEXT_LIKE: tuple[type[Any], ...] = (
     ipaddress.IPv4Network,
     ipaddress.IPv6Network,
     pydantic_core.Url,
-    AnyUrl,
+    pydantic_core.MultiHostUrl,
+    *_pydantic_types(
+        "AnyUrl",
+        "_BaseUrl",
+        "_BaseMultiHostUrl",
+        "EmailStr",
+        "NameEmail",
+        "IPvAnyAddress",
+        "IPvAnyInterface",
+        "IPvAnyNetwork",
+    ),
 )
+_TEMPORAL_ALIASES: dict[Any, Any] = {
+    **dict.fromkeys(_pydantic_types("PastDate", "FutureDate"), dt.date),
+    **dict.fromkeys(
+        _pydantic_types(
+            "AwareDatetime", "NaiveDatetime", "PastDatetime", "FutureDatetime"
+        ),
+        dt.datetime,
+    ),
+}
+_DOC_TYPE: Any = getattr(typing_extensions, "Doc", None)
 _UNION_TYPE_NAMES: dict[Any, str] = {
     str: "str",
     bool: "bool",
@@ -373,6 +417,10 @@ class FieldSpec:
         clef_name: Name of the Clef question, when there is one. It equals
             ``wire_name`` for Clef-engine fields and ``<field>.__type`` for a
             union of primitives (whose value is asked from Clairic).
+        nullable: Whether ``None`` is a valid value (``Optional`` fields).
+        alias: The key ``model_validate`` expects for this field when it is not
+            the field name (from ``alias`` or a plain-string
+            ``validation_alias``); ``None`` when the name itself is the key.
     """
 
     path: Path
@@ -396,6 +444,8 @@ class FieldSpec:
     extra: Mapping[str, Any] = field(default_factory=FrozenMap)
     warnings: tuple[str, ...] = ()
     clef_name: str = ""
+    nullable: bool = False
+    alias: str | None = None
 
 
 @dataclass(frozen=True, eq=False)
@@ -450,6 +500,9 @@ class SchemaPlan:
     ) -> dict[str, ClairicField]:
         """Return the Clairic fields to send, keyed by wire name.
 
+        The fields are deep copies, so callers may change them without
+        affecting the cached plan.
+
         Args:
             paths: Restrict to these paths; ``None`` means every field.
 
@@ -457,7 +510,7 @@ class SchemaPlan:
             KeyError: If a path is not a field of the schema.
         """
         return {
-            spec.wire_name: spec.clairic
+            spec.wire_name: spec.clairic.model_copy(deep=True)
             for spec in self._select(paths)
             if spec.clairic is not None
         }
@@ -467,6 +520,9 @@ class SchemaPlan:
     ) -> dict[str, Question]:
         """Return the Clef questions to send, keyed by wire name.
 
+        The questions are deep copies, so callers may change them without
+        affecting the cached plan.
+
         Args:
             paths: Restrict to these paths; ``None`` means every field.
 
@@ -474,7 +530,7 @@ class SchemaPlan:
             KeyError: If a path is not a field of the schema.
         """
         return {
-            spec.clef_name: spec.clef
+            spec.clef_name: spec.clef.model_copy(deep=True)
             for spec in self._select(paths)
             if spec.clef is not None
         }
@@ -566,7 +622,14 @@ def _constraints(metadata: Iterable[Any]) -> dict[str, Any]:
 
 
 def _is_model(tp: Any) -> bool:
-    return isinstance(tp, type) and issubclass(tp, BaseModel)
+    """Whether ``tp`` is a model-like class: a pydantic model or a TypedDict.
+
+    A nested TypedDict is recorded like a nested model; the expander converts it
+    with ``coerce_schema``.
+    """
+    return isinstance(tp, type) and (
+        issubclass(tp, BaseModel) or typing_extensions.is_typeddict(tp)
+    )
 
 
 def _is_enum(tp: Any) -> bool:
@@ -671,11 +734,25 @@ def _member_description(member: enum.Enum) -> str | None:
 
 @dataclass
 class _Option:
-    """One choice (or score level): id, Python value and description."""
+    """One choice (or score level): id, Python value and descriptions.
+
+    ``description`` is the raw description (an enum member's own text, if any)
+    and ``criterion`` the text sent as the option's criteria entry.
+    """
 
     id: str
     value: Any
     description: str | None
+    criterion: str | None
+
+
+@dataclass(frozen=True)
+class _Candidate:
+    """A Literal value or Enum member before it gets an option id."""
+
+    value: Any
+    name: str | None = None
+    description: str | None = None
 
 
 @dataclass
@@ -693,6 +770,7 @@ class _Kind:
     post: str = ""
     warnings: list[str] = field(default_factory=list)
     union_names: list[str] = field(default_factory=list)
+    bounds: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -707,7 +785,23 @@ class _Ctx:
     required: bool
     gates: GateConfig
     limits: Limits
-    stack: tuple[type[BaseModel], ...]
+    model: type[BaseModel]
+
+
+def _resolve(ctx: _Ctx, tp: Any) -> Any:
+    """Resolve a leftover forward reference to the model or a module-level class.
+
+    pydantic leaves a reference nested in a generic (``list["Node"]``) as a
+    string on some Python versions. The common case is a model naming itself.
+    """
+    if isinstance(tp, typing.ForwardRef):
+        tp = tp.__forward_arg__
+    if not isinstance(tp, str):
+        return tp
+    if tp == ctx.model.__name__:
+        return ctx.model
+    found = getattr(sys.modules.get(ctx.model.__module__), tp, None)
+    return found if isinstance(found, type) else tp
 
 
 def _option_id(text: str, used: set[str]) -> str:
@@ -721,17 +815,66 @@ def _option_id(text: str, used: set[str]) -> str:
     return candidate
 
 
-def _options_for(values: list[Any], descriptions: list[str | None]) -> list[_Option]:
+def _criterion(option_id: str, candidate: _Candidate) -> str:
+    """Return the criteria text for an option.
+
+    The text carries what the id alone would lose: an enum member's name and
+    value, or a literal's original spelling when sanitising changed it, followed
+    by the member's own description. With nothing to add it is the original
+    value.
+    """
+    raw = str(candidate.value)
+    if candidate.name is not None:
+        label: str | None = (
+            candidate.name if raw == candidate.name else f"{candidate.name} ({raw})"
+        )
+    else:
+        label = raw if option_id != raw else None
+    if label == option_id:
+        label = None
+    parts = [part for part in (label, candidate.description) if part]
+    return ": ".join(parts) if parts else raw
+
+
+def _options_for(candidates: list[_Candidate]) -> list[_Option]:
     used: set[str] = set()
-    return [
-        _Option(_option_id(str(value), used), value, description)
-        for value, description in zip(values, descriptions, strict=True)
-    ]
+    options: list[_Option] = []
+    for candidate in candidates:
+        text = candidate.name if candidate.name is not None else str(candidate.value)
+        option_id = _option_id(text, used)
+        options.append(
+            _Option(
+                option_id,
+                candidate.value,
+                candidate.description,
+                _criterion(option_id, candidate),
+            )
+        )
+    return options
 
 
-def _choice_kind(ctx: _Ctx, values: list[Any], descriptions: list[str | None]) -> _Kind:
-    """Build the Clef choice or score kind for a set of option values."""
-    options = _options_for(values, descriptions)
+def _unstated_option(options: list[_Option]) -> _Option:
+    used = {option.id for option in options}
+    return _Option(_option_id("unstated", used), UNSTATED, None, _UNSTATED_TEXT)
+
+
+def _candidates(base: Any) -> list[_Candidate]:
+    if _is_enum(base):
+        return [
+            _Candidate(member.value, member.name, _member_description(member))
+            for member in base
+        ]
+    values, _ = _literal_values(base)
+    return [_Candidate(value) for value in values]
+
+
+def _choice_kind(ctx: _Ctx, candidates: list[_Candidate]) -> _Kind:
+    """Build the Clef choice or score kind for a set of option values.
+
+    A choice on a field that is nullable or has a default gets an extra
+    ``unstated`` option, so an unmentioned field is not forced to a real value.
+    """
+    options = _options_for(candidates)
     wanted = ctx.options.get("clef")
     if wanted not in (None, "choice", "score"):
         raise ValueError(
@@ -750,13 +893,18 @@ def _choice_kind(ctx: _Ctx, values: list[Any], descriptions: list[str | None]) -
             options=options,
             key_map={str(i): option.value for i, option in enumerate(options)},
         )
-    if len(options) > _MAX_CHOICE_OPTIONS:
+    if len(options) > _MAX_CHOICE_OPTIONS - (0 if ctx.required else 1):
         raise ValueError(
-            f"field {ctx.pretty!r} has {len(options)} options; a Clef choice "
-            f"supports at most {_MAX_CHOICE_OPTIONS}"
+            f"field {ctx.pretty!r} has {len(options) + (0 if ctx.required else 1)} "
+            f"options; a Clef choice supports at most {_MAX_CHOICE_OPTIONS}"
         )
+    if len(options) == 1 and ctx.required:
+        only = options[0]
+        return _Kind("const", key_map={only.id: only.value}, post="const")
     if len(options) < 2:
         return _Kind("skip", warnings=["single_option"])
+    if not ctx.required:
+        options.append(_unstated_option(options))
     return _Kind(
         "clef",
         clef="choice",
@@ -771,10 +919,11 @@ def _bool_kind(ctx: _Ctx) -> _Kind:
         raise ValueError(f"field {ctx.pretty!r}: a bool cannot be scored")
     if wanted == "choice" or (ctx.nullable and wanted != "noul"):
         options = [
-            _Option("yes", True, "The input says this is true."),
-            _Option("no", False, "The input says this is false."),
-            _Option("unstated", None, "The input does not say."),
+            _Option("yes", True, None, "The input says this is true."),
+            _Option("no", False, None, "The input says this is false."),
         ]
+        if not ctx.required:
+            options.append(_unstated_option(options))
         return _Kind(
             "clef",
             clef="choice",
@@ -790,26 +939,23 @@ def _number_kind(ctx: _Ctx, base: Any) -> _Kind:
     if base is int:
         clairic: dict[str, Any] = {"type": "number", "integer": True}
         post = "int"
-    elif base is Decimal:
-        decimals = ctx.options.get("decimals", c.get("decimal_places", 2))
-        clairic = {"type": "number", "decimals": decimals}
-        post = "decimal"
     else:
         clairic = {"type": "number"}
         decimals = ctx.options.get("decimals", c.get("decimal_places"))
         if decimals is not None:
             clairic["decimals"] = decimals
-        post = "float"
+        post = "decimal" if base is Decimal else "float"
     kind = _Kind("clairic", clairic=clairic, hints=hints, post=post)
     if "decimals" in clairic and not 0 <= clairic["decimals"] <= 6:
         clairic["decimals"] = min(6, max(0, clairic["decimals"]))
         kind.warnings.append("decimals_clamped")
     low = c.get("ge", c.get("gt"))
     high = c.get("le", c.get("lt"))
-    if ctx.limits.estimate_for_bounded_numbers and low is not None and high is not None:
-        bounds = {"min": _bound(low, base), "max": _bound(high, base)}
-        clairic.clear()
-        clairic.update(type="estimate", **bounds)
+    if low is not None and high is not None:
+        kind.bounds = {"min": _bound(low, base), "max": _bound(high, base)}
+        if ctx.limits.estimate_for_bounded_numbers:
+            clairic.clear()
+            clairic.update(type="estimate", **kind.bounds)
     return kind
 
 
@@ -817,9 +963,8 @@ def _bound(value: Any, base: Any) -> Any:
     return int(value) if base is int else float(value)
 
 
-def _item_kind(item: _Shape, unit: str) -> tuple[str, str] | None:
+def _item_kind(base: Any, unit: str) -> tuple[str, str] | None:
     """Return ``(item_kind, clairic items)`` for a supported list element."""
-    base = item.base
     table: dict[Any, tuple[str, str]] = {
         str: ("str", "text"),
         int: ("int", "number"),
@@ -835,7 +980,7 @@ def _item_kind(item: _Shape, unit: str) -> tuple[str, str] | None:
     found = table.get(base)
     if found is not None:
         return found
-    if isinstance(base, type) and issubclass(base, str) and not _is_enum(base):
+    if isinstance(base, type) and issubclass(base, _TEXT_LIKE) and not _is_enum(base):
         return ("str", "text")
     return None
 
@@ -845,20 +990,17 @@ def _list_kind(ctx: _Ctx, container: str, item: _Shape) -> _Kind:
     c = ctx.constraints
     hints = _length_hints(c, "items")
     post = "" if container == "list" else container
-    base = item.base
+    resolved = _resolve(ctx, item.base)
+    base = _TEMPORAL_ALIASES.get(resolved, resolved)
     if _is_model(base) or (
         item.members is not None and all(_is_model(m.base) for m in item.members)
     ):
-        return _model_kind(
-            ctx,
-            "collection",
-            [base] if _is_model(base) else [m.base for m in item.members or ()],
-        )
+        return _model_kind(ctx, "collection")
     if base is typing.Any or base is object or base is dict:
         return _Kind("skip")
     if typing_extensions.get_origin(base) in _LITERAL_ORIGINS or _is_enum(base):
-        values, descriptions = _choice_values(base)
-        options = _options_for(values, descriptions)
+        candidates = _candidates(base)
+        options = _options_for(candidates)
         kind = _Kind(
             "clairic",
             clairic={"type": "list", "items": "text"},
@@ -868,10 +1010,12 @@ def _list_kind(ctx: _Ctx, container: str, item: _Shape) -> _Kind:
             post=post,
         )
         kind.hints.append(
-            "Each item must be one of: " + ", ".join(o.id for o in options[:30]) + "."
+            "Each item must be one of: "
+            + ", ".join(str(c.value) for c in candidates[:30])
+            + "."
         )
         return kind
-    parsed = _item_kind(item, unit)
+    parsed = _item_kind(base, unit)
     if parsed is None:
         return _Kind("skip", warnings=["unsupported_list_item"])
     item_kind, items = parsed
@@ -891,22 +1035,14 @@ def _list_kind(ctx: _Ctx, container: str, item: _Shape) -> _Kind:
     return kind
 
 
-def _choice_values(base: Any) -> tuple[list[Any], list[str | None]]:
-    if _is_enum(base):
-        members = list(base)
-        return (
-            [member.value for member in members],
-            [_member_description(member) for member in members],
-        )
-    values, _ = _literal_values(base)
-    return values, [None] * len(values)
+def _model_kind(ctx: _Ctx, engine: Engine) -> _Kind:
+    """Record a nested-model field, applying the depth guard.
 
-
-def _model_kind(ctx: _Ctx, engine: Engine, models: list[Any]) -> _Kind:
-    """Record a nested-model field, applying the depth and recursion guards."""
-    if len(ctx.path) + 1 > ctx.limits.max_depth or any(
-        model in ctx.stack for model in models
-    ):
+    Recursion is not detected here: a self-referencing model is recorded as a
+    deferred ``submodel`` or ``collection`` and the expander enforces
+    ``limits.max_depth`` as it descends.
+    """
+    if len(ctx.path) + 1 > ctx.limits.max_depth:
         return _Kind("skip", warnings=["max_depth"])
     return _Kind(engine)
 
@@ -914,12 +1050,12 @@ def _model_kind(ctx: _Ctx, engine: Engine, models: list[Any]) -> _Kind:
 def _union_kind(ctx: _Ctx, shape: _Shape) -> _Kind:
     members = shape.members or ()
     if all(_is_model(m.base) for m in members):
-        return _model_kind(ctx, "union_models", [m.base for m in members])
+        return _model_kind(ctx, "union_models")
     if all(typing_extensions.get_origin(m.base) in _LITERAL_ORIGINS for m in members):
-        values: list[Any] = []
+        candidates: list[_Candidate] = []
         for member in members:
-            values.extend(_literal_values(member.base)[0])
-        return _choice_kind(ctx, values, [None] * len(values))
+            candidates.extend(_candidates(member.base))
+        return _choice_kind(ctx, candidates)
     names: list[str] = []
     for member in members:
         name = _UNION_TYPE_NAMES.get(member.base)
@@ -934,7 +1070,10 @@ def _union_kind(ctx: _Ctx, shape: _Shape) -> _Kind:
         "clairic",
         clairic={"type": "text"},
         clef="choice",
-        options=[_Option(name, name, _UNION_TYPE_HELP[name]) for name in names],
+        options=[
+            _Option(name, name, _UNION_TYPE_HELP[name], _UNION_TYPE_HELP[name])
+            for name in names
+        ],
         key_map={name: name for name in names},
         post="union",
         union_names=names,
@@ -942,10 +1081,11 @@ def _union_kind(ctx: _Ctx, shape: _Shape) -> _Kind:
 
 
 def _classify(ctx: _Ctx, shape: _Shape) -> _Kind:
-    base = shape.base
+    base = _resolve(ctx, shape.base)
     c = ctx.constraints
     if shape.members is not None:
         return _union_kind(ctx, shape)
+    base = _TEMPORAL_ALIASES.get(base, base)
     origin = typing_extensions.get_origin(base)
     if base is typing.Any or base is object:
         return _any_kind(ctx)
@@ -956,14 +1096,15 @@ def _classify(ctx: _Ctx, shape: _Shape) -> _Kind:
         if args[0] is not str:
             return _Kind("skip", warnings=["unsupported_mapping_key"])
         return _Kind("mapping")
-    if origin in _LITERAL_ORIGINS:
-        values, _ = _literal_values(base)
-        return _choice_kind(ctx, values, [None] * len(values))
-    if _is_enum(base):
-        values, descriptions = _choice_values(base)
-        return _choice_kind(ctx, values, descriptions)
+    if origin in _LITERAL_ORIGINS or _is_enum(base):
+        return _choice_kind(ctx, _candidates(base))
     if _is_model(base):
-        return _model_kind(ctx, "submodel", [base])
+        return _model_kind(ctx, "submodel")
+    if origin is tuple:
+        args = typing_extensions.get_args(base)
+        if len(args) == 2 and args[1] is Ellipsis:
+            return _list_kind(ctx, "list", _strip(args[0]))
+        return _Kind("skip", warnings=["unsupported_type"])
     if origin in _LIST_ORIGINS or base is list:
         args = typing_extensions.get_args(base)
         return _list_kind(ctx, "list", _strip(args[0]) if args else _Shape(typing.Any))
@@ -1042,18 +1183,58 @@ def _s1_options(info: FieldInfo, pretty_name: str) -> dict[str, Any]:
     return dict(options)
 
 
-def _description(info: FieldInfo, shape: _Shape, name: str) -> str:
+def _doc_text(metadata: list[Any]) -> str | None:
+    """Return the text of a ``typing_extensions.Doc`` annotation, if present."""
+    if _DOC_TYPE is None:
+        return None
+    for item in metadata:
+        if isinstance(item, _DOC_TYPE):
+            text = getattr(item, "documentation", None)
+            if isinstance(text, str):
+                return text
+    return None
+
+
+def _description(info: FieldInfo, shape: _Shape, name: str, metadata: list[Any]) -> str:
+    """Pick the field description: Field, ``Doc``, title, then the name."""
     extra = info.json_schema_extra
     schema_description = extra.get("description") if isinstance(extra, dict) else None
     for candidate in (
         info.description,
         schema_description,
+        _doc_text(metadata),
         info.title,
         shape.description,
     ):
         if isinstance(candidate, str) and candidate.strip():
             return _clean(candidate)
     return _humanise(name)
+
+
+def _validation_key(name: str, info: FieldInfo) -> tuple[str | None, str | None]:
+    """Return ``(alias, warning)``: the key ``model_validate`` expects.
+
+    ``alias`` is ``None`` when the field name itself is accepted. A
+    ``validation_alias`` wins over ``alias``; an ``AliasChoices`` contributes
+    its first string choice. An ``AliasPath`` (or choices without a plain string)
+    cannot be written as a flat key, so the field name is used with a warning.
+    """
+    candidate: Any = info.validation_alias
+    if candidate is None:
+        candidate = info.alias
+    if isinstance(candidate, AliasChoices):
+        strings = [c for c in candidate.choices if isinstance(c, str)]
+        candidate = strings[0] if strings else candidate
+    if isinstance(candidate, AliasPath):
+        path = candidate.path
+        candidate = (
+            path[0] if len(path) == 1 and isinstance(path[0], str) else candidate
+        )
+    if isinstance(candidate, str):
+        return (None if candidate == name else candidate), None
+    if candidate is None:
+        return None, None
+    return None, "alias_path"
 
 
 def _synthesise(
@@ -1095,21 +1276,45 @@ def _choice_criteria(kind: _Kind, override: Any) -> Any:
     out: dict[str, Any] = {}
     for option in kind.options:
         text = mapping.get(option.id, mapping.get(str(option.value)))
-        out[option.id] = text if text is not None else option.description
+        out[option.id] = text if text is not None else option.criterion
     return out
 
 
-def _compile_field(
+@dataclass
+class _Draft:
+    """A classified field that still needs wire names and question text."""
+
+    name: str
+    info: FieldInfo
+    kind: _Kind
+    options: Mapping[str, Any]
+    description: str
+    required: bool
+    nullable: bool
+    has_default: bool
+    null_threshold: float
+    min_confidence: float
+    alias: str | None
+    warnings: list[str]
+    messages: list[str]
+
+    @property
+    def path(self) -> Path:
+        return (self.name,)
+
+
+_NUMBER_TYPES = frozenset({"number", "estimate", "forecast"})
+
+
+def _draft_field(
+    model: type[BaseModel],
     name: str,
     info: FieldInfo,
     *,
-    title: str,
     gates: GateConfig,
     limits: Limits,
-    stack: tuple[type[BaseModel], ...],
-    clairic_names: FieldNameMapBuilder,
-    clef_names: FieldNameMapBuilder,
-) -> tuple[FieldSpec, list[str]]:
+) -> _Draft:
+    """Classify one field and resolve everything that does not need a name."""
     path: Path = (name,)
     pretty_name = pretty(path)
     options = _s1_options(info, pretty_name)
@@ -1127,29 +1332,50 @@ def _compile_field(
         required=required,
         gates=gates,
         limits=limits,
-        stack=stack,
+        model=model,
     )
     kind = _Kind("skip") if options.get("skip") else _classify(ctx, shape)
     wanted_clef = options.get("clef")
-    if wanted_clef is not None and kind.clef is None and kind.engine != "skip":
+    if (
+        wanted_clef is not None
+        and kind.clef is None
+        and kind.engine not in ("skip", "const")
+    ):
         raise ValueError(
-            f"field {pretty_name!r}: s1_field(clef={wanted_clef!r}) only applies "
-            "to bool, Literal and Enum fields"
+            f"field {pretty_name!r}: s1_field(clef={wanted_clef!r}) only "
+            "applies to bool, Literal and Enum fields"
         )
-    description = _description(info, shape, name)
+    description = _description(info, shape, name, metadata)
     if "instructions" in options:
         description = _clean(options["instructions"])
-    messages: list[str] = []
     warnings = list(kind.warnings)
+    messages: list[str] = []
     if _AGGREGATION_RE.search(description):
         warnings.append("aggregation")
         messages.append(
             f"{pretty_name}: description {description!r} looks like an aggregate; "
             "derive it with a pydantic computed_field instead of extracting it"
         )
+    override = options.get("clairic_type")
+    if override is not None and kind.clairic is not None:
+        native = kind.clairic["type"]
+        if override != native and not (
+            override in _NUMBER_TYPES and native in _NUMBER_TYPES
+        ):
+            warnings.append("clairic_type_mismatch")
+            messages.append(
+                f"{pretty_name}: clairic_type={override!r} does not match the "
+                f"{native!r} field the annotation implies"
+            )
+    alias, alias_warning = _validation_key(name, info)
+    if alias_warning is not None:
+        warnings.append(alias_warning)
+        messages.append(
+            f"{pretty_name}: the validation alias is an AliasPath or has no plain "
+            "string choice; documents are keyed by the field name"
+        )
     for tag in kind.warnings:
         messages.append(f"{pretty_name}: {tag}")
-
     null_threshold = options.get(
         "null_threshold",
         gates.required_null_threshold if required else gates.optional_null_threshold,
@@ -1161,24 +1387,39 @@ def _compile_field(
             if kind.clairic is not None
             else gates.min_choice_confidence
         )
+    return _Draft(
+        name=name,
+        info=info,
+        kind=kind,
+        options=options,
+        description=description,
+        required=required,
+        nullable=nullable,
+        has_default=has_default,
+        null_threshold=null_threshold,
+        min_confidence=min_confidence,
+        alias=alias,
+        warnings=warnings,
+        messages=messages,
+    )
 
-    wire = ""
-    clef_name = ""
+
+def _build_spec(
+    draft: _Draft,
+    *,
+    title: str,
+    limits: Limits,
+    wire: str,
+    clef_name: str,
+    shortened_clairic: bool,
+    shortened_clef: bool,
+) -> FieldSpec:
+    """Write the question text and assemble the spec once names are known."""
+    kind, options, description = draft.kind, draft.options, draft.description
+    path, pretty_name = draft.path, pretty(draft.path)
     clairic_field: ClairicField | None = None
     clef_question: Question | None = None
     instructions = description
-    shortened_clairic = shortened_clef = False
-
-    if kind.clairic is not None:
-        wire = clairic_names.add(path)
-        shortened_clairic = wire in clairic_names.shortened
-    if kind.clef is not None:
-        if kind.clairic is not None:
-            clef_name = clef_names.add(path, suffix="__type")
-        else:
-            clef_name = clef_names.add(path)
-            wire = clef_name
-        shortened_clef = clef_name in clef_names.shortened
 
     if kind.clairic is not None:
         prefix = _context(title, path) if shortened_clairic else ""
@@ -1195,13 +1436,16 @@ def _compile_field(
             fields["type"] = override
             if override == "list":
                 fields.setdefault("items", "text")
+            if override in ("estimate", "forecast"):
+                for key, bound in kind.bounds.items():
+                    fields.setdefault(key, bound)
         if "unit" in options and fields["type"] != "duration":
             fields["unit"] = options["unit"]
         if "integer" in options:
             fields["integer"] = options["integer"]
         if "decimals" in options and "decimals" not in fields:
             fields["decimals"] = options["decimals"]
-        fields["null_threshold"] = null_threshold
+        fields["null_threshold"] = draft.null_threshold
         try:
             clairic_field = ClairicField(instructions=instructions, **fields)
         except ValueError as exc:
@@ -1252,19 +1496,19 @@ def _compile_field(
                 criteria=_choice_criteria(kind, override_criteria),
             )
 
-    spec = FieldSpec(
+    return FieldSpec(
         path=path,
         pretty=pretty_name,
         wire_name=wire,
-        annotation=info.annotation,
-        required=required,
-        has_default=has_default,
+        annotation=draft.info.annotation,
+        required=draft.required,
+        has_default=draft.has_default,
         engine=kind.engine,
         clairic=clairic_field,
         clef=clef_question,
         key_map=FrozenMap(kind.key_map) if kind.key_map is not None else None,
-        null_threshold=null_threshold,
-        min_confidence=min_confidence,
+        null_threshold=draft.null_threshold,
+        min_confidence=draft.min_confidence,
         description=description,
         instructions=instructions,
         item_kind=kind.item_kind,
@@ -1276,10 +1520,11 @@ def _compile_field(
         post=kind.post,
         identity=bool(options.get("identity", False)),
         extra=FrozenMap(options),
-        warnings=tuple(warnings),
+        warnings=tuple(draft.warnings),
         clef_name=clef_name,
+        nullable=draft.nullable,
+        alias=draft.alias,
     )
-    return spec, messages
 
 
 def _identity(specs: tuple[FieldSpec, ...]) -> tuple[str, ...]:
@@ -1306,23 +1551,59 @@ def _compile_model(
 ) -> SchemaPlan:
     title = model.model_config.get("title") or model.__name__
     doc = inspect.cleandoc(model.__doc__) if model.__doc__ else ""
-    clairic_names = FieldNameMapBuilder("clairic")
-    clef_names = FieldNameMapBuilder("clef")
+    drafts = [
+        _draft_field(model, name, info, gates=gates, limits=limits)
+        for name, info in model.model_fields.items()
+    ]
+    # Names are allocated for the whole schema at once so that a collision gives
+    # every colliding path the digest form, whatever the declaration order.
+    clairic_builder = FieldNameMapBuilder("clairic")
+    clef_builder = FieldNameMapBuilder("clef")
+    clairic_requests: list[tuple[Path, str | None]] = []
+    clef_requests: list[tuple[Path, str | None]] = []
+    for draft in drafts:
+        if draft.kind.clairic is not None:
+            clairic_requests.append((draft.path, None))
+        if draft.kind.clef is not None:
+            clef_requests.append(
+                (draft.path, "__type" if draft.kind.clairic is not None else None)
+            )
+    clairic_names = dict(
+        zip(
+            (r[0] for r in clairic_requests),
+            clairic_builder.add_all(clairic_requests),
+            strict=True,
+        )
+    )
+    clef_assigned = dict(
+        zip(
+            (r[0] for r in clef_requests),
+            clef_builder.add_all(clef_requests),
+            strict=True,
+        )
+    )
+    clairic_short = clairic_builder.shortened
+    clef_short = clef_builder.shortened
     specs: list[FieldSpec] = []
     messages: list[str] = []
-    for name, info in model.model_fields.items():
-        spec, field_messages = _compile_field(
-            name,
-            info,
-            title=title,
-            gates=gates,
-            limits=limits,
-            stack=(model,),
-            clairic_names=clairic_names,
-            clef_names=clef_names,
+    for draft in drafts:
+        wire = clairic_names.get(draft.path, "")
+        clef_name = clef_assigned.get(draft.path, "")
+        if draft.kind.clairic is None:
+            wire = clef_name
+        specs.append(
+            _build_spec(
+                draft,
+                title=title,
+                limits=limits,
+                wire=wire,
+                clef_name=clef_name,
+                shortened_clairic=wire in clairic_short
+                and draft.kind.clairic is not None,
+                shortened_clef=clef_name in clef_short,
+            )
         )
-        specs.append(spec)
-        messages.extend(field_messages)
+        messages.extend(draft.messages)
     frozen_specs = tuple(specs)
     return SchemaPlan(
         schema=model,
@@ -1330,8 +1611,8 @@ def _compile_model(
         title=title,
         description=doc,
         specs=frozen_specs,
-        clairic_names=clairic_names.build(),
-        clef_names=clef_names.build(),
+        clairic_names=clairic_builder.build(),
+        clef_names=clef_builder.build(),
         identity=_identity(frozen_specs),
         warnings=tuple(messages),
     )

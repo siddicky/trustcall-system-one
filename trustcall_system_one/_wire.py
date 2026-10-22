@@ -117,6 +117,7 @@ _MAX_IMAGE_BYTES = 4 * 1024 * 1024
 _MAX_TOTAL_IMAGE_BYTES = 8 * 1024 * 1024
 _MAX_CLAIRIC_BODY_BYTES = 16 * 1024 * 1024
 _MAX_CLEF_BODY_BYTES = 13 * 1024 * 1024
+_BASE64 = re.compile(r"(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?")
 _DATA_URL = re.compile(r"data:([^;,]*)((?:;[^;,]*)*),(.*)", re.IGNORECASE | re.DOTALL)
 
 _DURATION_UNITS = frozenset(
@@ -127,7 +128,7 @@ _DURATION_UNITS = frozenset(
 class _Request(BaseModel):
     """Base class for request models: strict keys and a payload serialiser."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     def to_payload(self) -> dict[str, Any]:
         """Serialise to the JSON-ready request body, dropping unset optionals."""
@@ -149,11 +150,15 @@ def _decoded_size(content_type: str, payload: str) -> int:
         raise ValueError(
             f"image type must be one of {sorted(_IMAGE_TYPES)}, got {content_type!r}"
         )
+    stripped = payload.translate(_ASCII_WHITESPACE)
+    # Python 3.10's ``validate=True`` only checks the alphabet and tolerates
+    # excess padding, so the shape is checked explicitly to behave the same on
+    # every supported version.
+    if _BASE64.fullmatch(stripped) is None:
+        raise ValueError("image data is not valid base64")
     try:
         # MIME-wrapped base64 contains line breaks; they are not data.
-        size = len(
-            base64.b64decode(payload.translate(_ASCII_WHITESPACE), validate=True)
-        )
+        size = len(base64.b64decode(stripped, validate=True))
     except (binascii.Error, ValueError):
         raise ValueError("image data is not valid base64") from None
     if size > _MAX_IMAGE_BYTES:

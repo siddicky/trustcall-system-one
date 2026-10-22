@@ -9,7 +9,8 @@ rather than Python's per-process ``hash()``.
 
 import hashlib
 import re
-from collections.abc import Iterable, Mapping
+from collections import Counter
+from collections.abc import Iterable, Mapping, Sequence
 from types import MappingProxyType
 from typing import Literal
 
@@ -245,7 +246,10 @@ class FieldNameMapBuilder:
         return frozenset(name for _, name, short in self._entries if short)
 
     def add(self, path: Path, *, suffix: str | None = None) -> str:
-        """Allocate a name for a path.
+        """Allocate a name for one path.
+
+        Prefer ``add_all`` when the whole set of paths is known: ``add`` can only
+        see the names allocated before it, so the outcome depends on call order.
 
         Args:
             path: The leaf path.
@@ -258,16 +262,58 @@ class FieldNameMapBuilder:
         Raises:
             ValueError: If the path was already added or no name is free.
         """
-        key: Path = path if suffix is None else (*path, suffix)
-        if key in self._paths:
-            raise ValueError(f"path {pretty(key)!r} already has a wire name")
-        name = wire_name(path, target=self._target, taken=self._taken, suffix=suffix)
-        self._paths.add(key)
-        self._taken.add(name)
-        self._entries.append(
-            (key, name, name != _unshortened(path, self._target, suffix))
-        )
-        return name
+        return self.add_all([(path, suffix)])[0]
+
+    def add_all(self, entries: Sequence[tuple[Path, str | None]]) -> list[str]:
+        """Allocate names for a batch of paths, independent of their order.
+
+        Paths whose plain names coincide (for example ``"a b"`` and ``"a_b"``)
+        or that are too long all get the digest form; none of them keeps the
+        plain name. Digest names are allocated after the plain ones, so a digest
+        form can never take a name a plain path needs.
+
+        Args:
+            entries: ``(path, suffix)`` pairs; see ``wire_name`` for ``suffix``.
+
+        Returns:
+            The names, in the order of ``entries``.
+
+        Raises:
+            ValueError: If a path repeats (in the batch or from an earlier call)
+                or no free name exists.
+        """
+        limit = _LIMITS[self._target]
+        keys: list[Path] = []
+        plains: list[str] = []
+        for path, suffix in entries:
+            if not path:
+                raise ValueError("a wire name needs a non-empty path")
+            key: Path = path if suffix is None else (*path, suffix)
+            if key in self._paths or key in keys:
+                raise ValueError(f"path {pretty(key)!r} already has a wire name")
+            keys.append(key)
+            plains.append(_unshortened(path, self._target, suffix))
+        counts = Counter(plains)
+        names: list[str | None] = [None] * len(entries)
+        for index, plain in enumerate(plains):
+            if counts[plain] == 1 and len(plain) <= limit and plain not in self._taken:
+                names[index] = plain
+                self._taken.add(plain)
+        for index, (path, suffix) in enumerate(entries):
+            if names[index] is not None:
+                continue
+            segments = [_sanitise(segment) for segment in path]
+            digest_path = path if suffix is None else (*path, suffix)
+            name = _shorten(segments, digest_path, self._target, self._taken)
+            names[index] = name
+            self._taken.add(name)
+        result: list[str] = []
+        for key, plain, assigned in zip(keys, plains, names, strict=True):
+            assert assigned is not None
+            self._paths.add(key)
+            self._entries.append((key, assigned, assigned != plain))
+            result.append(assigned)
+        return result
 
     def build(self) -> FieldNameMap:
         """Freeze the allocated names into an immutable map."""

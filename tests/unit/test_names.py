@@ -217,3 +217,55 @@ def test_every_name_matches_its_regex_and_maps_back(
 def test_names_are_deterministic(path: Path) -> None:
     first = wire_name(path, target="clairic", taken=set())
     assert first == wire_name(path, target="clairic", taken=set())
+
+
+def test_add_all_gives_every_colliding_path_the_digest_form() -> None:
+    entries: list[tuple[Path, str | None]] = [
+        (("a b",), None),
+        (("a_b",), None),
+        (("c",), None),
+    ]
+    for ordering in (entries, list(reversed(entries))):
+        builder = FieldNameMapBuilder("clairic")
+        names = dict(
+            zip((e[0] for e in ordering), builder.add_all(ordering), strict=True)
+        )
+        assert names[("c",)] == "c"
+        assert names[("a b",)] == "a_b_a_b_9e6d48"
+        assert names[("a_b",)].startswith("a_b_a_b_")
+        assert names[("a_b",)] != names[("a b",)]
+        assert "a_b" not in names.values()
+        assert builder.build().shortened == {names[("a b",)], names[("a_b",)]}
+
+
+def test_add_all_treats_int_and_str_segments_with_the_same_text_as_a_collision() -> (
+    None
+):
+    builder = FieldNameMapBuilder("clef")
+    one, two = builder.add_all([(("a", 1), None), (("a", "1"), None)])
+    assert one != two
+    assert "a.1" not in (one, two)
+    assert builder.build().name_to_path[one] == ("a", 1)
+
+
+def test_add_all_avoids_names_from_earlier_calls() -> None:
+    builder = FieldNameMapBuilder("clairic")
+    assert builder.add(("x",)) == "x"
+    (second,) = builder.add_all([(("x ",), None)])
+    assert second != "x"
+
+
+def test_add_all_rejects_repeats_within_and_across_batches() -> None:
+    builder = FieldNameMapBuilder("clairic")
+    with pytest.raises(ValueError, match="already"):
+        builder.add_all([(("a",), None), (("a",), None)])
+    builder.add_all([(("b",), None)])
+    with pytest.raises(ValueError, match="already"):
+        builder.add_all([(("b",), None)])
+
+
+def test_add_all_shortens_long_names_and_keeps_the_suffix_form() -> None:
+    builder = FieldNameMapBuilder("clef")
+    long, typed = builder.add_all([(("x" * 120,), None), (("kind",), "__type")])
+    assert len(long) <= 100 and long != "x" * 120
+    assert typed == "kind.__type"

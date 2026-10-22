@@ -10,6 +10,8 @@ import inspect
 import json
 import re
 import threading
+import types
+import typing
 from collections import OrderedDict
 from collections.abc import Callable, Hashable, Mapping
 from typing import Annotated, Any, Union
@@ -101,12 +103,72 @@ def _parse_arg_docs(doc: str) -> dict[str, str]:
     }
 
 
+_UNION_ORIGINS: frozenset[Any] = frozenset({Union, types.UnionType})
+
+
+def _convert_annotation(annotation: Any, active: tuple[type[Any], ...] = ()) -> Any:
+    """Replace TypedDict classes anywhere inside an annotation with models.
+
+    Handles ``Optional``/unions, ``Annotated`` and subscripted containers such as
+    ``list[...]`` and ``dict[...]``.
+
+    Raises:
+        TypeError: If a TypedDict refers to itself.
+    """
+    if isinstance(annotation, (str, typing.ForwardRef)):
+        # Python 3.10 leaves forward references nested in generics unresolved;
+        # a reference to a TypedDict that is being converted is a cycle.
+        name = annotation if isinstance(annotation, str) else annotation.__forward_arg__
+        if any(name == td.__name__ for td in active):
+            raise TypeError(
+                f"recursive TypedDict {name!r} cannot be used as a schema; use a "
+                "pydantic model"
+            )
+        return annotation
+    if isinstance(annotation, type) and typing_extensions.is_typeddict(annotation):
+        if annotation in active:
+            raise TypeError(
+                f"recursive TypedDict {annotation.__name__!r} cannot be used as a "
+                "schema; use a pydantic model"
+            )
+        return _typed_dict_model(annotation, active)
+    origin = typing_extensions.get_origin(annotation)
+    if origin is None or origin is typing_extensions.Literal:
+        return annotation
+    args = typing_extensions.get_args(annotation)
+    if origin is Annotated:
+        inner = _convert_annotation(args[0], active)
+        if inner is args[0]:
+            return annotation
+        rebuilt: Any = inner
+        for item in args[1:]:
+            rebuilt = Annotated[rebuilt, item]
+        return rebuilt
+    if any(isinstance(arg, (list, dict)) for arg in args):
+        return annotation
+    converted = tuple(_convert_annotation(arg, active) for arg in args)
+    if all(new is old for new, old in zip(converted, args, strict=True)):
+        return annotation
+    if origin in _UNION_ORIGINS:
+        return Union[converted]  # noqa: UP007
+    try:
+        return origin[converted]
+    except TypeError:
+        return annotation
+
+
 def _from_typed_dict(schema: type[Any]) -> type[BaseModel]:
+    return _typed_dict_model(schema, ())
+
+
+def _typed_dict_model(
+    schema: type[Any], active: tuple[type[Any], ...]
+) -> type[BaseModel]:
     hints = typing_extensions.get_type_hints(schema, include_extras=True)
     required = getattr(schema, "__required_keys__", frozenset(hints))
     fields: dict[str, Any] = {}
     for key, annotation in hints.items():
-        stripped = unwrap_required(annotation)
+        stripped = _convert_annotation(unwrap_required(annotation), (*active, schema))
         # A key that may be absent becomes a field with a ``None`` default so the
         # generated model accepts the same documents as the TypedDict.
         fields[key] = (stripped, ...) if key in required else (stripped, None)
@@ -139,6 +201,7 @@ def _from_callable(function: Callable[..., Any]) -> type[BaseModel]:
             raise TypeError(
                 f"{name}: parameter {parameter.name!r} needs a type annotation"
             )
+        annotation = _convert_annotation(annotation)
         description = descriptions.get(parameter.name)
         if description:
             annotation = Annotated[annotation, Field(description=description)]

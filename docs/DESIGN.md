@@ -148,30 +148,33 @@ identity, names, preamble, warnings}`.
 | annotation | engine / emitted |
 | --- | --- |
 | `str` | Clairic `text` (length/pattern constraints in prose, enforced by pydantic) |
-| `int` / `float` / `Decimal` | Clairic `number` (+`integer` / `decimals`) |
+| `int` / `float` / `Decimal` | Clairic `number` (+`integer`; `decimals` only when `decimal_places` or `s1_field(decimals=)` is set) |
 | `date` / `time` / `datetime` | Clairic same-named type; `reference_date` at request level |
 | `timedelta` | Clairic `duration` with `unit` (default seconds) |
-| `list[str\|int\|float\|date]`, `set`, `frozenset` | Clairic `list` with `items` |
+| `list[str\|int\|float\|date]`, `tuple[X, ...]`, `set`, `frozenset` | Clairic `list` with `items`; answers parse per element and spans stay aligned with the surviving elements |
 | `list[datetime\|time\|timedelta]` | `items:"text"` + per-element parse (flagged lossy) |
 | `list[Literal\|Enum]` | `items:"text"` then one Clef `choice` per element |
 | `bool` | Clef `noul` with `criteria{true,false}`; abstain inside `0.5 ± 0.15` |
-| `Optional[bool]` | Clef `choice{yes,no,unstated}` |
-| `Literal` / `Enum` | Clef `choice` (2–255 options), `key_map` back to values; `s1_field(clef="score")` for ordered enums |
-| nested `BaseModel` | dotted paths; each sub-model is its own field group |
+| `Optional[bool]` | Clef `choice{yes,no,unstated}`; `unstated` maps to the `UNSTATED` sentinel (nullable field → `None`) |
+| `Literal` / `Enum` | Clef `choice` (2–255 options), `key_map` back to values; option ids are the sanitised value (Enum: the member name) and the criteria text keeps the original value/name and member description; `s1_field(clef="score")` for ordered enums |
+| `Literal` / `Enum` / bool-as-choice that is nullable or has a default | the same `choice` plus an `unstated` option (`unstated_2`, … on a collision) mapping to the `UNSTATED` sentinel, so an unmentioned field is not forced to a real value: `coerce` gives `None` for a nullable field and `ok=False, reason="unstated"` for a defaulted one (the default stays). A required non-nullable field gets no `unstated` option |
+| single-option `Literal` / `Enum` | required field: engine `const`, filled in code, no request (discriminator tags); nullable or defaulted: skipped with a `single_option` warning |
+| nested `BaseModel` / `TypedDict` (also self-referencing) | dotted paths; each sub-model is its own field group; recursion is recorded and bounded by the expander (`limits.max_depth`) |
 | `list[BaseModel]`, `dict[str, prim]` | handed to the collection engine |
-| `Union` of prims / of models | Clef `choice` over member types/discriminator, then the chosen member's fields |
+| `Union[prim, prim]` | Clairic `text` + Clef `choice` over the member types (`<field>.__type`); `coerce_union` parses the text as the chosen member |
+| `Union` of models | Clef `choice` over members/discriminator, then the chosen member's fields |
 | `dict[str, Any]`, `Any` | skipped (pydantic default), opt-in `limits.any_policy="text"` |
 | required / optional | `null_threshold` 0.7 / 0.3 |
-| recursion | guard at `limits.max_depth = 8` |
+| recursion | recorded as a deferred `submodel`/`collection`; the expander stops at `limits.max_depth = 8` |
 
 `ge/le/gt/lt` go into prose (Clairic `min`/`max` are estimate/forecast-only); opt-in
 `limits.estimate_for_bounded_numbers`. Instructions = parent context (" → "-joined ancestor
 descriptions; mandatory when a name was shortened) + description (`Field.description` →
-title → attribute docstring → humanised name) + type/constraint hints, templated per entity
+`typing_extensions.Doc` → title → attribute docstring → humanised name) + type/constraint hints, templated per entity
 ("{label}'s {desc}"). A lint warns on aggregation-style descriptions ("total of…").
 
 Names: Clairic `^[A-Za-z_][A-Za-z0-9_.\-]{0,63}$`, Clef ids `[A-Za-z0-9_.\-]{1,100}`;
-over-length → `head_tail_<blake2s 6 hex>`, widened on collision, pinned by a test. Per-entity
+over-length or colliding → `head_tail_<blake2s 6 hex>` (every path in a collision group gets the digest form, so names do not depend on declaration order), widened on a digest collision, pinned by a test. Documents are keyed by field name; `FieldSpec.alias` records the key `model_validate` expects and `unflatten(plan=...)`/`prune_nulls` emit it. Per-entity
 requests never put list indices in names.
 
 ## Collection engine (`_collection.py`) — multi-entity and nested lists

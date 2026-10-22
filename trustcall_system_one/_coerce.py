@@ -2,13 +2,16 @@
 
 import math
 import re
-from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from dataclasses import dataclass, replace
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from pydantic import TypeAdapter, ValidationError
+
 from trustcall_system_one._compile import FieldSpec
 from trustcall_system_one._config import GateConfig
+from trustcall_system_one._types import UNSTATED
 from trustcall_system_one._wire import (
     ChoiceAnswer,
     ChoiceQuestion,
@@ -19,7 +22,7 @@ from trustcall_system_one._wire import (
     ScoreQuestion,
 )
 
-__all__ = ["Coerced", "coerce"]
+__all__ = ["UNSTATED", "Coerced", "coerce", "coerce_union"]
 
 _EPS = 1e-9
 _SECONDS_PER_UNIT: dict[str, float] = {
@@ -173,13 +176,50 @@ def _to_number(value: Any, post: str) -> Any:
     return value
 
 
-def _parse_date(value: Any) -> date:
+_DATE = TypeAdapter(date)
+_DATETIME = TypeAdapter(datetime)
+_TIME = TypeAdapter(time)
+_NUMERIC = re.compile(r"[+-]?\d+(?:\.\d+)?")
+
+
+def _fixed_offset(offset: timedelta | None) -> timezone | None:
+    return None if offset is None else timezone(offset)
+
+
+def _checked_text(value: Any, what: str) -> str:
+    """Return the stripped string, refusing non-strings and bare numbers.
+
+    pydantic reads a bare number as a Unix timestamp (``"20261021"`` would
+    become a date in 1970), which is never what a text answer means.
+    """
     if not isinstance(value, str):
-        raise ValueError(f"{value!r} is not a date string")
+        raise ValueError(f"{value!r} is not a {what} string")
     text = value.strip()
+    if _NUMERIC.fullmatch(text):
+        raise ValueError(f"{value!r} is a bare number, not an ISO {what}")
+    return text
+
+
+# Dates and times go through pydantic rather than ``datetime.fromisoformat`` so
+# that accepted formats do not depend on the Python version (3.11 widened them).
+
+
+def _parse_datetime(value: Any) -> datetime:
+    text = _checked_text(value, "datetime")
     try:
-        return date.fromisoformat(text)
-    except ValueError:
+        result = _DATETIME.validate_python(text)
+    except ValidationError:
+        raise ValueError(f"{value!r} is not an ISO datetime") from None
+    if result.tzinfo is None:
+        return result
+    return result.replace(tzinfo=_fixed_offset(result.utcoffset()))
+
+
+def _parse_date(value: Any) -> date:
+    text = _checked_text(value, "date")
+    try:
+        return _DATE.validate_python(text)
+    except ValidationError:
         pass
     try:
         return _parse_datetime(text).date()
@@ -187,26 +227,15 @@ def _parse_date(value: Any) -> date:
         raise ValueError(f"{value!r} is not an ISO date") from None
 
 
-def _iso_tz(text: str) -> str:
-    return f"{text[:-1]}+00:00" if text.endswith(("Z", "z")) else text
-
-
-def _parse_datetime(value: Any) -> datetime:
-    if not isinstance(value, str):
-        raise ValueError(f"{value!r} is not a datetime string")
-    try:
-        return datetime.fromisoformat(_iso_tz(value.strip()))
-    except ValueError:
-        raise ValueError(f"{value!r} is not an ISO datetime") from None
-
-
 def _parse_time(value: Any) -> time:
-    if not isinstance(value, str):
-        raise ValueError(f"{value!r} is not a time string")
+    text = _checked_text(value, "time")
     try:
-        return time.fromisoformat(_iso_tz(value.strip()))
-    except ValueError:
+        result = _TIME.validate_python(text)
+    except ValidationError:
         raise ValueError(f"{value!r} is not an ISO time") from None
+    if result.tzinfo is None:
+        return result
+    return result.replace(tzinfo=_fixed_offset(result.tzinfo.utcoffset(None)))
 
 
 def _timedelta(amount: float, unit: str) -> timedelta:
@@ -291,26 +320,28 @@ def _element(kind: str | None, value: Any) -> Any:
 # --------------------------------------------------------------------------- #
 
 
-def _list_value(spec: FieldSpec, value: Any) -> tuple[Any, str | None]:
+def _list_value(spec: FieldSpec, value: Any) -> tuple[list[Any], str | None, list[int]]:
+    """Parse list elements, returning the values, a note and their source indexes."""
     if not isinstance(value, list):
         raise ValueError("a list answer must be an array")
     kept: list[Any] = []
+    indexes: list[int] = []
     dropped: list[str] = []
-    for item in value:
+    is_set = spec.post.startswith(("set", "frozenset"))
+    for index, item in enumerate(value):
         try:
-            kept.append(_element(spec.item_kind, item))
+            parsed = _element(spec.item_kind, item)
         except ValueError as exc:
             dropped.append(str(exc))
-    if spec.post.startswith(("set", "frozenset")):
-        unique: list[Any] = []
-        for item in kept:
-            if item not in unique:
-                unique.append(item)
-        kept = unique
+            continue
+        if is_set and parsed in kept:
+            continue
+        kept.append(parsed)
+        indexes.append(index)
     reason = None
     if dropped:
         reason = f"dropped {len(dropped)} element(s): {dropped[0]}"
-    return kept, reason
+    return kept, reason, indexes
 
 
 def _clairic_value(spec: FieldSpec, answer: ClairicAnswer) -> tuple[Any, str | None]:
@@ -318,7 +349,8 @@ def _clairic_value(spec: FieldSpec, answer: ClairicAnswer) -> tuple[Any, str | N
     value = answer.value
     kind = spec.clairic.type
     if kind == "list":
-        return _list_value(spec, value)
+        kept, note, _ = _list_value(spec, value)
+        return kept, note
     if kind == "duration":
         unit = _unit_of(spec.post, spec.clairic.unit or "seconds")
         if isinstance(value, str):
@@ -344,9 +376,10 @@ def _clairic_value(spec: FieldSpec, answer: ClairicAnswer) -> tuple[Any, str | N
 
 
 def _clairic(spec: FieldSpec, answer: ClairicAnswer) -> Coerced:
+    spans = _spans(answer.spans)
     meta: dict[str, Any] = {
         "span": _pair(answer.span),
-        "spans": _spans(answer.spans),
+        "spans": spans,
         "p_null": answer.p_null,
         "confidence": answer.confidence,
         "guess": answer.guess,
@@ -356,7 +389,16 @@ def _clairic(spec: FieldSpec, answer: ClairicAnswer) -> Coerced:
     if answer.value is None:
         return Coerced(None, True, None, **meta)
     try:
-        value, note = _clairic_value(spec, answer)
+        if spec.clairic.type == "list":
+            value, note, indexes = _list_value(spec, answer.value)
+            # Spans stay aligned with the values: they follow the elements that
+            # survived, and are dropped when the model's counts already differ.
+            if spans is not None and len(spans) == len(answer.value):
+                meta["spans"] = tuple(spans[index] for index in indexes)
+            else:
+                meta["spans"] = None
+        else:
+            value, note = _clairic_value(spec, answer)
     except ValueError as exc:
         return Coerced(None, False, str(exc), **meta)
     return Coerced(value, True, note, **meta)
@@ -386,11 +428,18 @@ def _choice(spec: FieldSpec, answer: ChoiceAnswer) -> Coerced:
             confidence=answer.confidence,
             score=probability,
         )
-    return Coerced(
-        spec.key_map[answer.choice],
-        confidence=answer.confidence,
-        score=probability,
-    )
+    value = spec.key_map[answer.choice]
+    if value is UNSTATED:
+        # The model says the input does not state the value. For a nullable
+        # field that is a null; otherwise the caller keeps the field's default.
+        return Coerced(
+            None,
+            spec.nullable,
+            "unstated",
+            confidence=answer.confidence,
+            score=probability,
+        )
+    return Coerced(value, confidence=answer.confidence, score=probability)
 
 
 def _score(spec: FieldSpec, answer: ScoreAnswer) -> Coerced:
@@ -421,6 +470,88 @@ def _level_order(level: str) -> float:
         return math.inf
 
 
+def _truth(text: str) -> bool:
+    lowered = text.strip().lower()
+    if lowered in ("true", "yes", "y", "1", "on"):
+        return True
+    if lowered in ("false", "no", "n", "0", "off"):
+        return False
+    raise ValueError(f"{text!r} is not a boolean")
+
+
+def _union_value(type_name: str, text: str) -> Any:
+    """Parse the Clairic text as the member type that Clef chose."""
+    if type_name == "str":
+        return text
+    if type_name in ("int", "float", "decimal"):
+        return _to_number(text, type_name)
+    if type_name == "bool":
+        return _truth(text)
+    if type_name == "date":
+        return _parse_date(text)
+    if type_name == "datetime":
+        return _parse_datetime(text)
+    if type_name == "time":
+        return _parse_time(text)
+    if type_name == "duration":
+        return _duration_text(text, "seconds")
+    raise ValueError(f"unknown union member type {type_name!r}")
+
+
+def coerce_union(
+    spec: FieldSpec,
+    text_answer: ClairicAnswer,
+    type_answer: ChoiceAnswer,
+    gates: GateConfig = GateConfig(),  # noqa: B008 - frozen dataclass
+) -> Coerced:
+    """Convert the two answers for a union of primitives (``int | str`` ...).
+
+    The Clairic answer holds the value as text and the Clef answer (the spec's
+    ``<field>.__type`` question) says which member type it is; the text is then
+    parsed with that member's parser (``int``, ``float``, ``decimal``, ``bool``,
+    ``date``, ``datetime``, ``time``, ``duration`` or ``str``). Span, ``p_null``,
+    ``confidence`` and ``guess`` come from the Clairic answer and ``score`` is
+    the probability of the chosen type.
+
+    Never raises: a null text is a valid ``None``; an unknown or low-confidence
+    type (below ``gates.min_choice_prob`` or ``gates.min_choice_confidence``) or
+    text that does not parse as the chosen type is ``ok=False`` with a reason.
+
+    Args:
+        spec: A spec compiled from a union of primitives.
+        text_answer: The Clairic answer for ``spec.wire_name``.
+        type_answer: The Clef answer for ``spec.clef_name``.
+        gates: Supplies the choice thresholds.
+
+    Returns:
+        The converted value plus answer metadata.
+    """
+    if spec.post != "union" or spec.clairic is None or spec.clef is None:
+        return Coerced(None, False, "spec is not a union of primitives")
+    base = _clairic(spec, text_answer)
+    if not base.ok or base.value is None:
+        return base
+    chosen = _choice(spec, type_answer)
+    if not chosen.ok:
+        return replace(
+            base, value=None, ok=False, reason=chosen.reason, score=chosen.score
+        )
+    below_prob = chosen.score is not None and chosen.score < gates.min_choice_prob
+    below_conf = (
+        chosen.confidence is not None
+        and chosen.confidence < gates.min_choice_confidence
+    )
+    if below_prob or below_conf:
+        return replace(
+            base, value=None, ok=False, reason="type_uncertain", score=chosen.score
+        )
+    try:
+        value = _union_value(chosen.value, base.value)
+    except ValueError as exc:
+        return replace(base, value=None, ok=False, reason=str(exc), score=chosen.score)
+    return replace(base, value=value, score=chosen.score)
+
+
 def coerce(
     spec: FieldSpec,
     answer: ClairicAnswer | NoulAnswer | ChoiceAnswer | ScoreAnswer,
@@ -447,6 +578,11 @@ def coerce(
     * Clef choice: ``spec.key_map[choice]``; an unknown option is not ok.
     * Clef score: the most probable level mapped through ``spec.key_map``; the
       weighted score is kept in ``Coerced.score``.
+    * A choice whose option maps to ``UNSTATED`` gives ``value=None`` with
+      ``reason="unstated"``: ``ok`` for a nullable field, not ok for a field with
+      a default (so the caller leaves the default).
+    * A union of primitives is refused here (``ok=False``); it needs both
+      answers, see ``coerce_union``.
 
     Args:
         spec: The field the answer belongs to.
@@ -456,6 +592,10 @@ def coerce(
     Returns:
         The converted value plus answer metadata.
     """
+    if spec.post == "union":
+        return Coerced(
+            None, False, "a union of primitives needs two answers: use coerce_union"
+        )
     if isinstance(answer, ClairicAnswer):
         return _clairic(spec, answer)
     if isinstance(answer, NoulAnswer):

@@ -181,3 +181,38 @@ def test_plain_class_is_rejected_with_guidance() -> None:
     factory: Callable[..., Any] = Plain
     with pytest.raises(TypeError, match="BaseModel"):
         coerce_schema(factory)
+
+
+class Geo(TypedDict):
+    lat: float
+
+
+class Trip(TypedDict):
+    start: Geo
+    stops: list[Geo]
+    maybe: Geo | None
+    by_name: dict[str, Geo]
+    tagged: Annotated[Geo, Field(description="Tagged")]
+    pair: NotRequired[tuple[Geo, ...]]
+
+
+def test_nested_typed_dicts_become_nested_models() -> None:
+    model = coerce_schema(Trip)
+    start = model.model_fields["start"].annotation
+    assert isinstance(start, type) and issubclass(start, BaseModel)
+    assert start.__name__ == "Geo"
+    assert model.model_fields["tagged"].description == "Tagged"
+    for name in ("stops", "maybe", "by_name", "pair"):
+        text = repr(model.model_fields[name].annotation)
+        assert "TypedDict" not in text and "Geo" in text
+    instance: Any = model.model_validate(
+        {
+            "start": {"lat": 1},
+            "stops": [{"lat": 2}],
+            "maybe": None,
+            "by_name": {"a": {"lat": 3}},
+            "tagged": {"lat": 4},
+        }
+    )
+    assert instance.stops[0].lat == 2.0
+    assert instance.by_name["a"].lat == 3.0

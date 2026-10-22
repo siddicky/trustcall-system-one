@@ -11,7 +11,7 @@ import pytest
 from pydantic import Field, create_model
 
 from trustcall_system_one import FieldSpec, GateConfig, compile_schema, s1_field
-from trustcall_system_one._coerce import Coerced, coerce
+from trustcall_system_one._coerce import UNSTATED, Coerced, coerce, coerce_union
 from trustcall_system_one._wire import (
     ChoiceAnswer,
     ClairicAnswer,
@@ -364,11 +364,6 @@ def test_metadata_is_carried_on_failures_and_nulls() -> None:
     )
 
 
-def test_union_text_value_is_returned_as_text() -> None:
-    result = coerce(spec_for(Union[int, str]), answer("text", "forty-two"))
-    assert result.value == "forty-two"
-
-
 def test_clairic_answer_for_a_clef_or_skipped_spec_is_not_ok() -> None:
     for annotation in (bool, Literal["a", "b"], Any):
         result = coerce(spec_for(annotation), answer("text", "x"))
@@ -443,7 +438,7 @@ def test_choice_maps_the_option_id_back_to_the_value() -> None:
 
 
 def test_choice_over_an_enum_returns_the_enum_value() -> None:
-    result = coerce(spec_for(Level), choice("mid", low=0.1, mid=0.8, high=0.1))
+    result = coerce(spec_for(Level), choice("MID", LOW=0.1, MID=0.8, HIGH=0.1))
     assert result.value == "mid"
 
 
@@ -462,13 +457,6 @@ def test_optional_bool_choice_can_say_unstated() -> None:
     assert (yes.value, yes.ok) == (True, True)
     assert (no.value, no.ok) == (False, True)
     assert (unstated.value, unstated.ok) == (None, True)
-
-
-def test_union_choice_returns_the_member_type_name() -> None:
-    model = create_model("M", f=(Union[int, str], Field(..., description="x")))
-    spec = compile_schema(model).specs[0]
-    result = coerce(spec, choice("int", int=0.9, str=0.1))
-    assert result.value == "int"
 
 
 def score(value: float, **probabilities: float) -> ScoreAnswer:
@@ -535,7 +523,279 @@ def test_score_answer_for_a_choice_spec_is_not_ok() -> None:
     assert coerce(score_spec, choice("low", low=1.0)).ok is False
 
 
+def test_unstated_is_exported_from_coerce() -> None:
+    from trustcall_system_one._types import UNSTATED as TYPES_UNSTATED
+
+    assert UNSTATED is TYPES_UNSTATED
+
+
 def test_coerced_is_frozen() -> None:
     result = coerce(spec_for(str), answer("text", "x"))
     with pytest.raises(AttributeError):
         result.value = "y"  # type: ignore[misc]
+
+
+# --------------------------------------------------------------------------- #
+# Review fixes: unstated, unions, spans, date parsing
+# --------------------------------------------------------------------------- #
+
+
+def test_unstated_on_a_nullable_field_is_an_ok_none() -> None:
+    for annotation, default in (
+        (Optional[Literal["open", "closed"]], None),
+        (Optional[Level], ...),
+        (Optional[bool], None),
+    ):
+        spec = spec_for(annotation, default)
+        result = coerce(spec, choice("unstated", unstated=0.8, open=0.1, closed=0.1))
+        assert (result.value, result.ok, result.reason) == (None, True, "unstated")
+        assert result.confidence == 0.8
+        assert result.score == 0.8
+
+
+def test_unstated_on_a_defaulted_field_is_not_ok_so_the_default_stays() -> None:
+    spec = spec_for(Level, Level.LOW)
+    result = coerce(
+        spec, choice("unstated", unstated=0.7, LOW=0.2, MID=0.05, HIGH=0.05)
+    )
+    assert (result.value, result.ok, result.reason) == (None, False, "unstated")
+    real = coerce(spec, choice("HIGH", unstated=0.1, LOW=0.1, MID=0.1, HIGH=0.7))
+    assert (real.value, real.ok, real.reason) == ("high", True, None)
+
+
+def test_unstated_with_a_renamed_id_is_still_recognised() -> None:
+    spec = spec_for(Optional[Literal["unstated", "a"]], None)
+    assert coerce(spec, choice("unstated", unstated=0.9)).value == "unstated"
+    result = coerce(spec, choice("unstated_2", unstated_2=0.9))
+    assert (result.value, result.ok, result.reason) == (None, True, "unstated")
+
+
+# Unions of primitives --------------------------------------------------------
+
+
+def union_spec(annotation: Any = Union[int, str]) -> FieldSpec:
+    return spec_for(annotation, description="x")
+
+
+def type_choice(name: str, **others: float) -> ChoiceAnswer:
+    probabilities = {name: 0.9, **others}
+    return ChoiceAnswer(
+        type="choice", choice=name, probabilities=probabilities, confidence=0.8
+    )
+
+
+def test_plain_coerce_refuses_a_union_spec() -> None:
+    spec = union_spec()
+    for given in (answer("text", "42"), choice("int", int=1.0)):
+        result = coerce(spec, given)
+        assert result.ok is False
+        assert result.reason is not None and "coerce_union" in result.reason
+
+
+@pytest.mark.parametrize(
+    ("annotation", "chosen", "text", "expected"),
+    [
+        (Union[int, str], "int", "42", 42),
+        (Union[int, str], "str", "42", "42"),
+        (Union[int, str], "int", "7.0", 7),
+        (Union[int, float], "float", "2.5", 2.5),
+        (Union[Decimal, str], "decimal", "1.10", Decimal("1.10")),
+        (Union[bool, str], "bool", "Yes", True),
+        (Union[bool, str], "bool", "no", False),
+        (Union[dt.date, str], "date", "2026-10-21", dt.date(2026, 10, 21)),
+        (
+            Union[dt.datetime, str],
+            "datetime",
+            "2026-10-21T10:00:00Z",
+            dt.datetime(2026, 10, 21, 10, tzinfo=dt.timezone.utc),
+        ),
+        (Union[dt.time, str], "time", "10:30", dt.time(10, 30)),
+        (Union[dt.timedelta, str], "duration", "2 hours", dt.timedelta(hours=2)),
+    ],
+)
+def test_union_text_is_parsed_with_the_chosen_member(
+    annotation: Any, chosen: str, text: str, expected: Any
+) -> None:
+    spec = union_spec(annotation)
+    other = "str" if chosen != "str" else "int"
+    result = coerce_union(
+        spec,
+        answer("text", text, span=[0, len(text)], confidence=0.9),
+        type_choice(chosen, **{other: 0.1}),
+    )
+    assert result.ok, result.reason
+    assert result.value == expected
+    assert type(result.value) is type(expected)
+    assert result.span == (0, len(text))
+    assert result.confidence == 0.9
+    assert result.score == 0.9
+
+
+def test_union_unparseable_text_is_not_ok() -> None:
+    result = coerce_union(
+        union_spec(), answer("text", "forty-two"), type_choice("int", str=0.1)
+    )
+    assert result.ok is False
+    assert result.value is None
+    assert result.reason
+
+
+def test_union_null_text_is_a_valid_none() -> None:
+    result = coerce_union(
+        union_spec(), answer("text", None, p_null=0.9), type_choice("int", str=0.1)
+    )
+    assert (result.value, result.ok, result.p_null) == (None, True, 0.9)
+
+
+def test_union_unknown_or_uncertain_type_is_not_ok() -> None:
+    spec = union_spec()
+    unknown = ChoiceAnswer(
+        type="choice", choice="zzz", probabilities={"zzz": 1.0}, confidence=0.9
+    )
+    assert coerce_union(spec, answer("text", "1"), unknown).ok is False
+    shaky = ChoiceAnswer(
+        type="choice",
+        choice="int",
+        probabilities={"int": 0.5, "str": 0.5},
+        confidence=0.9,
+    )
+    result = coerce_union(spec, answer("text", "1"), shaky)
+    assert (result.ok, result.reason) == (False, "type_uncertain")
+    relaxed = GateConfig(min_choice_prob=0.4)
+    assert coerce_union(spec, answer("text", "1"), shaky, relaxed).value == 1
+    unsure = ChoiceAnswer(
+        type="choice", choice="int", probabilities={"int": 0.9}, confidence=0.1
+    )
+    assert coerce_union(spec, answer("text", "1"), unsure).reason == "type_uncertain"
+
+
+def test_coerce_union_rejects_other_specs() -> None:
+    result = coerce_union(spec_for(str), answer("text", "x"), type_choice("int"))
+    assert result.ok is False
+
+
+# List spans -------------------------------------------------------------------
+
+
+def test_spans_follow_the_elements_that_survive() -> None:
+    result = coerce(
+        spec_for(list[int]),
+        answer("list", ["1", "x", "3"], spans=[[0, 1], [2, 3], [4, 5]]),
+    )
+    assert result.value == [1, 3]
+    assert result.spans == ((0, 1), (4, 5))
+
+
+def test_set_spans_keep_the_first_occurrence() -> None:
+    result = coerce(
+        spec_for(set[str]),
+        answer("list", ["a", "b", "a"], spans=[[0, 1], [2, 3], [4, 5]]),
+    )
+    assert result.value == ["a", "b"]
+    assert result.spans == ((0, 1), (2, 3))
+
+
+def test_spans_are_dropped_when_the_model_counts_disagree() -> None:
+    spec = spec_for(list[str])
+    short = coerce(spec, answer("list", ["a", "b", "c"], spans=[[0, 1], [2, 3]]))
+    assert short.value == ["a", "b", "c"] and short.spans is None
+    long = coerce(spec, answer("list", ["a"], spans=[[0, 1], [2, 3]]))
+    assert long.spans is None
+    missing = coerce(spec, answer("list", ["a", "b"]))
+    assert missing.spans is None
+
+
+def test_untouched_lists_keep_all_their_spans() -> None:
+    result = coerce(
+        spec_for(list[str]), answer("list", ["a", "b"], spans=[[0, 1], [2, 3]])
+    )
+    assert result.spans == ((0, 1), (2, 3))
+
+
+# Date parsing is the same on every Python version ------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("2026-10-21T10:00:00Z", dt.datetime(2026, 10, 21, 10, tzinfo=dt.timezone.utc)),
+        (
+            "2026-10-21T10:00:00.12Z",
+            dt.datetime(2026, 10, 21, 10, 0, 0, 120000, tzinfo=dt.timezone.utc),
+        ),
+        (
+            "2026-10-21T10:00:00+0000",
+            dt.datetime(2026, 10, 21, 10, tzinfo=dt.timezone.utc),
+        ),
+        (
+            "2026-10-21T10:00:00-05:30",
+            dt.datetime(
+                2026, 10, 21, 10, tzinfo=dt.timezone(-dt.timedelta(hours=5, minutes=30))
+            ),
+        ),
+        ("2026-10-21 10:00", dt.datetime(2026, 10, 21, 10)),
+        ("2026-10-21", dt.datetime(2026, 10, 21)),
+    ],
+)
+def test_datetime_formats(text: str, expected: dt.datetime) -> None:
+    result = coerce(spec_for(dt.datetime), answer("datetime", text))
+    assert result.ok, result.reason
+    assert result.value == expected
+    assert result.value.utcoffset() == expected.utcoffset()
+    assert type(result.value.tzinfo) in (type(None), dt.timezone)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["20261021T100000Z", "20261021", "1700000000", "1700000000.5", "2026-W43-3", "x"],
+)
+def test_ambiguous_or_unsupported_datetime_strings_are_rejected(text: str) -> None:
+    result = coerce(spec_for(dt.datetime), answer("datetime", text))
+    assert result.ok is False and result.value is None
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("2026-10-21", dt.date(2026, 10, 21)),
+        ("2026-10-21T00:00:00Z", dt.date(2026, 10, 21)),
+        ("2026-10-21T10:00:00.12Z", dt.date(2026, 10, 21)),
+    ],
+)
+def test_date_formats(text: str, expected: dt.date) -> None:
+    assert coerce(spec_for(dt.date), answer("date", text)).value == expected
+
+
+@pytest.mark.parametrize(
+    "text", ["20261021", "2026-W43-3", "1700000000", "2026-13-01", "21 Oct 2026"]
+)
+def test_unsupported_date_strings_are_rejected(text: str) -> None:
+    result = coerce(spec_for(dt.date), answer("date", text))
+    assert result.ok is False and result.value is None
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("10:00", dt.time(10)),
+        ("10:00:00.5", dt.time(10, 0, 0, 500000)),
+        ("10:00Z", dt.time(10, tzinfo=dt.timezone.utc)),
+        ("23:59:59", dt.time(23, 59, 59)),
+    ],
+)
+def test_time_formats(text: str, expected: dt.time) -> None:
+    result = coerce(spec_for(dt.time), answer("time", text))
+    assert result.value == expected
+    assert type(result.value.tzinfo) in (type(None), dt.timezone)
+
+
+@pytest.mark.parametrize("text", ["T10:00", "10", "36000", "24:00:01", "ten"])
+def test_unsupported_time_strings_are_rejected(text: str) -> None:
+    assert coerce(spec_for(dt.time), answer("time", text)).ok is False
+
+
+def test_unconstrained_decimals_keep_their_precision() -> None:
+    spec = spec_for(Decimal)
+    assert spec.clairic is not None and spec.clairic.decimals is None
+    assert coerce(spec, answer("number", 0.000123)).value == Decimal("0.000123")
+    assert coerce(spec, answer("number", "0.000123")).value == Decimal("0.000123")

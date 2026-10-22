@@ -15,6 +15,7 @@ dependencies = [
   "jsonpatch>=1.33,<2",
   "jsonpointer>=2.4",
   "typing-extensions>=4.9",
+  "annotated-types>=0.4",
 ]
 
 [project.optional-dependencies]

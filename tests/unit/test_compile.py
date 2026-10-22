@@ -9,7 +9,14 @@ from typing import Annotated, Any, Literal, NewType, Optional, Union
 
 import pytest
 import typing_extensions
-from pydantic import BaseModel, ConfigDict, Field, computed_field, create_model
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    computed_field,
+    create_model,
+)
 from typing_extensions import NotRequired, TypeAliasType, TypedDict
 
 from trustcall_system_one import (
@@ -20,7 +27,8 @@ from trustcall_system_one import (
     compile_schema,
     s1_field,
 )
-from trustcall_system_one._wire import ClairicRequest, ClefRequest
+from trustcall_system_one._types import UNSTATED
+from trustcall_system_one._wire import ChoiceQuestion, ClairicRequest, ClefRequest
 
 DESC = "Thing"
 REQUIRED_THRESHOLD = 0.7
@@ -141,7 +149,13 @@ class Dog(BaseModel):
             numeric(decimals=2),
             id="float-decimal-places",
         ),
-        pytest.param(Decimal, {}, numeric(decimals=2), id="decimal"),
+        pytest.param(Decimal, {}, numeric(), id="decimal"),
+        pytest.param(
+            Decimal,
+            {"json_schema_extra": s1_field(decimals=5)},
+            numeric(decimals=5),
+            id="decimal-option",
+        ),
         pytest.param(
             Annotated[Decimal, Field(decimal_places=4)],
             {},
@@ -283,7 +297,7 @@ def test_list_of_literals_and_enums_records_element_choices() -> None:
         "done": "done",
     }
     spec = spec_for(set[Color])
-    assert dict(spec.element_choices or {}) == {"red": "red", "blue": "blue"}
+    assert dict(spec.element_choices or {}) == {"RED": "red", "BLUE": "blue"}
     assert spec.post == "set"
     assert spec.clef is None
 
@@ -368,11 +382,16 @@ def test_optional_bool_is_a_three_way_choice(annotation: Any) -> None:
         "criteria": {
             "yes": "The input says this is true.",
             "no": "The input says this is false.",
-            "unstated": "The input does not say.",
+            "unstated": "The input does not state this.",
         },
     }
-    assert dict(spec.key_map or {}) == {"yes": True, "no": False, "unstated": None}
+    assert dict(spec.key_map or {}) == {
+        "yes": True,
+        "no": False,
+        "unstated": UNSTATED,
+    }
     assert spec.required is False
+    assert spec.nullable is True
 
 
 def test_optional_bool_can_stay_noul() -> None:
@@ -390,7 +409,7 @@ def test_literal_is_a_choice_with_sanitised_option_ids() -> None:
     assert clef_dict(spec) == {
         "type": "choice",
         "instructions": "Pick the option that best fits: Thing",
-        "criteria": {"a": None, "b_c": None, "d_e": None},
+        "criteria": {"a": "a", "b_c": "b c", "d_e": "d/e"},
     }
     assert dict(spec.key_map or {}) == {"a": "a", "b_c": "b c", "d_e": "d/e"}
 
@@ -412,22 +431,22 @@ def test_literal_with_non_string_values_maps_back_to_the_values() -> None:
 
 def test_plain_enum_is_a_choice_mapping_back_to_values() -> None:
     spec = spec_for(Color)
-    assert clef_dict(spec)["criteria"] == {"red": None, "blue": None}
-    assert dict(spec.key_map or {}) == {"red": "red", "blue": "blue"}
+    assert clef_dict(spec)["criteria"] == {"RED": "RED (red)", "BLUE": "BLUE (blue)"}
+    assert dict(spec.key_map or {}) == {"RED": "red", "BLUE": "blue"}
 
 
 def test_str_enum_and_int_enum_are_choices() -> None:
-    assert dict(spec_for(Size).key_map or {}) == {"s": "s", "l": "l"}
-    assert dict(spec_for(Rank).key_map or {}) == {"1": 1, "2": 2}
+    assert dict(spec_for(Size).key_map or {}) == {"SMALL": "s", "LARGE": "l"}
+    assert dict(spec_for(Rank).key_map or {}) == {"LOW": 1, "HIGH": 2}
     assert spec_for(Rank).engine == "clef"
 
 
 def test_enum_member_descriptions_become_criteria() -> None:
     spec = spec_for(Impact)
     assert clef_dict(spec)["criteria"] == {
-        "low": "Barely noticeable",
-        "medium": "Noticeable but tolerable",
-        "high": "Severe",
+        "LOW": "LOW (low): Barely noticeable",
+        "MEDIUM": "MEDIUM (medium): Noticeable but tolerable",
+        "HIGH": "HIGH (high): Severe",
     }
 
 
@@ -438,7 +457,10 @@ def test_member_docstring_is_used_when_assigned() -> None:
 
     Mood.GOOD.__doc__ = "Things went well"
     spec = spec_for(Mood)
-    assert clef_dict(spec)["criteria"] == {"good": "Things went well", "bad": None}
+    assert clef_dict(spec)["criteria"] == {
+        "GOOD": "GOOD (good): Things went well",
+        "BAD": "BAD (bad)",
+    }
 
 
 def test_choice_criteria_can_be_overridden_by_id_or_value() -> None:
@@ -487,10 +509,34 @@ def test_more_than_255_options_is_an_error_naming_the_field() -> None:
     assert len(spec_for(ok).key_map or {}) == 255
 
 
-def test_single_option_literal_is_skipped_with_a_warning() -> None:
-    spec = spec_for(Literal["only"])
-    assert spec.engine == "skip"
-    assert spec.warnings == ("single_option",)
+def test_single_option_literal_on_a_required_field_is_a_constant() -> None:
+    spec = spec_for(Literal["cat"])
+    assert spec.engine == "const"
+    assert spec.clairic is None and spec.clef is None
+    assert spec.wire_name == "" and spec.warnings == ()
+    assert dict(spec.key_map or {}) == {"cat": "cat"}
+    fields: dict[str, Any] = {"kind": (Literal["cat"], ...), "n": (int, ...)}
+    plan = compile_schema(create_model("M", **fields))
+    assert list(plan.clairic_fields()) == ["n"]
+    assert plan.clef_questions() == {}
+
+
+def test_single_option_with_a_default_or_nullable_is_skipped_with_a_warning() -> None:
+    for default in ("cat", None):
+        spec = spec_for(Optional[Literal["cat"]], default)
+        assert spec.engine == "skip"
+        assert spec.warnings == ("single_option",)
+    spec = spec_for(Literal["cat"], "cat")
+    assert (spec.engine, spec.warnings) == ("skip", ("single_option",))
+
+
+def test_single_member_enum_on_a_required_field_is_a_constant() -> None:
+    class One(enum.Enum):
+        ONLY = 7
+
+    spec = spec_for(One)
+    assert spec.engine == "const"
+    assert dict(spec.key_map or {}) == {"ONLY": 7}
 
 
 def test_clef_override_is_rejected_where_it_cannot_apply() -> None:
@@ -646,7 +692,7 @@ def test_max_depth_guard_skips_nested_models() -> None:
     assert any("max_depth" in message for message in shallow.warnings)
 
 
-def test_recursive_models_are_skipped() -> None:
+def test_recursive_models_are_recorded_for_the_expander() -> None:
     class Node(BaseModel):
         name: str
         parent: Optional["Node"] = None
@@ -654,9 +700,12 @@ def test_recursive_models_are_skipped() -> None:
 
     Node.model_rebuild()
     plan = compile_schema(Node)
-    assert plan.spec(("parent",)).engine == "skip"
-    assert plan.spec(("parent",)).warnings == ("max_depth",)
-    assert plan.spec(("children",)).engine == "skip"
+    assert plan.spec(("parent",)).engine == "submodel"
+    assert plan.spec(("children",)).engine == "collection"
+    assert plan.spec(("parent",)).warnings == ()
+    assert [spec.pretty for spec in plan.deferred()] == ["parent", "children"]
+    shallow = compile_schema(Node, limits=Limits(max_depth=1))
+    assert shallow.spec(("parent",)).warnings == ("max_depth",)
 
 
 # --------------------------------------------------------------------------- #
@@ -697,7 +746,7 @@ def test_annotated_constraints_reach_the_prose() -> None:
 
 def test_literal_none_makes_a_field_optional() -> None:
     spec = spec_for(Literal["a", "b", None])
-    assert list(spec.key_map or {}) == ["a", "b"]
+    assert list(spec.key_map or {}) == ["a", "b", "unstated"]
     assert spec.required is False
 
 
@@ -1276,3 +1325,419 @@ def test_context_helper_is_never_empty_and_joins_ancestors() -> None:
         "Person → work address → geo"
     )
     assert _context("T", ("a", "b", "c")) == "T → a → b"
+
+
+# --------------------------------------------------------------------------- #
+# Review fixes: unstated options, frozen wire models, aliases, types, names
+# --------------------------------------------------------------------------- #
+
+
+def option_ids(spec: FieldSpec) -> list[str]:
+    return list(spec.key_map or {})
+
+
+@pytest.mark.parametrize(
+    ("annotation", "default", "expected"),
+    [
+        (Optional[Literal["open", "closed"]], None, ["open", "closed", "unstated"]),
+        (Optional[Color], None, ["RED", "BLUE", "unstated"]),
+        (Color | None, ..., ["RED", "BLUE", "unstated"]),
+        (Color, Color.RED, ["RED", "BLUE", "unstated"]),
+        (Literal["open", "closed"], "open", ["open", "closed", "unstated"]),
+        (Optional[bool], None, ["yes", "no", "unstated"]),
+    ],
+)
+def test_nullable_or_defaulted_choices_get_an_unstated_option(
+    annotation: Any, default: Any, expected: list[str]
+) -> None:
+    spec = spec_for(annotation, default)
+    assert option_ids(spec) == expected
+    assert (spec.key_map or {})["unstated"] is UNSTATED
+    assert clef_dict(spec)["criteria"]["unstated"] == "The input does not state this."
+    assert spec.null_threshold == OPTIONAL_THRESHOLD
+
+
+@pytest.mark.parametrize("annotation", [Literal["open", "closed"], Color, bool])
+def test_required_choices_get_no_unstated_option(annotation: Any) -> None:
+    spec = spec_for(annotation, json_schema_extra=s1_field(clef="choice"))
+    assert "unstated" not in option_ids(spec)
+    assert UNSTATED not in (spec.key_map or {}).values()
+
+
+def test_required_bool_forced_to_a_choice_is_just_yes_no() -> None:
+    spec = spec_for(bool, json_schema_extra=s1_field(clef="choice"))
+    assert option_ids(spec) == ["yes", "no"]
+    assert dict(spec.key_map or {}) == {"yes": True, "no": False}
+
+
+def test_defaulted_bool_forced_to_a_choice_gets_unstated() -> None:
+    spec = spec_for(bool, False, json_schema_extra=s1_field(clef="choice"))
+    assert option_ids(spec) == ["yes", "no", "unstated"]
+    assert spec.nullable is False
+
+
+def test_unstated_id_is_renamed_when_it_collides() -> None:
+    spec = spec_for(Optional[Literal["unstated", "a", "unstated_2"]], None)
+    assert option_ids(spec) == ["unstated", "a", "unstated_2", "unstated_3"]
+    assert (spec.key_map or {})["unstated_3"] is UNSTATED
+    assert (spec.key_map or {})["unstated"] == "unstated"
+
+
+def test_unstated_counts_towards_the_255_option_limit() -> None:
+    assert len(spec_for(make_enum("Fits", 254), None).key_map or {}) == 255
+    with pytest.raises(ValueError, match=r"'f'.*256 options"):
+        spec_for(make_enum("Over", 255), None)
+
+
+def test_scores_never_get_an_unstated_option() -> None:
+    spec = spec_for(Rank, Rank.LOW, json_schema_extra=s1_field(clef="score"))
+    assert dict(spec.key_map or {}) == {"0": 1, "1": 2}
+
+
+def test_unstated_sentinel_survives_copying_and_pickling() -> None:
+    import copy
+    import pickle
+
+    assert copy.deepcopy(UNSTATED) is UNSTATED
+    assert copy.copy(UNSTATED) is UNSTATED
+    assert pickle.loads(pickle.dumps(UNSTATED)) is UNSTATED
+    assert repr(UNSTATED) == "UNSTATED"
+    spec = spec_for(Optional[Color], None)
+    assert spec.key_map is not None and hash(spec) == hash(spec)
+
+
+def test_wire_models_are_frozen() -> None:
+    plan = compile_schema(Everything)
+    field = plan.clairic_fields()["integer"]
+    with pytest.raises(ValidationError):
+        field.instructions = "changed"  # type: ignore[misc]
+    question = plan.clef_questions()["flag"]
+    with pytest.raises(ValidationError):
+        question.instructions = "changed"  # type: ignore[misc]
+    request = ClairicRequest(state="x", fields={"a": field})
+    with pytest.raises(ValidationError):
+        request.state = "y"  # type: ignore[misc]
+
+
+def test_mutating_returned_objects_does_not_leak_into_the_cached_plan() -> None:
+    class Leaky(BaseModel):
+        kind: Literal["a", "b"]
+        n: int
+
+    plan = compile_schema(Leaky)
+    fields = plan.clairic_fields()
+    fields["extra"] = fields["n"]
+    fields.pop("n")
+    questions = plan.clef_questions()
+    question = questions["kind"]
+    assert isinstance(question, ChoiceQuestion)
+    question.criteria["a"] = "tampered"
+    question.criteria["zzz"] = "tampered"
+    questions.clear()
+    again = compile_schema(Leaky)
+    assert list(again.clairic_fields()) == ["n"]
+    fresh = again.clef_questions()["kind"]
+    assert isinstance(fresh, ChoiceQuestion)
+    assert fresh.criteria == {"a": "a", "b": "b"}
+    assert fresh is not question
+
+
+def test_alias_free_fields_have_no_alias() -> None:
+    assert spec_for(int).alias is None
+
+
+def test_aliases_are_recorded_for_validation() -> None:
+    from pydantic import AliasChoices, AliasPath
+
+    class Aliased(BaseModel):
+        plain: str
+        by_alias: str = Field(alias="byAlias")
+        by_validation: str = Field(validation_alias="byValidation")
+        both: str = Field(alias="a", validation_alias="v")
+        choices: str = Field(validation_alias=AliasChoices(AliasPath("x", 0), "second"))
+        path: str = Field(validation_alias=AliasPath("x", 0))
+        same: str = Field(alias="same")
+
+    plan = compile_schema(Aliased)
+    aliases = {spec.pretty: spec.alias for spec in plan.specs}
+    assert aliases == {
+        "plain": None,
+        "by_alias": "byAlias",
+        "by_validation": "byValidation",
+        "both": "v",
+        "choices": "second",
+        "path": None,
+        "same": None,
+    }
+    assert plan.spec(("path",)).warnings == ("alias_path",)
+    assert plan.spec(("choices",)).warnings == ()
+    assert any("AliasPath" in message for message in plan.warnings)
+    assert plan.spec(("by_alias",)).wire_name == "by_alias"
+
+
+# Pydantic and stdlib types ---------------------------------------------------
+
+
+def test_network_and_text_like_types_are_text() -> None:
+    import ipaddress
+
+    from pydantic import HttpUrl, IPvAnyAddress, IPvAnyInterface, IPvAnyNetwork
+
+    for annotation in (
+        HttpUrl,
+        IPvAnyAddress,
+        IPvAnyInterface,
+        IPvAnyNetwork,
+        ipaddress.IPv4Address,
+        Optional[HttpUrl],
+    ):
+        spec = spec_for(annotation)
+        assert clairic_dict(spec)["type"] == "text", annotation
+        assert spec.warnings == ()
+
+
+def test_email_types_are_text() -> None:
+    pytest.importorskip("email_validator")
+    from pydantic import EmailStr, NameEmail
+
+    assert clairic_dict(spec_for(EmailStr))["type"] == "text"
+    assert clairic_dict(spec_for(NameEmail))["type"] == "text"
+
+
+def test_email_types_are_recognised_without_email_validator() -> None:
+    from trustcall_system_one._compile import _TEXT_LIKE
+
+    names = {cls.__name__ for cls in _TEXT_LIKE}
+    assert {"EmailStr", "NameEmail", "IPvAnyAddress"} <= names
+
+
+@pytest.mark.parametrize(
+    ("name", "kind"),
+    [
+        ("PastDate", "date"),
+        ("FutureDate", "date"),
+        ("AwareDatetime", "datetime"),
+        ("NaiveDatetime", "datetime"),
+        ("PastDatetime", "datetime"),
+        ("FutureDatetime", "datetime"),
+    ],
+)
+def test_pydantic_temporal_types_use_their_base_type(name: str, kind: str) -> None:
+    import pydantic
+
+    annotation: Any = getattr(pydantic, name)
+    assert clairic_dict(spec_for(annotation))["type"] == kind
+    assert clairic_dict(spec_for(Optional[annotation]))["type"] == kind
+    listed = spec_for(list[annotation])
+    assert clairic_dict(listed)["type"] == "list"
+    assert listed.item_kind == kind
+
+
+def test_variadic_tuples_are_lists() -> None:
+    spec = spec_for(tuple[str, ...])
+    assert clairic_dict(spec) == numeric("list", items="text")
+    assert spec.item_kind == "str"
+    assert spec.post == ""
+    assert clairic_dict(spec_for(tuple[int, ...]))["items"] == "number"
+    assert clairic_dict(spec_for(tuple[dt.date, ...]))["items"] == "date"
+    assert spec_for(tuple[dt.datetime, ...]).warnings == ("lossy_list",)
+    assert spec_for(tuple[int, str]).warnings == ("unsupported_type",)
+    assert spec_for(tuple).warnings == ("unsupported_type",)
+
+
+def test_nested_typed_dicts_compile_as_submodels_and_collections() -> None:
+    class Geo(TypedDict):
+        lat: float
+
+    class Place(TypedDict):
+        name: str
+        geo: Geo
+        spots: list[Geo]
+        maybe: Optional[Geo]
+        later: NotRequired[Geo]
+
+    plan = compile_schema(Place)
+    engines = {spec.pretty: spec.engine for spec in plan.specs}
+    assert engines == {
+        "name": "clairic",
+        "geo": "submodel",
+        "spots": "collection",
+        "maybe": "submodel",
+        "later": "submodel",
+    }
+    geo = plan.spec(("geo",)).annotation
+    assert issubclass(geo, BaseModel) and geo.__name__ == "Geo"
+    assert geo.model_fields["lat"].is_required()
+    assert plan.spec(("later",)).has_default is True
+
+
+def test_typed_dict_fields_inside_a_model_are_recorded_for_the_expander() -> None:
+    class Geo(TypedDict):
+        lat: float
+
+    class Owner(BaseModel):
+        home: Optional[Geo] = None
+        homes: list[Geo] = []
+
+    plan = compile_schema(Owner)
+    assert plan.spec(("home",)).engine == "submodel"
+    assert plan.spec(("homes",)).engine == "collection"
+
+
+def test_function_parameters_may_be_typed_dicts() -> None:
+    class Geo(TypedDict):
+        lat: float
+
+    def where(point: Geo, trail: list[Geo]) -> None: ...
+
+    plan = compile_schema(where)
+    assert [spec.engine for spec in plan.specs] == ["submodel", "collection"]
+
+
+class Tree(TypedDict):
+    kids: list["Tree"]
+
+
+def test_recursive_typed_dicts_are_rejected() -> None:
+    with pytest.raises(TypeError, match="recursive"):
+        compile_schema(Tree)
+
+
+def test_dict_of_models_stays_a_mapping() -> None:
+    spec = spec_for(dict[str, Pet])
+    assert spec.engine == "mapping"
+    assert spec.warnings == ()
+    assert spec.clairic is None and spec.clef is None
+    assert spec_for(Optional[dict[str, Pet]]).engine == "mapping"
+
+
+# Option ids and criteria ------------------------------------------------------
+
+
+def test_int_enum_options_use_the_member_name_and_keep_the_value() -> None:
+    spec = spec_for(Rank)
+    assert clef_dict(spec)["criteria"] == {"LOW": "LOW (1)", "HIGH": "HIGH (2)"}
+    assert dict(spec.key_map or {}) == {"LOW": 1, "HIGH": 2}
+
+
+def test_literal_option_ids_keep_the_original_spelling_in_the_criteria() -> None:
+    spec = spec_for(Literal["N/A", "<18", "in progress", "done"])
+    assert clef_dict(spec)["criteria"] == {
+        "N_A": "N/A",
+        "_18": "<18",
+        "in_progress": "in progress",
+        "done": "done",
+    }
+    assert dict(spec.key_map or {}) == {
+        "N_A": "N/A",
+        "_18": "<18",
+        "in_progress": "in progress",
+        "done": "done",
+    }
+
+
+def test_enum_member_names_are_deduplicated_after_sanitising() -> None:
+    factory: Any = enum.Enum
+    spec = spec_for(factory("Odd", {"a b": 1, "a_b": 2, "A": 3}))
+    assert option_ids(spec) == ["a_b", "a_b_2", "A"]
+
+
+def test_enum_whose_name_equals_its_value_needs_no_label() -> None:
+    class Plain(enum.Enum):
+        YES = "YES"
+        NO = "NO"
+
+    assert clef_dict(spec_for(Plain))["criteria"] == {"YES": "YES", "NO": "NO"}
+
+
+# Names ----------------------------------------------------------------------------
+
+
+def test_colliding_plain_names_all_get_the_digest_form_in_any_order() -> None:
+    fields: dict[str, Any] = {
+        "a b": (str, Field(..., description="one")),
+        "a_b": (str, Field(..., description="two")),
+        "other": (str, Field(..., description="three")),
+    }
+    forward = compile_schema(create_model("Fwd", **fields))
+    backward = compile_schema(
+        create_model("Bwd", **dict(reversed(list(fields.items()))))
+    )
+    for plan in (forward, backward):
+        names = {spec.pretty: spec.wire_name for spec in plan.specs}
+        assert names["other"] == "other"
+        assert names["a b"].startswith("a_b_a_b_")
+        assert names["a_b"].startswith("a_b_a_b_")
+        assert names["a b"] != names["a_b"]
+        assert len(plan.clairic_names.shortened) == 2
+    assert {s.pretty: s.wire_name for s in forward.specs} == {
+        s.pretty: s.wire_name for s in backward.specs
+    }
+
+
+# Descriptions and overrides --------------------------------------------------
+
+
+def test_doc_annotation_is_a_description_source() -> None:
+    from typing_extensions import Doc
+
+    spec = spec_for(Annotated[int, Doc("From Doc")], description=None, title="T")
+    assert spec.description == "From Doc"
+    spec = spec_for(Annotated[int, Doc("From Doc")], description="From Field")
+    assert spec.description == "From Field"
+    spec = spec_for(int, description=None, title="From title")
+    assert spec.description == "From title"
+    spec = spec_for(Optional[Annotated[int, Doc("Inner")]], description=None)
+    assert spec.description == "Inner"
+
+
+@pytest.mark.parametrize(
+    ("annotation", "override", "warns"),
+    [
+        (str, "date", True),
+        (str, "number", True),
+        (int, "text", True),
+        (dt.date, "datetime", True),
+        (str, "text", False),
+        (str, "list", True),
+    ],
+)
+def test_mismatching_clairic_type_overrides_warn(
+    annotation: Any, override: str, warns: bool
+) -> None:
+    kwargs: dict[str, Any] = {"clairic_type": override}
+    spec = spec_for(annotation, json_schema_extra=s1_field(**kwargs))
+    assert ("clairic_type_mismatch" in spec.warnings) is warns
+    if warns:
+        assert any(
+            "clairic_type" in message
+            for message in compile_schema(
+                create_model(
+                    "W",
+                    f=(annotation, Field(..., json_schema_extra=s1_field(**kwargs))),
+                )
+            ).warnings
+        )
+
+
+def test_numeric_overrides_between_number_kinds_do_not_warn() -> None:
+    model = create_model(
+        "M",
+        f=(
+            Annotated[float, Field(ge=0, le=1)],
+            Field(..., json_schema_extra=s1_field(clairic_type="estimate")),
+        ),
+    )
+    assert compile_schema(model).specs[0].warnings == ()
+
+
+def test_estimate_override_takes_min_and_max_from_the_bounds() -> None:
+    model = create_model(
+        "M",
+        f=(
+            Annotated[float, Field(ge=0, lt=1)],
+            Field(..., json_schema_extra=s1_field(clairic_type="forecast")),
+        ),
+    )
+    payload = clairic_dict(compile_schema(model).specs[0])
+    assert (payload["type"], payload["min"], payload["max"]) == ("forecast", 0.0, 1.0)

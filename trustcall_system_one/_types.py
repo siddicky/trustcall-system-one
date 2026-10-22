@@ -6,7 +6,33 @@ from typing import Literal
 
 from trustcall_system_one._wire import ClairicUsage, ClefUsage, normalize_model_id
 
-__all__ = ["CallKind", "CallRecord", "Usage"]
+__all__ = ["UNSTATED", "CallKind", "CallRecord", "Usage"]
+
+
+class _Unstated:
+    """The type of ``UNSTATED``."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "UNSTATED"
+
+    def __copy__(self) -> "_Unstated":
+        return self
+
+    def __deepcopy__(self, memo: dict[int, object]) -> "_Unstated":
+        return self
+
+    def __reduce__(self) -> str:
+        return "UNSTATED"
+
+
+UNSTATED = _Unstated()
+"""Sentinel for a Clef choice that says the input does not state the value.
+
+It is never a field value: for a nullable field it stands for ``None`` and for a
+field with a default it means "leave the default".
+"""
 
 CallKind = Literal[
     "presence",
