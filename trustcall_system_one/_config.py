@@ -270,9 +270,13 @@ class Limits:
         estimate_for_bounded_numbers: Emit a Clairic ``estimate`` field for a
             number with both a lower and an upper bound.
         max_instruction_chars: Longest instruction string sent to a model.
-        clef_state_token_budget: Estimated tokens above which a Clef state is
-            narrowed to mention windows. Clef silently truncates at 65,536
-            tokens, so the budget leaves headroom for the estimate's error.
+        clef_state_token_budget: Estimated tokens (state AND questions,
+            ``_render.estimate_request_tokens``, calibrated on recorded
+            table-heavy requests) above which a Clef request is split by
+            questions or has its state narrowed to mention windows. Clef silently
+            truncates at 65,536 tokens and refuses a request over 65,529 (HTTP
+            422), so the budget leaves headroom for the estimate's error. A
+            transport may advertise a smaller one (``state_token_budget``).
         list_strategy: How a ``list[str]`` field of free text is read unless the
             field says otherwise (``s1_field(list_strategy=...)``). ``"list"``
             asks Clairic's ``list`` type, which is a span picker: confident for

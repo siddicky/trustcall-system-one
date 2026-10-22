@@ -16,11 +16,13 @@ an offset in the ORIGINAL input, and a span that lands outside the input block
 """
 
 import json
-from collections.abc import Iterable, Mapping, Sequence
+import re
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 __all__ = [
+    "CHOICE_OPTION_TOKENS",
     "ELLIPSIS",
     "Focus",
     "Parent",
@@ -28,13 +30,18 @@ __all__ = [
     "clef_state",
     "discovery_focus",
     "entity_focus",
+    "estimate_json_tokens",
+    "estimate_request_tokens",
+    "estimate_text_tokens",
     "estimate_tokens",
     "fit_clef_state",
     "mention_windows",
     "narrow_text",
     "narrowed_spans",
     "reanchor",
+    "rebase_spans",
     "render_clairic",
+    "state_spans",
 ]
 
 ELLIPSIS = "…"
@@ -479,8 +486,179 @@ def clef_state(
 
 
 def estimate_tokens(state: Any) -> float:
-    """Estimate the token count of a Clef state as ``len(json) / 3.5``."""
+    """Estimate the token count of a Clef state as ``len(json) / 3.5``.
+
+    This is the plain estimate. It is a fair guess for prose but it runs low on
+    table-heavy markdown (a median 0.82 of the provider's count on recorded spec
+    sheets) and it cannot see the questions or the options of choice questions
+    (0.16 where those dominate); the engine's budget check uses
+    ``estimate_request_tokens``.
+    """
     return len(json.dumps(state)) / _CHARS_PER_TOKEN
+
+
+# --- the calibrated estimate ------------------------------------------------ #
+#
+# Calibrated on 524 recorded Clef requests (a live run on Cloudflare over
+# table-heavy aircraft spec sheets: 4 KB of quotation prose, a 19 KB and a 54 KB
+# spec table), comparing the estimate with the provider's ``usage.input_tokens``:
+#
+# * Dense markdown tables and prose tokenise at 2.4-2.9 characters per token (not
+#   3.5): digits, pipes, backticks and short words cost about a token each, so
+#   cell-by-cell text is far denser than sentences. A space-padded table is the
+#   other extreme (5-6 characters per token: runs of spaces and dashes collapse).
+#   A single characters-per-token ratio therefore cannot fit both; counting
+#   word pieces, digits, punctuation and collapsed runs does (below).
+# * A choice question costs about 18 tokens per option and per question for a
+#   ``"c12": "Honeywell"`` entry (about one token per character, where a flat
+#   ratio says 5-6): a request of 16 questions over 250 clusters is 72,000 tokens
+#   of options alone, which is what produced the live HTTP 422 (69,639 tokens
+#   against the maximum of 65,529). ``CHOICE_OPTION_TOKENS`` is the extra per option
+#   and question that the JSON-level count does not see.
+# * With these rules (safety factor 1.1 included) the estimate over the 524
+#   requests was never below the provider's count (min 1.02 times it, median 1.24,
+#   max 1.52 for the space-padded 54 KB table), where ``estimate_tokens`` ran from
+#   0.16 to 1.73 times it (median 0.82) and saw 10,573 tokens in the request that
+#   the provider counted as 65,227.
+_TOKEN_PIECES = re.compile(
+    r"([A-Za-z]+)|(\d)|( {2,})|(\n+)|([\-_=*|`.,:;\\]{2,})|([\x80-\U0010ffff])|(\S)|\s"
+)
+_WORD_CHARS_PER_TOKEN = 4.0
+_RUN_CHARS_PER_TOKEN = 8.0
+_NON_ASCII_TOKENS = 2.0
+_SAFETY = 1.1
+_REQUEST_OVERHEAD = 50.0
+CHOICE_OPTION_TOKENS = 10.0
+"""Tokens a choice option costs per question beyond what its JSON text suggests."""
+
+
+def estimate_text_tokens(text: str) -> float:
+    """Estimate the tokens of a piece of JSON or text (before the safety factor).
+
+    Alphabetic runs count one token per 4 characters (at least one), every digit
+    and every other symbol one token, a run of 2 or more spaces or of punctuation
+    one token per 8 characters (padding and rules of tables collapse), a newline
+    run one token, and a non-ASCII character two.
+    """
+    total = 0.0
+    for word, digit, spaces, newline, rule, wide, other in (
+        m.groups() for m in _TOKEN_PIECES.finditer(text)
+    ):
+        if word:
+            total += max(1.0, len(word) / _WORD_CHARS_PER_TOKEN)
+        elif digit or newline or other:
+            total += 1.0
+        elif spaces:
+            total += max(1.0, len(spaces) / _RUN_CHARS_PER_TOKEN)
+        elif rule:
+            total += max(1.0, len(rule) / _RUN_CHARS_PER_TOKEN)
+        elif wide:
+            total += _NON_ASCII_TOKENS
+    return total
+
+
+def estimate_json_tokens(value: Any) -> float:
+    """The calibrated estimate of a part of a request (no per-request overhead)."""
+    return (
+        estimate_text_tokens(json.dumps(value, ensure_ascii=False, default=str))
+        * _SAFETY
+    )
+
+
+def _options_of(question: Any) -> int:
+    """How many options a choice question lists (0 for any other question)."""
+    if isinstance(question, Mapping):
+        if question.get("type") != "choice":
+            return 0
+        criteria = question.get("criteria")
+    else:
+        if getattr(question, "type", None) != "choice":
+            return 0
+        criteria = getattr(question, "criteria", None)
+    return len(criteria) if isinstance(criteria, Mapping) else 0
+
+
+def estimate_request_tokens(
+    state: Any, questions: Mapping[str, Any] | None = None
+) -> float:
+    """Estimate the input tokens of a Clef request: the state plus its questions.
+
+    Conservative on purpose (see the calibration above): it is meant to be compared
+    with ``limits.clef_state_token_budget``, not to predict the bill.
+
+    Args:
+        state: The structured (or string) state.
+        questions: The questions of the request, as models or as dicts; omitted
+            when only the state is measured.
+
+    Returns:
+        The estimated tokens, safety factor included.
+    """
+    total = estimate_text_tokens(json.dumps(state, ensure_ascii=False, default=str))
+    total += _REQUEST_OVERHEAD
+    for question in (questions or {}).values():
+        dumped = (
+            question.model_dump(mode="json")
+            if hasattr(question, "model_dump")
+            else question
+        )
+        total += estimate_text_tokens(
+            json.dumps(dumped, ensure_ascii=False, default=str)
+        )
+        total += CHOICE_OPTION_TOKENS * _options_of(dumped)
+    return total * _SAFETY
+
+
+def rebase_spans(value: Any, length: int, windows: Sequence[Span]) -> Any:
+    """Re-base the ``"span"`` entries of a state into a narrowed input.
+
+    A narrowed input (``narrow_text``) is a different string, so the offsets a state
+    carries for mentions would point at the wrong text. A span inside one window is
+    mapped into the narrowed text; one that is not is removed (its entry keeps its
+    text and context). The ``input`` key itself is left alone.
+
+    Args:
+        value: A state (or part of one): dicts and lists are copied.
+        length: Length of the whole input.
+        windows: The windows the input was narrowed to.
+
+    Returns:
+        The state with its spans re-based.
+    """
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if key == "span" and isinstance(item, (list, tuple)) and len(item) == 2:
+                moved = narrowed_spans(length, windows, [(int(item[0]), int(item[1]))])
+                if moved:
+                    result[key] = list(moved[0])
+                continue
+            result[key] = (
+                item if key == "input" else rebase_spans(item, length, windows)
+            )
+        return result
+    if isinstance(value, list):
+        return [rebase_spans(item, length, windows) for item in value]
+    return value
+
+
+def state_spans(state: Mapping[str, Any]) -> list[Span]:
+    """Every span a state cites outside its input (mentions, clusters, parents)."""
+    found: list[Span] = []
+
+    def walk(value: Any) -> None:
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                if key == "span" and isinstance(item, (list, tuple)) and len(item) == 2:
+                    found.append((int(item[0]), int(item[1])))
+                elif key != "input":
+                    walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    walk(state)
+    return found
 
 
 def fit_clef_state(
@@ -489,6 +667,8 @@ def fit_clef_state(
     *,
     spans: Sequence[Span] | None = None,
     window_chars: int = 600,
+    estimate: Callable[[Any], float] = estimate_tokens,
+    rebase: bool = False,
 ) -> tuple[dict[str, Any], str | None]:
     """Shrink a Clef state that is too large for the model.
 
@@ -502,12 +682,16 @@ def fit_clef_state(
         budget: Largest acceptable estimate, in tokens.
         spans: Spans in the input worth keeping.
         window_chars: Starting size of the windows.
+        estimate: The size estimate (``estimate_tokens``, or
+            ``lambda s: estimate_request_tokens(s)`` for the calibrated one).
+        rebase: Re-base the spans the rest of the state cites into the narrowed
+            input (``rebase_spans``); without it they keep their original offsets.
 
     Returns:
         ``(state, warning)``. The state is returned unchanged with no warning
         when it already fits.
     """
-    if estimate_tokens(state) <= budget:
+    if estimate(state) <= budget:
         return state, None
     text = state["input"]
     if spans:
@@ -515,7 +699,9 @@ def fit_clef_state(
         while True:
             windows = mention_windows(len(text), spans, size)
             narrowed = {**state, "input": narrow_text(text, windows)}
-            if estimate_tokens(narrowed) <= budget or size <= 50:
+            if rebase:
+                narrowed = rebase_spans(narrowed, len(text), windows)
+            if estimate(narrowed) <= budget or size <= 50:
                 break
             size //= 2
         return narrowed, (
@@ -524,9 +710,11 @@ def fit_clef_state(
         )
     limit = len(text)
     narrowed = state
-    while estimate_tokens(narrowed) > budget and limit > 100:
+    while estimate(narrowed) > budget and limit > 100:
         limit = int(limit * 0.8)
         narrowed = {**state, "input": text[:limit]}
+        if rebase:
+            narrowed = rebase_spans(narrowed, len(text), [(0, limit)])
     return narrowed, (
         f"clef_state_truncated: no mentions to anchor on, so the input was cut "
         f"to its first {limit} characters to fit the Clef budget"

@@ -412,15 +412,14 @@ def _question(sentence: Sentence, described: str) -> NoulQuestion:
 def _tokens(value: Any) -> float:
     """Tokens of a Clef state or question set, with a floor for non-ASCII text.
 
-    ``estimate_tokens`` counts the JSON with every non-ASCII character escaped
-    (several characters each), which is generous for accented Latin text; a language
-    written in CJK or emoji still costs about a token per character, so that is the
-    least the estimate may say.
+    ``estimate_json_tokens`` is the calibrated estimate the budget is checked
+    with; a language written in CJK or emoji still costs about a token per
+    character, so that is the least the estimate may say.
     """
-    from trustcall_system_one._render import estimate_tokens
+    from trustcall_system_one._render import estimate_json_tokens
 
     wide = sum(1 for ch in json.dumps(value, ensure_ascii=False) if ord(ch) > 0x2E7F)
-    return max(estimate_tokens(value), float(wide))
+    return max(estimate_json_tokens(value), float(wide))
 
 
 async def read_sentences(ctx: "Ctx", spec: "FieldSpec") -> "Resolved":
@@ -479,7 +478,7 @@ async def read_sentences(ctx: "Ctx", spec: "FieldSpec") -> "Resolved":
     # narrowed to windows around the sentences ITS questions quote (the question
     # holds the sentence, so the state only has to place it) into whatever the
     # questions leave. When even that does not fit, the chunk is halved.
-    budget = limits.clef_state_token_budget
+    budget = ctx.run.clef_budget()
     ids = list(questions)
     span_of = {f"sentence.{i}": s.span for i, s in enumerate(candidates)}
 

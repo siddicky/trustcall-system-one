@@ -35,12 +35,15 @@ from pydantic import BaseModel, ValidationError
 from pydantic_core import PydanticUndefined
 
 from trustcall_system_one._compile import (
+    IDENTITY_SEP,
     CollectionPlan,
     FieldGroup,
     FieldSpec,
     SchemaPlan,
     UnionGroup,
     UnionMember,
+    identity_doc_keys,
+    identity_spec,
 )
 from trustcall_system_one._diff import (
     MISSING,
@@ -78,6 +81,7 @@ from trustcall_system_one._match import (
     candidate_options,
     identity_compatible,
     identity_keys,
+    record_value,
 )
 from trustcall_system_one._names import Path
 from trustcall_system_one._nested import (
@@ -210,8 +214,12 @@ async def _presence(ctx: Ctx) -> float:
         ctx.run.clef_state(ctx.text),
         meta=ctx.meta("presence"),
     )
-    answer = answers["presence"]
-    assert isinstance(answer, NoulAnswer)
+    answer = answers.get("presence")
+    if not isinstance(answer, NoulAnswer):
+        # the request was refused (see ``Run.call_clef``): neither present nor absent,
+        # so the entity is extracted and judged by what comes back
+        presence = ctx.run.presence
+        return (presence.threshold_absent + presence.threshold_present) / 2
     return answer.noul
 
 
@@ -1219,7 +1227,7 @@ def _identity_target(ctx: Ctx, spec: FieldSpec) -> bool:
         ctx.info is not None
         and ctx.existing is None
         and bool(ctx.info.mentions)
-        and spec.path in {(name,) for name in ctx.plan.identity}
+        and IDENTITY_SEP.join(str(p) for p in spec.path) in ctx.plan.identity
         and spec.clairic is not None
         and spec.clairic.type == "text"
         and _name_like(spec)
@@ -2178,8 +2186,20 @@ def _json_default(model: type[BaseModel], spec: FieldSpec) -> Any:
         return MISSING
 
 
-def _group_node(result: _GroupResult, key: str) -> GroupNode:
-    """The tree the diff walks, from the groups as they were asked and answered."""
+def _identity_names(ctx: Ctx) -> frozenset[str]:
+    """The identity fields of an update (dotted when nested), whoever named them."""
+    return frozenset((*ctx.plan.identity, *ctx.identity))
+
+
+def _group_node(
+    result: _GroupResult, key: str, identity: frozenset[str] = frozenset()
+) -> GroupNode:
+    """The tree the diff walks, from the groups as they were asked and answered.
+
+    ``identity`` are the names of the identity fields (a dotted path for a nested
+    one) beyond the ones a spec or a group marks: the diff never replaces such a
+    field by a token subset of its value.
+    """
     group = result.group
     node = GroupNode(key, group, present=result.present)
     if not result.present:
@@ -2196,18 +2216,20 @@ def _group_node(result: _GroupResult, key: str) -> GroupNode:
                 spec=spec,
                 value=leaf.final(),
                 handled=handled,
-                identity=spec.identity or str(spec.path[-1]) in group.identity,
+                identity=spec.identity
+                or str(spec.path[-1]) in group.identity
+                or IDENTITY_SEP.join(str(p) for p in spec.path) in identity,
                 spans=tuple(state.spans) if state is not None else (),
                 default=_json_default(group.model, spec),
                 ref=leaf,
             )
         )
     for child in result.children:
-        node.children.append(_group_node(child, _key(child.group)))
+        node.children.append(_group_node(child, _key(child.group), identity))
     for union in result.unions:
         union_key = _key(union.union)
         member = (
-            _group_node(union.members[union.chosen.label], union_key)
+            _group_node(union.members[union.chosen.label], union_key, identity)
             if union.chosen is not None
             else None
         )
@@ -2593,7 +2615,7 @@ async def _evaluate(
     the removal question, so they stand as they are.
     """
     run, plan = ctx.run, ctx.plan
-    nodes = _group_node(root, "")
+    nodes = _group_node(root, "", _identity_names(ctx))
     diff = diff_group(nodes, before, allow_null_removals=run.gates.allow_null_removals)
     changes = [*diff.changes, *nested.changes]
     for settled in nested.fixed:
@@ -2749,7 +2771,10 @@ async def _repair_update(
             return
         # a Clef answer always resolves: ask whether the input states it
         await _check_stated(
-            ctx, _group_node(root, ""), before, only={id(leaf) for leaf in clef}
+            ctx,
+            _group_node(root, "", _identity_names(ctx)),
+            before,
+            only={id(leaf) for leaf in clef},
         )
         for leaf in clef:
             resolved = leaf.resolved
@@ -3126,11 +3151,12 @@ def _identity_conflict(
     """
     seen: list[tuple[str, str, str]] = []
     for name in names:
-        spec = next((s for s in plan.specs if s.path == (name,)), None)
+        spec = identity_spec(plan, name)
         state = by_wire.get(spec.wire_name) if spec is not None else None
         if spec is None or state is None or not state.has_value():
             continue
-        new, old = state.resolved.value, before.get(spec.alias or name)
+        new = state.resolved.value
+        old = record_value(before, IDENTITY_SEP.join(identity_doc_keys(plan, name)))
         if not isinstance(new, str) or not isinstance(old, str):
             continue
         if not new.strip() or not old.strip():
@@ -3185,9 +3211,10 @@ def _record_identity(plan: SchemaPlan, data: Mapping[str, Any], record_id: str) 
     """
     keys = identity_keys(plan, plan.identity)
     values = [
-        str(data[key]).strip()
+        str(value).strip()
         for key in keys
-        if isinstance(data.get(key), (str, int)) and str(data.get(key)).strip()
+        if isinstance(value := record_value(data, key), (str, int))
+        and str(value).strip()
     ]
     if values:
         return _clip_label(", ".join(values))
@@ -3312,6 +3339,7 @@ async def update_one(
     placed = placement or Placement()
     ctx = dataclasses.replace(
         ctx,
+        identity=tuple(identity),
         parent=placed.parent,
         lineage=placed.lineage,
         nest=placed.nest
@@ -3345,7 +3373,7 @@ async def update_one(
 
     root = await _run_unit(ctx, plan.root)
     plain = ctx.input_only()
-    nodes = _group_node(root, "")
+    nodes = _group_node(root, "", _identity_names(ctx))
     states = list(_leaf_states(root))
     by_wire = {st.spec.wire_name: st for st in states}
     unchanged: set[str] = set()
@@ -3431,7 +3459,7 @@ async def update_one(
         refused_answers.append(f"{leaf.spec.pretty} ({asked.reject})")
     if propose_only:
         found = diff_group(
-            _group_node(root, ""),
+            _group_node(root, "", _identity_names(ctx)),
             before,
             allow_null_removals=run.gates.allow_null_removals,
         )

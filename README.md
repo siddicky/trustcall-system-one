@@ -923,6 +923,17 @@ want a normalised vocabulary, make the field a `Literal` (a Clef choice), not fr
 - `One(Schema)`: exactly one entity of that schema. `Many(Schema, identity="name")`: any number.
   Both wrap a schema in `create_extractor([...])`.
 - Nested lists use a marker: `pets: Annotated[list[Pet], Many(identity="name")]`.
+- The identity may be a dotted path to a scalar inside a sub-model:
+  `Many(AircraftSpec, identity="identification.msn")` (also in a compound identity or a nested
+  list marker). It is used for discovery, for matching against existing records and to protect the
+  identity from being replaced by a short form of itself. A path that does not exist or does not end
+  at a plain field is a `ValueError`.
+- Items with no identity (`engines: list[EngineInfo]`, rows with a position and serial numbers) are
+  found by what an item is, the mentions are screened in code and one by one before clustering
+  (warnings `junk_mentions_dropped`, `mentions_screened_out`) and the result is cut to the count.
+  Name the items with `Many(identity=...)` whenever they have something to be named by.
+- A sub-model's class docstring is sent: it describes a field that has no description, and it
+  follows the instructions of the sub-model's fields ("hours times 60 plus the minutes").
 - Without a wrapper: list-form `existing` with records of a schema implies `Many(Schema)`;
   dict-form `{"Schema": record}` implies `One(Schema)`; otherwise `One(Schema)`. An explicit
   wrapper always wins. `One` given several list-form records raises `ValueError` ("use Many").
@@ -994,6 +1005,12 @@ entities got through). Clairic is $0.10 per million input tokens, which is why t
 examples print costs in fractions of a cent. Clef's price is not published, so
 `result.cost` sums the priced models and reports the rest as unpriced
 (`result.cost.complete` is `False` until `prices=Prices(per_million_input={...})` covers every model).
+Every Clef request is estimated before it is sent (state and questions, calibrated on real
+table-heavy text) and kept under `Limits(clef_state_token_budget=56_000)`: split by questions, or its
+input narrowed to windows around the mentions. A request the provider still refuses as such (HTTP
+400, 413, 422: too large, malformed) does not abort the invoke: that request's answers are missing
+and `request_rejected` says which; auth errors, rate limits and uncertain outcomes still raise, and
+`strict=True` raises on a refusal too.
 `result.usage`, `result.calls` (one entry per request, with kind, status and duration)
 and `result.warnings` tell you what happened; `passes=PassesConfig(split="entity" |
 "submodel" | "field")` trades request count for narrower questions.
@@ -1125,8 +1142,13 @@ Read these before relying on it.
 - **Cost and speed.** Verification costs requests: expect 3 to 10 per record and 2 to 5 seconds
   live. Clef's price is unpublished and Clairic/Clef rate limits are undocumented; the
   transport adapts to 429s but you may meet them in large batches.
-- **Long inputs.** Clef truncates long state silently, so the library estimates the size
-  first, narrows `input` to windows around the mentions and warns past 97% of the limit.
+- **Long inputs.** Clef truncates long state silently and refuses a request over its maximum, so
+  the library estimates every request (state and questions, calibrated on recorded table-heavy
+  requests: dense tables are 2.4 to 2.9 characters per token, and each option of a choice
+  question costs about 18 tokens per question), splits it or narrows `input` to windows around
+  the mentions to stay under `clef_state_token_budget`, contains a refusal as a warning, and
+  warns past 97% of the limit. On a table-heavy sheet with hundreds of table cells the
+  entities of identity-less lists are still the weak part (see DESIGN, Risks 10).
 - **Alpha.** Public names are in `trustcall_system_one/__init__.py`; anything with a leading
   underscore is internal and may change.
 

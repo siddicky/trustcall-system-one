@@ -1,5 +1,6 @@
 """Exception hierarchy for trustcall-system-one."""
 
+import re
 from typing import Any
 
 __all__ = [
@@ -9,11 +10,14 @@ __all__ = [
     "ExtractionValidationError",
     "ModelResponseError",
     "RateLimitError",
+    "RequestTooLargeError",
     "ServerError",
     "StateTruncatedError",
     "TransportError",
     "TrustcallSystemOneError",
     "UncertainOutcomeError",
+    "is_request_rejection",
+    "is_size_rejection",
 ]
 
 
@@ -115,6 +119,17 @@ class BadRequestError(TransportError):
         self.cf_errors: list[dict[str, object]] = [] if cf_errors is None else cf_errors
 
 
+class RequestTooLargeError(BadRequestError):
+    """A Clef request the engine would not send: it is over the size budget.
+
+    Raised by the engine itself, before anything is put on the wire, when a request
+    stays over ``limits.clef_state_token_budget`` after its state was narrowed and
+    its questions split. The engine treats it like the provider's own "request too
+    large" rejection: that one request is dropped (its questions go unanswered)
+    with a warning, and the invoke goes on.
+    """
+
+
 class ServerError(TransportError):
     """Server failed (5xx) after retries were exhausted."""
 
@@ -207,3 +222,43 @@ class AmbiguousMatchError(TrustcallSystemOneError):
         self.schema_name = schema_name
         self.label = label
         self.candidates = candidates
+
+
+_SIZE_WORDS = re.compile(
+    r"too (?:large|long|big)|requires \d+ tokens|maximum (?:is|context|number)|"
+    r"max(?:imum)? (?:input|context|token)|exceeds?|context (?:length|window)|"
+    r"payload too|token limit|too many tokens",
+    re.IGNORECASE,
+)
+
+
+def is_size_rejection(exc: BaseException) -> bool:
+    """Whether a provider refused one request because of its size.
+
+    HTTP 413, a local ``RequestTooLargeError``, or a 400/422 whose message talks
+    about tokens, size or a maximum (Cloudflare: ``Request requires 69639 tokens;
+    the maximum is 65529``).
+    """
+    if isinstance(exc, RequestTooLargeError):
+        return True
+    if not isinstance(exc, BadRequestError):
+        return False
+    if exc.status_code == 413:
+        return True
+    return exc.status_code in (400, 422) and bool(_SIZE_WORDS.search(str(exc)))
+
+
+def is_request_rejection(exc: BaseException) -> bool:
+    """Whether an error says that THIS request was refused, not that the service is.
+
+    A 400, 413 or 422 ``BadRequestError`` (or the engine's own
+    ``RequestTooLargeError``) is about one request's content or size: the same
+    request would be refused again, but every other request is unaffected, so the
+    engine drops that request and goes on. Everything else keeps raising: a rejected
+    key (``AuthError``), a rate limit, a server failure, a wrong URL or model (404),
+    and above all ``UncertainOutcomeError`` (the request may have run and been
+    charged; retrying or guessing is the caller's decision).
+    """
+    if isinstance(exc, RequestTooLargeError):
+        return True
+    return isinstance(exc, BadRequestError) and exc.status_code in (400, 413, 422)

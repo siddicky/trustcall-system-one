@@ -19,11 +19,19 @@ from trustcall_system_one._config import (
     RepairConfig,
     VerifyConfig,
 )
+from trustcall_system_one._errors import (
+    BadRequestError,
+    RequestTooLargeError,
+    is_request_rejection,
+    is_size_rejection,
+)
 from trustcall_system_one._render import (
     RenderedState,
     clef_state,
+    estimate_request_tokens,
     fit_clef_state,
     reanchor,
+    state_spans,
 )
 from trustcall_system_one._types import CallRecord, Usage, _reported_cost
 from trustcall_system_one._wire import (
@@ -35,6 +43,7 @@ from trustcall_system_one._wire import (
     ClairicOptions,
     ClairicRequest,
     ClairicResponse,
+    ClairicUsage,
     ClefRequest,
     NoulAnswer,
     NoulQuestion,
@@ -69,6 +78,11 @@ CANCELLED_AFTER_SEND = "cancelled after send; outcome unknown"
 
 _CLEF_CONTEXT_TOKENS = 65_536
 _TRUNCATION_RATIO = 0.97
+_STATE_SHARE = 0.5
+"""Share of the request budget a state may keep when its questions have to share it."""
+_MAX_SPLIT = 3
+"""Most requests a Clef request is split into before its state is narrowed instead."""
+_REJECTION_SHOWN = 160
 
 Answer = Union[NoulAnswer, ChoiceAnswer, ScoreAnswer]  # noqa: UP007
 """Any Clef answer."""
@@ -76,6 +90,34 @@ Question = Union[NoulQuestion, ChoiceQuestion, ScoreQuestion]  # noqa: UP007
 """Any Clef question."""
 
 T = TypeVar("T")
+
+
+def _shown(exc: BaseException) -> str:
+    """An error as a warning shows it: its class and a clipped message."""
+    text = " ".join(str(exc).split())
+    if len(text) > _REJECTION_SHOWN:
+        text = text[: _REJECTION_SHOWN - 1] + "\u2026"
+    return f"{type(exc).__name__}: {text}"
+
+
+def _pack(
+    chunk: Sequence[tuple[str, Question]], costs: Sequence[float], room: float
+) -> list[list[tuple[str, Question]]]:
+    """Group questions, in order, so that each group's cost is at most ``room``."""
+    groups: list[list[tuple[str, Question]]] = []
+    used = 0.0
+    for item, cost in zip(chunk, costs, strict=True):
+        if not groups or used + cost > room:
+            groups.append([])
+            used = 0.0
+        groups[-1].append(item)
+        used += cost
+    return groups
+
+
+def _narrowable(state: Any) -> bool:
+    """Whether a state is the structured kind whose ``input`` can be narrowed."""
+    return isinstance(state, dict) and isinstance(state.get("input"), str)
 
 
 def _being_cancelled() -> bool:
@@ -244,6 +286,11 @@ class Run:
         clef_memo: The answers to the Clef requests sent so far, by the hash of the
             request (``memo_key``): a byte-identical request is answered from here,
             not sent again.
+        rejected: The hashes of the requests (Clef and Clairic) a provider refused
+            as a request (HTTP 400, 413 or 422): the same request is not sent again,
+            it is treated as refused again.
+        sent_sizes: ``(call kind, estimated tokens)`` of every Clef request put on
+            the wire (``estimate_request_tokens``), for tests and diagnostics.
         fallback_used: How many requests a fallback transport answered after
             its primary failed (also reported as the ``clef_fallback_used`` warning).
         fallback_hard: How many of those answers had no probabilities.
@@ -278,6 +325,8 @@ class Run:
         default_factory=dict
     )
     clef_memo: "dict[str, dict[str, Answer]]" = field(default_factory=dict)
+    rejected: set[str] = field(default_factory=set)
+    sent_sizes: list[tuple[str, float]] = field(default_factory=list)
     fallback_used: int = 0
     fallback_hard: int = 0
     fallback_fields: dict[str, None] = field(default_factory=dict)
@@ -533,8 +582,16 @@ class Run:
         Returns:
             The parsed response.
 
+        A request the provider refuses as such (HTTP 400, 413 or 422: too large,
+        malformed) does not raise: it is logged, a ``request_rejected`` warning is
+        recorded, and the response has no answers (every field then resolves as
+        ``missing_answer``). The same request is never sent again. In ``strict`` mode
+        the error is raised.
+
         Raises:
-            TransportError: If the call failed (after it was logged).
+            TransportError: If the call failed in any other way (after it was
+                logged): a rejected key, a rate limit, a server failure, an
+                uncertain outcome.
             ModelResponseError: If the response does not match the schema (after
                 it was logged).
         """
@@ -547,9 +604,21 @@ class Run:
             reference_date=self.reference_date,
             options=ClairicOptions(return_state_text=True),
         )
-        sent = await self._send(
-            self.clairic_model, request.to_payload(), meta, len(fields)
-        )
+        payload = request.to_payload()
+        key = memo_key(self.clairic_model, payload)
+        if key in self.rejected:  # refused once: it would be refused again
+            return self._unanswered_clairic(text)
+        try:
+            sent = await self._send(self.clairic_model, payload, meta, len(fields))
+        except BadRequestError as exc:
+            if self.strict or not is_request_rejection(exc):
+                raise
+            # this request is refused (too large, malformed): its fields come back
+            # without an answer (`missing_answer`) and the rest of the run goes on;
+            # the same request is never sent a second time
+            self.rejected.add(key)
+            self._warn_rejected(meta, len(fields), exc)
+            return self._unanswered_clairic(text)
         try:
             response = parse_clairic(sent.body)
         except Exception as exc:
@@ -568,6 +637,16 @@ class Run:
             fallback_from=sent.fallback_from,
         )
         return response
+
+    def _unanswered_clairic(self, text: str) -> ClairicResponse:
+        """The stand-in for a Clairic request that was refused: no answers at all."""
+        return ClairicResponse(
+            model=self.clairic_model,
+            answers={},
+            truncated=False,
+            state_text=text,
+            usage=ClairicUsage(input_tokens=0, output_tokens=0),
+        )
 
     def anchor(
         self, rendered: RenderedState, response: ClairicResponse
@@ -590,6 +669,19 @@ class Run:
                 "block; span offsets are unknown"
             )
         return anchored
+
+    def clef_budget(self) -> int:
+        """The effective Clef request budget, in estimated tokens.
+
+        ``limits.clef_state_token_budget``, lowered to the budget the transport
+        advertises (``state_token_budget``, read defensively like ``max_questions``:
+        absent or ``None`` means no limit of its own).
+        """
+        advertised = getattr(self.transport, "state_token_budget", None)
+        budget = self.limits.clef_state_token_budget
+        if isinstance(advertised, int) and not isinstance(advertised, bool):
+            return min(budget, advertised)
+        return budget
 
     def clef_batch(self, model: str | None = None) -> int:
         """Most questions one Clef request to ``model`` may carry on this transport.
@@ -630,8 +722,18 @@ class Run:
         Returns:
             Answers keyed by question id.
 
+        Every request is estimated first (``estimate_request_tokens``, state and
+        questions) and kept within ``limits.clef_state_token_budget``: split by
+        questions, or its ``input`` narrowed to windows around the spans the state
+        cites. A request the provider refuses as such (HTTP 400, 413, 422) is
+        contained like Clairic's: warning, no answers for its questions, never sent
+        again (a size rejection of several questions is first sent once more as
+        two smaller requests). ``strict`` raises instead.
+
         Raises:
-            TransportError: If a call failed (after it was logged).
+            TransportError: If a call failed in any other way (after it was
+                logged): a rejected key, a rate limit, a server failure, an
+                uncertain outcome (never retried here).
             ModelResponseError: If a response does not match the schema.
         """
         model = model or self.clef_model
@@ -643,12 +745,111 @@ class Run:
         )
         chunks = [items[i : i + width] for i in range(0, len(items), width)]
         parts = await gather(
-            *(self._clef_once(model, chunk, state, meta) for chunk in chunks)
+            *(self._clef_chunk(model, chunk, state, meta) for chunk in chunks)
         )
         merged: dict[str, Answer] = {}
         for part in parts:
             merged.update(part)
         return merged
+
+    async def _clef_chunk(
+        self,
+        model: str,
+        chunk: list[tuple[str, Question]],
+        state: Any,
+        meta: CallMeta,
+    ) -> dict[str, Answer]:
+        """Fit one chunk of questions to the request budget, then send it.
+
+        The request is estimated (``estimate_request_tokens``: the state AND its
+        questions) before anything is sent. One that is over
+        ``limits.clef_state_token_budget`` is split into several requests when its
+        questions are what is large, and has its ``input`` narrowed to windows
+        around the spans the state cites when the state is; if it still does not fit
+        it is dropped as a rejected request (its questions go unanswered, with a
+        warning) and nothing is sent.
+        """
+        try:
+            plans = self._fit_request(chunk, state, meta)
+        except RequestTooLargeError as exc:
+            if self.strict:
+                raise
+            self._warn_rejected(meta, len(chunk), exc)
+            return {}
+        if len(plans) == 1:
+            return await self._clef_once(model, plans[0][0], plans[0][1], meta)
+        parts = await gather(
+            *(self._clef_once(model, group, shown, meta) for group, shown in plans)
+        )
+        merged: dict[str, Answer] = {}
+        for part in parts:
+            merged.update(part)
+        return merged
+
+    def _fit_request(
+        self, chunk: list[tuple[str, Question]], state: Any, meta: CallMeta
+    ) -> list[tuple[list[tuple[str, Question]], Any]]:
+        """Plan the requests of a chunk so that each is within the budget.
+
+        Returns:
+            ``[(questions, state), ...]``: one entry when the chunk fits as it is.
+
+        Raises:
+            RequestTooLargeError: If no split and no narrowing makes it fit.
+        """
+        budget = self.clef_budget()
+        if estimate_request_tokens(state, dict(chunk)) <= budget:
+            return [(chunk, state)]
+        empty = estimate_request_tokens("", {})
+        costs = [
+            estimate_request_tokens("", {qid: question}) - empty
+            for qid, question in chunk
+        ]
+        where = ".".join(p for p in (meta.schema, meta.field) if p)
+        label = f"{meta.kind} ({where})" if where else meta.kind
+        base = estimate_request_tokens(state)
+        room = budget - base
+        if room >= max(costs):
+            groups = _pack(chunk, costs, room)
+            if len(groups) <= _MAX_SPLIT or not _narrowable(state):
+                self.warn(
+                    f"clef_request_split: a {label} request of {len(chunk)} "
+                    f"question(s) was estimated over the budget of {budget} "
+                    f"tokens and was sent as {len(groups)} requests"
+                )
+                return [(group, state) for group in groups]
+        if _narrowable(state):
+            fitted, warning = self._narrow(state, budget * _STATE_SHARE)
+            need = max(costs)
+            if estimate_request_tokens(fitted) + need > budget:
+                fitted, warning = self._narrow(state, budget - need)
+            if warning:
+                self.warn(f"{warning} ({label})")
+            room = budget - estimate_request_tokens(fitted)
+            if room >= need:
+                groups = _pack(chunk, costs, room)
+                if len(groups) > 1:
+                    self.warn(
+                        f"clef_request_split: a {label} request of {len(chunk)} "
+                        f"question(s) was sent as {len(groups)} requests"
+                    )
+                return [(group, fitted) for group in groups]
+        raise RequestTooLargeError(
+            f"a {label} request is estimated at "
+            f"{estimate_request_tokens(state, dict(chunk)):.0f} tokens, over the "
+            f"budget of {budget}, and could not be narrowed or split enough"
+        )
+
+    def _narrow(self, state: dict[str, Any], budget: float) -> tuple[Any, str | None]:
+        """Narrow a state's input to the spans it cites (or its start) to ``budget``."""
+        return fit_clef_state(
+            state,
+            int(budget),
+            spans=state_spans(state) or None,
+            window_chars=self.verify.window_chars,
+            estimate=estimate_request_tokens,
+            rebase=True,
+        )
 
     async def _clef_once(
         self,
@@ -656,6 +857,8 @@ class Run:
         chunk: list[tuple[str, Question]],
         state: Any,
         meta: CallMeta,
+        *,
+        resplit: bool = True,
     ) -> dict[str, Answer]:
         request = ClefRequest(
             model=body_model(model),
@@ -675,9 +878,44 @@ class Run:
             if any(_fallback_provider(a) for a in known.values()):
                 self._note_fallback_use(meta)
             return dict(known)
-        answers = await self._clef_send(model, chunk, payload, meta)
+        if key in self.rejected:  # refused once: it would be refused again
+            return {}
+        self.sent_sizes.append((meta.kind, estimate_request_tokens(state, dict(chunk))))
+        try:
+            answers = await self._clef_send(model, chunk, payload, meta)
+        except BadRequestError as exc:
+            if self.strict or not is_request_rejection(exc):
+                raise
+            self.rejected.add(key)
+            if resplit and len(chunk) > 1 and is_size_rejection(exc):
+                # two SMALLER requests, never the one that was refused again
+                middle = len(chunk) // 2
+                self.warn(
+                    f"clef_request_resplit: a {meta.kind} request of {len(chunk)} "
+                    f"question(s) was refused as too large ({_shown(exc)}) and "
+                    "was sent again as two smaller requests"
+                )
+                halves = await gather(
+                    self._clef_once(model, chunk[:middle], state, meta, resplit=False),
+                    self._clef_once(model, chunk[middle:], state, meta, resplit=False),
+                )
+                return {**halves[0], **halves[1]}
+            self._warn_rejected(meta, len(chunk), exc)
+            return {}
         self.clef_memo[key] = answers
         return dict(answers)
+
+    def _warn_rejected(self, meta: CallMeta, n_items: int, exc: BaseException) -> None:
+        """Warn that a request was refused and its questions or fields go unanswered."""
+        where = ".".join(
+            p for p in (meta.scope, meta.schema, meta.entity, meta.field) if p
+        )
+        self.warn(
+            f"request_rejected: the {meta.kind} request"
+            f"{f' for {where}' if where else ''} ({n_items} item(s)) was refused "
+            f"({_shown(exc)}); its answers are missing and the rest of the run goes "
+            "on"
+        )
 
     async def _clef_send(
         self,
@@ -738,6 +976,11 @@ class Run:
     ) -> dict[str, Any]:
         """Build a Clef state and keep it under ``limits.clef_state_token_budget``.
 
+        The size is ``estimate_request_tokens`` (calibrated on recorded requests;
+        table-heavy text is denser than the old characters-over-3.5 rule). Spans
+        that ``extra`` cites are re-based into the narrowed input, or dropped when
+        they fall outside every window.
+
         Args:
             text: The user's input.
             entity: What the question is about.
@@ -761,11 +1004,11 @@ class Run:
         )
         state, warning = fit_clef_state(
             state,
-            self.limits.clef_state_token_budget
-            if budget is None
-            else min(budget, self.limits.clef_state_token_budget),
+            self.clef_budget() if budget is None else min(budget, self.clef_budget()),
             spans=spans,
             window_chars=self.verify.window_chars,
+            estimate=estimate_request_tokens,
+            rebase=True,
         )
         if warning:
             self.warn(warning)

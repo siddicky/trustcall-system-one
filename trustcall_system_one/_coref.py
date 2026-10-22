@@ -35,6 +35,11 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
+from trustcall_system_one._render import (
+    CHOICE_OPTION_TOKENS,
+    estimate_json_tokens,
+    estimate_request_tokens,
+)
 from trustcall_system_one._run import Run, gather
 from trustcall_system_one._types import Mention
 from trustcall_system_one._wire import (
@@ -75,6 +80,12 @@ NEW = "__new__"
 _MAX_OPTIONS = 255
 _BATCH = 16
 """Mentions an incremental request assigns at once."""
+_MIN_OPTIONS = 24
+"""Fewest earlier entities a batch is matched against before the batch is made
+smaller instead (a choice question carries every option once per question)."""
+_INPUT_SHARE = 0.5
+"""Largest share of the Clef budget the input may take in a coreference request; the
+rest is for the mentions, the earlier entities and the questions."""
 _FLOOR = 1e-12
 _POSSESSIVES = frozenset({"my", "our", "your", "his", "her", "their", "its"})
 
@@ -523,11 +534,16 @@ def _state(
     source: str,
     shown: Mapping[int, Mention],
     clusters: Mapping[str, object] | None = None,
+    *,
+    share: float = 1.0,
 ) -> dict[str, object]:
     """A coreference state holding only the mentions ``shown`` (by index).
 
     ``clusters`` (incremental assignment) are the earlier entities the mentions are
-    matched with, each described once.
+    matched with, each described once. ``share`` is how much of the Clef budget the
+    state may take: past it the input is narrowed to windows around the mentions
+    shown (``Run.clef_state``), and the spans of the mentions are re-based into the
+    narrowed input.
     """
     extra: dict[str, object] = {
         "mentions": {
@@ -537,7 +553,12 @@ def _state(
     }
     if clusters is not None:
         extra["clusters"] = dict(clusters)
-    return run.clef_state(source, spans=_spans(list(shown.values())), extra=extra)
+    return run.clef_state(
+        source,
+        spans=_spans(list(shown.values())),
+        extra=extra,
+        budget=int(run.clef_budget() * share),
+    )
 
 
 async def _pairwise(
@@ -603,7 +624,7 @@ async def _pairwise(
             return dict(
                 await run.call_clef(
                     {qid: questions[qid] for qid in chunk},
-                    _state(run, source, dict(sorted(shown.items()))),
+                    _state(run, source, dict(sorted(shown.items())), share=0.75),
                     meta=CallMeta(kind="coref", schema=schema, scope=scope),
                 )
             )
@@ -623,13 +644,21 @@ async def _pairwise(
     }
 
 
-def _cluster_entry(members: Sequence[Mention]) -> dict[str, object]:
-    """A cluster as the incremental state shows it: its label and up to 3 mentions."""
+def _cluster_entry(
+    members: Sequence[Mention], *, spans: bool = True
+) -> dict[str, object]:
+    """A cluster as the incremental state shows it: its label and up to 3 mentions.
+
+    ``spans=False`` leaves the offsets out (the input was narrowed, so they would
+    point at the wrong text).
+    """
     shown = list(members) if len(members) <= 3 else [*members[:2], members[-1]]
     return {
         "label": canonical_label([m.text for m in members]),
         "mentions": [
-            {"text": m.text, "span": list(m.span)} if m.span else {"text": m.text}
+            {"text": m.text, "span": list(m.span)}
+            if m.span and spans
+            else {"text": m.text}
             for m in shown
         ],
     }
@@ -651,6 +680,47 @@ def _lookup_in(pairs: Mapping[tuple[int, int], float]) -> Callable[[int, int], f
     return lambda i, j: pairs.get((i, j), 0.0)
 
 
+def _options_within_budget(
+    run: Run,
+    noun: str,
+    batch: Sequence[int],
+    base: Mapping[str, object],
+    described: Mapping[str, Mapping[str, object]],
+) -> int:
+    """How many of the earlier entities (most recent first) one request can offer.
+
+    A choice question lists every option, and a request asks one question per
+    mention of the batch, so an option costs once in ``state.clusters`` and once per
+    question: 16 questions over 254 entities are 4,000 options. The count is the
+    longest prefix of ``described`` that keeps the whole request, state and
+    questions, within ``Run.clef_budget``.
+    """
+    skeleton = {
+        f"assign.m{k}": ChoiceQuestion(
+            type="choice",
+            instructions=(
+                f"Which {noun} does `mentions.m{k}` refer to? Pick the earlier "
+                f"{noun} it names (see `clusters`), or {NEW} if it is a different "
+                f"{noun}."
+            ),
+            criteria={"c0": "x", NEW: f"A {noun} that none of the others is."},
+        )
+        for k in batch
+    }
+    used = estimate_request_tokens({**base, "clusters": {}}, skeleton)
+    budget = run.clef_budget()
+    kept = 0
+    for option, entry in described.items():
+        cost = estimate_json_tokens({option: entry}) + len(batch) * (
+            estimate_json_tokens({option: entry["label"]}) + CHOICE_OPTION_TOKENS * 1.1
+        )
+        if used + cost > budget:
+            break
+        used += cost
+        kept += 1
+    return kept
+
+
 async def _incremental(
     run: Run,
     *,
@@ -663,44 +733,73 @@ async def _incremental(
 ) -> list[list[int]]:
     """Assign the mentions, a batch at a time, to a cluster so far or a new one."""
     clusters: list[list[int]] = [[0]] if mentions else []
-    capped = False
+    capped_by_budget = False
+    capped_by_count = False
+    budget = run.clef_budget()
     position = 1
     while position < len(mentions):
-        batch = list(range(position, min(len(mentions), position + _BATCH)))
-        position += _BATCH
-        shown = list(range(len(clusters)))
-        if len(shown) > _MAX_OPTIONS - 1:  # the most recently mentioned ones fit
-            shown = sorted(shown, key=lambda c: max(clusters[c]))[-(_MAX_OPTIONS - 1) :]
-            shown.sort()
-            capped = True
-        described = {
-            f"c{c}": _cluster_entry([mentions[i] for i in clusters[c]]) for c in shown
-        }
-        criteria: dict[str, str | None] = {
-            option: str(entry["label"]) for option, entry in described.items()
-        }
-        criteria[NEW] = f"A {noun} that none of the others is."
-        questions = {
-            f"assign.m{k}": ChoiceQuestion(
-                type="choice",
-                instructions=(
-                    f"Which {noun} does `mentions.m{k}` refer to? Pick the earlier "
-                    f"{noun} it names (see `clusters`), or {NEW} if it is a different "
-                    f"{noun}."
-                ),
-                criteria=criteria,
+        size = _BATCH
+        while True:
+            batch = list(range(position, min(len(mentions), position + size)))
+            base = _state(
+                run, source, {k: mentions[k] for k in batch}, share=_INPUT_SHARE
             )
-            for k in batch
-        }
-        answers = await run.call_clef(
-            questions,
-            _state(run, source, {k: mentions[k] for k in batch}, described),
-            meta=CallMeta(
-                kind="coref",
-                schema=schema,
-                field=f"m{batch[0]}-m{batch[-1]}",
-                scope=scope,
-            ),
+            narrowed = base["input"] != source
+            # the most recently mentioned entities are the likeliest to be named again
+            recent = sorted(range(len(clusters)), key=lambda c: max(clusters[c]))
+            candidates = recent[-(_MAX_OPTIONS - 1) :][::-1]
+            described_all = {
+                f"c{c}": _cluster_entry(
+                    [mentions[i] for i in clusters[c]], spans=not narrowed
+                )
+                for c in candidates
+            }
+            keep = _options_within_budget(run, noun, batch, base, described_all)
+            if keep >= min(len(candidates), _MIN_OPTIONS) or len(batch) == 1:
+                break
+            size = max(1, len(batch) // 2)  # fewer questions, each with more options
+        position = batch[-1] + 1
+        capped_by_count = capped_by_count or len(clusters) > len(candidates)
+        while True:
+            shown = sorted(candidates[:keep])
+            described = {f"c{c}": described_all[f"c{c}"] for c in shown}
+            state = {**base, "clusters": described}
+            criteria: dict[str, str | None] = {
+                option: str(entry["label"]) for option, entry in described.items()
+            }
+            criteria[NEW] = f"A {noun} that none of the others is."
+            questions = {
+                f"assign.m{k}": ChoiceQuestion(
+                    type="choice",
+                    instructions=(
+                        f"Which {noun} does `mentions.m{k}` refer to? Pick the "
+                        f"earlier {noun} it names (see `clusters`), or {NEW} if it "
+                        f"is a different {noun}."
+                    ),
+                    criteria=criteria,
+                )
+                for k in batch
+            }
+            # the per-option sum above is an approximation: check the whole request
+            if keep == 0 or estimate_request_tokens(state, questions) <= budget:
+                break
+            keep = min(keep - 1, int(keep * 0.95))
+        capped_by_budget = capped_by_budget or keep < len(candidates)
+        # a choice needs an option beside `__new__`; with none that fits the budget
+        # the mentions of the batch start entities of their own
+        answers = (
+            await run.call_clef(
+                questions,
+                state,
+                meta=CallMeta(
+                    kind="coref",
+                    schema=schema,
+                    field=f"m{batch[0]}-m{batch[-1]}",
+                    scope=scope,
+                ),
+            )
+            if shown
+            else {}
         )
         fresh: list[int] = []
         joins: dict[int, list[int]] = {}
@@ -730,7 +829,15 @@ async def _incremental(
             )
             groups = agglomerate(len(sub), _lookup_in(pairs), run.coref.merge_threshold)
             clusters.extend([fresh[i] for i in group] for group in groups)
-    if capped:
+    if capped_by_budget:
+        run.warn(
+            f"coref_options_capped: so many entities of {schema} were found that a "
+            "batch of mentions could not be matched against all of them within the "
+            "Clef request budget (limits.clef_state_token_budget); each batch was "
+            "matched against the most recently mentioned ones, and a mention of an "
+            "earlier one may have started a new entity"
+        )
+    elif capped_by_count:
         run.warn(
             f"coref_options_capped: more than {_MAX_OPTIONS - 1} entities of "
             f"{schema} were found; each batch of mentions was matched against the "

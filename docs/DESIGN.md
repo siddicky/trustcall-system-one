@@ -251,8 +251,9 @@ up, and a bare `spec(path)` that several members share raises instead of guessin
 
 `ge/le/gt/lt` go into prose (Clairic `min`/`max` are estimate/forecast-only); opt-in
 `limits.estimate_for_bounded_numbers`. Instructions = parent context (" → "-joined model title and ancestor field names, with the member after a union field: `Book → author → address`, `Owner → pet (Dog)`; always present for a nested field, and mandatory when a name was shortened) + description, templated through the owner chain (`the Book's author's address's city`; a leading article of the description is dropped so the template does not double it) (`Field.description` →
-`typing_extensions.Doc` → title → attribute docstring → humanised name) + type/constraint hints, templated per entity
-("{label}'s {desc}"). A lint warns on aggregation-style descriptions ("total of…").
+`typing_extensions.Doc` → title → the class docstring of the model the field holds (its first sentence, for a sub-model or the items of a `list[Model]`; pydantic's own default docstring is never used, nor one that only repeats the names) → humanised name) + type/constraint hints, templated per entity
+("{label}'s {desc}").
+**Class docstrings reach the leaves.** The parent context of a field of a nested model also carries the first sentences (at most 160 characters) of the docstring of the model that declares it, after the last ancestor: `Aircraft → airframe → total airframe hours (A duration as printed on a sheet. The total in minutes is hours times 60 plus the minutes): total minutes`. So what `HhMm` says about converting hours:minutes to `total_minutes` is part of the Clairic instruction and of every Clef question about that leaf (`FieldSpec.context` / `clef_context`, which the engine reuses when it rebuilds a question). Not added below a union member (the member's tag already carries its docstring), nor when the docstring only repeats the model or field name ("An address."), nor beyond `limits.max_instruction_chars` (the description is never the part that is cut). A lint warns on aggregation-style descriptions ("total of…").
 
 Names: Clairic `^[A-Za-z_][A-Za-z0-9_.\-]{0,63}$`, Clef ids `[A-Za-z0-9_.\-]{1,100}`;
 over-length or colliding → `head_tail_<blake2s 6 hex>` (every path in a collision group gets the digest form, so names do not depend on declaration order), widened on a digest collision, pinned by a test. Documents are keyed by field name; `FieldSpec.alias` records the key `model_validate` expects and `unflatten(plan=...)`/`prune_nulls` emit it. Per-entity
@@ -280,7 +281,19 @@ all_pairs_below=24)`, passed to
 schema title: "Person").
 
 1. **Identity field:** `Many(identity=...)` (compound allowed; a name the schema lacks is a
-   `ValueError` at `create_extractor`) → `SchemaPlan.identity` (`s1_field(identity=True)`, else
+   `ValueError` at `create_extractor`; a name may be a **dotted path through sub-models to a scalar
+   leaf**, `Many(AircraftSpec, identity="identification.msn")`, also in a compound identity and in a
+   nested-list marker `Annotated[list[AircraftSpec], Many(identity="identification.msn")]`. A path
+   that does not exist, passes through something that is not a sub-model, or ends at a sub-model, a
+   list of models or a mapping is a `ValueError` naming the step that fails. The same resolved
+   path is used everywhere an identity is: the discovery question (`by their msn (manufacturer
+   serial number)`: the last segment and the leaf's description), the existing records' identity
+   values for matching and the prefilter (`record_value` reads the aliased keys level by level:
+   `identification.serial`), the compact record shown to Clef (the sub-model keeps only its
+   identity leaves), the identity-conflict guard, and the identity-subset protection of the diff: a
+   named identity is never replaced by a token subset of itself (`identity_subset`), whoever
+   named it (`Ctx.identity`). `s1_field(identity=True)` stays per level: it marks the identity of the
+   model that declares the field, not of the model above it) → `SchemaPlan.identity` (`s1_field(identity=True)`, else
    a `str` field named name/full_name/title/label/id/key/slug/email/handle/sku, else the first
    required `str`) → none: discovery then follows the schema docstring ("Every mention of a
    Reading (A temperature reading…)") and the run warns `no_identity_field`. The identity reads
@@ -670,6 +683,44 @@ repair are about that item of that parent. The label of a `One` parent is "the O
 metadata: `CallMeta.scope` is `"<parent key>/<pointer>"` (`e0/pets`) on every call of the
 collection and of its items, and run warnings start with the ancestors: `Emma Thompson (e0) ›
 pets: count_exceeds_discovered ...`, `Emma Thompson (e0) › Rex (e1): ...`.
+
+**Items without an identity (rows).** A nested list whose item model has no text field to name an
+item by (`list[EngineInfo]` with a `Literal` position and serial numbers, `list[LandingGear]`
+with an enum) used to be discovered like a list of people: the model listed the words of the
+table (live: 40 to 70 per list and aircraft, among them the class name, `1`, `Honeywell`,
+`TSN:**<br`), each was clustered (up to 29 coreference requests on a small sheet; on a real
+table the incremental assignment that overflowed the Clef window) and qualified, 134 to 208
+requests for one datasheet. For a nested collection with no identity (`Scope.parent` set and no
+identity names; a top-level `Many` keeps its behaviour, since `Many(Reading)` over bare numbers
+is legitimate) the engine now:
+
+1. asks by what an item *is*: "Every mention of a {kind} belonging to {parent} ({docstring}), in
+   the order they appear. Give one entry per {kind}: the exact words of the input that label it or
+   tell it apart from the others, such as its position, number or model (a {kind} has {fields}). Do
+   not list headings, units, bare numbers or the values of those fields on their own, and list a
+   {kind} once for each row or place that describes it." {kind} is the title-derived kind
+   (`EngineInfo` is "engine") unless `Many(label=)` says otherwise;
+2. **screens the mentions in code** (`_prefilter`, warning `junk_mentions_dropped`): markup
+   (`**`, `|`, `<br>`) is stripped, then a mention is dropped when nothing is left, when it is a bare
+   figure (unless the item model has a *required* numeric field: `Reading.value` keeps `21.5`),
+   when it is one or two letters without a digit (`A`, `MA`), or when it is only a heading: the
+   stoplist (`model`, `type`, `total`, `cycles`, `status`, ...), what the collection and its item are
+   called, or the label of one of the item's own fields or a word of it (`tsn` for `tsn_hours`);
+3. **qualifies each remaining mention on its own before coreference** (`_group(screen=True)`): one
+   `noul` per mention, 64 to a request, so a table of 100 cells costs two requests, and only the
+   mentions that are not refused are clustered. The refused ones are not entities; one warning
+   (`mentions_screened_out`) counts them and quotes the first five, instead of 100 `SkippedEntity`
+   rows that would bury the real skips. Qualification answers are cached by mention, so a
+   cluster that is a single mention is not asked again;
+4. cuts the result to the **count** Clairic gave when more candidates qualify than the input holds
+   (`items_capped_to_count`, the best qualified first; the others are `not_qualified` skips), because
+   merge checks cannot join items that no name connects.
+
+On a synthetic engine, gear and component table (two engines, three gear legs, 120 table cells that a
+model might list) this takes 33 requests where the old path took 61 (coreference 29 → 2), and no cell
+is reported as a skipped entity. Left out: a plural phrase that covers several items ("2 x V2527-A5",
+"CFM56-7B26 engines") is still one mention, and so one item; splitting it by the count is a
+positional extraction that needs the model, not a rule, and is a known limit (see Risks).
 
 **Insert.** Each item runs `insert_one` (full pipeline, own repair loop); the valid ones are
 put into the parent's document in first-mention order (a list), or keyed by the extracted key
@@ -1464,9 +1515,52 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
   3030, "list fields don't take 'null_threshold'"; a list answer has no `p_null` either). The
   compiler never emits it for a list, `Ctx.clairic_field` leaves it out of re-asks, and
   `ClairicField` rejects it, so `FakeTransport` catches it offline. Every other type accepts it.
-- Clef truncates long state **silently**: estimate size before sending (budget 56K of 64K
-  tokens), narrow `input` to mention windows when over, and warn when
-  `usage.input_tokens ≥ 0.97 × 65,536`.
+- Clef truncates long state **silently**, and a request over the provider's maximum is refused
+  (Cloudflare: HTTP 422 `Request requires 69639 tokens; the maximum is 65529`). Every Clef
+  request is therefore estimated before it is sent and kept within
+  `Limits.clef_state_token_budget` (default 56,000 of 64K estimated tokens; the one knob), in ONE
+  place, `Run.call_clef`, so no caller can forget it:
+  * **The estimate** (`_render.estimate_request_tokens`) covers the state AND the questions, and
+    counts word pieces, digits, symbols and collapsed runs of spaces or rules instead of
+    characters over 3.5. It was calibrated on 524 recorded Clef requests of a live run over
+    table-heavy spec sheets (`usage.input_tokens` against the estimate). Findings: dense
+    markdown tables and prose are 2.4-2.9 characters per token, a space-padded table 5-6, so no
+    single ratio fits both (the old `len(json)/3.5` was a median 0.82 of the real count on that
+    run); and a choice question costs about 18 tokens per option **per question**, which a
+    character ratio does not see at all: 16 questions over 250 clusters are 72,000 tokens of
+    options. The old estimate saw 10,573 tokens in the request the provider counted as 65,227.
+    The calibrated one was never below the provider's count over the 524 requests (min 1.02
+    times it, median 1.24, max 1.52; includes a 1.1 safety factor and 10 extra tokens per option
+    and question). The padded table is the 1.52: the estimate is deliberately conservative where
+    it cannot tell, and a long dense document is narrowed a little earlier than it had to be.
+  * **The guard** (`Run._fit_request`): a request over budget is first *split* by questions (up to
+    3 requests, the state shared) when its questions are what is large, else the `input` is
+    narrowed to windows around the spans the state cites (mentions, clusters, parent), with those
+    spans re-based into the narrowed text (`rebase_spans`; spans outside every window are
+    dropped, text and context stay) and the questions split to fit what is left; if even that does
+    not fit, the request is dropped without being sent (`RequestTooLargeError`, treated like a
+    refusal below). `Run.clef_state` (what the callers use to build a state) narrows with the same
+    estimate, and `Run.clef_budget()` is the effective budget: the knob, lowered to a
+    `state_token_budget` a transport may advertise (read defensively, like `max_questions`).
+  * **Coreference** (`_incremental`) builds its requests to the budget: the input is held to half
+    of it (windows around the 16 mentions of the batch beyond that), the earlier entities offered
+    are the longest *most recent* prefix that fits (`coref_options_capped` now also says "within
+    the Clef request budget"), the batch is halved while fewer than 24 entities would fit, and
+    with no room at all the batch's mentions simply start entities of their own. The pairwise
+    questions keep a quarter of the budget for themselves.
+  * **A refused request does not abort the invoke.** HTTP 400, 413 or 422 (`BadRequestError`, or the
+    engine's own `RequestTooLargeError`) are about one request: it is logged, a
+    `request_rejected` warning names the call (kind, scope, schema, entity, field) and the provider's
+    message, and the call returns no answers, which every caller already handles as an unanswered
+    question: a Clairic field resolves as `missing_answer`, a presence or qualify question as
+    "unknown", a coreference pair or assignment as "not the same entity", a gate as "not a pass".
+    The identical request is never sent again in the run (`Run.rejected`), a refused request of
+    several questions that looks size-related (413, or a message about tokens or a maximum) is
+    sent once more as two *smaller* requests (`clef_request_resplit`), and with `strict=True` the
+    error is raised instead. What still raises: `AuthError` (401/403), rate limits, server errors,
+    a 404/405 (a wrong URL or model, nothing request-specific), and `UncertainOutcomeError`, which
+    is never swallowed and never retried (the request may have run and been charged).
+  * The post-hoc check stays: a warning when `usage.input_tokens ≥ 0.97 × 65,536`.
 - Usage per call into `CallRecord`s and a `Usage` total by model and by kind. `Prices`
   defaults to Clairic $0.10/M only; Clef's price isn't published, so `Prices.cost(usage)`
   returns a frozen `CostReport{usd, unpriced_models, complete}`: `usd` sums the priced models
@@ -1622,6 +1716,12 @@ README scenario (Many(Person), 3 existing, 4 people + Sunny, ~9 mentions): ~39 r
 ~8 sequential hops; Clef median 209 ms (published), Clairic latency unpublished (assume
 0.3–0.8 s) → roughly 2–3.5 s end to end. Flat `One` insert: ~7 requests, ~1–2 s.
 
+Table-heavy spec sheets (live aircraft run, `AircraftSpec` with engine, gear and check lists): 134 requests
+and 229 k input tokens for one sheet of one aircraft before the item screening, 206 and 588 k for two,
+about two thirds of the tokens Clef's; about half of the requests are the per-field attribution
+checks. The screening of identity-less items (see "Nested collections") and the request budget
+exist to cut the junk part of that and to keep every request under the provider's maximum.
+
 ## Delivery
 
 ### Packaging, CI and release
@@ -1702,6 +1802,7 @@ Each milestone landed as one commit that left `make lint` and `make test` green.
 | M9 | nested `list[Model]` / `dict[str, prim]` through the engine |
 | M10a | cassette/recording transports, live smoke, evals harness |
 | M10b | README, CI workflow, Makefile polish |
+| M11 | aircraft-run fixes: Clef request budget (calibrated estimate, central guard, coreference to the budget), containment of a refused request, dotted identity paths, class docstrings of nested models, screening of identity-less items |
 
 ### README
 
@@ -1743,7 +1844,14 @@ green. The examples were the acceptance tests for M5 to M9.
    Senior Marketing Manager last month" rather than a paraphrase, and Olivia's relationship
    comes back as "my cousin" (speaker's voice). Normalised vocabularies should use `Literal`
    (→ Clef `choice`). README shows real output.
-2. Clef silently truncates long state — pre-send budget + narrowing + post-hoc warning.
+2. Clef silently truncates long state, and a request over the maximum is refused — pre-send budget
+   on the calibrated estimate of the whole request (state and questions), split/narrow in
+   `Run.call_clef`, containment of a refusal, post-hoc warning. The estimate is calibrated on one
+   live run of one kind of document (aircraft spec tables on Cloudflare); another tokenizer, a
+   dense non-Latin text or images (not counted) can still exceed it, in which case the provider's
+   422 is contained (that request's answers are missing, with a `request_rejected` warning) rather
+   than fatal. Containment means an invoke can now *finish* with some fields `missing_answer` or
+   some mentions unclustered where it used to raise: read `warnings`, or use `strict=True`.
 3. Clairic/Clef rate limits are unpublished; ~40 requests per invoke × `batch` may hit 429s —
    adaptive limiter.
 4. Span offsets could drift if Clairic normalises state — always request `state_text`.
@@ -1758,6 +1866,16 @@ green. The examples were the acceptance tests for M5 to M9.
 9. Cassettes are snapshots of request bodies: any change to the wording of a question, the
    rendering of a state or a threshold that is sent to a model (`null_threshold`) changes the key.
    A replay that misses names the call; record again rather than loosening the match.
+10. Identity-less nested items are still the weakest path. The screening cuts the junk, not the
+    granularity: one mention that covers several items ("CFM56-7B26 engines") is one entity, so
+    an engine row can still be lost (live, two-aircraft run: the A320's engine row was proposed as
+    `1` / `CFM56-5B4/3` and refused, the B737's two engines became one entity that failed
+    validation on `position`); the count cap keeps the best qualified but cannot split a phrase.
+    A required `Literal` that the input does not state for an item still drops the whole item. The
+    junk-word stoplist and the field-label rule are English/table oriented heuristics.
+11. A nested `s1_field(identity=True)` identifies the sub-model, not the record above it (per-level
+    identity is documented and tested), so an identity inside a sub-model of a `Many` item is
+    named with `Many(identity="a.b")`, not marked on the field.
 
 ## Verification
 
