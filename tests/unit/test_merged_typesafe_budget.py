@@ -44,9 +44,9 @@ JEV = 24_000
 META = CallMeta(kind="gate")
 
 
-def typesafe(handler: Any) -> TypeSafeTransport:
+def typesafe(handler: Any, **kwargs: Any) -> TypeSafeTransport:
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    return TypeSafeTransport(api_key=KEY, client=client, max_retries=0)
+    return TypeSafeTransport(api_key=KEY, client=client, max_retries=0, **kwargs)
 
 
 def question(text: str) -> NoulQuestion:
@@ -71,12 +71,19 @@ class Spy(Bridge):
     def __init__(self, inner: Any, backend: JevBackend) -> None:
         super().__init__(inner, backend)
         self.clef: list[tuple[str, float]] = []
+        self.states_checked = 0
 
     async def run(self, model: str, payload: Any, **kwargs: Any) -> Any:
+        before = len(self.backend.requests)
         if "questions" in payload:
             size = estimate_request_tokens(payload["state"], payload["questions"])
             self.clef.append((kwargs["meta"].kind, size))
-        return await super().run(model, payload, **kwargs)
+        reply = await super().run(model, payload, **kwargs)
+        if "questions" in payload:  # Clef: what Jev got is what the engine built
+            for body in self.backend.requests[before:]:
+                assert body["state"] == payload["state"]
+                self.states_checked += 1
+        return reply
 
 
 # --------------------------------------------------------------------------- #
@@ -118,6 +125,7 @@ async def test_no_request_exceeds_the_budget_on_a_table_like_input() -> None:
     )
     result = await extractor.ainvoke(text)
     assert spy.clef and max(size for _, size in spy.clef) <= JEV
+    assert spy.states_checked >= len(spy.clef)  # Jev read the engine's state, whole
     assert backend.requests  # it really went through the Jev wire
     assert (
         sorted(r.value.name for r in result.records if isinstance(r.value, Part))
@@ -130,7 +138,20 @@ async def test_no_request_exceeds_the_budget_on_a_table_like_input() -> None:
 # (b) a local "too large" refusal of TypeSafe is contained
 # --------------------------------------------------------------------------- #
 
-HUGE = "x " + "-" * 120_000  # the engine's estimate sees ~17k tokens, Jev's ~40k
+HUGE = "x " + "-" * 120_000  # the engine estimates this question at ~17k tokens
+
+
+def small_context(handler: Any, **kwargs: Any) -> TypeSafeTransport:
+    """A TypeSafe transport whose context takes less than the engine's budget.
+
+    The engine fits every request to what the transport advertises, so a request that
+    the transport then refuses locally is not one it builds with the real limits (the
+    two measure alike). A smaller Jev context, or a model the budget was not
+    advertised for, reaches that refusal: the transport's limit is lowered here.
+    """
+    transport = typesafe(handler, **kwargs)
+    transport._question_tokens = 5_000
+    return transport
 
 
 async def test_a_local_too_large_refusal_is_a_rejected_request_not_an_abort() -> None:
@@ -140,7 +161,7 @@ async def test_a_local_too_large_refusal_is_a_rejected_request_not_an_abort() ->
         sent.append(request)
         return jev_answer(request)
 
-    run = Run(transport=typesafe(handler))
+    run = Run(transport=small_context(handler))
     big = {"big": question(HUGE)}
     assert estimate_request_tokens({"input": "t"}, big) <= run.clef_budget()  # passes
     answers = await run.call_clef(big, {"input": "t"}, meta=META)
@@ -154,7 +175,7 @@ async def test_a_local_too_large_refusal_is_a_rejected_request_not_an_abort() ->
     assert not sent
 
     # strict mode raises it
-    strict = Run(transport=typesafe(handler), strict=True)
+    strict = Run(transport=small_context(handler), strict=True)
     with pytest.raises(RequestTooLargeError):
         await strict.call_clef(big, {"input": "t"}, meta=META)
     assert not sent
@@ -167,32 +188,82 @@ async def test_the_other_questions_of_a_refused_request_are_still_asked() -> Non
         sent.append(request)
         return jev_answer(request)
 
-    run = Run(transport=typesafe(handler))
+    run = Run(transport=small_context(handler))
     asked = {"big": question(HUGE), "small": question("Is it small?")}
     answers = await run.call_clef(asked, {"input": "t"}, meta=META)
-    assert set(answers) == {"small"}  # the one that fits was resent on its own
+    assert set(answers) == {"small"}  # the one that fits was sent on its own
     assert [list(json.loads(r.content)["questions"]) for r in sent] == [["small"]]
-    assert any(w.startswith("clef_request_resplit") for w in run.warnings)
     assert any(w.startswith("request_rejected") for w in run.warnings)
+
+
+async def test_a_local_refusal_names_the_question_and_only_it_is_refused() -> None:
+    """The oversized question is isolated; its siblings go out in ONE request, not in
+    halves that keep meeting the same question."""
+    sent: list[list[str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(list(json.loads(request.content)["questions"]))
+        return jev_answer(request)
+
+    run = Run(transport=small_context(handler))
+    asked = {
+        "a": question("Is a so?"),
+        "b": question("Is b so?"),
+        "big": question(HUGE),
+        "c": question("Is c so?"),
+        "d": question("Is d so?"),
+    }
+    answers = await run.call_clef(asked, {"input": "t"}, meta=META)
+    assert set(answers) == {"a", "b", "c", "d"}
+    assert sent == [["a", "b", "c", "d"]]  # one request of the siblings, nothing else
+    assert any(w.startswith("clef_request_isolated") for w in run.warnings)
+    assert any(w.startswith("request_rejected") for w in run.warnings)
+    assert not any(w.startswith("clef_request_resplit") for w in run.warnings)
+
+
+async def test_a_server_size_refusal_is_still_halved_not_isolated() -> None:
+    """The isolation is for a refusal made before anything was sent. A refusal the
+    server made (it ran its checks on the whole request) says nothing about which
+    question is at fault: that one is sent again in halves."""
+    sent: list[list[str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        qids = list(json.loads(request.content)["questions"])
+        sent.append(qids)
+        if len(qids) > 2:
+            return httpx.Response(400, json={"detail": "max_tokens_exceeded"})
+        return jev_answer(request)
+
+    run = Run(transport=typesafe(handler))
+    asked = {f"q{i}": question(f"Is {i} so?") for i in range(4)}
+    answers = await run.call_clef(asked, {"input": "t"}, meta=META)
+    assert set(answers) == set(asked)
+    assert sent == [["q0", "q1", "q2", "q3"], ["q0", "q1"], ["q2", "q3"]]
+    assert any(w.startswith("clef_request_resplit") for w in run.warnings)
+    assert not any(w.startswith("clef_request_isolated") for w in run.warnings)
 
 
 def test_the_local_refusals_of_to_jev_clef_are_typed_size_refusals() -> None:
     from trustcall_system_one._typesafe import to_jev_clef
 
-    huge = {"type": "noul", "instructions": HUGE, "criteria": {"true": "y"}}
+    # a question as large as Jev's context: no state would make the request fit
+    options = {f"o{i}": "x" * 400 for i in range(254)}
+    huge = {"type": "choice", "instructions": "Which?", "criteria": options}
     payload = {"model": "clef", "state": {"input": "t"}, "questions": {"q": huge}}
     with pytest.raises(RequestTooLargeError) as alone:
         to_jev_clef(
             payload, "jev-latest", question_budget=30_000, request_budget=60_000
         )
     assert is_size_rejection(alone.value) and is_request_rejection(alone.value)
-    # a state with nothing left to cut: many short strings, none above the floor
-    state = {f"k{i}": "word " * 30 for i in range(900)}
+    assert alone.value.question_id == "q"  # it names the question
+    # a state with nothing to narrow: no input, only the user's records
+    state = {"records": {f"r{i}": "word " * 30 for i in range(900)}}
     small = {"type": "noul", "instructions": "Is it?", "criteria": {"true": "y"}}
     stuck = {"model": "clef", "state": state, "questions": {"q": small}}
     with pytest.raises(RequestTooLargeError) as no_room:
         to_jev_clef(stuck, "jev-latest", question_budget=30_000, request_budget=60_000)
     assert is_size_rejection(no_room.value)
+    assert no_room.value.question_id is None  # no single question is at fault
     # other local refusals (an image, a malformed request) are not size refusals
     with pytest.raises(BadRequestError) as other:
         to_jev_clef({"model": "clef"}, "jev-latest")
@@ -219,7 +290,7 @@ def _split_transport() -> tuple[TypeSafeTransport, dict[str, int]]:
         return jev_answer(request)
 
     transport = typesafe(handler)
-    transport._request_tokens = 3420  # a split into several Jev requests
+    transport._request_tokens = 2400  # a split into several Jev requests
     return transport, seen
 
 

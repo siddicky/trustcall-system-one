@@ -107,6 +107,27 @@ def _shown(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {text}"
 
 
+_REQUEST_ID = re.compile(
+    r"\s*\((?:request|correlation|trace)\s+id\b[^)]*\)", re.IGNORECASE
+)
+
+
+def _refusal_signature(exc: BadRequestError) -> str:
+    """What makes two refusals "the same" for the circuit breaker.
+
+    The status and the message with the figures taken out (``Request requires 69639
+    tokens``) and WITHOUT the id the server gave the request: transports put it in
+    the message (``(request id 3f9a...)``, ``(correlation id ...)``), it is different
+    every time, and a breaker that counted it would never trip.
+    """
+    text = str(exc)
+    request_id = getattr(exc, "request_id", None)
+    if request_id:
+        text = text.replace(str(request_id), "")
+    text = _REQUEST_ID.sub("", text)
+    return re.sub(r"\d+", "N", f"{exc.status_code} {text}")
+
+
 def _pack(
     chunk: Sequence[tuple[str, Question]], costs: Sequence[float], room: float
 ) -> list[list[tuple[str, Question]]]:
@@ -412,6 +433,27 @@ class Run:
         if primary is not None:
             self._log_primary(model, meta, n_items, primary)
 
+    def _record_siblings(
+        self, model: str, meta: CallMeta, n_items: int, exc: BaseException
+    ) -> None:
+        """Log the other requests of a failed call of several (TypeSafe's split).
+
+        Those that failed with it (a timeout is an uncertain outcome: it may have
+        been charged) are logged with their own error, and those that were cancelled
+        in flight as ``CANCELLED_AFTER_SEND``, so a charge is never invisible just
+        because another request's error is the one that was raised.
+        """
+        for sibling in getattr(exc, "sibling_errors", ()):
+            self._log_primary(model, meta, n_items, sibling)
+        for _ in range(int(getattr(exc, "cancelled_siblings", 0))):
+            self._record(
+                getattr(exc, "served_model", None) or model,
+                meta,
+                n_items,
+                error=CANCELLED_AFTER_SEND,
+                provider=getattr(exc, "provider", None),
+            )
+
     def _log_primary(
         self, model: str, meta: CallMeta, n_items: int, primary: BaseException
     ) -> None:
@@ -470,6 +512,7 @@ class Run:
             raise
         except Exception as exc:
             self._record_primary(model, meta, n_items, exc)
+            self._record_siblings(model, meta, n_items, exc)
             charged_model = getattr(exc, "served_model", None) or model
             spent = getattr(exc, "reported_cost", None)
             self._record(
@@ -491,6 +534,8 @@ class Run:
             raise
         if response.fallback_from is not None:
             self._note_fallback(model, meta, n_items, response, started)
+        for note in response.warnings:  # what the transport changed on the way
+            self.warn(note)
         if response.rerouted_from is not None:
             self.warn(
                 f"request_rerouted: {response.rerouted_from} cannot serve a request "
@@ -700,14 +745,23 @@ class Run:
         ``None`` means no limit of its own). Jev reads 32k tokens, so
         ``TypeSafeTransport`` advertises 24k and the effective budget is
         ``min(56k, 24k)``. A routing or fallback transport answers for the model
-        behind it. Everything that sizes a Clef request asks this.
+        behind it, so the budget depends on the model the request goes to. Everything
+        that sizes a Clef request asks this.
 
         Args:
-            model: The Clef model the request goes to (default: this run's).
+            model: The Clef model the request goes to. Without one (a state built
+                before it is known which model will read it) the smallest budget of
+                the models this run uses (``clef_model`` and ``gate_model``): a state
+                that fits that fits whichever reads it.
         """
-        budget = self.limits.clef_state_token_budget
-        advertised = state_token_budget(self.transport, model or self.clef_model)
-        return budget if advertised is None else min(budget, advertised)
+        knob = self.limits.clef_state_token_budget
+        models = (
+            [model]
+            if model
+            else list(dict.fromkeys((self.clef_model, self.gate_model)))
+        )
+        found = [state_token_budget(self.transport, m) for m in models]
+        return min([knob, *(b for b in found if b is not None)])
 
     def clef_batch(self, model: str | None = None) -> int:
         """Most questions one Clef request to ``model`` may carry on this transport.
@@ -796,7 +850,7 @@ class Run:
         warning) and nothing is sent.
         """
         try:
-            plans = self._fit_request(chunk, state, meta)
+            plans = self._fit_request(chunk, state, meta, model)
         except RequestTooLargeError as exc:
             if self.strict:
                 raise
@@ -813,7 +867,11 @@ class Run:
         return merged
 
     def _fit_request(
-        self, chunk: list[tuple[str, Question]], state: Any, meta: CallMeta
+        self,
+        chunk: list[tuple[str, Question]],
+        state: Any,
+        meta: CallMeta,
+        model: str | None = None,
     ) -> list[tuple[list[tuple[str, Question]], Any]]:
         """Plan the requests of a chunk so that each is within the budget.
 
@@ -823,7 +881,7 @@ class Run:
         Raises:
             RequestTooLargeError: If no split and no narrowing makes it fit.
         """
-        budget = self.clef_budget()
+        budget = self.clef_budget(model)
         if estimate_request_tokens(state, dict(chunk)) <= budget:
             return [(chunk, state)]
         empty = estimate_request_tokens("", {})
@@ -915,6 +973,24 @@ class Run:
             if not self._contains(exc, count=resplit):
                 raise
             self.rejected.add(key)
+            isolated = (
+                getattr(exc, "question_id", None)
+                if isinstance(exc, RequestTooLargeError)
+                else None
+            )
+            if resplit and len(chunk) > 1 and any(q == isolated for q, _ in chunk):
+                # A refusal made locally, before anything was sent (it can never have
+                # been charged), that names ONE question that cannot fit: refuse
+                # that one alone and ask its siblings without it, rather than
+                # halving the request over and over.
+                self._warn_rejected(meta, 1, exc)
+                rest = [item for item in chunk if item[0] != isolated]
+                self.warn(
+                    f"clef_request_isolated: question {isolated!r} of a {meta.kind} "
+                    f"request was too large to send and was refused alone; its "
+                    f"{len(rest)} sibling question(s) were sent without it"
+                )
+                return await self._clef_once(model, rest, state, meta)
             if resplit and len(chunk) > 1 and is_size_rejection(exc):
                 # two SMALLER requests, never the one that was refused again
                 middle = len(chunk) // 2
@@ -951,7 +1027,7 @@ class Run:
                     return False
         if not count:  # the halves of a request that was counted already
             return True
-        signature = re.sub(r"\d+", "N", f"{exc.status_code} {exc}")
+        signature = _refusal_signature(exc)
         self.refusals[signature] = self.refusals.get(signature, 0) + 1
         return self.refusals[signature] <= _MAX_SAME_REFUSAL
 
@@ -1023,6 +1099,7 @@ class Run:
         spans: Sequence[tuple[int, int]] | None = None,
         extra: Mapping[str, Any] | None = None,
         budget: int | None = None,
+        model: str | None = None,
     ) -> dict[str, Any]:
         """Build a Clef state and keep it under ``limits.clef_state_token_budget``.
 
@@ -1042,6 +1119,9 @@ class Run:
                 question that goes with the state takes up the rest). That limit is
                 itself capped by what the transport says it takes
                 (``transport.state_token_budget``: Jev reads 32k tokens).
+            model: The Clef model that will read the state, when it is known (its
+                transport's budget applies); else the smallest budget of the models
+                this run uses (``clef_budget``).
 
         Returns:
             The state; when it was too large the input is narrowed and a warning
@@ -1054,7 +1134,7 @@ class Run:
             proposed_change=proposed_change,
             extra=extra,
         )
-        cap = self.clef_budget()
+        cap = self.clef_budget(model)
         state, warning = fit_clef_state(
             state,
             cap if budget is None else min(budget, cap),

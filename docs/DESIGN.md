@@ -1691,38 +1691,64 @@ question, never the option: it can be the user's text).
 
 *Jev's context is 64k tokens for the state and all the questions of a request and 32k for the state and
 one question* (262k with `long_context=True`). Clef cut a long state silently; Jev answers `400
-max_tokens_exceeded`. So the transport meets the limits itself, with conservative token estimates
-(one token per three characters, so the limits are 60,000 and 30,000):
+max_tokens_exceeded`. So the transport meets the limits itself, with the engine's own estimate
+(`_render.estimate_request_tokens`, calibrated and conservative: the unit the budget it advertises
+is in, so the engine and the transport never disagree about how large a request is; the limits are
+60,000 for a request and 30,000 for the state and its widest question):
 
 * it **advertises the state it takes**: `TypeSafeTransport.state_token_budget` (24,000; a
   `long_context` transport takes more; `None` for every other transport, which says nothing).
   `transport.state_token_budget(transport, model)` reads it (an int attribute or a method, like
   `max_questions`); `RoutingTransport` answers for the transport that serves the model,
-  `FallbackTransport` with the smaller of its two, and `RecordingTransport` and `CassetteTransport` forward
-  it like `max_questions` (a cassette is replayed with the budget it was recorded with, so the
-  request keys still match). The engine has ONE effective budget, `Run.clef_budget()`:
+  `FallbackTransport` with the smaller of its two (a fallback that does not `serve` the model is not
+  counted, as for `max_questions`), and `RecordingTransport` and `CassetteTransport` forward it like
+  `max_questions` (a cassette is replayed with the budget each model was recorded with, so the
+  request keys still match). The engine has ONE effective budget, `Run.clef_budget(model)`:
   `min(Limits.clef_state_token_budget, transport budget)` (56,000 and 24,000 on TypeSafe, so 24,000),
-  read through `transport.state_token_budget(...)`. Every place that sizes a Clef request asks it
-  (`Run.clef_state`, the request guard `Run._fit_request`, coreference, matching, sentences), and the
-  budget bounds the state AND the questions of one request (the calibrated estimate), so a request
-  is not built for Cloudflare's larger window and then refused by Jev;
-* **`to_jev_clef` splits and narrows as the last line of defence**: questions go into as few requests
+  read through `transport.state_token_budget(...)` for the model the request goes to (a state
+  built before the model is known fits the smaller budget of `clef_model` and `gate_model`). Every
+  place that sizes a Clef request asks it (`Run.clef_state`, the request guard `Run._fit_request`,
+  coreference, matching, sentences). The budget bounds the state AND the questions of one request,
+  and 24,000 is below both Jev limits (30,000 for the state and its widest question, 60,000 for the
+  request) in the SAME unit, so **a request the engine fitted passes the transport's checks
+  untouched: Jev reads exactly the state the engine built**, spans and records included;
+* **`to_jev_clef` splits and narrows as the last line of defence** (for a request that did not
+  come through the engine's budget, or a smaller Jev context): questions go into as few requests
   as hold them (each with the whole state; the answers are merged in the request's order, the usage
-  summed), and a state still too large for even one question is narrowed, in as many rounds as it takes
-  (the longest string first, never below 200 characters), so no request exceeds 32k per question or 64k
-  per request. The narrowing keeps windows around the passages the questions quote (a quoted value
-  in a question is found in the state and kept with its surroundings, a `…` marking what was left
-  out) and cuts text nobody quotes from its end. A request that cannot be made to fit is refused
+  summed), and a state still too large for even one question has its `input` narrowed, with the
+  engine's own machinery (`fit_clef_state`: windows around the spans the state cites and around the
+  passages the questions quote, spans re-based with `rebase_spans` under `OFFSET_KEYS`; text nobody
+  cites is cut from its end), so no request exceeds 32k per question or 64k per request. **Only
+  `input` is ever narrowed**: a `record`, `records`, `proposed_change` or `existing` is the user's
+  data and is never cut, and a narrowing is never silent (`TransportResponse.warnings`, recorded by the
+  engine as a `typesafe_state_narrowed` warning). A request that cannot be made to fit is refused
   locally with a `RequestTooLargeError` (a `BadRequestError`) and nothing is sent. The engine
   recognises it as a size refusal (`is_size_rejection`) and treats it as a rejected request: a
   `request_rejected` warning, the request's questions unanswered, the invoke goes on (see the
   Clef budget item above). Nothing was sent, so it is safe to contain; an error that says
   `maybe_sent` or carries a `partial_usage` is never contained, whatever its class. Refused so: a
   question that alone is as large as the context (30k estimated tokens), or a state that has
-  nothing left to cut. A request that fits is one request with the questions as they are.
+  nothing left to cut (no `input`, or the rest of the state is too large). When the refusal names
+  ONE question that cannot fit (`question_id`), the engine refuses that question alone and sends its
+  siblings together in one request (`clef_request_isolated`), instead of halving the request over and
+  over; only a local refusal is treated so, because nothing was sent and nothing was charged, never
+  a refusal the server made (those are sent again in halves). A request that fits is one request
+  with the questions as they are.
   If some parts of a split request answered and another failed, the error carries what the answered
   parts cost (`partial_usage`) and `maybe_sent`, so it is `uncertain` and a `FallbackTransport` does
-  not re-ask the questions that were already charged.
+  not re-ask the questions that were already charged. **Concurrent siblings.** The parts of a split
+  Clef request and the batches of a Clairic stage go out together, so one may be refused (a 400
+  `max_tokens_exceeded`) in the same moment that another times out, or is still in flight when the
+  first failure is raised. `gather_all` therefore says what became of the others
+  (`cancelled_siblings`: still running and cancelled; `sibling_errors`: failed too, even in the same
+  tick), and `_blame` makes the raised error uncontainable whenever there is any: if a sibling's
+  error says it may have run (`may_have_run`: an uncertain outcome, a 5xx, `maybe_sent`,
+  `partial_usage`) THAT error is raised, with the refusal logged beside it; otherwise the error
+  itself is raised with `maybe_sent`. The engine then never contains the refusal as a size
+  rejection or resends the siblings' questions, and `Run._record_siblings` logs every sibling (the
+  timed-out ones with their error, the cancelled ones as `cancelled after send; outcome unknown`),
+  so a possible charge is never invisible. A call of a single request is unaffected: its 400 is
+  still contained.
 
 ### Clairic: selection, following TypeSafe's extraction cookbooks
 

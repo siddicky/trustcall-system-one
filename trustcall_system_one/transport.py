@@ -38,6 +38,7 @@ from trustcall_system_one._errors import (
     TransportError,
     TrustcallSystemOneError,
     UncertainOutcomeError,
+    may_have_run,
 )
 from trustcall_system_one._types import CallKind
 from trustcall_system_one._typesafe import (
@@ -182,6 +183,9 @@ class TransportResponse:
         rerouted_from: When a ``RoutingTransport`` handed a request it could not
             send to the routed transport (images) to its default, the provider
             it was routed to; the engine records a warning.
+        warnings: What the transport changed in the request on its way (a state it
+            had to narrow to fit its model's context); the engine records each as a
+            warning, so nothing is cut silently.
     """
 
     body: dict[str, Any]
@@ -195,6 +199,7 @@ class TransportResponse:
     served_model: str | None = None
     primary_error: BaseException | None = None
     rerouted_from: str | None = None
+    warnings: tuple[str, ...] = ()
 
 
 @runtime_checkable
@@ -1743,10 +1748,13 @@ TYPESAFE_URL = "https://api.typesafe.ai"
 TYPESAFE_MODEL = "jev-latest"
 _TYPESAFE_LIMITER_KEY = "typesafe"
 _JEV_STATE_TOKENS = 24_000
-"""Estimated tokens of a Clef state Jev takes with room for the questions: it takes
-32k for the state and one question, 64k for the state and all of them."""
+"""Estimated tokens (``estimate_request_tokens``) of a whole Clef request the engine
+may build for Jev: below the 30k and 60k that the transport itself enforces, which
+leaves room for the widest question and for the estimate's error."""
 _JEV_QUESTION_TOKENS = 30_000
+"""Jev takes 32k tokens for the state and one question (estimated as above)."""
 _JEV_REQUEST_TOKENS = 60_000
+"""... and 64k for the state and all the questions of a request."""
 _JEV_LONG_TOKENS = 250_000  # 262k with the long-context header
 
 
@@ -1890,9 +1898,12 @@ class TypeSafeTransport(ExperientialTransport):
         self.state_token_budget: int = (
             _JEV_LONG_TOKENS - 30_000 if long_context else _JEV_STATE_TOKENS
         )
-        """Estimated tokens of a Clef state this transport takes (the engine narrows a
-        state to ``min(limits.clef_state_token_budget, this)``): Jev reads 32k tokens
-        for the state and one question, so the state keeps room for the question."""
+        """Estimated tokens (``estimate_request_tokens``, the engine's own unit) of a
+        Clef request this transport takes, state and questions together: the engine
+        fits every request to ``min(limits.clef_state_token_budget, this)``
+        (``Run.clef_budget``). Jev reads 32k tokens for the state and one question
+        and 64k for the state and all of them, and this is below both, so a request
+        the engine fitted passes the transport's own checks untouched."""
         self._stitch_memo: dict[str, asyncio.Future[dict[str, float]]] = {}
 
     def serves(self, model: str, payload: Mapping[str, Any] | None = None) -> bool:
@@ -2062,16 +2073,21 @@ class TypeSafeTransport(ExperientialTransport):
         self, payload: Mapping[str, Any], timeout: float | None
     ) -> TransportResponse:
         """A Clef request: one Jev request, or several when Jev's context needs it."""
+        notes: list[str] = []
         requests = to_jev_clef(
             payload,
             self._model,
             question_budget=self._question_tokens,
             request_budget=self._request_tokens,
+            notes=notes,
         )
         if len(requests) == 1:
             (request,) = requests
-            return await self._post(
+            single = await self._post(
                 _TYPESAFE_LIMITER_KEY, request, request["questions"], timeout=timeout
+            )
+            return (
+                dataclasses.replace(single, warnings=tuple(notes)) if notes else single
             )
         started = time.perf_counter()
         answered: list[TransportResponse] = []
@@ -2086,11 +2102,12 @@ class TypeSafeTransport(ExperientialTransport):
         try:
             sent = await gather_all(*(one(r) for r in requests))
         except BaseException as exc:
-            siblings = int(getattr(exc, "cancelled_siblings", 0))
+            error = _blame(exc)
+            siblings = int(getattr(error, "cancelled_siblings", 0))
             if answered or siblings:
-                exc.maybe_sent = True  # type: ignore[attr-defined]
+                error.maybe_sent = True  # type: ignore[attr-defined]
             if answered:  # those parts were run, and charged
-                exc.partial_usage = ClefUsage(  # type: ignore[attr-defined]
+                error.partial_usage = ClefUsage(  # type: ignore[attr-defined]
                     input_tokens=sum(
                         int(p.body["usage"]["input_tokens"]) for p in answered
                     ),
@@ -2098,9 +2115,11 @@ class TypeSafeTransport(ExperientialTransport):
                         int(p.body["usage"]["output_tokens"]) for p in answered
                     ),
                 )
-                exc.served_model = answered[-1].served_model  # type: ignore[attr-defined]
-            _note_siblings(exc, siblings)
-            raise
+                error.served_model = answered[-1].served_model  # type: ignore[attr-defined]
+            _note_siblings(error, siblings)
+            if error is exc:
+                raise
+            raise error from exc
         answers: dict[str, Any] = {}
         usage = {"input_tokens": 0, "output_tokens": 0}
         for part in sent:
@@ -2118,6 +2137,7 @@ class TypeSafeTransport(ExperientialTransport):
             body=body,
             retries=sum(p.retries for p in sent),
             duration_ms=(time.perf_counter() - started) * 1000,
+            warnings=tuple(notes),
         )
         return merged_response
 
@@ -2144,19 +2164,25 @@ class TypeSafeTransport(ExperientialTransport):
             used += cost
         return [b for b in batches if b]
 
-    def _annotate(self, exc: BaseException, stats: RunStats) -> None:
-        """Put what the earlier requests of a failed Clairic call cost on its error."""
-        exc.served_model = stats.model or self._model  # type: ignore[attr-defined]
-        siblings = int(getattr(exc, "cancelled_siblings", 0))
+    def _annotate(self, exc: BaseException, stats: RunStats) -> BaseException:
+        """Put what the earlier requests of a failed Clairic call cost on its error.
+
+        Returns the error to raise: ``exc`` itself, or, when a request that failed
+        at the same time may have been charged (``_blame``), that one.
+        """
+        error = _blame(exc)
+        error.served_model = stats.model or self._model  # type: ignore[attr-defined]
+        siblings = int(getattr(error, "cancelled_siblings", 0))
         if stats.requests or siblings:
-            exc.maybe_sent = True  # type: ignore[attr-defined]
+            error.maybe_sent = True  # type: ignore[attr-defined]
         if stats.requests:
-            exc.partial_usage = ClairicUsage(  # type: ignore[attr-defined]
+            error.partial_usage = ClairicUsage(  # type: ignore[attr-defined]
                 input_tokens=stats.input_tokens,
                 output_tokens=stats.output_tokens,
                 passes=stats.requests,
             )
-        _note_siblings(exc, siblings)
+        _note_siblings(error, siblings)
+        return error
 
     async def _clairic(
         self, payload: Mapping[str, Any], timeout: float | None
@@ -2222,8 +2248,10 @@ class TypeSafeTransport(ExperientialTransport):
             self._annotate(error, stats)
             raise error from None
         except BaseException as exc:
-            self._annotate(exc, stats)
-            raise
+            blamed = self._annotate(exc, stats)
+            if blamed is exc:
+                raise
+            raise blamed from exc
         return TransportResponse(
             body=body,
             retries=stats.retries,
@@ -2248,6 +2276,48 @@ certainly ran nothing. ``uncertain`` (the request may have been run and charged)
 the same vendor, which is what "do not auto-retry" is about."""
 FallbackTrigger = Union[str, "type[Exception]"]
 _NEVER_FALL_BACK = (AuthError, BadRequestError)
+
+
+def _blame(exc: BaseException) -> BaseException:
+    """The error to raise for a call of several requests that failed.
+
+    ``gather_all`` leaves on ``exc`` what became of the other requests: the ones it
+    cancelled and the errors of the ones that failed with it. Whenever there are
+    any, the call is NOT a plain refusal of one request: a sibling may have been sent
+    and charged (it timed out, or was cancelled mid-flight), and the engine must not
+    contain the error (a size refusal, say) and send the siblings' questions again.
+
+    * If a sibling's error says the request may have run (``may_have_run``: an
+      uncertain outcome, a server failure, ``maybe_sent``, ``partial_usage``) and
+      ``exc`` does not, THAT error is the one raised (the original is chained from
+      it, and logged by the engine as a sibling).
+    * Otherwise ``exc`` is raised, marked ``maybe_sent``.
+
+    The choice is made once per error: a failure shared by several calls (the
+    stitch memo) is annotated by each of them.
+    """
+    siblings: list[BaseException] = list(getattr(exc, "sibling_errors", ()))
+    cancelled = int(getattr(exc, "cancelled_siblings", 0))
+    if not siblings and not cancelled:
+        return exc
+    chosen: BaseException | None = getattr(exc, "_blamed", None)
+    if chosen is not None:
+        return chosen
+    heavy = None
+    if not may_have_run(exc):
+        heavy = next((s for s in siblings if may_have_run(s)), None)
+    if heavy is None:
+        chosen = exc
+    else:
+        chosen = heavy
+        chosen.sibling_errors = [  # type: ignore[attr-defined]
+            exc,
+            *(s for s in siblings if s is not heavy),
+        ]
+        chosen.cancelled_siblings = cancelled  # type: ignore[attr-defined]
+    chosen.maybe_sent = True  # type: ignore[attr-defined]
+    exc._blamed = chosen  # type: ignore[attr-defined]
+    return chosen
 
 
 def _note_siblings(exc: BaseException, siblings: int) -> None:
@@ -2409,16 +2479,19 @@ class FallbackTransport:
         return min(limit, max_questions(self._fallback, model))
 
     def state_token_budget(self, model: str) -> int | None:
-        """The smaller state budget of the two transports (``None``: none says one)."""
-        found = [
-            b
-            for b in (
-                state_token_budget(self._primary, model),
-                state_token_budget(self._fallback, model),
-            )
-            if b is not None
-        ]
-        return min(found) if found else None
+        """The smaller budget of the two transports (``None``: none says one).
+
+        Like ``max_questions``: the fallback receives the same request, so it has to
+        take it too, but a fallback that does not serve the model is not counted
+        (a Decisions fallback behind a Jev primary does not narrow the request for a
+        model it would never be asked).
+        """
+        found = [state_token_budget(self._primary, model)]
+        serves = getattr(self._fallback, "serves", None)
+        if not (callable(serves) and not serves(model)):
+            found.append(state_token_budget(self._fallback, model))
+        known = [b for b in found if b is not None]
+        return min(known) if known else None
 
     def _falls_back_on(self, exc: Exception) -> bool:
         if isinstance(exc, _NEVER_FALL_BACK):

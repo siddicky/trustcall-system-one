@@ -709,8 +709,40 @@ def _number_words(text: str, field_: ClairicField | None) -> list[Candidate]:
     return out
 
 
+def own_description(instructions: str) -> str:
+    """What a field's instructions say about the field itself, without its context.
+
+    A nested field's instructions carry the compiler's context in front, written as
+    ``"Aircraft → times (Total time in service, including overhauls): Airframe
+    hours."`` (``render_instructions``: ``prefix: body``), where the parenthesis is
+    the docstring of the model that holds the field. That text describes the parent,
+    not the field, and must not be read as the field asking for a total.
+
+    The context is recognised by its ``" → "`` outside any parenthesis; the body
+    starts after the first ``": "`` that follows it outside any parenthesis. Without
+    that arrow (a field at the top, or a hand-written instruction) the whole text is
+    the description.
+    """
+    depth = 0
+    arrow = False
+    for i, char in enumerate(instructions):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+        elif depth == 0:
+            if instructions.startswith(" \u2192 ", i):
+                arrow = True
+            elif char == ":" and arrow and instructions[i + 1 : i + 2] == " ":
+                return instructions[i + 2 :]
+    return instructions
+
+
 def _is_total(field_: ClairicField | None) -> bool:
-    return bool(field_ and field_.instructions and _TOTAL.search(field_.instructions))
+    """Whether the field itself asks for a total (not its parent's docstring)."""
+    if field_ is None or not field_.instructions:
+        return False
+    return bool(_TOTAL.search(own_description(field_.instructions)))
 
 
 def _sum_candidates(

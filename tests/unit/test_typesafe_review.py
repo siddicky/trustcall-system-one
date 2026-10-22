@@ -48,16 +48,18 @@ from trustcall_system_one import (
     ModelResponseError,
     Prices,
     RateLimitError,
+    RequestTooLargeError,
     RoutingTransport,
     TransportError,
     TransportResponse,
     TypeSafeConfig,
+    TypeSafeTransport,
     UncertainOutcomeError,
     Usage,
     system_one_transport,
 )
 from trustcall_system_one._candidates import pattern_candidates
-from trustcall_system_one._render import estimate_request_tokens, estimate_tokens
+from trustcall_system_one._render import estimate_request_tokens
 from trustcall_system_one._repair import _Blocks
 from trustcall_system_one._run import Run
 from trustcall_system_one._structure import join_questions, structure_key, to_lines
@@ -192,12 +194,24 @@ def test_routing_and_fallback_say_the_budget_of_who_serves() -> None:
     assert state_token_budget(FallbackTransport(other, spare), CLEF) is None
 
 
+_EMPTY = estimate_request_tokens("", {})
+
+
+def measure(part: dict[str, Any]) -> tuple[float, list[float]]:
+    """The size of a Jev request in the transport's own unit (the engine's estimate)."""
+    return estimate_request_tokens(part["state"]), [
+        estimate_request_tokens("", {qid: q}) - _EMPTY
+        for qid, q in part["questions"].items()
+    ]
+
+
 def test_the_engine_narrows_a_clef_state_to_what_the_transport_takes() -> None:
-    text = "word " * 6000  # about 10k tokens
+    text = "word " * 6000  # about 6.6k estimated tokens
     plain = Run(transport=FakeTransport(lambda *_: None))
-    assert (
-        estimate_request_tokens(plain.clef_state(text)) > 5_000
-    )  # the library limit: 24k
+    # a transport that says nothing: only the library's 56k knob applies, so the
+    # state is left whole (and is larger than every limit below)
+    assert estimate_request_tokens(plain.clef_state(text)) > 5_000
+    assert not plain.warnings
     narrow = FakeTransport(lambda *_: None)
     narrow.state_token_budget = 3_000  # type: ignore[attr-defined]
     run_ = Run(transport=narrow)
@@ -213,6 +227,32 @@ def test_the_engine_narrows_a_clef_state_to_what_the_transport_takes() -> None:
     assert estimate_request_tokens(capped.clef_state(text)) <= 2_000
 
 
+def test_what_the_engine_fits_for_typesafe_passes_the_transports_own_checks() -> None:
+    """The transport measures with the engine's estimate, so it never re-narrows."""
+    jev = TypeSafeTransport(api_key="test-key-for-typesafe")
+    engine = Run(transport=jev)
+    question = {
+        "type": "noul",
+        "instructions": "Is it so?",
+        "criteria": {"true": "y", "false": "n"},
+    }
+    prose = "word " * 30_000
+    padded = ("| " + "-" * 30 + " " * 20 + " |\n") * 3000
+    for text in (prose, padded):
+        state = engine.clef_state(text)
+        assert estimate_request_tokens(state) <= 24_000
+        notes: list[str] = []
+        (part,) = to_jev_clef(
+            {"model": "clef", "state": state, "questions": {"q": question}},
+            "jev-latest",
+            question_budget=30_000,
+            request_budget=60_000,
+            notes=notes,
+        )
+        assert part["state"] == state  # not a character of it was changed
+        assert not notes
+
+
 async def test_a_clef_request_over_jevs_limits_is_split_and_narrowed() -> None:
     big = {"input": "word " * 40_000}  # 200k characters: 67k tokens
     questions = {
@@ -226,8 +266,7 @@ async def test_a_clef_request_over_jevs_limits_is_split_and_narrowed() -> None:
     assert len(parts) > 1
     assert [q for p in parts for q in p["questions"]] == list(questions)  # in order
     for part in parts:
-        state = estimate_tokens(part["state"])
-        costs = [estimate_tokens(q) for q in part["questions"].values()]
+        state, costs = measure(part)
         assert state + max(costs) <= 30_000  # Jev: 32k for the state and a question
         assert state + sum(costs) <= 60_000  # and 64k for the state and them all
     # a request that fits is one request, unchanged
@@ -253,8 +292,7 @@ def test_the_transport_sends_a_big_clef_request_as_several_and_merges() -> None:
     sent = run(transport.run(CLEF, payload, meta=META))
     assert len(jev.requests) > 1
     for request in jev.requests:
-        state = estimate_tokens(request["state"])
-        costs = [estimate_tokens(q) for q in request["questions"].values()]
+        state, costs = measure(request)
         assert state + max(costs) <= 32_000
         assert state + sum(costs) <= 64_000
     assert list(sent.body["answers"]) == list(questions)  # every answer, in order
@@ -979,7 +1017,7 @@ def _clef_split_failure() -> tuple[Any, Any, dict[str, int]]:
         )
 
     transport = make(handler, max_retries=0)
-    transport._request_tokens = 3420  # a split into several requests
+    transport._request_tokens = 2400  # a split into several requests
     return transport, payload, seen
 
 
@@ -1104,29 +1142,50 @@ def _delete_question(i: int) -> dict[str, Any]:
 
 def _fits(parts: list[dict[str, Any]]) -> None:
     for part in parts:
-        state = estimate_tokens(part["state"])
-        costs = [estimate_tokens(q) for q in part["questions"].values()]
+        state, costs = measure(part)
         assert state + max(costs) <= 30_000
         assert state + sum(costs) <= 60_000
 
 
-def test_a_state_of_many_records_is_narrowed_until_the_request_fits() -> None:
+def test_a_state_of_many_records_is_refused_not_cut() -> None:
     records = {
         f"r{i}": {"name": f"Person {i}", "notes": "lorem ipsum dolor sit amet " * 30}
         for i in range(300)
     }
     state = {"input": "Alice left the company. " * 50, "records": records}
     questions = {f"delete.r{i}": _delete_question(i) for i in range(60)}
-    assert estimate_tokens(state) > 50_000
+    assert estimate_request_tokens(state) > 50_000
+    payload = {"model": "clef", "state": state, "questions": questions}
+    with pytest.raises(RequestTooLargeError, match="cannot be narrowed"):
+        to_jev_clef(
+            payload, "jev-latest", question_budget=30_000, request_budget=60_000
+        )
+    # the user's records are never cut to make a request fit: refused, nothing sent
+    recorder = Recorder(ok())
+    with pytest.raises(RequestTooLargeError):
+        run(make(recorder).run(CLEF, payload, meta=META))
+    assert not recorder.requests
+
+
+def test_only_the_input_is_narrowed_and_the_records_are_kept() -> None:
+    records = {f"r{i}": {"name": f"Person {i}"} for i in range(20)}
+    state = {"input": "Alice left the company. " * 5000, "records": records}
+    questions = {f"delete.r{i}": _delete_question(i) for i in range(20)}
+    notes: list[str] = []
     parts = to_jev_clef(
         {"model": "clef", "state": state, "questions": questions},
         "jev-latest",
         question_budget=30_000,
         request_budget=60_000,
+        notes=notes,
     )
     _fits(parts)
     assert [q for p in parts for q in p["questions"]] == list(questions)
-    assert parts[0]["state"]["input"].startswith("Alice left")  # the input is kept
+    for part in parts:
+        assert part["state"]["records"] == records  # exactly as they were
+        assert part["state"]["input"].startswith("Alice left")
+        assert len(part["state"]["input"]) < len(state["input"])
+    assert notes and notes[0].startswith("typesafe_state_narrowed")  # and it says so
 
 
 def test_what_the_questions_quote_is_kept_when_the_state_is_narrowed() -> None:
@@ -1138,18 +1197,22 @@ def test_what_the_questions_quote_is_kept_when_the_state_is_narrowed() -> None:
         "instructions": f"Does `input` say the city is Lisbon? It reads '{needle}'.",
         "criteria": {"true": "yes", "false": "no"},
     }
+    notes: list[str] = []
     (part,) = to_jev_clef(
         {"model": "clef", "state": {"input": text}, "questions": {"q": question}},
         "jev-latest",
         question_budget=30_000,
         request_budget=60_000,
+        notes=notes,
     )
     kept = part["state"]["input"]
     assert needle in kept  # not just the start of the text
     assert "\u2026" in kept  # with a mark where text was left out
     assert len(kept) < len(text)
+    assert notes
     _fits([part])
-    # text the questions do not quote is cut from its end
+    # text nobody quotes or cites is cut from its end
+    plain_notes: list[str] = []
     (plain,) = to_jev_clef(
         {
             "model": "clef",
@@ -1159,9 +1222,33 @@ def test_what_the_questions_quote_is_kept_when_the_state_is_narrowed() -> None:
         "jev-latest",
         question_budget=30_000,
         request_budget=60_000,
+        notes=plain_notes,
     )
     assert plain["state"]["input"].startswith("filler words")
-    assert plain["state"]["input"].endswith("\u2026")
+    assert len(plain["state"]["input"]) < len(text)
+    assert plain_notes
+
+
+def test_the_spans_a_state_cites_are_rebased_when_its_input_is_narrowed() -> None:
+    filler = "filler words go here " * 3000
+    name = "Captain Alvarez"
+    text = f"{filler}{name} flew the aircraft. {filler}"
+    at = text.index(name)
+    state = {
+        "input": text,
+        "mentions": [{"text": name, "span": [at, at + len(name)]}],
+        "records": {"r1": {"span": [3, 4], "note": "a field called span"}},
+    }
+    (part,) = to_jev_clef(
+        {"model": "clef", "state": state, "questions": {"q": _delete_question(1)}},
+        "jev-latest",
+        question_budget=30_000,
+        request_budget=60_000,
+    )
+    sent = part["state"]
+    start, end = sent["mentions"][0]["span"]
+    assert sent["input"][start:end] == name  # it points at the same words
+    assert sent["records"] == state["records"]  # a record's own "span" is not an offset
 
 
 def test_a_question_that_alone_fills_jevs_context_is_refused_locally() -> None:
@@ -1191,7 +1278,7 @@ def test_a_state_that_cannot_be_cut_small_enough_is_refused_locally() -> None:
     }  # all under the floor
     payload = {"model": "clef", "state": state, "questions": {"q": _delete_question(1)}}
     recorder = Recorder(ok())
-    with pytest.raises(BadRequestError, match="cannot be narrowed"):
+    with pytest.raises(RequestTooLargeError, match="no input to narrow"):
         run(make(recorder).run(CLEF, payload, meta=META))
     assert not recorder.requests
 

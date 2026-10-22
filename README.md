@@ -1055,9 +1055,16 @@ examples print costs in fractions of a cent. Clef's price is not published, so
 (`result.cost.complete` is `False` until `prices=Prices(per_million_input={...})` covers every model).
 Every Clef request is estimated before it is sent (state and questions, calibrated on real
 table-heavy text) and kept under `Limits(clef_state_token_budget=56_000)`: split by questions, or its
-input narrowed to windows around the mentions. A request the provider still refuses for its size
-(HTTP 413, or Cloudflare's "Request requires N tokens") does not abort the invoke: that request's
-answers are missing and `request_rejected` says which. Any other 4xx (a malformed field), auth
+input narrowed to windows around the mentions. A transport can ask for less: on `TypeSafeTransport`
+the effective budget is `min(56_000, 24_000)`, the 24k of what Jev reads, in the same unit, so Jev
+receives exactly the state the library built and never narrows it again. A request the provider
+still refuses for its size (HTTP 413, Cloudflare's "Request requires N tokens", Jev's 400
+`max_tokens_exceeded`) or that `TypeSafeTransport` refuses locally before sending anything (a typed
+`RequestTooLargeError`: a question as large as Jev's context, a state with nothing to narrow) does not
+abort the invoke: that request's answers are missing and `request_rejected` says which (a local
+refusal of one oversized question leaves its sibling questions to be asked). When the refusal arrives
+beside parts of the same call that failed or timed out, which may have been charged, it is raised
+instead and nothing is sent again. Any other 4xx (a malformed field), auth
 errors, rate limits, anything that may have been charged (an uncertain outcome, also behind a
 fallback) and a refusal that repeats more than 8 times still raise, and `strict=True` raises on a
 size refusal too.

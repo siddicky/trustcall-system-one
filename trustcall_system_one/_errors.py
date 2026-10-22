@@ -133,7 +133,14 @@ class RequestTooLargeError(BadRequestError):
     unanswered) with a ``request_rejected`` warning, and the invoke goes on. Nothing
     was sent, so it is safe to contain; an error that says ``maybe_sent`` or carries
     a ``partial_usage`` is never treated as one, whatever its class.
+
+    Attributes:
+        question_id: When the refusal names one question that cannot fit in any
+            request (a question as large as the model's context), its id: the engine
+            refuses that question alone and still asks its siblings.
     """
+
+    question_id: str | None = None
 
 
 class ServerError(TransportError):

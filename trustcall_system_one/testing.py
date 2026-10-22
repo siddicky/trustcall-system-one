@@ -2496,7 +2496,7 @@ class CassetteTransport:
         self._cursor: dict[str, int] = {}
         self._lock = threading.Lock()
         self._recorded_limit: int | None = None
-        self._recorded_budget: int | None = None
+        self._recorded_budgets: dict[str, int] = {}
         self.hits = 0
         self.forwarded = 0
         self.misses: list[tuple[str, dict[str, Any], CallMeta]] = []
@@ -2532,11 +2532,14 @@ class CassetteTransport:
                     isinstance(budget, int)
                     and not isinstance(budget, bool)
                     and budget > 0
-                    and (
-                        self._recorded_budget is None or budget < self._recorded_budget
-                    )
                 ):
-                    self._recorded_budget = budget
+                    try:
+                        name = body_model(entry["model"])
+                    except ValueError:
+                        continue
+                    known = self._recorded_budgets.get(name)
+                    if known is None or budget < known:  # the smallest of each model
+                        self._recorded_budgets[name] = budget
 
     def max_questions(self, model: str) -> int:
         """Questions one Clef request may carry when it is replayed.
@@ -2554,13 +2557,21 @@ class CassetteTransport:
         return min(limits) if limits else DEFAULT_MAX_QUESTIONS
 
     def state_token_budget(self, model: str) -> int | None:
-        """The state budget the Clef requests were recorded with (the smallest).
+        """The state budget the requests of ``model`` were recorded with (smallest).
 
-        So the states are narrowed as they were and the request keys match; and, when
-        a miss can go to an ``inner`` transport, no larger than that one takes.
-        ``None`` if neither says one.
+        Per model: a cassette recorded through a routing transport holds ``clef`` and
+        ``clef-flash`` requests narrowed to different budgets, and each must be
+        replayed with its own for the request keys to match. When a miss can go to an
+        ``inner`` transport, no larger than that one takes for the model. ``None`` if
+        neither says one.
         """
-        found = [b for b in (self._recorded_budget,) if b is not None]
+        found: list[int] = []
+        try:
+            recorded = self._recorded_budgets.get(body_model(model))
+        except ValueError:
+            recorded = None
+        if recorded is not None:
+            found.append(recorded)
         if self._inner is not None:
             inner = state_token_budget(self._inner, model)
             if inner is not None:
@@ -2604,7 +2615,7 @@ class CassetteTransport:
         other._inner = self._inner if inner is None else inner
         other._entries = self._entries
         other._recorded_limit = self._recorded_limit
-        other._recorded_budget = self._recorded_budget
+        other._recorded_budgets = dict(self._recorded_budgets)
         other._cursor = {}
         other._lock = threading.Lock()
         other.hits = other.forwarded = 0

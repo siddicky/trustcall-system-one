@@ -71,6 +71,11 @@ from trustcall_system_one._errors import (
     ModelResponseError,
     RequestTooLargeError,
 )
+from trustcall_system_one._render import (
+    estimate_request_tokens,
+    fit_clef_state,
+    state_spans,
+)
 from trustcall_system_one._structure import (
     JOIN_AFTER_DANGLING,
     JOIN_AFTER_TERMINAL,
@@ -236,8 +241,6 @@ def estimate_tokens(value: Any) -> float:
     return len(json.dumps(value, ensure_ascii=False, default=str)) / 3.0
 
 
-_FLOOR = 200
-"""No string is cut to fewer characters than this."""
 _QUOTED = re.compile(
     r"[\"'`\u201c\u2018]([^\"'`\u201c\u201d\u2018\u2019\n]{4,120})[\"'`\u201d\u2019]"
 )
@@ -265,52 +268,35 @@ def _anchors(questions: Mapping[str, Any]) -> list[str]:
     return list(found)[:20]
 
 
-def _windows(text: str, spans: list[tuple[int, int]], keep: int) -> str | None:
-    """``text`` cut to about ``keep`` characters in windows around ``spans``."""
-    spans = sorted(spans)
-    reach = keep // (2 * len(spans))
-    while True:
-        merged: list[tuple[int, int]] = []
-        for a, b in spans:
-            lo, hi = max(0, a - reach), min(len(text), b + reach)
-            while 0 < lo < a and not text[lo - 1].isspace():  # start at a word
-                lo += 1
-            while b < hi < len(text) and not text[hi].isspace():  # end at a word
-                hi -= 1
-            if merged and lo <= merged[-1][1]:
-                merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
-            else:
-                merged.append((lo, hi))
-        if sum(hi - lo + 3 for lo, hi in merged) <= keep:
-            break
-        if reach == 0:  # the spans alone are too long: keep as many as fit
-            kept: list[tuple[int, int]] = []
-            total = 0
-            for lo, hi in merged:
-                if total + hi - lo + 3 > keep:
-                    break
-                kept.append((lo, hi))
-                total += hi - lo + 3
-            if not kept:
-                return None
-            merged = kept
-            break
-        reach //= 2
-    body = "\n\u2026\n".join(text[lo:hi] for lo, hi in merged)
-    head = "\u2026\n" if merged[0][0] > 0 else ""
-    tail = "\n\u2026" if merged[-1][1] < len(text) else ""
-    return head + body + tail
+def _narrow_state(
+    state: Any, room: float, anchors: Sequence[str]
+) -> tuple[Any, str | None]:
+    """``state`` with its ``input`` narrowed until the state fits ``room`` tokens.
 
+    The same narrowing as the engine's own (``fit_clef_state``, measured with
+    ``estimate_request_tokens``, the unit of the budget the transport advertises): the
+    input is cut to windows around the spans the state cites and around the passages
+    the questions quote, and the spans are re-based into the narrowed text
+    (``rebase_spans``, only under ``OFFSET_KEYS``). Nothing else is touched: a
+    ``record``, ``records`` or ``proposed_change`` is the user's data and is never cut.
 
-def _cut(text: str, keep: int, anchors: Sequence[str]) -> str:
-    """``text`` cut to about ``keep`` characters.
+    Returns:
+        ``(state, warning)``: the state is unchanged, with no warning, when it fits.
 
-    The windows around the passages the questions quote are kept, with a mark
-    (``…``) where text was left out; with none of those in the text, its start.
+    Raises:
+        RequestTooLargeError: If the input cannot be narrowed to fit (the state has
+            no ``input`` to narrow, or the rest of it is already too large).
     """
-    if keep >= len(text):
-        return text
-    spans: list[tuple[int, int]] = []
+    if estimate_request_tokens(state) <= room:
+        return state, None
+    if not isinstance(state, dict) or not isinstance(state.get("input"), str):
+        raise RequestTooLargeError(
+            f"the state is about {int(estimate_request_tokens(state))} tokens, more "
+            f"than the {int(room)} that Jev takes together with this request's "
+            "largest question, and it has no input to narrow"
+        )
+    text = state["input"]
+    spans = state_spans(state)
     for anchor in anchors:
         at = text.find(anchor)
         found = 0
@@ -318,65 +304,20 @@ def _cut(text: str, keep: int, anchors: Sequence[str]) -> str:
             spans.append((at, at + len(anchor)))
             found += 1
             at = text.find(anchor, at + len(anchor))
-    if spans:
-        windowed = _windows(text, spans, keep)
-        if windowed is not None:
-            return windowed
-    cut = text.rfind(" ", 0, keep)
-    return text[: cut if cut > 0 else keep].rstrip() + "\n\u2026"
-
-
-def _strings(value: Any, path: tuple[Any, ...] = ()) -> Any:
-    """Every string in a JSON value with its path."""
-    if isinstance(value, str):
-        yield path, value
-    elif isinstance(value, dict):
-        for k, v in value.items():
-            yield from _strings(v, (*path, k))
-    elif isinstance(value, list):
-        for i, v in enumerate(value):
-            yield from _strings(v, (*path, i))
-
-
-def _replace(value: Any, path: tuple[Any, ...], new: str) -> Any:
-    if not path:
-        return new
-    head, rest = path[0], path[1:]
-    if isinstance(value, dict):
-        return {**value, head: _replace(value[head], rest, new)}
-    return [*value[:head], _replace(value[head], rest, new), *value[head + 1 :]]
-
-
-def _shrink(value: Any, excess: int, anchors: Sequence[str] = ()) -> Any:
-    """``value`` with about ``excess`` characters fewer, from its longest string.
-
-    A string is never cut below ``_FLOOR`` characters; when the longest cannot give
-    any more the next longest is cut, so repeated calls reach every string.
-    """
-    longest = max(
-        ((p, t) for p, t in _strings(value) if len(t) > _FLOOR),
-        key=lambda pt: len(pt[1]),
-        default=None,
+    narrowed, warning = fit_clef_state(
+        state,
+        int(room),
+        spans=spans or None,
+        estimate=estimate_request_tokens,
+        rebase=True,
     )
-    if longest is None:
-        return value
-    path, text = longest
-    return _replace(value, path, _cut(text, max(_FLOOR, len(text) - excess), anchors))
-
-
-def _fit(state: Any, room: float, anchors: Sequence[str]) -> Any:
-    """Narrow ``state`` until its estimate is at most ``room`` tokens, or refuse."""
-    cost = estimate_tokens(state)
-    while cost > room:
-        state = _shrink(state, int((cost - room) * 3.0) + 3, anchors)
-        narrowed = estimate_tokens(state)
-        if narrowed >= cost:  # nothing is left to cut
-            raise RequestTooLargeError(
-                f"the state cannot be narrowed to the {int(room)} tokens that Jev "
-                "takes together with this request's largest question"
-            )
-        cost = narrowed
-    return state
+    if estimate_request_tokens(narrowed) > room:
+        raise RequestTooLargeError(
+            f"the state cannot be narrowed to the {int(room)} tokens that Jev takes "
+            "together with this request's largest question (what is left besides the "
+            "input is too large)"
+        )
+    return narrowed, warning
 
 
 def to_jev_clef(
@@ -385,16 +326,19 @@ def to_jev_clef(
     *,
     question_budget: int | None = None,
     request_budget: int | None = None,
+    notes: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """The Jev requests for a Clef request: the same state and questions.
 
     Jev takes 32k tokens for the state and one question and 64k for the state and all
-    the questions (estimated here, conservatively). A Clef request that fits is one
-    Jev request with the questions as they are. One that does not is split: the
-    questions go into as few requests as hold them, each with the whole state; and a
-    state too large for even one question is narrowed (its largest string is cut at a
-    word and marked ``…``), since the API would refuse it (HTTP 400
-    ``max_tokens_exceeded``) where Clef cut a long state silently.
+    the questions. Sizes are measured with ``estimate_request_tokens``, the engine's
+    own (calibrated, conservative) estimate and the unit of the budget the transport
+    advertises, so a request the engine fitted to that budget always passes the checks
+    below untouched. A Clef request that fits is one Jev request with the questions as
+    they are. One that does not is split: the questions go into as few requests as
+    hold them, each with the whole state; and a state too large for even one question
+    has its ``input`` narrowed (``_narrow_state``), since the API would refuse it
+    (HTTP 400 ``max_tokens_exceeded``) where Clef cut a long state silently.
 
     Args:
         payload: The Clef request body.
@@ -402,15 +346,17 @@ def to_jev_clef(
         question_budget: Estimated tokens for the state plus one question.
         request_budget: Estimated tokens for the state plus all the questions of one
             request. ``None`` for both: no splitting.
+        notes: When given, a warning is appended for every narrowing that was made
+            (the engine records them as warnings; nothing is cut silently).
 
     Returns:
         One or more ``{model, state, questions}``; in order, their questions are the
         request's questions in order.
 
-    The narrowing keeps windows around the passages the questions quote and cuts
-    other text from its end, in as many rounds as it takes. A request that cannot be
-    made to fit (a question that alone is as large as the context, a state that
-    cannot be cut small enough) is refused here, locally, with nothing sent: a
+    The narrowing keeps windows around the spans the state cites and the passages the
+    questions quote, re-bases the spans, and touches only ``input``. A request that
+    cannot be made to fit (a question that alone is as large as the context, a state
+    that cannot be narrowed enough) is refused here, locally, with nothing sent: a
     ``RequestTooLargeError``, which the engine recognises as a size refusal
     (``is_size_rejection``) and contains as a ``request_rejected`` warning.
 
@@ -435,16 +381,24 @@ def to_jev_clef(
     questions = dict(payload["questions"])
     if question_budget is None and request_budget is None:
         return [{"model": jev_model, "state": state, "questions": questions}]
-    costs = {qid: estimate_tokens(q) for qid, q in questions.items()}
+    empty = estimate_request_tokens("", {})
+    costs = {
+        qid: estimate_request_tokens("", {qid: q}) - empty
+        for qid, q in questions.items()
+    }
     cap = min(b for b in (question_budget, request_budget) if b is not None)
     widest = max(costs, key=lambda qid: costs[qid])
     if costs[widest] >= cap:  # no state at all would make it fit
-        raise RequestTooLargeError(
+        refusal = RequestTooLargeError(
             f"question {widest!r} alone is about {int(costs[widest])} tokens: more "
             f"than the {cap} that Jev takes for a question and its state"
         )
-    state = _fit(state, cap - costs[widest], _anchors(questions))
-    state_cost = estimate_tokens(state)
+        refusal.question_id = widest  # the engine can refuse it alone
+        raise refusal
+    state, warning = _narrow_state(state, cap - costs[widest], _anchors(questions))
+    if warning and notes is not None:
+        notes.append(f"typesafe_state_narrowed: {warning}")
+    state_cost = estimate_request_tokens(state)
     limit = request_budget if request_budget is not None else float("inf")
     batches: list[dict[str, Any]] = [{}]
     used = state_cost
@@ -1513,8 +1467,12 @@ async def _escalate(
 async def gather_all(*aws: Awaitable[Any]) -> list[Any]:
     """Run awaitables concurrently; if one raises, cancel the rest and re-raise.
 
-    The error carries ``cancelled_siblings``: how many of the others were still
-    running (so they may have been sent, and charged, without an answer).
+    The error says what became of the others, because any of them may have been sent,
+    and charged, without an answer:
+
+    * ``cancelled_siblings``: how many were still running when it was raised;
+    * ``sibling_errors``: the errors of those that had failed too (possibly in the
+      very same moment: they are done, not running, but they did not succeed).
     """
     tasks = [asyncio.ensure_future(a) for a in aws]
     try:
@@ -1523,6 +1481,11 @@ async def gather_all(*aws: Awaitable[Any]) -> list[Any]:
         running = [t for t in tasks if not t.done()]
         for task in tasks:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        settled = await asyncio.gather(*tasks, return_exceptions=True)
         exc.cancelled_siblings = len(running)  # type: ignore[attr-defined]
+        exc.sibling_errors = [  # type: ignore[attr-defined]
+            other
+            for other in settled
+            if isinstance(other, Exception) and other is not exc
+        ]
         raise
