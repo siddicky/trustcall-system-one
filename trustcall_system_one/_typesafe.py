@@ -645,7 +645,11 @@ def _desc(spec: ClairicField, name: str) -> str:
 
 
 def _pick_instructions(
-    desc: str, structured: bool, repair: _Repair | None = None, name: str = ""
+    desc: str,
+    structured: bool,
+    repair: _Repair | None = None,
+    name: str = "",
+    has_sum: bool = False,
 ) -> str:
     options = (
         "Each option is an exact quoted span of `input`, or the id of a block (B..), "
@@ -655,6 +659,11 @@ def _pick_instructions(
     )
     desc = desc if desc.rstrip().endswith((".", "?", "!", ":")) else desc.rstrip() + "."
     again = repair.note(name) if repair is not None else ""
+    if has_sum:
+        again = (
+            " An option written 'N (the sum of ...)' is the total of the amounts "
+            "that `input` states; choose it if the field asks for that total." + again
+        )
     return (
         f"For the entity named in `focus`, from what `input` states: {desc} "
         f"Which option is it? {options} Choose {NONE} if `input` does not state it."
@@ -692,6 +701,35 @@ def _candidate_ref(c: Candidate) -> dict[str, Any]:
     if c.contexts:
         ref["context"] = c.contexts[0]
     return ref
+
+
+_STRUCTURAL = ("block", "sentence", "clause", "phrase")
+"""The candidates that come from the structure of the input, not from a pattern."""
+_STATEMENT_KINDS = ("block", "sentence", "clause")
+"""What a list of statements is made of: a note is a clause or a sentence, never the
+name or the number inside it."""
+_LIST_KIND = {
+    "items": "Short named values: names, languages, tags, ids, places.",
+    "statements": "Free-form statements or facts, as clauses or whole sentences.",
+}
+
+
+def _kind_question(desc: str) -> dict[str, Any]:
+    """Whether the items of a list of text are short values or statements.
+
+    Asked in the same request as the member questions (the library asks the same of
+    Clef, when it has to: ``_sentences._ask_kind``). A list of statements (notes) is
+    made of whole sentences and clauses; one of short values (names, tags) of what a
+    pattern finds, and neither is made of the other's pieces.
+    """
+    return {
+        "type": "choice",
+        "instructions": (
+            f"Are the items of the field ({' '.join(desc.split())}) short named "
+            "values (names, languages, tags, ids) or free-form statements and facts?"
+        ),
+        "criteria": dict(_LIST_KIND),
+    }
 
 
 def _member_question(desc: str, c: Candidate) -> dict[str, Any]:
@@ -758,6 +796,7 @@ class _Job:
     finalists: list[Candidate] = field(default_factory=list)
     answer: ChoiceAnswer | None = None
     repair: _Repair | None = None
+    list_kind: str = "items"  # "items" or "statements": what a list of text holds
     members: dict[int, float] = field(default_factory=dict)
     parts: dict[str, Part] = field(default_factory=dict)
     time_parts: dict[str, Part] = field(default_factory=dict)
@@ -1082,13 +1121,19 @@ def _stage_one(job: _Job) -> dict[str, Any]:
             out[qid] = {
                 "type": "choice",
                 "instructions": _pick_instructions(
-                    desc, _structured(spec), job.repair, name
+                    desc,
+                    _structured(spec),
+                    job.repair,
+                    name,
+                    any(c.kind == "sum" for c in chunk),
                 ),
                 "criteria": _criteria(chunk),
             }
     elif job.kind == "list":
         for i, candidate in enumerate(job.options):
             out[f"{name}::in{i}"] = _member_question(desc, candidate)
+        if spec.items == "text" and job.options:
+            out[f"{name}::kind"] = _kind_question(desc)
     else:
         role = _role(spec, name)
         if spec.type in ("date", "datetime"):
@@ -1132,7 +1177,11 @@ def _absorb(job: _Job, answers: Mapping[str, Any]) -> dict[str, Any]:
             f"{name}::final": {
                 "type": "choice",
                 "instructions": _pick_instructions(
-                    _desc(spec, name), _structured(spec), job.repair, name
+                    _desc(spec, name),
+                    _structured(spec),
+                    job.repair,
+                    name,
+                    any(c.kind == "sum" for c in job.finalists),
                 ),
                 "criteria": _criteria(job.finalists),
             }
@@ -1142,6 +1191,13 @@ def _absorb(job: _Job, answers: Mapping[str, Any]) -> dict[str, Any]:
             answer = answers.get(f"{name}::in{i}")
             if isinstance(answer, NoulAnswer):
                 job.members[i] = answer.noul
+        kind = answers.get(f"{name}::kind")
+        if (
+            isinstance(kind, ChoiceAnswer)
+            and kind.choice == "statements"
+            and kind.probabilities.get("statements", 0.0) >= 0.5
+        ):
+            job.list_kind = "statements"
         if spec.items == "date":
             follow: dict[str, Any] = {}
             role_of = _role(spec, name)
@@ -1259,14 +1315,37 @@ def _finish_parts(
         out["guess"] = result.value
 
 
+def _of_its_kind(job: _Job, accepted: list[int]) -> list[int]:
+    """The accepted members of a list of text that are the kind of thing it holds.
+
+    * Statements (notes): only whole sentences and clauses (and blocks). A name, a
+      number or a noun phrase inside an accepted sentence is not a note of its own,
+      and neither is one inside a sentence that was not accepted ("Berlin").
+    * Short values (names, tags): a clause or a sentence that contains an accepted
+      value is not one. "Olivia Davis, she's a 27-year-old graphic designer" is not
+      the name of a person whose name "Olivia Davis" was also accepted.
+    """
+    options = job.options
+    if job.list_kind == "statements":
+        return [i for i in accepted if options[i].kind in _STATEMENT_KINDS]
+    values = [i for i in accepted if options[i].kind not in _STRUCTURAL]
+    return [
+        i
+        for i in accepted
+        if options[i].kind not in _STRUCTURAL
+        or not any(
+            options[i].start <= options[j].start and options[j].end <= options[i].end
+            for j in values
+        )
+    ]
+
+
 def _finish_list(job: _Job, base: int, today: date, config: TypeSafeConfig) -> None:
     out = job.out
     accepted = [i for i, p in job.members.items() if p >= 0.5]
-    structural = [
-        i
-        for i in accepted
-        if job.options[i].kind in ("block", "sentence", "clause", "phrase")
-    ]
+    if job.spec.items == "text":
+        accepted = _of_its_kind(job, accepted)
+    structural = [i for i in accepted if job.options[i].kind in _STRUCTURAL]
     drop = {
         i
         for i in structural

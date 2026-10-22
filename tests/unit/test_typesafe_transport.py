@@ -820,7 +820,12 @@ def test_a_notes_list_asks_one_yes_no_per_block_or_sentence() -> None:
     sent = clairic(make(jev), payload)
     select = next(r for r in jev.requests if "notes::in0" in r["questions"])
     asked = select["questions"]
-    refs = [q["instructions"]["candidate"] for q in asked.values()]
+    refs = [
+        q["instructions"]["candidate"]
+        for qid, q in asked.items()
+        if qid.startswith("notes::in")
+    ]
+    assert "notes::kind" in asked  # asked in the same request: items or statements
     # a sentence is named by its id, the text is in the state
     assert {"id": "S001"} in refs
     assert all("text" not in r for r in refs if r.get("id") in ("S000", "S001", "S002"))
@@ -863,17 +868,21 @@ def test_an_empty_list_is_null_with_the_confidence_of_the_noes() -> None:
 def test_a_number_field_picks_among_found_numbers_and_returns_the_number() -> None:
     text = "Invoice INV-2291: 4 pallets at $250.00 each, shipping $80.00."
     field = {"total": {"type": "number", "instructions": "The total amount due"}}
-    jev = Jev(picks(total="4 pallets at $250.00 each, shipping $80.00"))
+    jev = Jev(picks(total="1080 (the sum of 1000 + 80)"))
     sent = clairic(
         make(jev, config=TypeSafeConfig(verify_selection=False)),
         clairic_payload(field, text),
     )
     select = next(r for r in jev.requests if "total::pick" in r["questions"])
-    criteria = select["questions"]["total::pick"]["criteria"]
-    assert (
-        criteria["4 pallets at $250.00 each, shipping $80.00"]
-        == "1080 (the sum of 1000 + 80)"
+    question = select["questions"]["total::pick"]
+    criteria = question["criteria"]
+    # the sum is offered under a name that says what it is, not as the sentence
+    assert "4 pallets at $250.00 each, shipping $80.00" not in criteria
+    assert criteria["1080 (the sum of 1000 + 80)"] == (
+        "the total of the amounts written in "
+        "'4 pallets at $250.00 each, shipping $80.00'"
     )
+    assert "is the total of the amounts" in question["instructions"]
     assert criteria["$250.00"] == "250 USD"
     answer = sent.body["answers"]["total"]
     assert answer["value"] == 1080

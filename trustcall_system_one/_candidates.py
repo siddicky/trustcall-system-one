@@ -203,7 +203,8 @@ _NP_STOP = _words(
 )
 _WORD = re.compile(r"[A-Za-z][\w'\u2019\-]*")
 _CLAUSE_SPLIT = re.compile(
-    r"[,;:\u2014\u2013]|\s[-\u2013\u2014]\s|"
+    # a comma or a colon between two digits is part of a number or a time
+    r"(?:(?<!\d)[,:]|[,:](?!\d)|[;\u2014\u2013])|\s[-\u2013\u2014]\s|"
     r"\s(?:and|or|but|while|because|so|then|which|who|that)\s",
     re.IGNORECASE,
 )
@@ -793,15 +794,27 @@ def _sum_candidates(
     if len(chain) >= 2:
         groups.append(chain)
     groups.append(terms)
-    out = []
+    out: list[Candidate] = []
     for group in groups:
         number = _json_number(sum((t[2] for t in group), Decimal(0)), field_)
         if number is None or not _in_bounds(number, field_):
             continue
         start, end = group[0][0], group[-1][1]
         parts = " + ".join(str(_json_number(t[2], None)) for t in group)
+        label = f"{number} (the sum of {parts})"
+        written = " ".join(text[start:end].split())
+        summed = _make(text, start, end, number, "sum")
+        # The option id says what the value is: the number and its terms. An id that
+        # was only the span ("4 pallets at $250.00 each, shipping $80.00") read as
+        # the sentence and not as the total, and Jev chose `none`.
+        if any(c.id == label for c in out):
+            continue
         out.append(
-            _make(text, start, end, number, "sum", f"{number} (the sum of {parts})")
+            replace(
+                summed,
+                id=label,
+                description=f"the total of the amounts written in '{written[:100]}'",
+            )
         )
     return out
 

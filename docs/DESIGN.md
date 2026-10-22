@@ -1858,6 +1858,28 @@ triggered, because Jev's list answers are confident (>= 0.5 by construction) and
 `auto` fallback does not fire; the sentence boundaries inside a block still come from the
 splitter, since the cookbook recovers blocks only, not sentence ends.
 
+**What a list of text holds** (found by the first live run of the TypeSafe-only provider: notes that
+held "Berlin" and a phone number next to the sentence they came from, and a person whose label was a
+whole clause). A `list` of text asks one more question in the same request as its members,
+`<field>::kind` (the question the library asks of Clef for `list_strategy: auto`): are the items short
+named values (names, tags, ids) or free-form statements? Jev's answer, at 0.5 or more for
+`statements` (anything else is `items`), decides what the accepted members may be:
+
+* **statements** (notes): only whole sentences, clauses and blocks. A name, a number or a noun phrase is
+  not a note, whether or not the sentence around it was accepted; a clause inside an accepted
+  sentence is dropped as before.
+* **items** (names, tags, mentions): everything the generators find, except that a sentence or clause that
+  *contains* an accepted value is not itself one ("Olivia Davis, she's a 27-year-old graphic designer" is
+  not the name of a person whose name "Olivia Davis" was also accepted, so the label of an entity found by
+  discovery is the name). A clause with no accepted value inside stays (mentions that are not names,
+  such as "the tea towels at 5").
+
+Two smaller repairs from the same run: a comma or colon between digits (`$1,125.00`, `2:30`) is not a
+clause boundary, and a **sum** is offered under an option id that says what it is
+(`1080 (the sum of 1000 + 80)`, described as "the total of the amounts written in '4 pallets at $250.00
+each, shipping $80.00'") with a sentence in the instructions that such an option is the total, where it had
+been offered under the text of the sentence and Jev chose `none` for the total of an invoice.
+
 **Date extraction** (cookbook: "TypeSafe answers `Choice` questions about the date in one call,
 code turns those answers into a `date`. The model reads what the text says and never does the
 calendar math"). For each date field, seven choices go in the same request: `mode` (`absolute`,

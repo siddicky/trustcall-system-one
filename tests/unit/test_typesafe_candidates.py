@@ -236,7 +236,10 @@ def test_a_sum_is_offered_only_when_the_field_asks_for_a_total() -> None:
     assert asked["4 pallets at $250.00 each, shipping $80.00"].value == 1080
     chained = found("number", "That is 4 x 250 + 80 in all.", instructions="the total")
     assert chained["4 x 250 + 80"].value == 1080
-    assert "(the sum of 1000 + 80)" in (chained["4 x 250 + 80"].reading or "")
+    assert chained["4 x 250 + 80"].id == "1080 (the sum of 1000 + 80)"
+    assert asked["4 pallets at $250.00 each, shipping $80.00"].id == (
+        "1080 (the sum of 1000 + 80)"
+    )
 
 
 def test_a_list_of_numbers_has_no_sums() -> None:

@@ -206,6 +206,12 @@ class JevBackend:
             return {"type": "noul", "noul": 0.05}
         answer = truth.get(name, {})
         value = answer.get("value")
+        if rest == "kind":  # a list of text: statements (notes) or short values
+            wanted = value if isinstance(value, list) else []
+            statements = any(len(str(w).split()) >= 4 for w in wanted)
+            return _choice(
+                list(question["criteria"]), "statements" if statements else "items"
+            )
         if question["type"] == "noul":
             wanted = value if isinstance(value, list) else []
             cand = question["instructions"]["candidate"]
@@ -232,11 +238,9 @@ class JevBackend:
             if isinstance(description, str) and f"'{text}'" in description:
                 return oid
         if isinstance(value, (int, float)):
-            for oid, description in options.items():
-                if isinstance(description, str) and description.startswith(
-                    f"{value} ("
-                ):
-                    return str(oid)  # a sum: "1080 (the sum of ...)"
+            for oid in options:
+                if oid.startswith(f"{value} (the sum of "):
+                    return str(oid)  # a sum: the id reads "1080 (the sum of ...)"
             for oid in options:
                 if _option_number(oid) == float(value):
                     return str(oid)
