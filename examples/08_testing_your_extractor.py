@@ -201,19 +201,16 @@ def test_a_value_the_text_does_not_support_is_dropped() -> None:
 
 def test_the_fake_rejects_answers_that_do_not_fit_the_request() -> None:
     def forgetful(model: str, payload: Body, meta: CallMeta) -> Body | None:
-        if meta.kind == "presence":
-            return clef_response({"presence": noul(0.97)})
-        if meta.kind == "extract":  # answers only one of the requested fields
-            return clairic_response({"requester": clairic_answer("text", None)})
-        return None
+        # answers a question that was not asked, and not the one that was
+        return clef_response({"is_it_a_meeting": noul(0.97)})
 
     with world(FakeTransport(forgetful)) as w:
         try:
             parse_meeting_request(EMAIL, w.extractor)
         except AssertionError as error:  # with pytest: `with pytest.raises(...)`
-            assert "differ from the requested" in str(error)
+            assert "differ from the asked questions" in str(error)
         else:
-            raise AssertionError("the fake should have refused the incomplete answer")
+            raise AssertionError("the fake should have refused the wrong answer")
 
 
 def test_the_request_carries_the_text_and_the_field_descriptions() -> None:

@@ -177,7 +177,7 @@ def test_02_support_ticket(capsys: pytest.CaptureFixture[str]) -> None:
     # never mentioned: the presence gate skips the sub-model entirely
     assert ticket.shipping_address is None
     gate = record.fields["shipping_address"]
-    assert (gate.engine, gate.rejected_reason) == ("clef", "absent")
+    assert (gate.engine, gate.rejected_reason) == ("submodel", "absent")
     assert not [path for path in record.fields if path.startswith("shipping_address.")]
     # one presence request for it, and no extraction request about it at all
     assert [c.field for c in result.calls if c.kind == "presence"] == [
