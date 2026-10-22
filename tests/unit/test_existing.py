@@ -298,7 +298,7 @@ def test_one_with_several_records_suggests_many() -> None:
 
 def test_list_form_records_without_a_wrapper_imply_many_which_is_m7_m8() -> None:
     es = coerced([("a", "DummySchema", REC)])
-    with pytest.raises(NotImplementedError, match="M7-M8"):
+    with pytest.raises(NotImplementedError, match="M8"):
         target_for("DummySchema", es, explicit=False)
 
 

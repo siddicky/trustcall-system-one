@@ -1,8 +1,6 @@
 """Stop one person's fact from landing on the other person's record.
 
-Needs milestone M7 (multi-entity extraction with the attribution check); until it
-lands ``Many(...)`` raises ``NotImplementedError`` (``tests/unit/test_examples.py``
-expects that and flips when M7 does).
+Runs on milestone M7 (multi-entity extraction with the attribution check).
 ``uv run python examples/06_attribution_guard.py [--offline]``
 
 The failure this guards against is the quiet one. Extraction with several people in a

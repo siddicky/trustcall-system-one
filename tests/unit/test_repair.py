@@ -1146,6 +1146,93 @@ async def test_an_error_below_a_union_member_in_an_update_is_repaired() -> None:
     assert record.fields["pet.tricks"].repaired
 
 
+Short = Annotated[str, Field(max_length=10)]
+
+
+class ShortCat(BaseModel):
+    kind: Literal["cat"]
+    toys: list[Short] = []
+
+
+class ShortDog(BaseModel):
+    kind: Literal["dog"]
+    toys: list[Short] = []
+
+
+class PetOwner(BaseModel):
+    name: str
+    pet: Union[ShortCat, ShortDog]
+
+
+def pet_owner_world(**repair: Any) -> Script:
+    world = Script()
+    world.clairic = {
+        "name": ca("text", "Sam", find="Sam"),
+        "pet.ShortDog.toys": ca(
+            "list",
+            ["an extremely long rope toy"],
+            find_all=["an extremely long rope toy"],
+        ),
+        "pet.ShortCat.toys": ca("list", None, p_null=0.99),
+    }
+    world.clef = {"pet": pick("dog", ["cat", "dog"])}
+    world.repair = dict(repair)
+    return world
+
+
+PET_TEXT = "Sam now has a dog with an extremely long rope toy."
+CAT_RECORD = {"name": "Sam", "pet": {"kind": "cat", "toys": ["yarn"]}}
+
+
+async def test_an_element_in_a_replaced_ancestor_is_not_the_records_to_keep() -> None:
+    # the record held pet.toys[0] ("yarn"), but `replace /pet` wrote a new pet whose
+    # toys[0] only sits at the same place: the error is the update's, and is repaired
+    world = pet_owner_world(
+        **{"pet.ShortDog.toys": ca("list", ["rope"], find_all=["rope"])}
+    )
+    record = only(await run([One(PetOwner)], world, PET_TEXT, existing=pet_existing()))
+    assert record.valid, record.errors
+    assert [c[2].field for c in repair_calls(world)] == ["pet.ShortDog.toys"]
+    assert record.after is not None
+    assert record.after["pet"] == {"kind": "dog", "toys": ["rope"]}
+    assert [(p.op, p.path) for p in record.patches] == [("replace", "/pet")]
+
+
+async def test_a_replaced_pet_that_cannot_be_repaired_is_dropped() -> None:
+    # the repair gives the same long toy again: the operation that brought the
+    # error in is dropped, and the record stays valid as it was
+    world = pet_owner_world()
+    record = only(await run([One(PetOwner)], world, PET_TEXT, existing=pet_existing()))
+    assert [c[2].field for c in repair_calls(world)] == ["pet.ShortDog.toys"]
+    assert record.valid, record.errors
+    assert record.patches == ()
+    assert record.after == CAT_RECORD
+    assert [(r.path, r.reason) for r in record.rejected if r.op] == [
+        ("/pet", "validation")
+    ]
+
+
+def pet_existing() -> dict[str, Any]:
+    return {"PetOwner": CAT_RECORD}
+
+
+async def test_an_element_the_record_held_is_still_not_repaired() -> None:
+    # the same element, untouched by any operation that wrote above it
+    world = Script()
+    world.clairic = {
+        "name": ca("text", "Sam", find="Sam"),
+        "pet.ShortDog.toys": ca("list", None, p_null=0.99),
+        "pet.ShortCat.toys": ca("list", None, p_null=0.99),
+    }
+    world.clef = {"pet": pick("dog", ["cat", "dog"])}
+    held = {"name": "Sam", "pet": {"kind": "dog", "toys": ["a very long rope toy"]}}
+    record = only(
+        await run([One(PetOwner)], world, "Sam is back.", existing={"PetOwner": held})
+    )
+    assert repair_calls(world) == []
+    assert record.patches == () and record.after == held
+
+
 # --------------------------------------------------------------------------- #
 # The record never reaches a repair request
 # --------------------------------------------------------------------------- #
@@ -1394,15 +1481,77 @@ class OrderedStay(BaseModel):
         return self
 
 
-async def test_named_answers_are_kept_as_a_set_never_one_by_one() -> None:
-    # either date alone would make the record valid again (start = end), but the
-    # start's first answer was shown wrong by the validator: both stay
+async def test_a_named_answer_the_record_does_not_need_is_taken_back() -> None:
+    # either date alone makes the record valid again (start = end): the set is kept
+    # because it fixed the error, then refined, one answer at a time, to what the
+    # record needs. Exactly one of the two stays.
     world = stay_world()
     record = only(await run([OrderedStay], world, STAY))
     stay = value_of(record, OrderedStay)
-    assert (stay.start, stay.end) == (dt.date(2024, 5, 1), dt.date(2024, 5, 10))
+    assert stay.end >= stay.start
     assert (stay.guest, stay.room) == ("Ann Lee", "12")
     assert sorted(c[2].field or "" for c in repair_calls(world)) == ["end", "start"]
+    reverted = [
+        name
+        for name in ("start", "end")
+        if any("reverted, it was not needed" in n for n in record.fields[name].warnings)
+    ]
+    assert len(reverted) == 1
+    kept = "end" if reverted == ["start"] else "start"
+    assert record.fields[kept].repaired and not record.fields[reverted[0]].repaired
+
+
+class Range(BaseModel):
+    label: str = Field(description="the caption")
+    low: int = Field(description="the lower end")
+    high: int = Field(description="the upper end")
+
+    @model_validator(mode="after")
+    def _ordered(self) -> "Range":
+        if self.high <= self.low:
+            raise ValueError("high must exceed low (the label is only a caption)")
+        return self
+
+
+async def test_named_answers_that_only_rode_along_are_taken_back() -> None:
+    # the message names label, low and high; only the two ends were wrong, and
+    # the caption's re-ask (a different quote) is not needed once they are fixed
+    text = "Range A runs from 3 to 9, also called B."
+    world = Script()
+    world.clairic = {
+        "label": ca("text", "A", find="A"),
+        "low": ca("number", 9),
+        "high": ca("number", 3),
+    }
+    world.repair = {
+        "label": ca("text", "B", find="B"),
+        "low": ca("number", 3),
+        "high": ca("number", 9),
+    }
+    record = only(await run([Range], world, text))
+    value = value_of(record, Range)
+    assert (value.label, value.low, value.high) == ("A", 3, 9)
+    assert record.fields["low"].repaired and record.fields["high"].repaired
+    assert not record.fields["label"].repaired
+    assert any("reverted" in n for n in record.fields["label"].warnings)
+    assert sorted(c[2].field or "" for c in repair_calls(world)) == [
+        "high",
+        "label",
+        "low",
+    ]
+
+
+async def test_named_answers_that_are_needed_together_all_stay() -> None:
+    # reverting either date breaks the booking again: both are kept
+    world = Script()
+    world.clairic = {
+        "start": ca("date", "2024-05-10"),
+        "end": ca("date", "2024-05-01"),
+    }
+    world.repair = {"start": ca("date", "2024-05-01"), "end": ca("date", "2024-05-10")}
+    record = only(await run([Booking], world, "Booked from 1 May 2024 to 10 May 2024."))
+    booking = value_of(record, Booking)
+    assert (booking.start, booking.end) == (dt.date(2024, 5, 1), dt.date(2024, 5, 10))
     assert record.fields["start"].repaired and record.fields["end"].repaired
 
 

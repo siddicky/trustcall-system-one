@@ -99,7 +99,7 @@ def threshold(gates: GateConfig, change: Change) -> float:
 
 
 def _entity(ctx: Ctx) -> dict[str, Any]:
-    return {"label": ctx.label, "mentions": list(ctx.mentions)}
+    return ctx.entity_dict()
 
 
 def _gate_question(change: Change) -> NoulQuestion:

@@ -21,9 +21,10 @@ offline tests of an extractor trustworthy:
 * Spans are computed with ``str.find`` over the state the library actually rendered
   (``find_span`` below), so the offsets in your fake answers are the real ones.
 
-Later (milestone M7) ``testing.FakeWorld`` will answer every call kind of a
-multi-entity run from one declaration of text, entities and faults; for a single
-entity this hand-written handler table is all you need and stays valid.
+``testing.FakeWorld`` (test 7) answers every call kind of a multi-entity run from one
+declaration of text, entities and faults, so a test says what the text contains and
+asserts what the library made of it; for a single entity the hand-written handler
+table above is all you need.
 
 Look at the output: one line per test, then the request log of the last test.
 There is no live mode here; the point is that tests never need one.
@@ -42,9 +43,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import heading, paint, print_banner
 from pydantic import BaseModel, Field
 
-from trustcall_system_one import CallMeta, Extractor, Transport, create_extractor
+from trustcall_system_one import (
+    CallMeta,
+    Extractor,
+    Many,
+    Transport,
+    create_extractor,
+)
 from trustcall_system_one.testing import (
     FakeTransport,
+    FakeWorld,
     clairic_answer,
     clairic_response,
     clef_response,
@@ -243,6 +251,67 @@ def test_the_request_carries_the_text_and_the_field_descriptions() -> None:
     assert "person asking for the meeting" in described
 
 
+class Attendee(BaseModel):
+    """Someone who will attend a meeting."""
+
+    name: str = Field(description="full name")
+    role: str | None = Field(None, description="the person's role")
+
+
+ATTENDEES = "Maria Alvarez will present. Tom Becker, the finance lead, will take notes."
+
+
+def attendee_world() -> FakeWorld:
+    """Declare WHAT the text contains; the world answers every kind of call."""
+    world = FakeWorld(ATTENDEES)
+    world.entity(
+        "Maria Alvarez",
+        schema=Attendee,
+        mentions=["Maria Alvarez"],
+        fields={"name": "Maria Alvarez"},
+    )
+    world.entity(
+        "Tom Becker",
+        schema=Attendee,
+        mentions=["Tom Becker"],
+        fields={"name": "Tom Becker", "role": "finance lead"},
+    )
+    return world
+
+
+def test_a_fake_world_answers_every_call_of_a_multi_entity_run() -> None:
+    extractor = create_extractor(
+        [Many(Attendee, identity="name")], transport=attendee_world().transport()
+    )
+    with extractor:
+        result = extractor.invoke(ATTENDEES)
+    maria, tom = result.responses
+    assert (maria.name, maria.role) == ("Maria Alvarez", None)  # type: ignore[attr-defined]
+    assert (tom.name, tom.role) == ("Tom Becker", "finance lead")  # type: ignore[attr-defined]
+    assert [r.entity.label for r in result.records if r.entity] == [
+        "Maria Alvarez",
+        "Tom Becker",
+    ]
+
+
+def test_a_fault_injected_into_the_world_is_caught_by_attribution() -> None:
+    world = attendee_world()
+    world.bleed(
+        "Maria Alvarez", "role", "finance lead"
+    )  # Tom's role, offered for Maria
+    extractor = create_extractor(
+        [Many(Attendee, identity="name")], transport=world.transport()
+    )
+    with extractor:
+        result = extractor.invoke(ATTENDEES)
+    maria, tom = result.responses
+    assert maria.role is None  # type: ignore[attr-defined]
+    assert tom.role == "finance lead"  # type: ignore[attr-defined]
+    assert [(r.path, r.reason) for r in result.records[0].rejected] == [
+        ("/role", "attribution")
+    ]
+
+
 TESTS: list[Callable[[], None]] = [
     test_extracts_the_request,
     test_text_without_a_request_makes_no_extraction_calls,
@@ -250,6 +319,8 @@ TESTS: list[Callable[[], None]] = [
     test_the_fake_rejects_answers_that_do_not_fit_the_request,
     test_the_fake_rejects_an_incomplete_extraction_answer,
     test_the_request_carries_the_text_and_the_field_descriptions,
+    test_a_fake_world_answers_every_call_of_a_multi_entity_run,
+    test_a_fault_injected_into_the_world_is_caught_by_attribution,
 ]
 
 

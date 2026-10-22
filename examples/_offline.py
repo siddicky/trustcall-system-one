@@ -17,11 +17,26 @@ this module is self-contained so an example never imports from ``tests``:
 * A list is consumed one request at a time (the last item repeats), which is how
   a re-ask returns something different from the first answer.
 
-Handlers for call kinds that the library only gains in later milestones
-(``discover``, ``coref``, ``qualify``, ``match``, ``gate``, ``crosscheck`` ...)
-are written against the request shapes in ``docs/DESIGN.md``. They look at
-``CallMeta``, the question ids and the structured Clef state defensively; when a
-milestone fixes the exact shapes, adjust the helpers at the bottom of this file.
+The collection engine's requests (milestone M7) have fixed shapes, and the helpers
+at the bottom of this file answer exactly those:
+
+* ``presence`` (Clef): one question, id ``presence``.
+* ``discover`` (Clairic): field ``mentions``, a ``list`` of ``text``; the state is
+  ``<focus schema="..." task="discover">`` plus ``<input>``; spans are offsets in
+  that state.
+* ``count`` (Clairic): field ``count``, an integer ``number``, same state.
+* ``coref`` (Clef): ONE structured state ``{"input", "mentions": {"m0": {"text",
+  "span", "context"}, ...}}`` and one question per pair, id ``pair.m0.m1``.
+* ``qualify`` (Clef): state ``{"input", "entity": {"label", "mentions"}}``, one
+  question, id ``qualify``.
+* ``extract`` and the verification calls about one entity carry
+  ``<focus schema="..." entity="Emma Thompson">`` (Clairic) or ``state.entity.label``
+  (Clef), which is what ``"<label>::<wire name>"`` keys are matched against.
+
+Kinds that arrive with M8 (``match``, ``delete``) are still written against the
+request shapes in ``docs/DESIGN.md``: they look at ``CallMeta``, the question ids
+and the structured Clef state defensively; adjust the helpers at the bottom of this
+file when that milestone fixes the exact shapes.
 """
 
 import json
@@ -275,10 +290,10 @@ class Call:
 
     @property
     def label(self) -> str | None:
-        """The entity the request is about (``<focus entity>`` or ``entity.label``)."""
+        """The entity asked about (the ``<focus>`` ``entity`` or ``entity.label``)."""
         state = self.state
         if isinstance(state, str):
-            found = re.search(r'<focus entity="([^"]*)"', state)
+            found = re.search(r'<focus\b[^>]*\bentity="([^"]*)"', state)
             return found.group(1) if found else None
         entity = state.get("entity") if isinstance(state, dict) else None
         if isinstance(entity, dict):
@@ -576,8 +591,10 @@ class OfflineScript:
 # These follow docs/DESIGN.md ("Collection engine", "Verification ladder"). They
 # answer from a small description of the world instead of from wire names, so
 # they keep working if the exact ids change; the shapes they read (the
-# ``mentions`` object of a coref state, the ``criteria`` of a match question, the
-# ``proposed_change`` of a gate state) are the documented ones.
+# ``mentions`` object of a coref state with its ``m0``, ``m1`` ... ids, the
+# ``criteria`` of a match question, the ``proposed_change`` of a gate state) are
+# the documented ones; the discovery, count, coreference and qualification shapes
+# are the ones the engine sends since M7.
 # --------------------------------------------------------------------------- #
 
 

@@ -5,6 +5,8 @@ import json
 from trustcall_system_one._render import (
     RenderedState,
     clef_state,
+    discovery_focus,
+    entity_focus,
     estimate_tokens,
     fit_clef_state,
     mention_windows,
@@ -340,3 +342,65 @@ def test_the_record_is_never_cut_when_the_input_is_narrowed() -> None:
     )
     assert rendered.text.endswith('{"k": "v"}\n</existing>')
     assert rendered.input_chars == 90
+
+
+# --------------------------------------------------------------------------- #
+# Collection headers
+# --------------------------------------------------------------------------- #
+
+
+def test_an_entity_focus_names_the_schema_the_entity_and_its_mentions() -> None:
+    focus = entity_focus(
+        "Person",
+        "Person",
+        "Ada Lovelace",
+        [("Ada Lovelace", (0, 12)), ("Ada", (44, 47))],
+    )
+    rendered = render_clairic(TEXT, label="ignored", focus=focus)
+    assert rendered.text == (
+        '<focus schema="Person" entity="Ada Lovelace">\n'
+        "Answer each field for Ada Lovelace only. Ignore facts about any other "
+        "person.\n"
+        'The input mentions Ada Lovelace as: "Ada Lovelace" at characters 0-12, '
+        '"Ada" at characters 44-47.\n'
+        "</focus>\n"
+        "<input>\n"
+        f"{TEXT}\n"
+        "</input>"
+    )
+    assert "ignored" not in rendered.text
+    # offsets still map back to the original input
+    span = span_of(rendered, "Charles Babbage")
+    original = rendered.to_original(span)
+    assert original is not None and TEXT[original[0] : original[1]] == "Charles Babbage"
+
+
+def test_an_entity_focus_without_spans_or_mentions_still_names_the_entity() -> None:
+    focus = entity_focus("Person", "Person", 'Ada "the Countess"', [("Ada", None)])
+    header, lines = focus
+    assert header == '<focus schema="Person" entity="Ada \'the Countess\'">'
+    assert lines[1] == 'The input mentions Ada "the Countess" as: "Ada".'
+    assert len(entity_focus("Person", "Person", "Ada", [])[1]) == 1
+
+
+def test_a_custom_focus_keeps_the_record_and_repair_notes() -> None:
+    focus = entity_focus("Person", "Person", "Ada", [])
+    rendered = render_clairic(
+        TEXT, label="x", focus=focus, existing="{}", trailer="<previous_attempt>"
+    )
+    head = rendered.text[: rendered.text.index("<input>")]
+    assert head.startswith('<focus schema="Person" entity="Ada">')
+    assert "The existing record after the input is context only" in head
+    assert "The blocks after the input describe an earlier answer" in head
+
+
+def test_the_discovery_focus_asks_for_every_mention_of_the_kind() -> None:
+    header, lines = discovery_focus("Person", "Person")
+    assert header == '<focus schema="Person" task="discover">'
+    assert lines[0].startswith("Look for every person the input mentions")
+
+
+def test_a_clef_state_takes_extra_keys() -> None:
+    state = clef_state(TEXT, extra={"mentions": {"m0": {"text": "Ada"}}})
+    assert state == {"input": TEXT, "mentions": {"m0": {"text": "Ada"}}}
+    assert clef_state(TEXT, extra={}) == {"input": TEXT}

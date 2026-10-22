@@ -1,8 +1,8 @@
 """A conversation updates three people you know and introduces a fourth.
 
-Needs milestones M7 and M8 (multi-entity extraction and record matching); until they
-land ``Many(...)`` raises ``NotImplementedError`` (``tests/unit/test_examples.py``
-expects that and flips when M8 does).
+Needs milestone M8 (record matching): the multi-entity discovery of M7 is built, but
+``Many`` with existing records still raises ``NotImplementedError``
+(``tests/unit/test_examples.py`` expects that and flips when M8 does).
 ``uv run python examples/05_people_memory.py [--offline]``
 
 The scenario is trustcall's "relationships" demo: you keep a list of people, and a
@@ -178,7 +178,7 @@ def offline_script() -> OfflineScript:
         bleed=[("Michael", "rock climbing", 0.05)],
     )
     script.handlers["discover"] = mention_discovery(names)
-    script.handlers["count"] = entity_count(5)
+    script.handlers["count"] = entity_count(4)
     script.handlers["coref"] = pair_coreference(same_person)
     script.handlers["qualify"] = qualifier({"Sunny": 0.04})
     script.handlers["match"] = record_matcher(

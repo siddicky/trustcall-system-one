@@ -247,34 +247,106 @@ requests never put list indices in names.
 
 ## Collection engine (`_collection.py`) — multi-entity and nested lists
 
-`collect(Scope(plan, source, parent, pointer, existing, cardinality)) -> CollectionOutcome`.
-Top-level and nested differ only in: discovery wording ("…belonging to {parent}"), existing
-items (records with ids vs list elements with indices), output (one `ResultRecord` per entity
-vs ops inside the parent's patch list such as `add /pets/-`), and removal flag
-(`enable_deletes` vs `enable_item_removals`).
+`collect(scope, run) -> CollectionOutcome{entities, skipped, warnings, presence, count}`
+with `Scope{plan, source, cardinality (the Many), parent, pointer, existing}`; at the top level
+`parent is None` and `pointer == ""`. `insert_collection(run, scope)` runs `collect` and then
+step 6. Top-level and nested differ only in: discovery wording ("…belonging to {parent}"),
+existing items (records with ids vs list elements with indices), output (one `ResultRecord` per
+entity vs ops inside the parent's patch list such as `add /pets/-`), and removal flag
+(`enable_deletes` vs `enable_item_removals`). M7 builds the discovery side and the insert of
+every entity: a `Many(S)` WITH existing records of S raises `NotImplementedError` naming M8
+(before any request; list-form `existing` of a schema without a wrapper implies `Many`, so it
+does too); an `"__any__"` record is never claimed by a `Many` (it stays in `untouched`, with a
+warning). Settings: `DiscoveryConfig(presence_absent=0.2, presence_present=0.5,
+count_trust_max=10, broaden_on_count_mismatch=True)` and `CorefConfig(strategy="auto",
+merge_threshold=0.5, max_pairwise_mentions=150, context_chars=120)`, passed to
+`create_extractor(discovery=, coref=)`. `Many.label` is what prompts call an entity (default the
+schema title: "Person").
 
-1. **Identity field:** `Many(identity=...)` (compound allowed) → `s1_field(identity=True)` →
-   a `str` field named name/full_name/title/label/id/key/slug/email/handle/sku → first
-   required `str` → none (docstring-driven discovery, whole-record matching, warning).
-2. **Discovery, in parallel:** Clef presence `noul` (< 0.2 → zero entities; 0.2–0.5 →
-   proceed only if mentions found); Clairic `list` of every identity mention incl. short
-   forms, no pronouns (stoplist + determiner stripping in code); Clairic integer count.
-3. **Coreference (`_coref.py`):** unit is the mention, not the surface form. One Clef `noul`
-   per mention pair over one structured state `{input, mentions:{m0:{text,span,context}}}`,
-   64 per request; average-linkage clustering at 0.5 resolves inconsistent triangles;
-   deterministic tie-break by first mention. Above 150 mentions switch to incremental
-   assignment (Clef `choice` over clusters + `__new__`). Canonical label = most tokens →
-   most frequent → earliest; the label is only framing, the stored identity value is
-   extracted like any field.
-4. **Qualification:** Clef `noul` per entity "is `entity.label` a {S}?" — filters "Sunny"
-   (a dog) out of `Person`.
-5. **Count reconciliation:** count > k → one broadened re-discovery, else warning; count < k →
-   cluster-level merge checks; above 10 a mismatch only warns (counting is a Clairic weakness).
-6. **Per-entity extraction:** one Clairic request per entity per field group, with a focus
-   header naming the entity and its mention spans, the input, and only that entity's matched
-   record. Chosen over packing `person.0.x, person.1.x` because disambiguation lives in the
+1. **Identity field:** `Many(identity=...)` (compound allowed; a name the schema lacks is a
+   `ValueError` at `create_extractor`) → `SchemaPlan.identity` (`s1_field(identity=True)`, else
+   a `str` field named name/full_name/title/label/id/key/slug/email/handle/sku, else the first
+   required `str`) → none: discovery then follows the schema docstring ("Every mention of a
+   Reading (A temperature reading…)") and the run warns `no_identity_field`. The identity reads
+   in the discovery question as `by their name (full name)`, compound fields joined with "and".
+2. **Discovery, three requests in parallel** (a forced `schema=` skips the presence question
+   only):
+   * presence, Clef `noul` (kind `presence`, id `presence`): "Does `input` mention any {Person}
+     ({description})?"; `p < presence_absent` → zero entities and no further call (the other two
+     requests are already in flight); `presence_absent ≤ p < presence_present` → proceed only if
+     discovery found mentions;
+   * discovery, Clairic `list` of `text` (kind `discover`, field `mentions`; state
+     `<focus schema="Person" task="discover">…</focus><input>…</input>`): "Every mention of a
+     Person by their {identity}, in the order they appear in the input. Include repeated
+     mentions and shortened ones (a first name alone). Do not list pronouns. Each item is the
+     exact words the input uses." A truncated answer goes through the usual chunking
+     (`ask_clairic`). In code each item is located in the ORIGINAL input (the span mapped out of
+     the rendered state, else a search after the previous mention; an item that is not in the
+     input is dropped with a `mention_not_in_input` warning), pronoun-only items are dropped
+     (English closed-class stoplist `_collection.PRONOUNS`), a leading article or demonstrative
+     (the/a/an/this/that/these/those) and a trailing possessive (`'s`) are stripped with the span
+     (a descriptive "my cousin" stays), of two overlapping mentions the longer wins. Result:
+     `Mention(text, span)` in input order;
+   * count, Clairic `number` with `integer: true` (kind `count`, field `count`, same state): "How
+     many distinct {Person}s does the input mention?". A truncated or null answer means "no
+     count" (`count_unreliable` warning when truncated).
+3. **Coreference (`_coref.py`):** unit is the mention, not the surface form. Strategy
+   `pairwise`: one Clef `noul` per mention pair (kind `coref`, id `pair.m{i}.m{j}`, i < j,
+   "Do `mentions.m{i}` and `mentions.m{j}` refer to the same {Person}?", criteria true/false),
+   ALL pairs sharing one structured state `{"input", "mentions": {"m0": {"text", "span",
+   "context"}, …}}` (context = ±`context_chars` of the input; the input is narrowed to windows
+   around the mentions when over the Clef budget), at most 64 questions per request, the
+   requests concurrent. Average-linkage agglomerative clustering at `merge_threshold` (inclusive):
+   the two clusters with the highest average pairwise probability merge first, ties go to the
+   lowest first-mention index, so A~B 0.9, B~C 0.9, A~C 0.05 gives {A, B}, {C}. Strategy
+   `incremental`: the mentions are walked in order, each (after the first) assigned with one
+   Clef `choice` (id `assign.m{k}`, state `{"input", "mention": {…}}`) over the clusters so far
+   (`c{n}`: "Emma Thompson: mentioned as "Emma Thompson" (0-13), …") plus `__new__`; the answer
+   joins a cluster only if its option has probability ≥ `merge_threshold`, else it starts one;
+   more than 254 clusters show the most recent 254 (`coref_options_capped` warning).
+   `strategy="auto"` is pairwise up to `max_pairwise_mentions` mentions and incremental above;
+   `"pairwise"` and `"incremental"` force it. Canonical label = the mention with the most tokens →
+   the most frequent normalised form → the earliest; the label is only framing, the stored
+   identity value is extracted like any field. Pair probabilities are cached, so the broadened
+   re-discovery asks only about pairs that involve a new mention.
+4. **Qualification:** one Clef `noul` per entity (kind `qualify`, id `qualify`; one request per
+   entity because each has its own state) over `{"input", "entity": {"label", "mentions":
+   [{"text", "span"}]}}`: "Is `entity.label` a {Person} ({description})?". `< 0.5` →
+   `SkippedEntity(reason="not_qualified")` ("Sunny", a dog, for `Person`); a missing answer
+   qualifies. Qualification runs BEFORE the count comparison, so "k" is the number of entities
+   that qualify.
+5. **Count reconciliation** (count `n` against `k` qualifying entities; acted on only when
+   `broaden_on_count_mismatch` and `max(n, k) ≤ count_trust_max`, else the mismatch only warns):
+   * `n > k`: ONE broadened re-discovery (the same question plus "Also include descriptive
+     references such as 'my cousin' when no name is given."), united with the first list
+     (the longer span wins an overlap), re-clustered (cached pairs) and re-qualified for the new
+     clusters; if `n > k` still, warning `count_exceeds_discovered` (an entity is never invented);
+   * `n < k`: cluster-level merge checks for every pair of qualifying clusters whose best
+     pairwise probability is ≥ 0.2 (needs the pairwise strategy): one Clef `noul` each (kind
+     `coref`, id `merge`, state `{"input", "a": {"label", "mentions"}, "b": {…}}`, "Do `a` and
+     `b` refer to the same {Person}?"), run together; pairs at ≥ `merge_threshold` merge, the
+     highest probability first, until `k == n`; if `n < k` still, warning
+     `count_below_discovered`.
+   Entities are then ordered by first mention and keyed `e0, e1, …` over ALL entities, skipped
+   ones included, so a skipped entity keeps its number (Sunny is `e1`, Michael `e2`).
+6. **Per-entity extraction:** every qualifying entity runs the single-entity insert pipeline
+   (`insert_one`: groups, unions, Clef typed fields, verification ladder incl. attribution,
+   repair loop) concurrently, without asking presence again. The Clairic focus header names the
+   schema, the entity and its mention spans:
+   `<focus schema="Person" entity="Emma Thompson">` / "Answer each field for Emma Thompson
+   only. Ignore facts about any other person." / `The input mentions Emma Thompson as: "Emma
+   Thompson" at characters 11-24, "Emma" at characters 131-135.` Instructions are templated with
+   the label ("Emma Thompson's full name"). Every Clef state about the entity (attribution, null
+   check, typed fields, sub-model presence, repair) is `{"input", "entity": {"label",
+   "mentions": [{"text", "span"}]}}`, mentions with spans so that two entities with the same label
+   stay apart. Chosen over packing `person.0.x, person.1.x` because disambiguation lives in the
    state not an index, server-side pass splitting would separate an entity's fields, records
    stay isolated (no cross-record echo), and failures stay per-entity.
+   **Result:** one `ResultRecord(kind="insert", json_doc_id=None, entity=EntityInfo(key, label,
+   mentions, first_mention, qualify_p, parent=None))` per qualifying entity in first-mention
+   order (`match_probs` stays empty until M8), the skipped entities (`not_qualified` and
+   `validation_failed`, in first-mention order) and the warnings; `responses` holds the valid
+   models in the same order.
 7. **Attribution (default on):** Clef `noul` per non-null value and per list element: "Does
    `input` state that {desc} of `entity.label` is '{value}'?" ≥ 0.6 keep, < 0.3 drop
    (`attribution`), between → isolated re-ask then one more check. On updates an op must pass
@@ -322,7 +394,7 @@ Clairic requests always send
 `ainvoke(text, existing=...)`: `_existing.py` coerces `existing` (five shapes, `"__any__"`,
 `existing_schema_policy`), then each `One` schema that has a record runs `update_one`
 (`_entity.py`); a schema without a record is extracted as an insert (`enable_inserts` decides about
-inserts next to existing records of the same schema, which needs `Many`, M7-M8).
+inserts next to existing records of the same schema, which needs `Many` and matching, M8).
 
 **`existing` (`_existing.py`).** Shapes: `{schema_name: record}` (the id is the schema name);
 `list[SchemaInstance]`; `list[(record_id, schema_name, record)]`; `list[(record_id, BaseModel)]`
@@ -347,7 +419,7 @@ validates (alias where there is one) at every level of sub-models and unions, so
 patches and validation talk about the same keys. Cardinality: dict form → `One(S)`; an explicit
 `One(S)` with exactly one list-form record of S → that record; several → `ValueError`
 ("use Many"); list-form records of S with no explicit wrapper imply `Many(S)` →
-`NotImplementedError` naming M7-M8.
+`NotImplementedError` naming M8.
 
 **Pipeline** (`update_one`):
 1. Presence gate as for inserts (skipped for a forced schema). Absent → no operation, no
@@ -501,9 +573,18 @@ max_attempts=5, stop_on_repeat=True, allow_pattern_reask=True)`.
    names no field are carried over to the next round, and when the record validates each is taken
    back in turn and stays back while the record still validates, until no single one can go; if
    the loop ends invalid they are all taken back. A revert never brings back a value that a message
-   named and a repair replaced. On an update, a repair that comes back to the RECORD's value for a
+   named and a repair replaced. A kept named set is then refined: each of its answers is taken back
+   in turn, and stays back, when the error that caused it stays away and no new error appears
+   without it (an answer that merely rode along, such as the caption of a range whose ends were
+   wrong), unless its earlier value is known to be wrong (named and replaced in an earlier
+   round); this repeats until no single answer can go, so answers that are only needed
+   together (a booking's start and end) stay. On an update, a repair that comes back to the RECORD's value for a
    field whose operation was meant to change it is a failed repair: the field keeps the answer
    the operation came from and the operation is reported `RejectedOp(op, path, "validation")`.
+   An error about a list element counts as one the record already held (no request, the update's
+   operations are not dropped for it) only when the patched document's element at that path equals
+   the record's and no applied operation wrote an ancestor of the path: after `replace /pet` the
+   new pet's `toys/0` is the update's own, even though the record had some `pet/toys/0`.
 
 | error type | re-asked as |
 | --- | --- |
@@ -596,7 +677,14 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
 - `testing.FakeTransport(handler)` routed on `CallMeta`, and **`FakeWorld`**: declare text,
   entities (mentions, field values, matching record), non-entities, injected bleed and
   low-confidence faults; it answers every request kind consistently and computes spans with
-  `str.find` over the rendered state.
+  `str.find` over the rendered state. `FakeWorld(text)`, `.entity(label, schema=, mentions=,
+  fields=, matches=, descriptive=)`, `.non_entity(label, schema=, mentions=)`, `.bleed(entity,
+  field, value)`, `.low_confidence(entity, field, confidence)`, `.coref(a, b, p)`,
+  `.count(schema, n)`, `.handler` (to wrap one kind of answer) and `.transport()`. The focused
+  entity is read from the `<focus … entity="…">` header (Clairic) or `state.entity` (Clef):
+  mention spans first, then the label, then "the only entity of the schema" (the `One` path).
+  Every request shape it relies on is listed in the `FakeWorld` docstring. `matches=` is stored
+  for M8 and `match` calls are answered `__new__`.
 - Unit tests (`pytest --disable-socket --allow-unix-socket`): `test_wire`, `test_compile` (one
   case per type-table row), `test_names` (regex property, pinned hash), `test_flatten`,
   `test_coerce`, `test_diff` (ordering, `/-` repair, list set semantics, echo spans),
@@ -604,7 +692,10 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
   (5 shapes × 3 policies, ported by behaviour from trustcall's `test_strict_existing.py`),
   `test_cardinality`, `test_transport` (`httpx.MockTransport`: retries, `Retry-After`,
   limiter, envelope).
-- `test_collection.py` on `FakeWorld`: (1) the trustcall README Emma/Michael/Sarah/Olivia
+- `test_collection.py` on `FakeWorld` (M7 covers the insert side: the README people without
+  existing records, Sunny `not_qualified`, coreference, count reconciliation, presence,
+  attribution bleed, mixed `[Many, One]`; the numbered scenarios below finish with M8/M9):
+  (1) the trustcall README Emma/Michael/Sarah/Olivia
   scenario — three updates with ids 0/1/2 and appended notes, Olivia inserted, existing notes
   untouched, Sunny `not_qualified`, `enable_inserts=False` variant skips Olivia;
   (2) coreference merge incl. inconsistent triangle and two distinct Emmas; (3) bleed

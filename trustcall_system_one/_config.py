@@ -10,7 +10,9 @@ from trustcall_system_one._wire import CLAIRIC, CLEF, CLEF_FLASH, normalize_mode
 
 __all__ = [
     "ConcurrencyConfig",
+    "CorefConfig",
     "CostReport",
+    "DiscoveryConfig",
     "GateConfig",
     "Limits",
     "PassesConfig",
@@ -505,3 +507,84 @@ class RepairConfig:
             raise ValueError(
                 f"max_attempts must be at least 1, got {self.max_attempts}"
             )
+
+
+def _check_int(name: str, value: object, floor: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an int, got {value!r}")
+    if value < floor:
+        raise ValueError(f"{name} must be at least {floor}, got {value}")
+
+
+@dataclass(frozen=True)
+class DiscoveryConfig:
+    """Settings of the discovery step of the collection engine (``Many``).
+
+    The instance is immutable and hashable.
+
+    Attributes:
+        presence_absent: Presence probability below which the input is taken to
+            mention no entity at all: nothing further is asked.
+        presence_present: Probability at or above which the entities are surely
+            there. Between the two the run goes on only if discovery found
+            mentions.
+        count_trust_max: The count of entities is trusted up to this many; a
+            mismatch between the count and the entities found only warns when
+            either number is larger (counting is a weak spot of the model).
+        broaden_on_count_mismatch: Act on a mismatch: when the count exceeds the
+            entities found, discover again with a broader question (descriptive
+            references such as "my cousin"); when it falls short, check whether
+            two entities are one. Off, a mismatch only warns.
+    """
+
+    presence_absent: float = 0.2
+    presence_present: float = 0.5
+    count_trust_max: int = 10
+    broaden_on_count_mismatch: bool = True
+
+    def __post_init__(self) -> None:
+        """Validate every setting."""
+        _check_unit("presence_absent", self.presence_absent, allow_zero=True)
+        _check_unit("presence_present", self.presence_present)
+        if self.presence_absent > self.presence_present:
+            raise ValueError("presence_absent must not exceed presence_present")
+        _check_int("count_trust_max", self.count_trust_max, 1)
+        _check_flag("broaden_on_count_mismatch", self.broaden_on_count_mismatch)
+
+
+@dataclass(frozen=True)
+class CorefConfig:
+    """Settings of mention clustering (coreference) in the collection engine.
+
+    The instance is immutable and hashable.
+
+    Attributes:
+        strategy: ``"pairwise"`` asks Clef about every pair of mentions and
+            clusters the answers with average linkage; ``"incremental"`` walks the
+            mentions in order and assigns each to a cluster so far (or a new one)
+            with one Clef choice, which scales linearly in the mentions;
+            ``"auto"`` is pairwise up to ``max_pairwise_mentions`` mentions and
+            incremental above.
+        merge_threshold: Probability (pairwise: the average over a pair of
+            clusters) at or above which two mentions or clusters are one entity.
+        max_pairwise_mentions: Largest number of mentions ``"auto"`` clusters
+            pairwise.
+        context_chars: Characters of the input kept on each side of a mention in
+            the state of a coreference question.
+    """
+
+    strategy: Literal["pairwise", "incremental", "auto"] = "auto"
+    merge_threshold: float = 0.5
+    max_pairwise_mentions: int = 150
+    context_chars: int = 120
+
+    def __post_init__(self) -> None:
+        """Validate every setting."""
+        if self.strategy not in ("pairwise", "incremental", "auto"):
+            raise ValueError(
+                "strategy must be 'pairwise', 'incremental' or 'auto', got "
+                f"{self.strategy!r}"
+            )
+        _check_unit("merge_threshold", self.merge_threshold)
+        _check_int("max_pairwise_mentions", self.max_pairwise_mentions, 2)
+        _check_int("context_chars", self.context_chars, 0)

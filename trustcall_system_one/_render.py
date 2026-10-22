@@ -22,8 +22,11 @@ from typing import Any
 
 __all__ = [
     "ELLIPSIS",
+    "Focus",
     "RenderedState",
     "clef_state",
+    "discovery_focus",
+    "entity_focus",
     "estimate_tokens",
     "fit_clef_state",
     "mention_windows",
@@ -40,6 +43,8 @@ _CHARS_PER_TOKEN = 3.5
 
 Span = tuple[int, int]
 Segment = tuple[int, int, int]
+Focus = tuple[str, tuple[str, ...]]
+"""A focus header: the opening tag and the lines that follow it."""
 
 
 @dataclass(frozen=True)
@@ -139,6 +144,48 @@ def narrow_text(text: str, windows: Sequence[Span]) -> str:
     return f"{lead}{body}{trail}"
 
 
+def entity_focus(
+    schema: str,
+    kind: str,
+    label: str,
+    mentions: Sequence[tuple[str, Span | None]],
+) -> Focus:
+    """The focus header of one entity of a collection.
+
+    Args:
+        schema: Name of the schema (``"Person"``).
+        kind: What the entity is, for "any other ...": the schema title.
+        label: The entity's label (``"Emma Thompson"``).
+        mentions: Its mentions as ``(text, span)``, spans in the original input.
+
+    Returns:
+        The opening tag (``<focus schema="Person" entity="Emma Thompson">``) and
+        the lines that name the entity and where the input mentions it.
+    """
+    header = f'<focus schema="{_attribute(schema)}" entity="{_attribute(label)}">'
+    lines = [
+        f"Answer each field for {label} only. "
+        f"Ignore facts about any other {kind.lower()}."
+    ]
+    if mentions:
+        cited = ", ".join(
+            f'"{_attribute(text)}"'
+            + (f" at characters {span[0]}-{span[1]}" if span else "")
+            for text, span in mentions
+        )
+        lines.append(f"The input mentions {label} as: {cited}.")
+    return header, tuple(lines)
+
+
+def discovery_focus(schema: str, kind: str) -> Focus:
+    """The focus header of the discovery and count requests of a collection."""
+    header = f'<focus schema="{_attribute(schema)}" task="discover">'
+    return header, (
+        f"Look for every {kind.lower()} the input mentions, whoever they are. "
+        "Answer from the input text only.",
+    )
+
+
 def render_clairic(
     text: str,
     *,
@@ -149,6 +196,7 @@ def render_clairic(
     existing_schema: str | None = None,
     windows: Sequence[Span] | None = None,
     trailer: str = "",
+    focus: Focus | None = None,
 ) -> RenderedState:
     """Lay out the Clairic state for one entity.
 
@@ -163,6 +211,9 @@ def render_clairic(
         existing_schema: The record's schema name (the ``schema`` attribute).
         windows: Ranges of ``text`` to keep instead of all of it; they must be
             disjoint and in increasing order (see ``mention_windows``).
+        focus: A header to use instead of the default one (``entity_focus``,
+            ``discovery_focus``): the opening tag and its lines. ``label`` and
+            ``mentions`` are then not used for the header.
         trailer: Further blocks written after everything else (the repair
             loop's ``<previous_attempt>``, ``<validation_errors>`` and
             ``<expected_schema>``). They are context only: a span that lands in
@@ -171,23 +222,26 @@ def render_clairic(
     Returns:
         The state and the map from state offsets back to ``text``.
     """
-    focus = [f'<focus entity="{_attribute(label)}">', f"Answer only about {label}."]
-    if mentions:
-        quoted = ", ".join(f'"{_attribute(m)}"' for m in mentions)
-        focus.append(f"The input mentions it as: {quoted}.")
+    if focus is not None:
+        lines = [focus[0], *focus[1]]
+    else:
+        lines = [f'<focus entity="{_attribute(label)}">', f"Answer only about {label}."]
+        if mentions:
+            quoted = ", ".join(f'"{_attribute(m)}"' for m in mentions)
+            lines.append(f"The input mentions it as: {quoted}.")
     if existing is not None:
-        focus.append(
+        lines.append(
             "The existing record after the input is context only: answer from "
             "the input text, never from the existing record."
         )
     if trailer:
-        focus.append(
+        lines.append(
             "The blocks after the input describe an earlier answer that was "
             "rejected. They are context only: answer from the input text, never "
             "from them."
         )
-    focus.append("</focus>\n")
-    head = "\n".join(focus)
+    lines.append("</focus>\n")
+    head = "\n".join(lines)
 
     pieces: list[tuple[str, int]]
     if windows:
@@ -318,6 +372,7 @@ def clef_state(
     entity: Mapping[str, Any] | None = None,
     record: Any = None,
     proposed_change: Any = None,
+    extra: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the structured state of a Clef request.
 
@@ -330,6 +385,8 @@ def clef_state(
             "mentions": [...]}``.
         record: An existing record (updates).
         proposed_change: A change under review (updates).
+        extra: Further keys of the state (the mentions of a coreference
+            question, the two sides of a merge check).
 
     Returns:
         ``{"input": text}`` plus the keys that were given.
@@ -341,6 +398,8 @@ def clef_state(
         state["record"] = record
     if proposed_change is not None:
         state["proposed_change"] = proposed_change
+    if extra:
+        state.update(extra)
     return state
 
 

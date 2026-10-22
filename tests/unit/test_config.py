@@ -7,6 +7,8 @@ import pytest
 from pydantic import BaseModel
 
 from trustcall_system_one import (
+    CorefConfig,
+    DiscoveryConfig,
     GateConfig,
     Limits,
     PassesConfig,
@@ -306,3 +308,78 @@ def test_repair_is_wired_into_the_extractor() -> None:
     assert extractor.with_options(repair=RepairConfig(max_attempts=2)).repair == (
         RepairConfig(max_attempts=2)
     )
+
+
+# --------------------------------------------------------------------------- #
+# DiscoveryConfig and CorefConfig (the collection engine)
+# --------------------------------------------------------------------------- #
+
+
+def test_discovery_defaults_and_value_semantics() -> None:
+    config = DiscoveryConfig()
+    assert (config.presence_absent, config.presence_present) == (0.2, 0.5)
+    assert config.count_trust_max == 10 and config.broaden_on_count_mismatch is True
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        config.count_trust_max = 3  # type: ignore[misc]
+    assert hash(config) == hash(DiscoveryConfig())
+    assert config == DiscoveryConfig()
+    assert len({config, DiscoveryConfig(count_trust_max=3)}) == 2
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"presence_absent": -0.1},
+        {"presence_absent": 1.5},
+        {"presence_present": 0},
+        {"presence_absent": 0.6, "presence_present": 0.5},
+        {"presence_absent": True},
+        {"count_trust_max": 0},
+        {"count_trust_max": 2.5},
+        {"count_trust_max": True},
+        {"broaden_on_count_mismatch": "yes"},
+    ],
+)
+def test_discovery_settings_are_validated(kwargs: dict[str, Any]) -> None:
+    with pytest.raises(ValueError):
+        DiscoveryConfig(**kwargs)
+
+
+def test_discovery_accepts_the_boundaries() -> None:
+    DiscoveryConfig(presence_absent=0.0, presence_present=0.5)
+    DiscoveryConfig(presence_absent=0.5, presence_present=0.5)
+    DiscoveryConfig(count_trust_max=1, broaden_on_count_mismatch=False)
+
+
+def test_coref_defaults_and_value_semantics() -> None:
+    config = CorefConfig()
+    assert config.strategy == "auto" and config.merge_threshold == 0.5
+    assert config.max_pairwise_mentions == 150 and config.context_chars == 120
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        config.strategy = "pairwise"  # type: ignore[misc]
+    assert hash(config) == hash(CorefConfig())
+    assert len({config, CorefConfig(strategy="incremental")}) == 2
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"strategy": "greedy"},
+        {"merge_threshold": 0},
+        {"merge_threshold": 1.1},
+        {"merge_threshold": True},
+        {"max_pairwise_mentions": 1},
+        {"max_pairwise_mentions": "150"},
+        {"context_chars": -1},
+        {"context_chars": 1.5},
+    ],
+)
+def test_coref_settings_are_validated(kwargs: dict[str, Any]) -> None:
+    with pytest.raises(ValueError):
+        CorefConfig(**kwargs)
+
+
+def test_coref_accepts_every_strategy_and_a_zero_context() -> None:
+    for strategy in ("pairwise", "incremental", "auto"):
+        CorefConfig(strategy=strategy)
+    CorefConfig(context_chars=0, merge_threshold=1.0)

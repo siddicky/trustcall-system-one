@@ -12,7 +12,9 @@ from trustcall_system_one._compile import (
 )
 from trustcall_system_one._config import (
     ConcurrencyConfig,
+    CorefConfig,
     CostReport,
+    DiscoveryConfig,
     GateConfig,
     Limits,
     PassesConfig,
@@ -71,7 +73,9 @@ __all__ = [
     "CallRecord",
     "CloudflareTransport",
     "ConcurrencyConfig",
+    "CorefConfig",
     "CostReport",
+    "DiscoveryConfig",
     "EntityInfo",
     "ExtractionInput",
     "ExtractionResult",

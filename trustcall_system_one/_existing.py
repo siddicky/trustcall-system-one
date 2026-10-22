@@ -342,7 +342,7 @@ def target_for(
 
     Raises:
         NotImplementedError: For list-form records of a schema without an
-            explicit wrapper: that implies ``Many`` (M7-M8).
+            explicit wrapper: that implies ``Many`` (M8).
         ValueError: For several records under an explicit ``One``.
     """
     records = existing.for_schema(schema_name)
@@ -350,7 +350,7 @@ def target_for(
     if not explicit and any(r.listed for r in named):
         raise NotImplementedError(
             f"list-form existing records of {schema_name} imply Many({schema_name}); "
-            "matching several records arrives in M7-M8. Wrap the schema in "
+            "matching several records arrives in M8. Wrap the schema in "
             f"One({schema_name}) to update a single record"
         )
     if len(records) > 1:

@@ -26,7 +26,7 @@ import asyncio
 import contextlib
 import dataclasses
 import json
-from collections.abc import Collection, Iterator, Mapping
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -65,7 +65,7 @@ from trustcall_system_one._errors import ExtractionValidationError
 from trustcall_system_one._existing import ExistingRecord, normalise_record
 from trustcall_system_one._gates import dedup_elements, gate_changes
 from trustcall_system_one._names import Path
-from trustcall_system_one._render import RenderedState
+from trustcall_system_one._render import Focus, RenderedState
 from trustcall_system_one._repair import (
     Hit,
     Outcome,
@@ -337,7 +337,7 @@ async def _clef_pass(
         return {}
     return await ctx.run.call_clef(
         questions,
-        ctx.run.clef_state(ctx.text),
+        ctx.state(),
         meta=ctx.meta("clef_fields", field=_group_meta_field(group)),
     )
 
@@ -385,7 +385,7 @@ async def _ask_presences(
         questions[group.spec.clef_name] = ctx.clef_question(group.spec)
     answers = await ctx.run.call_clef(
         questions,
-        ctx.run.clef_state(ctx.text),
+        ctx.state(),
         meta=ctx.meta("presence", field=",".join(g.pretty for g in groups)),
     )
     presence = ctx.run.presence
@@ -1142,7 +1142,7 @@ def _build(ctx: Ctx, root: _GroupResult) -> _Built:
 def _record(ctx: Ctx, built: _Built, qualify_p: float | None) -> ResultRecord:
     """The result record of a built candidate (valid or not)."""
     plan, out = ctx.plan, built.out
-    entity = EntityInfo(key=ctx.key, label=ctx.label, qualify_p=qualify_p)
+    entity = ctx.info or EntityInfo(key=ctx.key, label=ctx.label, qualify_p=qualify_p)
     # what was dropped for failing validation is reported as dropped
     answers: dict[str, FieldAnswer] = {}
     for key, answer in out.answers.items():
@@ -1383,6 +1383,8 @@ async def insert_one(
     label: str,
     skip_presence: bool = False,
     presence: float | None = None,
+    entity: EntityInfo | None = None,
+    focus: Focus | None = None,
 ) -> InsertOutcome:
     """Extract one entity of a schema from ``text``.
 
@@ -1399,6 +1401,10 @@ async def insert_one(
         label: How prompts name the entity (``"the Person"``).
         skip_presence: Skip the presence gate (the schema was forced).
         presence: The presence probability, when it has been asked already.
+        entity: The entity of a collection this record is about (``label`` then
+            is its name); its key and mentions go into the prompts and the
+            record. The presence gate is not asked for it.
+        focus: The focus header of the Clairic requests (a collection entity's).
 
     Returns:
         The outcome: no record when the gate finds no entity, else an insert
@@ -1409,12 +1415,28 @@ async def insert_one(
         StateTruncatedError: In strict mode, if Clairic keeps truncating.
         TransportError: If a request failed (it is in ``run.calls`` first).
     """
-    ctx = Ctx(run=run, plan=plan, text=text, label=label)
+    if entity is None:
+        ctx = Ctx(run=run, plan=plan, text=text, label=label)
+    else:
+        ctx = Ctx(
+            run=run,
+            plan=plan,
+            text=text,
+            label=label,
+            key=entity.key,
+            mentions=tuple(dict.fromkeys(m.text for m in entity.mentions)),
+            info=entity,
+            focus=focus,
+        )
+        skip_presence = True
     _note_unsupported(run, plan)
     qualify_p: float | None = presence
+    if entity is not None and qualify_p is None:
+        qualify_p = entity.qualify_p
     if not skip_presence and qualify_p is None:
         qualify_p = await _presence(ctx)
-    if qualify_p is not None and qualify_p < run.presence.threshold_absent:
+    absent = qualify_p is not None and qualify_p < run.presence.threshold_absent
+    if absent and entity is None:
         return InsertOutcome(None, extracted=False)
 
     root = await _run_unit(ctx, plan.root)
@@ -1710,25 +1732,49 @@ def _is_new(spec: FieldSpec, value: Any, old: Any, default: Any) -> bool:
     return is_change(spec, value, old, default)
 
 
-def _held_element(record: Mapping[str, Any], path: tuple[str | int, ...]) -> bool:
+def _walk(doc: Any, path: tuple[str | int, ...]) -> Any:
+    """Follow keys and list indexes through a document (``MISSING`` if absent)."""
+    value = doc
+    for part in path:
+        if isinstance(part, int) and isinstance(value, list):
+            if not 0 <= part < len(value):
+                return MISSING
+            value = value[part]
+        elif isinstance(value, Mapping) and part in value:
+            value = value[part]
+        else:
+            return MISSING
+    return value
+
+
+def _held_element(
+    record: Mapping[str, Any],
+    patched: Mapping[str, Any],
+    ops: Sequence[PatchOp],
+    path: tuple[str | int, ...],
+) -> bool:
     """Whether a path points at a list element the record already held.
 
     An error about such an element is not the update's: it was there before, and
-    it costs no repair request.
+    it costs no repair request. The element is the record's only when the patched
+    document holds exactly the record's element at that path and no applied
+    operation wrote an ancestor of the path (a ``replace /pet`` hands the
+    patched document a new pet whose ``toys/0`` merely sits where the old pet's
+    ``toys/0`` was).
+
+    Args:
+        record: The record before the update.
+        patched: The document the operations produced.
+        ops: The operations that were applied.
+        path: Document path of the error.
     """
     if not any(isinstance(part, int) for part in path):
         return False
-    held: Any = record
-    for part in path:
-        if isinstance(part, int) and isinstance(held, list):
-            if part >= len(held):
-                return False
-            held = held[part]
-        elif isinstance(held, Mapping) and part in held:
-            held = held[part]
-        else:
-            return False
-    return True
+    here = pointer(path)
+    if any(op.path != here and here.startswith(op.path + "/") for op in ops):
+        return False
+    old = _walk(record, path)
+    return old is not MISSING and _walk(patched, path) == old
 
 
 def _change_key(change: Change) -> tuple[str, str, str]:
@@ -1859,7 +1905,9 @@ async def _repair_update(
 
     def pre_existing(problem: Problem) -> bool:
         path = document_path(ctx.plan, problem.loc, ev.chosen)
-        return path is not None and _held_element(before, path)
+        return path is not None and _held_element(
+            before, ev.applied.doc, ev.applied.applied, path
+        )
 
     def pending() -> Pending:
         # errors of what the record held before the update are not the update's
@@ -1966,7 +2014,7 @@ async def _finish_update(
                 why[id(op)] = text
 
         for path, message in problems:
-            if _held_element(before, path):
+            if _held_element(before, applied.doc, applied.applied, path):
                 continue  # the record had that element: not this update's error
             for op in ops_for_errors(applied.applied, [path]):
                 blame(op, f"{_dotted(path)}: {message}")

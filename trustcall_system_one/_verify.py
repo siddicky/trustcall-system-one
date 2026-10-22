@@ -45,13 +45,14 @@ from trustcall_system_one._compile import (
 )
 from trustcall_system_one._errors import StateTruncatedError
 from trustcall_system_one._render import (
+    Focus,
     RenderedState,
     mention_windows,
     narrow_text,
     render_clairic,
 )
 from trustcall_system_one._run import Answer, Question, Run, gather
-from trustcall_system_one._types import CallKind
+from trustcall_system_one._types import CallKind, EntityInfo
 from trustcall_system_one._wire import (
     ChoiceAnswer,
     ChoiceQuestion,
@@ -142,6 +143,12 @@ class Ctx:
             because their span lay in the existing record.
         trailer: Blocks written after the input in every Clairic request of this
             context (the repair loop's description of a rejected answer).
+        info: The entity of a collection (key, label, mentions with their spans):
+            its Clef states carry the mentions with spans, so two entities that
+            share a label stay apart, and its record reports it.
+        focus: The focus header of every Clairic request of this context, when it
+            is not the default one (a collection entity's names the schema, the
+            entity and its mentions).
     """
 
     run: Run
@@ -158,6 +165,8 @@ class Ctx:
     )
     echoes: dict[str, list[str]] = field(default_factory=dict)
     trailer: str = ""
+    info: EntityInfo | None = None
+    focus: Focus | None = None
 
     def input_only(self) -> "Ctx":
         """The same context without the record: every request is about the input.
@@ -265,7 +274,36 @@ class Ctx:
             existing_schema=existing.schema_name if existing is not None else None,
             windows=windows or None,
             trailer=self.trailer,
+            focus=self.focus,
         )
+
+    def entity_dict(self) -> dict[str, Any]:
+        """The ``entity`` of a Clef state: ``{"label", "mentions"}``.
+
+        The mentions are the texts the input uses; for a collection entity each
+        is an object with its span in the input, so two entities that share a
+        label (two people called Emma) can still be told apart.
+        """
+        mentions: list[Any] = list(self.mentions)
+        if self.info is not None and self.info.mentions:
+            mentions = [
+                {"text": m.text, "span": list(m.span)} if m.span else {"text": m.text}
+                for m in self.info.mentions
+            ]
+        return {"label": self.label, "mentions": mentions}
+
+    def state(self, spans: list[Span] | None = None) -> dict[str, Any]:
+        """The Clef state of a question about the input: ``{input}``.
+
+        A collection entity's questions also carry the entity (``{input,
+        entity}``), because the input names several and the question must say
+        which one it is about. Everything else (a ``One``) stays ``{input}``.
+
+        Args:
+            spans: Spans to keep if the input is over the Clef budget.
+        """
+        entity = self.entity_dict() if self.info is not None else None
+        return self.run.clef_state(self.text, entity=entity, spans=spans)
 
     def entity_state(
         self,
@@ -288,7 +326,7 @@ class Ctx:
             text = narrow_text(text, windows)
         return self.run.clef_state(
             text,
-            entity={"label": self.label, "mentions": list(self.mentions)},
+            entity=self.entity_dict(),
             spans=None if narrow_to else anchors,
         )
 
@@ -1035,7 +1073,7 @@ async def _choose_elements(
         )
     answers = await ctx.run.call_clef(
         questions,
-        ctx.run.clef_state(ctx.text, spans=list(spans) if spans else None),
+        ctx.state(list(spans) if spans else None),
         meta=ctx.meta("clef_fields", field=spec.wire_name),
     )
     gates = ctx.run.gates
@@ -1327,7 +1365,7 @@ async def _borderline(ctx: Ctx, targets: list[FieldState]) -> None:
         for st in targets
     }
     answers = await ctx.run.call_clef(
-        questions, ctx.run.clef_state(ctx.text), meta=ctx.meta("null_check")
+        questions, ctx.state(), meta=ctx.meta("null_check")
     )
     await gather(*(_borderline_one(ctx, st, answers) for st in targets))
 

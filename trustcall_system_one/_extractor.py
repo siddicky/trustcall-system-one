@@ -24,9 +24,12 @@ from typing import Any, Literal, TypeVar, overload
 from typing_extensions import Required, TypedDict
 
 from trustcall_system_one._cardinality import Many, One, resolve_cardinality
+from trustcall_system_one._collection import Scope, identity_fields, insert_collection
 from trustcall_system_one._compile import SchemaPlan, compile_schema
 from trustcall_system_one._config import (
     ConcurrencyConfig,
+    CorefConfig,
+    DiscoveryConfig,
     GateConfig,
     Limits,
     PassesConfig,
@@ -321,19 +324,24 @@ def _note_failure(exc: Exception, run: Run) -> None:
 
 @dataclass(frozen=True)
 class _Entry:
-    """A schema that runs: its plan, how prompts name it, whether it was a ``One``."""
+    """A schema that runs: its plan, how prompts name it, whether it was wrapped.
+
+    ``many`` is the wrapper of a schema that has any number of entities (run by
+    the collection engine); ``None`` for a ``One``.
+    """
 
     plan: SchemaPlan
     label: str
     explicit: bool
+    many: Many | None = None
 
 
 @dataclass(frozen=True)
 class _Done:
-    """The outcome of one schema, whether it was inserted or updated."""
+    """The outcome of one schema: its records (inserted or updated) and skips."""
 
-    record: ResultRecord | None
-    skipped: SkippedEntity | None
+    records: tuple[ResultRecord, ...]
+    skipped: tuple[SkippedEntity, ...]
     handled: tuple[str, str] | None
     extracted: bool
     attempts: int = 0
@@ -372,6 +380,8 @@ class Extractor:
         verify: Verification-ladder settings.
         gates: Answer-level thresholds.
         repair: Validation repair loop settings.
+        discovery: Settings of entity discovery for ``Many`` schemas.
+        coref: Settings of mention clustering for ``Many`` schemas.
         passes: How Clairic fields are grouped into requests.
         limits: Structural limits.
         concurrency: Concurrency limits of the default transport (no effect on
@@ -395,6 +405,8 @@ class Extractor:
     verify: VerifyConfig = field(default_factory=VerifyConfig)
     gates: GateConfig = field(default_factory=GateConfig)
     repair: RepairConfig = field(default_factory=RepairConfig)
+    discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
+    coref: CorefConfig = field(default_factory=CorefConfig)
     passes: PassesConfig = field(default_factory=PassesConfig)
     limits: Limits = field(default_factory=Limits)
     concurrency: ConcurrencyConfig | None = None
@@ -420,7 +432,10 @@ class Extractor:
         _iso_date(self.reference_date)
         names: list[str] = []
         for item in self.schemas:
-            names.append(self.plan_for(_inner(item)).name)
+            plan = self.plan_for(_inner(item))
+            names.append(plan.name)
+            if isinstance(item, Many):
+                identity_fields(plan, item)  # an unknown identity field fails here
         duplicates = sorted({name for name in names if names.count(name) > 1})
         if duplicates:
             raise ValueError(f"schema names must be unique, got {duplicates} twice")
@@ -510,8 +525,13 @@ class Extractor:
         ``list[(record_id, schema_name, record)]``; ``list[(record_id,
         BaseModel)]``; and a bare ``list[BaseModel]`` (ids are minted). A record
         is a dict or a pydantic model; ``"__any__"`` as schema name applies to
-        any schema. Several list-form records of a schema imply ``Many`` (M7-M8);
-        a ``One`` takes exactly one.
+        any schema. Several list-form records of a schema imply ``Many``, which
+        needs matching against them (M8); a ``One`` takes exactly one.
+
+        A ``Many`` schema without existing records is a multi-entity insert: every
+        distinct entity of the schema the input mentions gets a record (discovery,
+        coreference and qualification, then the full single-entity pipeline per
+        entity, concurrently); see ``docs/DESIGN.md``, "Collection engine".
 
         Args:
             input: The text, or an ``ExtractionInput`` carrying it. Explicit
@@ -533,9 +553,8 @@ class Extractor:
             touch (including opaque ones kept by ``existing_schema_policy=False``).
 
         Raises:
-            NotImplementedError: For ``Many`` schemas (M7) and for list-form
-                existing records of a schema without an explicit wrapper (they
-                imply ``Many``, M7-M8).
+            NotImplementedError: For a ``Many`` schema that has existing records
+                (matching them is M8), also when list-form records imply ``Many``.
             ValueError: If ``schema`` is not one of the extractor's schemas, or
                 ``existing`` is malformed, names an unknown schema under
                 ``existing_schema_policy=True``, or gives a ``One`` several
@@ -563,12 +582,19 @@ class Extractor:
         cards = [resolve_cardinality(item, existing) for item in selected]
         for item, card in zip(selected, cards, strict=True):
             if isinstance(card, Many):
+                name = self.plan_for(card).name
+                if not records.named(name):
+                    continue
                 if isinstance(item, Many):
-                    raise NotImplementedError("Many(...) arrives in M7")
-                name = self.plan_for(item).name
+                    raise NotImplementedError(
+                        f"Many({name}) was given existing {name} records; matching "
+                        "the entities of the input against them arrives in M8. "
+                        f"Without existing records Many({name}) inserts every "
+                        "entity it finds"
+                    )
                 raise NotImplementedError(
                     f"list-form existing records of {name} imply Many({name}); "
-                    "matching several records arrives in M7-M8. Wrap the schema "
+                    "matching several records arrives in M8. Wrap the schema "
                     f"in One({name}) to update a single record"
                 )
         if not text.strip() and not images:
@@ -591,6 +617,8 @@ class Extractor:
             passes=self.passes,
             repair=self.repair,
             limits=self.limits,
+            discovery=self.discovery,
+            coref=self.coref,
             images=list(images) if images else None,
             reference_date=_iso_date(
                 reference_date if reference_date is not None else self.reference_date
@@ -601,8 +629,10 @@ class Extractor:
             run.warn(warning)
         entries: list[_Entry] = []
         for item, card in zip(selected, cards, strict=True):
-            assert isinstance(card, One)
             plan = self.plan_for(card)
+            if isinstance(card, Many):
+                entries.append(_Entry(plan, card.label or plan.title, True, many=card))
+                continue
             entries.append(
                 _Entry(
                     plan,
@@ -618,6 +648,11 @@ class Extractor:
             jobs = []
             for entry in entries:
                 name = entry.plan.name
+                if entry.many is not None:
+                    jobs.append(
+                        self._collect(run, entry, text, forced=schema is not None)
+                    )
+                    continue
                 view = records.without_unclaimed_any(name, claims)
                 target = target_for(name, view, explicit=entry.explicit)
                 known = presences.get(name)
@@ -656,16 +691,14 @@ class Extractor:
         except Exception as exc:
             _note_failure(exc, run)
             raise
-        results: list[ResultRecord] = [
-            o.record for o in outcomes if o.record is not None
-        ]
+        results: list[ResultRecord] = [r for o in outcomes for r in o.records]
         handled = {o.handled for o in outcomes if o.handled is not None}
         return ExtractionResult(
             records=tuple(results),
             responses=tuple(
                 r.value for r in results if r.valid and r.value is not None
             ),
-            skipped=tuple(o.skipped for o in outcomes if o.skipped is not None),
+            skipped=tuple(s for o in outcomes for s in o.skipped),
             untouched=records.untouched(handled),
             attempts=max((o.attempts for o in outcomes), default=0),
             usage=run.usage,
@@ -708,12 +741,20 @@ class Extractor:
         """
         claims: dict[str, str] = {}
         presences: dict[str, float] = {}
-        candidates = [e for e in entries if not records.named(e.plan.name)]
+        candidates = [
+            e for e in entries if e.many is None and not records.named(e.plan.name)
+        ]
         open_ = list(candidates)  # schemas that have not claimed a record yet
         floor = run.presence.threshold_absent
         for record in records.named(ANY):
             if not open_:
-                if candidates:
+                if any(e.many is not None for e in entries):
+                    run.warn(
+                        f"the {ANY!r} record {record.record_id!r} was claimed by no "
+                        "schema (a Many schema cannot claim a record before M8); "
+                        "it is left untouched"
+                    )
+                elif candidates:
                     run.warn(
                         f"the {ANY!r} record {record.record_id!r} was claimed by "
                         "no schema (each candidate took another such record); it "
@@ -779,7 +820,21 @@ class Extractor:
             run, plan, text, label=label, skip_presence=skip, presence=presence
         )
         return _Done(
-            outcome.record,
+            (outcome.record,) if outcome.record is not None else (),
+            (outcome.skipped,) if outcome.skipped is not None else (),
+            None,
+            outcome.extracted,
+            outcome.attempts,
+        )
+
+    @staticmethod
+    async def _collect(run: Run, entry: _Entry, text: str, *, forced: bool) -> _Done:
+        """Insert every entity of a ``Many`` schema the input mentions."""
+        assert entry.many is not None
+        scope = Scope(plan=entry.plan, source=text, cardinality=entry.many)
+        outcome = await insert_collection(run, scope, skip_presence=forced)
+        return _Done(
+            outcome.records,
             outcome.skipped,
             None,
             outcome.extracted,
@@ -808,8 +863,8 @@ class Extractor:
             presence=presence,
         )
         return _Done(
-            outcome.record,
-            outcome.skipped,
+            (outcome.record,) if outcome.record is not None else (),
+            (outcome.skipped,) if outcome.skipped is not None else (),
             outcome.handled,
             outcome.extracted,
             outcome.attempts,
@@ -1004,6 +1059,8 @@ def create_extractor(
     verify: VerifyConfig | None = None,
     gates: GateConfig | None = None,
     repair: RepairConfig | None = None,
+    discovery: DiscoveryConfig | None = None,
+    coref: CorefConfig | None = None,
     passes: PassesConfig | None = None,
     limits: Limits | None = None,
     concurrency: ConcurrencyConfig | None = None,
@@ -1036,6 +1093,10 @@ def create_extractor(
         gates: Answer-level thresholds.
         repair: Validation repair loop settings (on by default): a record that
             fails validation gets one narrow re-ask per failing field.
+        discovery: Settings of entity discovery for ``Many`` schemas (presence
+            thresholds, how far the count of entities is trusted).
+        coref: Settings of mention clustering for ``Many`` schemas (strategy,
+            merge threshold, the size at which clustering becomes incremental).
         passes: How Clairic fields are grouped into requests.
         limits: Structural limits.
         concurrency: Concurrency limits of the default transport.
@@ -1050,7 +1111,8 @@ def create_extractor(
     Raises:
         ValueError: If none of ``enable_inserts``, ``enable_updates`` and
             ``enable_deletes`` is true, no schema is given, schema names repeat,
-            or a schema cannot be compiled.
+            a schema cannot be compiled or ``Many(identity=...)`` names a field
+            the schema lacks.
     """
     return Extractor(
         schemas=tuple(schemas),
@@ -1067,6 +1129,8 @@ def create_extractor(
         verify=verify or VerifyConfig(),
         gates=gates or GateConfig(),
         repair=repair or RepairConfig(),
+        discovery=discovery or DiscoveryConfig(),
+        coref=coref or CorefConfig(),
         passes=passes or PassesConfig(),
         limits=limits or Limits(),
         concurrency=concurrency,

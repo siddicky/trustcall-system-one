@@ -355,7 +355,6 @@ def test_05_people_memory(capsys: pytest.CaptureFixture[str]) -> None:
             assert text[mention.span[0] : mention.span[1]] == mention.text
 
 
-@pytest.mark.xfail(raises=NotImplementedError, strict=True, reason="needs M7")
 def test_06_attribution_guard(capsys: pytest.CaptureFixture[str]) -> None:
     result = run("06_attribution_guard", capsys)
     priya, tom = result.responses
@@ -368,6 +367,55 @@ def test_06_attribution_guard(capsys: pytest.CaptureFixture[str]) -> None:
         "Priya Raman": {("/role", "attribution")},
         "Tom Becker": {("/city", "attribution")},
     }
+
+
+def test_06_calls_follow_the_collection_pipeline(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = run("06_attribution_guard", capsys, keep_output=True)
+    kinds = [call.kind for call in result.calls]
+    assert sorted(kinds[:3]) == ["count", "discover", "presence"]  # in parallel
+    assert (
+        kinds[3:]
+        == ["coref", "qualify", "qualify", "extract", "extract"] + ["attribution"] * 2
+    )
+    # the call log the example prints
+    out = capsys.readouterr().out
+    assert "10 requests" in out
+    assert "attribution 2" in out and "qualify 2" in out
+    colleague = result.records[0].entity
+    assert colleague is not None and colleague.label == "Priya Raman"
+    assert [m.text for m in colleague.mentions] == ["Priya Raman"]
+
+
+async def test_05_offline_script_answers_the_real_discovery_shapes() -> None:
+    """05 needs M8 for its update half; its discovery half already runs."""
+    from trustcall_system_one import Many, compile_schema
+    from trustcall_system_one._collection import Scope, collect
+    from trustcall_system_one._run import Run
+
+    module = load("05_people_memory")
+    script = module.offline_script()
+    scope = Scope(
+        compile_schema(module.Person),
+        module.CONVERSATION,
+        Many(module.Person, identity="name"),
+    )
+    outcome = await collect(scope, Run(transport=script.transport))
+    assert [e.label for e in outcome.entities] == [
+        "Emma Thompson",
+        "Michael Chen",
+        "Sarah",
+        "Olivia Davis",
+    ]
+    assert [(s.reason, s.entity.label) for s in outcome.skipped] == [
+        ("not_qualified", "Sunny")
+    ]
+    assert outcome.count == 4 and outcome.warnings == ()
+    for entity in outcome.entities:
+        for mention in entity.mentions:
+            assert mention.span is not None
+            assert module.CONVERSATION[slice(*mention.span)] == mention.text
 
 
 @pytest.mark.xfail(strict=True, reason="needs M9")
@@ -410,7 +458,7 @@ def test_07_update_path_reports_the_collection_it_cannot_extract_yet(
 
 
 # --------------------------------------------------------------------------- #
-# 08: runs today on FakeTransport + route (FakeWorld arrives with M7)
+# 08: FakeTransport + route, and FakeWorld for a multi-entity run
 # --------------------------------------------------------------------------- #
 
 
@@ -420,4 +468,4 @@ def test_08_testing_your_extractor(capsys: pytest.CaptureFixture[str]) -> None:
     out = capsys.readouterr().out
     assert BANNER in out
     assert outcome == {test.__name__: True for test in module.TESTS}
-    assert len(outcome) == 6
+    assert len(outcome) == 8

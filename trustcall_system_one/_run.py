@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from typing import Any, TypeVar, Union
 
 from trustcall_system_one._config import (
+    CorefConfig,
+    DiscoveryConfig,
     GateConfig,
     Limits,
     PassesConfig,
@@ -156,6 +158,8 @@ class Run:
         passes: How Clairic fields are grouped into requests.
         repair: Settings of the validation repair loop.
         limits: Structural limits (including the Clef state budget).
+        discovery: Settings of entity discovery (``Many``).
+        coref: Settings of mention clustering (``Many``).
         images: Images sent with every request that carries the user's input.
             Each request model validates the documented size limits before it is
             sent.
@@ -176,6 +180,8 @@ class Run:
     passes: PassesConfig = field(default_factory=PassesConfig)
     repair: RepairConfig = field(default_factory=RepairConfig)
     limits: Limits = field(default_factory=Limits)
+    discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
+    coref: CorefConfig = field(default_factory=CorefConfig)
     images: Sequence[Any] | None = None
     reference_date: str | None = None
     strict: bool = False
@@ -433,6 +439,7 @@ class Run:
         record: Any = None,
         proposed_change: Any = None,
         spans: Sequence[tuple[int, int]] | None = None,
+        extra: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Build a Clef state and keep it under ``limits.clef_state_token_budget``.
 
@@ -442,13 +449,18 @@ class Run:
             record: An existing record (updates).
             proposed_change: A change under review (updates).
             spans: Spans in ``text`` to keep if the input has to be narrowed.
+            extra: Further keys of the state (see ``_render.clef_state``).
 
         Returns:
             The state; when it was too large the input is narrowed and a warning
             is recorded.
         """
         state = clef_state(
-            text, entity=entity, record=record, proposed_change=proposed_change
+            text,
+            entity=entity,
+            record=record,
+            proposed_change=proposed_change,
+            extra=extra,
         )
         state, warning = fit_clef_state(
             state,
