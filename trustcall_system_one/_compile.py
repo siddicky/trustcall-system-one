@@ -2185,7 +2185,9 @@ class _Budget:
             )
 
 
-_LIMIT_TAGS = frozenset({"max_depth", "max_recursion", "no_viable_member"})
+_LIMIT_TAGS = frozenset(
+    {"max_depth", "max_recursion", "no_viable_member", "unviable_group"}
+)
 
 
 def _skipped_by_limit(draft: _Draft) -> bool:
@@ -2268,9 +2270,23 @@ def _expand(
             dead = True
         if kind.engine == "submodel":
             sub = child(kind.models[0], draft, typed=kind.typed_dict)
-            items.append(sub)
             if sub.dead and draft.required:
                 dead = True
+            if sub.dead and not draft.required:
+                # asked, it could only ever be dropped: leave it out altogether
+                draft.kind = _Kind("skip", warnings=["unviable_group"])
+                draft.warnings.append("unviable_group")
+                draft.messages.append(
+                    (
+                        "unviable_group",
+                        f"{draft.ctx.pretty}: unviable_group: a required field "
+                        "of the optional sub-model was skipped by a limit, so it "
+                        "could never validate; the field is skipped",
+                    )
+                )
+                items.append(draft)
+            else:
+                items.append(sub)
         elif kind.engine == "union_models":
             assert kind.union is not None
             labels = list(kind.union.labels)

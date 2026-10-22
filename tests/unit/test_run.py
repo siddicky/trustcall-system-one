@@ -336,3 +336,53 @@ async def test_gather_and_both_return_results_in_order() -> None:
     assert await gather(value(1), value(2)) == [1, 2]
     assert await both(value("a"), value(3)) == ("a", 3)
     assert await gather() == []
+
+
+async def test_gather_raises_the_real_error_not_a_siblings_cancellation() -> None:
+    shared: asyncio.Future[None] = asyncio.ensure_future(asyncio.sleep(10))
+
+    async def waits() -> None:
+        await shared  # cancelled out from under it by the failing sibling
+
+    async def boom() -> None:
+        shared.cancel()
+        await asyncio.sleep(0)  # the sibling ends up cancelled first
+        await asyncio.sleep(0)
+        raise ValueError("the real error")
+
+    with pytest.raises(ValueError, match="the real error"):
+        await gather(waits(), boom())
+    with pytest.raises(ValueError, match="the real error"):
+        await gather(boom(), waits())
+
+
+async def test_gather_re_raises_the_callers_own_cancellation() -> None:
+    started = asyncio.Event()
+    stopped = asyncio.Event()
+
+    async def child() -> None:
+        started.set()
+        try:
+            await asyncio.sleep(10)
+        finally:
+            stopped.set()
+
+    task = asyncio.ensure_future(gather(child(), child()))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert stopped.is_set()
+
+
+async def test_gather_with_a_cancelled_sibling_and_no_error_raises_cancelled() -> None:
+    async def victim() -> None:
+        await asyncio.sleep(10)
+
+    async def cancel_it(task: asyncio.Future[None]) -> None:
+        await asyncio.sleep(0)
+        task.cancel()
+
+    future = asyncio.ensure_future(victim())
+    with pytest.raises(asyncio.CancelledError):
+        await gather(future, cancel_it(future))

@@ -3,7 +3,7 @@
 # ruff: noqa: UP007, UP045 - tests deliberately spell Optional and Union
 
 import enum
-from typing import Any, Literal, Optional, Union
+from typing import Any, Literal, Optional, Union, cast
 
 import pytest
 from pydantic import BaseModel, Field
@@ -21,9 +21,12 @@ from trustcall_system_one import (
     ExtractionValidationError,
     GateConfig,
     Limits,
+    ModelResponseError,
     PassesConfig,
     PresenceConfig,
     ResultRecord,
+    TransportError,
+    TrustcallSystemOneError,
     VerifyConfig,
     s1_field,
 )
@@ -1339,12 +1342,12 @@ async def test_the_union_fallback_is_decided_by_clairic_evidence() -> None:
     }
     script.clef = {
         "kind": pick("Loud", ["Calm", "Loud"], 0.5),
-        "kind.Calm.quiet": noul(0.9),
-        "kind.Calm.still": noul(0.9),
+        "kind.Calm.quiet": noul(0.05),  # False is the default: no evidence
+        "kind.Calm.still": noul(0.05),
         "kind.Loud.shouts": noul(0.05),
     }
     record = only(await run([Beast], script, "Rex."))
-    # Calm has two resolved bools, Loud one name: the name is the evidence
+    # Calm's bools say what they would say anyway, Loud has a name: the name wins
     assert isinstance(record.value, Beast) and isinstance(record.value.kind, Loud)
 
 
@@ -1497,3 +1500,373 @@ async def test_a_recursive_models_deferred_field_is_warned_about_once() -> None:
     mentions = [w for w in result.warnings if "collection fields" in w]
     assert len(mentions) == 1 and "Tree.children" in mentions[0]
     assert sum("max_recursion" in w for w in result.warnings) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Clef answers as evidence, errors that go with a dropped group, alias dumps
+# --------------------------------------------------------------------------- #
+
+
+class Prefs(BaseModel):
+    dark_mode: bool = False
+    city: Optional[str] = None
+
+
+class User(BaseModel):
+    name: str
+    prefs: Optional[Prefs] = None
+
+
+async def test_a_clef_answer_that_differs_from_the_default_is_evidence() -> None:
+    script = Script()
+    script.clairic = {
+        "name": ca("text", "Ann", find="Ann"),
+        "prefs.city": ca("text", None, p_null=0.99),
+    }
+    script.clef = {"prefs.dark_mode": noul(0.98)}
+    script.group_presence = {"prefs": 0.4}
+    record = only(await run([User], script, "Ann uses dark mode."))
+    assert record.value == User(name="Ann", prefs=Prefs(dark_mode=True))
+    assert record.fields["prefs"].rejected_reason is None
+
+
+async def test_a_clef_answer_equal_to_the_default_is_not_evidence() -> None:
+    script = Script()
+    script.clairic = {
+        "name": ca("text", "Ann", find="Ann"),
+        "prefs.city": ca("text", None, p_null=0.99),
+    }
+    script.clef = {"prefs.dark_mode": noul(0.02)}  # False, the default
+    script.group_presence = {"prefs": 0.4}
+    record = only(await run([User], script, "Ann likes tea."))
+    assert record.value == User(name="Ann")
+    assert record.fields["prefs"].rejected_reason == "absent"
+
+
+class Mood(BaseModel):
+    happy: Optional[bool]  # nullable, no default
+    note: Optional[str] = None
+
+
+class Feeling(BaseModel):
+    name: str
+    mood: Optional[Mood] = None
+
+
+async def test_an_answered_nullable_clef_field_is_evidence_but_unstated_is_not() -> (
+    None
+):
+    answered = Script()
+    answered.clairic = {
+        "name": ca("text", "Ann", find="Ann"),
+        "mood.note": ca("text", None, p_null=0.99),
+    }
+    answered.clef = {"mood.happy": pick("yes", ["yes", "no", "unstated"])}
+    answered.group_presence = {"mood": 0.4}
+    record = only(await run([Feeling], answered, "Ann is happy."))
+    assert record.value == Feeling(name="Ann", mood=Mood(happy=True))
+    unstated = Script()
+    unstated.clairic = dict(answered.clairic)
+    unstated.clef = {"mood.happy": pick("unstated", ["yes", "no", "unstated"])}
+    unstated.group_presence = {"mood": 0.4}
+    record = only(await run([Feeling], unstated, "Ann is here."))
+    assert record.value == Feeling(name="Ann")
+
+
+async def test_a_clef_answer_differing_from_the_default_decides_a_union_fallback() -> (
+    None
+):
+    class Calm(BaseModel):
+        name: Optional[str] = None
+        quiet: bool = False
+
+    class Loud(BaseModel):
+        name: Optional[str] = None
+        shouts: bool = False
+
+    class Beast(BaseModel):
+        kind: Union[Calm, Loud]
+
+    script = Script()
+    script.clairic = {
+        "kind.Calm.name": ca("text", None, p_null=0.99),
+        "kind.Loud.name": ca("text", None, p_null=0.99),
+    }
+    script.clef = {
+        "kind": pick("Loud", ["Calm", "Loud"], 0.5),
+        "kind.Calm.quiet": noul(0.05),
+        "kind.Loud.shouts": noul(0.98),  # True is not the default
+    }
+    record = only(await run([Beast], script, "It roars."))
+    assert isinstance(record.value, Beast) and isinstance(record.value.kind, Loud)
+
+
+async def test_a_required_clef_leaf_never_counts_even_when_it_resolves() -> None:
+    class Strict(BaseModel):
+        flag: bool  # required
+        note: Optional[str] = None
+
+    class Holder(BaseModel):
+        name: str
+        strict: Optional[Strict] = None
+
+    script = Script()
+    script.clairic = {
+        "name": ca("text", "Ann", find="Ann"),
+        "strict.note": ca("text", None, p_null=0.99),
+    }
+    script.clef = {"strict.flag": noul(0.99)}
+    script.group_presence = {"strict": 0.4}
+    record = only(await run([Holder], script, "Ann."))
+    assert record.value == Holder(name="Ann")
+
+
+class Cat2(BaseModel):
+    kind: Literal["cat"]
+    lives: int
+
+
+class Dog2(BaseModel):
+    kind: Literal["dog"]
+    tricks: int
+
+
+class Keeper2(BaseModel):
+    name: Optional[str] = None
+    pet: Union[Cat2, Dog2]
+
+
+class Zoo2(BaseModel):
+    title: str
+    keeper: Optional[Keeper2] = None
+
+
+async def test_errors_of_a_dropped_group_do_not_invalidate_the_record() -> None:
+    script = Script()
+    script.clairic = {
+        "title": ca("text", "Zoo", find="Zoo"),
+        "keeper.name": ca("text", "Sam", find="Sam"),
+        "keeper.pet.Dog2.tricks": ca("number", None, p_null=0.99),
+        "keeper.pet.Cat2.lives": ca("number", None, p_null=0.99),
+    }
+    script.clef = {"keeper.pet": pick("dog", ["cat", "dog"])}
+    script.group_presence = {"keeper": 0.9}
+    result = await run([Zoo2], script, "Zoo keeper Sam has a dog.")
+    record = only(result)
+    # the required union inside `keeper` cannot be built, so `keeper` is dropped:
+    # that is all that is wrong, and the record stands
+    assert record.valid, record.errors
+    assert record.value == Zoo2(title="Zoo")
+    assert record.errors == ()
+    assert [
+        r.path for r in record.rejected if r.reason == "invalid_optional_group"
+    ] == ["/keeper"]
+
+
+async def test_a_required_union_error_still_counts_in_a_kept_group() -> None:
+    class Required(BaseModel):
+        title: str
+        keeper: Keeper2
+
+    script = Script()
+    script.clairic = {
+        "title": ca("text", "Zoo", find="Zoo"),
+        "keeper.name": ca("text", "Sam", find="Sam"),
+        "keeper.pet.Dog2.tricks": ca("number", None, p_null=0.99),
+        "keeper.pet.Cat2.lives": ca("number", None, p_null=0.99),
+    }
+    script.clef = {"keeper.pet": pick("dog", ["cat", "dog"])}
+    record = only(await run([Required], script, "Zoo keeper Sam has a dog."))
+    assert not record.valid
+    assert record.errors == ("keeper.pet.tricks: Input should be a valid integer",)
+
+
+class Inner2(BaseModel):
+    code: str = Field(alias="Code")
+    note: str = Field(alias="Note")
+
+
+class Outer2(BaseModel):
+    title: str = Field(alias="Title")
+    inner: Optional[Inner2] = Field(default=None, alias="Inner")
+    req: int = Field(alias="Req")
+
+
+async def test_the_after_of_an_invalid_record_is_keyed_by_alias_throughout() -> None:
+    script = Script()
+    script.clairic = {
+        "title": ca("text", "T", find="T"),
+        "inner.code": ca("text", "X1", find="X1"),
+        "inner.note": ca("text", "hi", find="hi"),
+        "req": ca("number", None, p_null=0.99),
+    }
+    record = only(await run([Outer2], script, "T X1 hi"))
+    assert not record.valid
+    assert record.after == {
+        "Title": "T",
+        "Req": None,
+        "Inner": {"Code": "X1", "Note": "hi"},
+    }
+
+
+async def test_a_typed_dict_member_in_after_stays_as_it_is() -> None:
+    from typing_extensions import TypedDict
+
+    class Geo(TypedDict):
+        lat: float
+
+    class Place(BaseModel):
+        name: str
+        geo: Optional[Geo] = None
+        size: int
+
+    script = Script()
+    script.clairic = {
+        "name": ca("text", "Oslo", find="Oslo"),
+        "geo.lat": ca("number", 59.9),
+        "size": ca("number", None, p_null=0.99),
+    }
+    record = only(await run([Place], script, "Oslo at 59.9."))
+    assert not record.valid
+    assert after(record)["geo"] == {"lat": 59.9}
+
+
+class Unviable(BaseModel):
+    code: str
+    again: "Unviable"  # required and recursive: it can never be filled in
+
+
+Unviable.model_rebuild()
+
+
+class Holds(BaseModel):
+    name: str
+    extra: Optional[Unviable] = None
+
+
+async def test_an_optional_group_that_can_never_validate_is_not_asked() -> None:
+    from trustcall_system_one import compile_schema
+
+    plan = compile_schema(Holds)
+    spec = plan.spec(("extra",))
+    assert spec.engine == "skip" and spec.warnings == ("unviable_group",)
+    assert spec.clef is None and [g.pretty for g in plan.groups] == [""]
+    assert sum("unviable_group" in w for w in plan.warnings) == 1
+    script = Script()
+    script.clairic = {"name": ca("text", "Ann", find="Ann")}
+    result = await run([Holds], script, "Ann.")
+    assert only(result).value == Holds(name="Ann")
+    assert presence_fields(script) == [None]  # no question about `extra`
+    assert extract_fields(script) == [["name"]]
+
+
+# --------------------------------------------------------------------------- #
+# Errors propagate as themselves from every concurrent step
+# --------------------------------------------------------------------------- #
+
+BOOM: list[Any] = [
+    TransportError("boom"),
+    ModelResponseError("bad response"),
+    AssertionError("fake says no"),
+]
+
+
+@pytest.mark.parametrize("error", BOOM, ids=lambda e: type(e).__name__)
+@pytest.mark.parametrize(
+    ("where", "schema"),
+    [
+        ("extract:title", Book),
+        ("clef_fields:pet", Owner),
+        ("extract:author.address.city", Book),  # a nested group
+        ("extract:pet.Dog.tricks", Owner),  # a union member
+        ("extract:name", Owner),
+    ],
+)
+async def test_errors_propagate_as_themselves(
+    error: Exception, where: str, schema: Any
+) -> None:
+    import asyncio
+
+    from trustcall_system_one.testing import FakeTransport, route
+
+    script = book_script() if schema is Book else owner_script()
+    kind, name = where.split(":")
+
+    def failing(handler: Any, mine: str) -> Any:
+        async def run_handler(model: str, payload: Any, meta: Any) -> Any:
+            fields = payload.get("fields") or payload.get("questions") or {}
+            if mine == kind and name in fields:
+                await asyncio.sleep(0)
+                raise error
+            await asyncio.sleep(0.02)  # the siblings are still pending
+            return handler(model, payload, meta)
+
+        return run_handler
+
+    script.clef = {**script.clef}
+    script.transport = FakeTransport(
+        route(
+            presence=failing(script._presence, "presence"),
+            extract=failing(script._extract, "extract"),
+            clef_fields=failing(script._clef_fields, "clef_fields"),
+            attribution=failing(script._attribution, "attribution"),
+        )
+    )
+    text = TEXT if schema is Book else OWNER_TEXT
+    with pytest.raises(type(error)) as info:
+        await make_extractor([schema], script).ainvoke(text)
+    assert info.value is error or str(info.value) == str(error)
+    if isinstance(error, TrustcallSystemOneError):
+        assert cast(Any, info.value).calls  # the M3 context is attached
+
+
+async def test_a_pending_clef_request_does_not_hide_a_transport_error() -> None:
+    import asyncio
+
+    from trustcall_system_one import create_extractor
+    from trustcall_system_one.testing import FakeTransport, clef_response, route
+
+    class Person(BaseModel):
+        name: str
+        active: bool
+
+    def presence(model: str, payload: Any, meta: Any) -> Any:
+        return clef_response({q: noul(0.95) for q in payload["questions"]})
+
+    def extract(model: str, payload: Any, meta: Any) -> Any:
+        raise TransportError("boom from extract")
+
+    async def clef_fields(model: str, payload: Any, meta: Any) -> Any:
+        await asyncio.sleep(0.05)
+        return clef_response({q: noul(0.9) for q in payload["questions"]})
+
+    transport = FakeTransport(
+        route(presence=presence, extract=extract, clef_fields=clef_fields)
+    )
+    with pytest.raises(TransportError, match="boom from extract") as info:
+        await create_extractor([Person], transport=transport).ainvoke("Ann is active.")
+    assert cast(Any, info.value).calls and cast(Any, info.value).usage is not None
+
+
+@pytest.mark.parametrize("schema", [Owner, Book], ids=lambda s: s.__name__)
+async def test_an_incomplete_clairic_answer_is_not_a_cancelled_error(
+    schema: Any,
+) -> None:
+    from trustcall_system_one.testing import FakeTransport, clairic_response, route
+
+    script = book_script() if schema is Book else owner_script()
+
+    def incomplete(model: str, payload: Any, meta: Any) -> Any:
+        return clairic_response({})
+
+    script.transport = FakeTransport(
+        route(
+            presence=script._presence,
+            extract=incomplete,
+            clef_fields=script._clef_fields,
+            attribution=script._attribution,
+        )
+    )
+    text = TEXT if schema is Book else OWNER_TEXT
+    with pytest.raises(AssertionError, match="does not fit the request"):
+        await make_extractor([schema], script).ainvoke(text)
