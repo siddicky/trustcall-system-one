@@ -2431,6 +2431,8 @@ class RecordingTransport:
             line["provider"] = result.provider
         if result.served_model:
             line["served_model"] = result.served_model
+        if result.warnings:  # what the transport changed in the request
+            line["warnings"] = list(result.warnings)
         self._write(line)
         return result
 
@@ -2708,6 +2710,7 @@ class CassetteTransport:
             status_code=entry.get("status"),
             provider=entry.get("provider"),
             served_model=entry.get("served_model"),
+            warnings=tuple(str(w) for w in entry.get("warnings") or ()),
         )
 
     @staticmethod

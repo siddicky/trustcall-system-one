@@ -1062,7 +1062,8 @@ still refuses for its size (HTTP 413, Cloudflare's "Request requires N tokens", 
 `max_tokens_exceeded`) or that `TypeSafeTransport` refuses locally before sending anything (a typed
 `RequestTooLargeError`: a question as large as Jev's context, a state with nothing to narrow) does not
 abort the invoke: that request's answers are missing and `request_rejected` says which (a local
-refusal of one oversized question leaves its sibling questions to be asked). When the refusal arrives
+refusal, or the library's own budget refusal, of one oversized question leaves its sibling
+questions to be asked). When the refusal arrives
 beside parts of the same call that failed or timed out, which may have been charged, it is raised
 instead and nothing is sent again. Any other 4xx (a malformed field), auth
 errors, rate limits, anything that may have been charged (an uncertain outcome, also behind a

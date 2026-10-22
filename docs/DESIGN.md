@@ -1721,7 +1721,8 @@ is in, so the engine and the transport never disagree about how large a request 
   cites is cut from its end), so no request exceeds 32k per question or 64k per request. **Only
   `input` is ever narrowed**: a `record`, `records`, `proposed_change` or `existing` is the user's
   data and is never cut, and a narrowing is never silent (`TransportResponse.warnings`, recorded by the
-  engine as a `typesafe_state_narrowed` warning). A request that cannot be made to fit is refused
+  engine as a `typesafe_state_narrowed` warning; a cassette records the warnings and replays them,
+  and one recorded before the field existed replays without any). A request that cannot be made to fit is refused
   locally with a `RequestTooLargeError` (a `BadRequestError`) and nothing is sent. The engine
   recognises it as a size refusal (`is_size_rejection`) and treats it as a rejected request: a
   `request_rejected` warning, the request's questions unanswered, the invoke goes on (see the
@@ -1730,9 +1731,12 @@ is in, so the engine and the transport never disagree about how large a request 
   question that alone is as large as the context (30k estimated tokens), or a state that has
   nothing left to cut (no `input`, or the rest of the state is too large). When the refusal names
   ONE question that cannot fit (`question_id`), the engine refuses that question alone and sends its
-  siblings together in one request (`clef_request_isolated`), instead of halving the request over and
-  over; only a local refusal is treated so, because nothing was sent and nothing was charged, never
-  a refusal the server made (those are sent again in halves). A request that fits is one request
+  siblings together in one request, fitted again (`clef_request_isolated`), instead of halving the
+  request over and over. That covers the engine's own refusal too, which is the one met at the real
+  limits: a question estimated over `Run.clef_budget` (24,000 on TypeSafe) with nothing else in the
+  request (`Run._fit_request`) never reaches the transport, so a question between 24k and Jev's 30k is
+  isolated by the engine. Only a refusal made before anything was sent is treated so (nothing was
+  charged), never one the server made (those are sent again in halves). A request that fits is one request
   with the questions as they are.
   If some parts of a split request answered and another failed, the error carries what the answered
   parts cost (`partial_usage`) and `maybe_sent`, so it is `uncertain` and a `FallbackTransport` does
@@ -1747,8 +1751,14 @@ is in, so the engine and the transport never disagree about how large a request 
   itself is raised with `maybe_sent`. The engine then never contains the refusal as a size
   rejection or resends the siblings' questions, and `Run._record_siblings` logs every sibling (the
   timed-out ones with their error, the cancelled ones as `cancelled after send; outcome unknown`),
-  so a possible charge is never invisible. A call of a single request is unaffected: its 400 is
-  still contained.
+  so a possible charge is never invisible. Only requests that were SENT count (`gather_all(in_flight=)`,
+  fed by `_post(on_send=)` the moment a request leaves its limiter slot): a batch still queued for a
+  slot sent nothing and is neither counted nor logged, so a call log has at most one row per request
+  put on the wire. A caller's cancellation (or any non-`Exception`) is never turned into an
+  `UncertainOutcomeError` by `_blame`: it is annotated and re-raised as it is. The sibling error that
+  is raised is a copy (an error object is never annotated in place), and `_own_copy` drops these
+  notes from the copy a waiter of a shared stitch gets. A call of a single request is unaffected:
+  its 400 is still contained.
 
 ### Clairic: selection, following TypeSafe's extraction cookbooks
 

@@ -1936,7 +1936,27 @@ def _doc_for_context(doc: str) -> str:
         return doc.rstrip(" .")
     cut = doc[:_CONTEXT_DOC_CHARS]
     stop = max(cut.rfind(". "), cut.rfind("; "))
-    return (cut[:stop] if stop > 40 else cut.rsplit(" ", 1)[0]).rstrip(" .;,") + "…"
+    clipped = cut[:stop] if stop > 40 else cut.rsplit(" ", 1)[0]
+    return _close_parentheses(clipped).rstrip(" .;,") + "…"
+
+
+def _close_parentheses(text: str) -> str:
+    """``text`` without a parenthesis it opened and never closed.
+
+    A docstring clipped inside ``(...)`` would leave the context unbalanced
+    (``"Aircraft → times (Total time (including ...…): Airframe hours"``), and the
+    field's own text could no longer be told from it: it is cut where the first
+    unclosed ``(`` opens.
+    """
+    opened: list[int] = []
+    for i, char in enumerate(text):
+        if char == "(":
+            opened.append(i)
+        elif char == ")" and opened:
+            opened.pop()
+    if not opened or opened[0] == 0:
+        return text if not opened else text[1:]
+    return text[: opened[0]].rstrip(" ,;:-")
 
 
 _WORD = re.compile(r"[a-z0-9]+")

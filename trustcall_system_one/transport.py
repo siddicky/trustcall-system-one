@@ -5,6 +5,7 @@ Cloudflare, Experiential Labs, the Decisions API and TypeSafe.
 
 import asyncio
 import contextlib
+import copy
 import dataclasses
 import functools
 import json
@@ -1413,11 +1414,14 @@ class ExperientialTransport(_HttpTransport):
         context: Any,
         *,
         timeout: float | None,
+        on_send: Callable[[], None] | None = None,
     ) -> TransportResponse:
         """Send one request body with the retry policy of the class.
 
         ``model`` is the key of the adaptive limiter; ``context`` is handed to
-        ``_read_success`` to read the answer.
+        ``_read_success`` to read the answer. ``on_send`` is called the first time the
+        request is about to be put on the wire (once it has its limiter slot): from
+        then on it may have been run, and charged.
         """
         token = self._token()
         url = self._base_url
@@ -1450,6 +1454,8 @@ class ExperientialTransport(_HttpTransport):
                     request = client.build_request(
                         "POST", url, json=outgoing, headers=headers, **post_kwargs
                     )
+                    if on_send is not None:
+                        on_send()
                     try:
                         response = await client.send(request)
                     except _PRE_SEND_RETRYABLE as exc:
@@ -2091,16 +2097,27 @@ class TypeSafeTransport(ExperientialTransport):
             )
         started = time.perf_counter()
         answered: list[TransportResponse] = []
+        in_flight = [False] * len(requests)
 
-        async def one(r: Mapping[str, Any]) -> TransportResponse:
+        async def one(i: int, r: Mapping[str, Any]) -> TransportResponse:
+            def mark() -> None:
+                in_flight[i] = True
+
             done = await self._post(
-                _TYPESAFE_LIMITER_KEY, r, r["questions"], timeout=timeout
+                _TYPESAFE_LIMITER_KEY,
+                r,
+                r["questions"],
+                timeout=timeout,
+                on_send=mark,
             )
             answered.append(done)  # counted as it completes, whatever its siblings do
             return done
 
         try:
-            sent = await gather_all(*(one(r) for r in requests))
+            sent = await gather_all(
+                *(one(i, r) for i, r in enumerate(requests)),
+                in_flight=in_flight.__getitem__,
+            )
         except BaseException as exc:
             error = _blame(exc)
             siblings = int(getattr(error, "cancelled_siblings", 0))
@@ -2191,7 +2208,10 @@ class TypeSafeTransport(ExperientialTransport):
         stats = RunStats()
 
         async def send(
-            state: Any, questions: Mapping[str, Mapping[str, Any]], stage: str
+            state: Any,
+            questions: Mapping[str, Mapping[str, Any]],
+            stage: str,
+            on_send: Callable[[], None] | None = None,
         ) -> Mapping[str, Any]:
             request = {
                 "model": self._model,
@@ -2199,7 +2219,11 @@ class TypeSafeTransport(ExperientialTransport):
                 "questions": dict(questions),
             }
             sent = await self._post(
-                _TYPESAFE_LIMITER_KEY, request, dict(questions), timeout=timeout
+                _TYPESAFE_LIMITER_KEY,
+                request,
+                dict(questions),
+                timeout=timeout,
+                on_send=on_send,
             )
             response = parse_clef(sent.body)
             # Counted the moment this request has answered: when a sibling fails
@@ -2219,7 +2243,19 @@ class TypeSafeTransport(ExperientialTransport):
         ) -> Mapping[str, Any]:
             merged: dict[str, Any] = {}
             batches = self._batches(state, questions)
-            for answers in await gather_all(*(send(state, b, stage) for b in batches)):
+            in_flight = [False] * len(batches)
+
+            def marker(i: int) -> Callable[[], None]:
+                def mark() -> None:
+                    in_flight[i] = True
+
+                return mark
+
+            results = await gather_all(
+                *(send(state, b, stage, marker(i)) for i, b in enumerate(batches)),
+                in_flight=in_flight.__getitem__,
+            )
+            for answers in results:
                 merged.update(answers)
             return merged
 
@@ -2296,6 +2332,8 @@ def _blame(exc: BaseException) -> BaseException:
     The choice is made once per error: a failure shared by several calls (the
     stitch memo) is annotated by each of them.
     """
+    if not isinstance(exc, Exception):
+        return exc  # a cancellation (or an interrupt) is never turned into an error
     siblings: list[BaseException] = list(getattr(exc, "sibling_errors", ()))
     cancelled = int(getattr(exc, "cancelled_siblings", 0))
     if not siblings and not cancelled:
@@ -2309,7 +2347,7 @@ def _blame(exc: BaseException) -> BaseException:
     if heavy is None:
         chosen = exc
     else:
-        chosen = heavy
+        chosen = _copy_of(heavy)  # an error object is never annotated in place
         chosen.sibling_errors = [  # type: ignore[attr-defined]
             exc,
             *(s for s in siblings if s is not heavy),
@@ -2318,6 +2356,14 @@ def _blame(exc: BaseException) -> BaseException:
     chosen.maybe_sent = True  # type: ignore[attr-defined]
     exc._blamed = chosen  # type: ignore[attr-defined]
     return chosen
+
+
+def _copy_of(error: BaseException) -> BaseException:
+    """A copy of an error that may be shared, to annotate (``error`` if it cannot)."""
+    try:
+        return copy.copy(error)
+    except Exception:
+        return error
 
 
 def _note_siblings(exc: BaseException, siblings: int) -> None:

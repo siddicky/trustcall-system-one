@@ -944,7 +944,14 @@ def _own_copy(error: Exception) -> Exception:
         mine = copy.copy(error)
     except Exception:
         return error
-    for name in ("cancelled_siblings", "maybe_sent", "partial_usage", "served_model"):
+    for name in (
+        "cancelled_siblings",
+        "sibling_errors",
+        "_blamed",
+        "maybe_sent",
+        "partial_usage",
+        "served_model",
+    ):
         mine.__dict__.pop(name, None)
     before = mine.__dict__.pop("_args_before_note", None)
     if before is not None:
@@ -1464,7 +1471,9 @@ async def _escalate(
         out.pop("span", None)
 
 
-async def gather_all(*aws: Awaitable[Any]) -> list[Any]:
+async def gather_all(
+    *aws: Awaitable[Any], in_flight: Callable[[int], bool] | None = None
+) -> list[Any]:
     """Run awaitables concurrently; if one raises, cancel the rest and re-raise.
 
     The error says what became of the others, because any of them may have been sent,
@@ -1473,19 +1482,34 @@ async def gather_all(*aws: Awaitable[Any]) -> list[Any]:
     * ``cancelled_siblings``: how many were still running when it was raised;
     * ``sibling_errors``: the errors of those that had failed too (possibly in the
       very same moment: they are done, not running, but they did not succeed).
+
+    Only requests that were actually sent count. ``in_flight(i)`` says whether the
+    ``i``-th awaitable got past the limiter slot and put its request on the wire;
+    one still waiting for a slot (or that failed before sending) sent nothing, cannot
+    have been charged, and is neither counted nor listed. Without ``in_flight`` every
+    awaitable is taken to have been sent.
     """
     tasks = [asyncio.ensure_future(a) for a in aws]
+
+    def sent(index: int) -> bool:
+        return True if in_flight is None else in_flight(index)
+
     try:
         return list(await asyncio.gather(*tasks))
     except BaseException as exc:
-        running = [t for t in tasks if not t.done()]
+        # still running, or already cancelled with the call (the caller cancelled it)
+        running = [
+            i
+            for i, t in enumerate(tasks)
+            if (not t.done() or t.cancelled()) and sent(i)
+        ]
         for task in tasks:
             task.cancel()
         settled = await asyncio.gather(*tasks, return_exceptions=True)
         exc.cancelled_siblings = len(running)  # type: ignore[attr-defined]
         exc.sibling_errors = [  # type: ignore[attr-defined]
             other
-            for other in settled
-            if isinstance(other, Exception) and other is not exc
+            for i, other in enumerate(settled)
+            if isinstance(other, Exception) and other is not exc and sent(i)
         ]
         raise

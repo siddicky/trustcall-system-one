@@ -735,6 +735,10 @@ def own_description(instructions: str) -> str:
                 arrow = True
             elif char == ":" and arrow and instructions[i + 1 : i + 2] == " ":
                 return instructions[i + 2 :]
+    if arrow and (closed := instructions.rfind("): ")) >= 0:
+        # parentheses that never balanced (a clipped docstring): the field's own text
+        # follows the last one that closes
+        return instructions[closed + 3 :]
     return instructions
 
 

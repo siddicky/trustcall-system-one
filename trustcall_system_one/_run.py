@@ -500,6 +500,7 @@ class Run:
             response = await self.transport.run(model, payload, meta=meta)
         except asyncio.CancelledError as cancelled:
             self._record_primary(model, meta, n_items, cancelled)
+            self._record_siblings(model, meta, n_items, cancelled)
             self._record(
                 getattr(cancelled, "served_model", None) or model,
                 meta,
@@ -854,6 +855,14 @@ class Run:
         except RequestTooLargeError as exc:
             if self.strict:
                 raise
+            isolated = exc.question_id
+            if len(chunk) > 1 and any(q == isolated for q, _ in chunk):
+                # ONE question cannot fit even alone: refuse it, and fit the others
+                # again without it (they are asked together, not in halves)
+                self._warn_rejected(meta, 1, exc)
+                rest = [item for item in chunk if item[0] != isolated]
+                self.warn(self._isolated(meta, str(isolated), len(rest)))
+                return await self._clef_chunk(model, rest, state, meta)
             self._warn_rejected(meta, len(chunk), exc)
             return {}
         if len(plans) == 1:
@@ -865,6 +874,14 @@ class Run:
         for part in parts:
             merged.update(part)
         return merged
+
+    @staticmethod
+    def _isolated(meta: CallMeta, question_id: str, siblings: int) -> str:
+        return (
+            f"clef_request_isolated: question {question_id!r} of a {meta.kind} "
+            f"request was too large to send and was refused alone; its "
+            f"{siblings} sibling question(s) were sent without it"
+        )
 
     def _fit_request(
         self,
@@ -891,6 +908,16 @@ class Run:
         ]
         where = ".".join(p for p in (meta.schema, meta.field) if p)
         label = f"{meta.kind} ({where})" if where else meta.kind
+        widest = max(range(len(chunk)), key=costs.__getitem__)
+        if empty + costs[widest] > budget:
+            # no state, however narrow, makes this question fit: it alone is refused
+            refusal = RequestTooLargeError(
+                f"a {label} question ({chunk[widest][0]!r}) is estimated at "
+                f"{empty + costs[widest]:.0f} tokens on its own, over the budget "
+                f"of {budget}"
+            )
+            refusal.question_id = chunk[widest][0]
+            raise refusal
         base = estimate_request_tokens(state)
         room = budget - base
         if room >= max(costs):
@@ -985,11 +1012,7 @@ class Run:
                 # halving the request over and over.
                 self._warn_rejected(meta, 1, exc)
                 rest = [item for item in chunk if item[0] != isolated]
-                self.warn(
-                    f"clef_request_isolated: question {isolated!r} of a {meta.kind} "
-                    f"request was too large to send and was refused alone; its "
-                    f"{len(rest)} sibling question(s) were sent without it"
-                )
+                self.warn(self._isolated(meta, str(isolated), len(rest)))
                 return await self._clef_once(model, rest, state, meta)
             if resplit and len(chunk) > 1 and is_size_rejection(exc):
                 # two SMALLER requests, never the one that was refused again
