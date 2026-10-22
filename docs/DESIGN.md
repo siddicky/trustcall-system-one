@@ -1513,7 +1513,7 @@ or `system_one_transport(provider="typesafe")`. No Cloudflare credential is need
 sent to any other company (a Clef provider other than Cloudflare's, or a Clef fallback, together
 with the TypeSafe provider is a `ValueError`).
 
-### What the live probes showed (5 requests; scrubbed bodies in `docs/schemas/typesafe-*.example.json`)
+### What the live probes showed (scrubbed bodies in `docs/schemas/typesafe-*.example.json`)
 
 * `GET /v1/models`: 200 `{models: [{name, description, release_date}]}` with `jev-latest` and
   `jev-preview` (the `release_date` is a full ISO timestamp, the docs say `YYYY-MM-DD`).
@@ -1525,18 +1525,28 @@ with the TypeSafe provider is a `ValueError`).
   its position in `criteria`, `score` is the probability-weighted level. Response headers: only
   `x-typesafe-request-id` is TypeSafe's (no rate-limit headers, no `Retry-After` seen); about 0.2 to
   0.4 s per request.
-* A candidate selection in the style of the pre-parsed cookbook (4 spans of an email header plus an
-  escape option): the right span at 0.93, the escape at 0.07, `confidence` 0.91 (the cookbook's choice
-  formula `(p_max - 1/n) / (1 - 1/n)` on 5 options). With a field the text does not state the escape
-  got 1.0, so a missing value is findable by selection (`typesafe-select*.example.json`). Per-candidate
-  yes/no questions in structured `instructions` answered 0.95 and 0.04.
+* **The shipped selection scheme, probed last** (`typesafe-span-ids-request.example.json` and
+  `typesafe-span-ids-response.example.json`, one request, 820 input and 252 output tokens, about
+  0.4 s): a choice whose option ids are the spans themselves, `"(415) 555-0177"`,
+  `"+1 415 555 0142"`, `"Dana Whit <dana.whit@acme-corp.com>"` (spaces, brackets, a plus sign and
+  punctuation), one sentence id with a description (`"S001"`), an amount with a reading, and `none` last.
+  For "the Person's mobile phone number to call first" Jev answered with the span, verbatim:
+  `(415) 555-0177` **0.65**, `none` **0.28**, the other phone number 0.04, `S001` 0.02, every other
+  option 0.00, `confidence` 0.60. For a field the input does not state (the fax number, in the same
+  request) `none` was **1.0**, `confidence` 1.0. So a span with spaces and punctuation works as an option
+  id, an answer comes back as the id itself (no escaping, no `candidate_N` indirection), and a missing
+  value is found by selecting `none`. The word "Call" was among the options and got 0.00 (it is an
+  instruction, not a name; the generators now drop such words). An earlier probe of a draft scheme
+  (`candidate_N` ids and a `__none__` escape; yes/no questions per candidate answered 0.95 and 0.04)
+  led to this one; its bodies are not kept because that scheme is not shipped.
 * A malformed question is `422 {"detail": [{type, loc, msg, input, ctx}]}`
   (`typesafe-error-422.example.json`); `input` echoes the offending value, which may be the user's
   text, so the library's error message shows `loc` and `msg` only.
 * Not probed: a question-count limit. The docs say there is none ("any number of questions is allowed as
   long as the request fits both limits": 64k tokens per request and 32k per question; 262k with
   `TypeSafe-Danger-Zone-Long-Context: true`). `TypeSafeTransport.max_questions` is 64, the bound of the
-  Clef request schema the library builds, and a request is split before it exceeds a token budget.
+  Clef request schema the library builds (it chunks the Clef requests the engine makes); the transport
+  itself splits by tokens alone (see below), since TypeSafe states no count.
 * The OpenAPI document is saved as `docs/schemas/typesafe-openapi.json`; the tests validate every
   request and response of the scripted Jev against it.
 
@@ -1545,19 +1555,41 @@ with the TypeSafe provider is a `ValueError`).
 Jev's `noul`, `choice` and `score` are Clef's, so `to_jev_clef` keeps the state, the question ids
 and their order and the questions as they are, and changes only `model` (`jev-latest`; `model=` or
 `TYPESAFE_DEFAULT_MODEL` pins one, which matters because the thresholds depend on calibration).
-`images` are refused (Jev reads text). The response is validated against the Clef response schema
-(`parse_clef`) and against the questions: an unanswered question, an answer of another type, an option
-or a level that was not offered is a `ModelResponseError`. Differences that remain: a choice may
-have one option in Jev (the library never sends one); Jev rejects too long a state with `400
-max_tokens_exceeded` where Clef truncated silently (lower `Limits.clef_state_token_budget` from 56,000
-to about 28,000 for the 32k per-question context, or pass `long_context=True`).
+`images` are refused (Jev reads text), and so a Clef request with images is not Jev's to answer
+(`serves()` says so; see the Decisions routing below). The response is validated against the Clef
+response schema (`parse_clef`) and against the questions: an unanswered question, an answer of another
+type, an option or a level that was not offered is a `ModelResponseError` (the message names the
+question, never the option: it can be the user's text).
+
+*Jev's context is 64k tokens for the state and all the questions of a request and 32k for the state and
+one question* (262k with `long_context=True`). Clef cut a long state silently; Jev answers `400
+max_tokens_exceeded`. So the transport meets the limits itself, with conservative token estimates
+(one token per three characters, so the limits are 60,000 and 30,000):
+
+* it **advertises the state it takes**: `TypeSafeTransport.state_token_budget` (24,000; a
+  `long_context` transport takes more; `None` for every other transport, which says nothing).
+  `transport.state_token_budget(transport, model)` reads it (an int attribute or a method, like
+  `max_questions`); `RoutingTransport` answers for the transport that serves the model,
+  `FallbackTransport` with the smaller of its two, and `RecordingTransport` and `CassetteTransport` forward
+  it like `max_questions` (a cassette is replayed with the budget it was recorded with, so the
+  request keys still match). The engine narrows every Clef state it builds to
+  `min(Limits.clef_state_token_budget, transport budget)` in one place (`Run.clef_state`), so a state is
+  not narrowed for Cloudflare's larger window and then refused by Jev;
+* **`to_jev_clef` splits and narrows as the last line of defence**: questions go into as few requests
+  as hold them (each with the whole state; the answers are merged in the request's order, the usage
+  summed), and a state still too large for even one question is narrowed (its largest string cut at a
+  word and marked `…`), so no request exceeds 32k per question or 64k per request. A request that fits
+  is one request with the questions as they are. A failure in one request of several cancels the
+  others (which may have been sent) and counts as `uncertain`.
 
 ### Clairic: selection, following TypeSafe's extraction cookbooks
 
 Jev answers closed questions and generates nothing ("select instead of generate"). So Clairic's
 `fields` are served by code that finds candidates and Jev that picks, in four ways. All questions over
-the same state go out in **one request** (the fan-out pattern), split only by the 64-question bound or a
-context budget (`TypeSafeConfig.request_token_budget`, 40k estimated tokens).
+the same state go out in **one request** (the fan-out pattern), split **by a token budget only**
+(`TypeSafeConfig.request_token_budget`, 40k estimated tokens): TypeSafe states no limit on the number of
+questions, so the internal stitch, selection and verification requests carry as many as fit (hundreds of
+list candidates, a stitch question per line) and are not capped at the 64 of a Clef request.
 
 | Clairic field | cookbook | what happens |
 | --- | --- | --- |
@@ -1572,10 +1604,12 @@ TypeSafe picks the one the question asks for, and code copies it verbatim"). Can
 type, always deduplicated by text (a repeated text is one option with up to three places) and in
 document order (Jev leans toward the first option, `none` is last):
 
-* `text`: email, URL, telephone (7 to 15 digits, not a date), `Label: value` values, quoted strings,
+* `text`: email, URL, telephone (7 to 15 digits, not a date; no pattern runs across a line break, so
+  a telephone number, a date or a time never joins two lines), `Label: value` values, quoted strings,
   identifiers with a letter (`INV-2291`), capitalised name sequences (with the parts of a name:
-  "Emma Thompson", "Emma", "Thompson"; `of` and particles inside a name; sentence starters and
-  weekday and month names dropped), amounts and numbers written as they are, and dates and times
+  "Emma Thompson", "Emma", "Thompson"; `of` and particles inside a name; sentence starters, the
+  verbs that open an instruction ("Call", "Please", "Contact", "Send", ...) and weekday and month names
+  dropped), amounts and numbers written as they are, and dates and times
   written as they are (not resolved);
 * `number`/`estimate` (`integer`, `decimals` and, for an estimate, `min`/`max` constrain the values):
   numeric literals (grouping, `.5`, European `1.315,50`, signs), currency (`$`, `€`, `£`, `¥`, `₹`
@@ -1597,9 +1631,13 @@ document order (Jev leans toward the first option, `none` is last):
 
 The answer maps back as `value` (the span's text, or the number), `span` (the candidate's exact
 offsets in the state that was sent: `state_text[s:e] == text` for a pattern candidate), `p_null` =
-P(`none`), `confidence` = Jev's, `guess` = the best non-`none` candidate, and `value` is null when
-`p_null` is above the field's `null_threshold` (default 0.5), as Clairic's. No candidate at all
-is a confident null without a request.
+P(`none`), `confidence` = Jev's and `guess` = the best non-`none` candidate. **When Jev's choice is
+`none` the value is null, whatever the other probabilities are** (`none` 0.45 over a phone number at
+0.40 is "not stated", and `p_null` is 0.45, so the ladder sees a doubt, not a decision), and the
+best candidate is only the `guess`. When a candidate was chosen, `value` is null if `p_null` is above
+the field's `null_threshold` (default 0.5), as Clairic's. No candidate at all is a confident null without
+a request. The option ids are the spans (probe 6 above); the ids of structure (`B003`, `S007`) and the
+description of an amount or a sum are the only non-span options.
 
 **Structure recovery** (cookbook: two passes, "the model never generates text: it answers narrow
 questions about the document, and code does the rendering"). Free text is read as blocks, not
@@ -1614,7 +1652,10 @@ as the lines it happened to be wrapped at:
    **0.5 or more after terminal punctuation** (the cookbook: true continuations score as low as 0.39,
    a list after a colon scores 0.22, so no single cutoff works). Both are `TypeSafeConfig` defaults to
    evaluate (they were tuned on one memo). The answers are remembered by the hash of the input, so the
-   engine's many calls over one input stitch once; a single-line input needs no request.
+   engine's many calls over one input stitch once, **also when they are concurrent** (the first call over an
+   input asks and the others await the same future: single flight; a failure clears the entry so the next
+   call asks again, and the calls that were waiting on it fail with it instead of sending the request
+   again); a single-line input needs no request.
 3. *Blocks and sentences* (code): merged lines are blocks `B003`; a block is split into sentences
    `S007` by the library's own splitter (`split_sentences`, pure code, now applied to a stitched
    block, where a hard wrap no longer splits a sentence), and a sentence into clauses `S007.1` and noun
@@ -1643,14 +1684,22 @@ calendar math"). For each date field, seven choices go in the same request: `mod
 `relative`, `none`), `month`, `day`, `year` (1900 to 2050 plus `none` and `out_of_range`),
 `day_anchor`, `weekday`, `week_offset`, in the cookbook's wording. Code reads only the parts `mode`
 calls for: a year-less date takes the reference year, or the next one when it is more than 31 days
-past; "next Thursday" is the following calendar week, "this Thursday" this week, a bare weekday
-the next on or after the reference date; February 30 or a missing month is "no date" (flagged, never
-guessed). **The confidence of the answer is the weakest confidence among the parts used**, `p_null`
-is P(`mode` = `none`) when a date was resolved and `max(P(none), 1 - confidence)` when it was not,
+past; "next Thursday" is the following calendar week, "this Thursday" this week, **"last Thursday" the
+previous one (`week_offset` has `previous`), "yesterday" the day before (`day_anchor` has
+`yesterday`)**, a bare weekday the next on or after the reference date; February 30 or a missing month is
+"no date" (flagged, never guessed). A year or a week that the text did **not** state is inferred by
+that code, and the answer says so: `needs_review` is true, `note` says "inferred year, not stated" (or
+week) and the confidence is capped at 0.8 (`INFERRED_CONFIDENCE`), which is under the library's
+low-confidence bar (0.85), so the ladder re-asks and cross-checks it instead of accepting it. A
+count of days ago ("3 days ago") is not a part, so such a date is not resolved (flagged). **The confidence of the answer is the weakest confidence among the parts used**, `p_null`
+is P(`mode` = `none`) when a date was resolved (for a `datetime` the larger of the date's and the
+time's, since it is not stated if either part is not) and `max(P(none), 1 - confidence)` when it was not,
 and the cookbook's review flag (no date, or confidence under **0.60**) is returned as `needs_review`
 (and `note`) next to the answer. The same scheme reads `time` (`mode`, `hour` on the 24-hour clock,
 `minute`), `datetime` (date parts and time parts; a date without a time is no datetime) and
-`duration` (`mode` and a count per unit from years to seconds; the answer is the sum in the
+`duration` (`mode` and a count per unit from years to seconds; the counts are every whole number from 1
+to 120 and then 150, 180, 240, 300, 360, 480 and 600, `0.5` and `out_of_range`, so 61 to 89 are
+there (an uncommon count above 120 is `out_of_range`: flagged, not guessed); the answer is the sum in the
 field's `unit`, `integer` and `decimals` honoured). The reference date is the request's
 `reference_date`, else the current UTC date. Dates carry no span, as Clairic's.
 A `list` of dates finds the mentions by pattern, asks a yes/no for each, and asks the date
@@ -1664,12 +1713,16 @@ reasoning model if a signal fires). The stages map onto the library's ladder lik
   (`instructions = {field_spec, extracted_field, main_question}`, `criteria = {true, false}`, "bad =
   true"): `hallucinated` ("is the extracted_field unsupported by, or absent from, the source
   text?") and `off_target` ("does the source text fail to genuinely report the thing the field_spec
-  describes, so the value was pulled from incidental text?"), the two gating heads of the cookbook,
+  describes, so the value was pulled from incidental text?"), two of the cookbook's seven heads, the
+  two it gates on,
   in one request over `{source_text, extraction}`. P(wrong) is the max of the two (the cookbook's
   `any_flag` gate: one confident red flag is enough) and is returned as `p_wrong`. This is the
   adapter's own cheap check; the library's attribution (Clef `noul` per value), null check, cross-check
   and re-ask still run on top of it as for any provider, and nothing here replaces them. The cookbook's
   `absence_wrong` head for an empty field is the library's `stated`/null check, so it is not duplicated.
+  The other heads are not asked: each is one more `noul` per field on every selection, and the
+  library's own checks cover what they would. They could be added to the same request as further
+  `noul`s under the same `any_flag` rule if the evals show they pay.
 * Stage 3, escalation: P(wrong) above **0.7** (`TypeSafeConfig.fire_threshold`, the cookbook's
   `FIRE_T`) escalates the field. There is no reasoning model in TypeSafe-only mode, so by default
   the answer comes back as the library's ladder understands doubt: `p_null = max(p_null, P(wrong))`,
@@ -1679,7 +1732,11 @@ reasoning model if a signal fires). The stages map onto the library's ladder lik
   hook is optional: `TypeSafeTransport(escalate=callable)` gets an `EscalationRequest` (field, spec, input,
   focus, selected value, `p_wrong`, signals), may be sync or async, and returns `{"value": ..., "span":
   [start, end] (offsets in the input), "confidence", "p_null"}` or `None` (decline: the default above
-  applies). Its answer is marked `escalated: "hook"`. The hook is the place to call a reasoning
+  applies). Its answer is marked `escalated: "hook"` and is **validated**: a value of the wrong type for the field,
+  a span that is not two integers inside the input (`0 <= start <= end <= len(input)`) or a
+  confidence or `p_null` outside 0..1 is not used (`escalated: "hook_invalid"`), and a hook that raises
+  is tagged `escalated: "hook_error"` and does not fail the call (the doubted field is returned as a
+  null for the ladder, as when there is no hook). The hook is the place to call a reasoning
   model; it is called once per doubted field and its cost is the caller's. `verify_selection=False`
   turns stage 2 off.
 
@@ -1692,6 +1749,15 @@ reasoning model if a signal fires). The stages map onto the library's ladder lik
   extraction, and they are English-oriented (number words, months, weekdays, stop words). Dates are
   the exception: Jev reads their parts, so a date written in another way or language can still be
   read.
+* **Dates**: the parts are read in English and resolved in code, with limits worth knowing. A two-digit
+  year is not resolved (the year choices are 1900 to 2050; "14/8/26" asks Jev to name a year and
+  it may name one wrongly, the confidence is then the weakest part's). Day-first against month-first
+  (`3/4/2026`) is Jev's reading of the text: nothing in code decides it, so a numeric date with both
+  numbers up to 12 is the least reliable. Time zones are not read: a time is the clock time written,
+  with no offset. The year-less date is biased to the future (the reference year, or the next if the
+  date is more than 31 days past); that and a bare weekday are flagged as inferred
+  (`needs_review`, confidence at most 0.8), but "August 14" in a document about last year still resolves
+  to the coming one. "Last Thursday" and "yesterday" are read; "3 days ago" is not.
 * Two entities whose names are the same text share candidates (dedup by text; the span is the first
   occurrence), and the focus can quote the entity's mentions but cannot tell which occurrence it means.
 * `count` fields ("how many Persons does the input mention?") find a numeral only if one is written:
@@ -1711,10 +1777,23 @@ reasoning model if a signal fires). The stages map onto the library's ladder lik
   input of more than `max_input_chars` (60,000) is cut at a word, the response says `truncated: true`
   and `state_text` is the prefix that was read, so the library re-asks on windows as it does for
   Clairic; `long_context=True` raises the limits.
-* The engine accounts a Clairic call under the model that answered (`TransportResponse.served_model`,
-  as for a fallback), here `jev-1.14.0`, so `Usage.by_model` shows Jev and its tokens are not priced
-  as Clairic's. `Prices` has no default for Jev ($0.042 per Mtok input, output free: pass
-  `Prices({"jev-1.14.0": 0.042})`); until then `cost.complete` is false. TypeSafe reports no cost field.
+* **Accounting.** A call is accounted under the model that answered
+  (`TransportResponse.served_model`, as for a fallback), here `jev-1.14.0`, so `Usage.by_model` shows
+  Jev and its tokens are not priced as Clairic's. An error is logged under the served model when the
+  failing request got one (an earlier request of the call did) and else under the alias (`jev-latest`):
+  that is the model that was asked. A Clairic call that sent no Jev request (no candidate in the input)
+  is recorded under the TypeSafe model (`jev-latest`) with 0 tokens and 0 passes. `Prices` has no
+  default for Jev ($0.042 per Mtok input, output free): give `Prices({"jev-latest": 0.042})`, which
+  prices every `jev-*` version that has no price of its own (the alias is the fallback for any
+  `jev-1.x.y`), or a price per version; until then `cost.complete` is false. TypeSafe reports no cost
+  field.
+* **A call of several requests that fails part-way still cost something.** The error carries the tokens
+  of the requests that had answered (`partial_usage`, a `ClairicUsage`) and the engine records them in
+  the call log and the totals; requests that were cancelled while in flight may have been sent and are
+  counted (`cancelled_siblings`, named in the message); and once any request went out the failure is
+  classified `uncertain` whatever its last error was (a rate limit on the third request is not "nothing
+  ran"). `call_deadline` (300 s) bounds the whole Clairic call, not each request: a call that runs out of
+  time is an `UncertainOutcomeError` when a request had answered.
 
 ### Transport, errors and retries
 
@@ -1722,19 +1801,25 @@ reasoning model if a signal fires). The stages map onto the library's ladder lik
 `TYPESAFE_BASE_URL` and `TYPESAFE_DEFAULT_MODEL` are the SDK's variables and are read too) and
 errors: one HTTP client per loop, the adaptive limiter (one limit for both models, key `typesafe`), a
 300 s call deadline. **A request that may have reached the server is never resent**: a timeout, a read
-or write error, a dropped connection, a 408 or any 5xx other than 529 raises `UncertainOutcomeError`
-(classified `uncertain` for `FallbackTransport`). **Retried**: a connect error (nothing was sent) with
-jittered backoff, and `429` and `529 Overloaded`, which the API documents as "retry after a short
-delay" and which mean the request was not processed: they honour `Retry-After` and `retry-after-ms`,
-otherwise back off exponentially up to `max_retries` (6), within the deadline; a wait longer than
-`max_retry_after` (60 s) fails at once; they halve the limiter. Unlike the Experiential
-transport a 429 **without** `Retry-After` is retried too, since TypeSafe says to back off and retry
-(`_retry_needs_hint = False`). After the retries a 429 or 529 is a `RateLimitError` (`unavailable`: nothing ran).
+or write error, a dropped connection, a 408 or **any 5xx, 529 Overloaded included**, raises
+`UncertainOutcomeError` (classified `uncertain` for `FallbackTransport`). A 529 means the server
+was overloaded, not that the request was not processed: it may have run the model and may have charged, so
+it is exactly as uncertain as a 503, never resent, and `max_retries` does not apply to it. **Retried**: a
+connect error (nothing was sent) with jittered backoff, and **`429 Too Many Requests` only**, which the
+API documents as "retry after a short delay" and which means the request was refused before any
+work: it honours `Retry-After` and `retry-after-ms`, otherwise backs off exponentially up to
+`max_retries` (6), within the deadline; a wait longer than `max_retry_after` (60 s) fails at once; it
+halves the limiter. Unlike the Experiential transport a 429 **without** `Retry-After` is retried too,
+since TypeSafe says to back off and retry (`_retry_needs_hint = False`). After the retries a 429 is a
+`RateLimitError` (`unavailable`: nothing ran).
 401 and 403 are `AuthError`, 400, 413, 415, 422 and other 4xx `BadRequestError` (a 422 shows each
-`detail` as `loc: msg`, without `input`), a 2xx that is not a valid answer to its questions a
+`detail` as `loc: msg`; **no user text is in an error message or in the body kept on the error**: `input` and
+`ctx` are dropped, a `loc` is cut after `criteria` (the next key is an option id, which can be the
+user's text), and `cf_errors` is the same cleaned list), a 2xx that is not a valid answer to its questions a
 `ModelResponseError`. A Clairic call is several requests; the error is the failing request's, the
-others are cancelled, and requests that already answered are not on the error (TypeSafe reports no
-cost to attribute). `x-typesafe-request-id` is the request id.
+others are cancelled, and what the requests that had answered cost is on the error (see Accounting
+above). The messages of `from_jev` and of an invalid request name the question and the field, never an
+option or a value. `x-typesafe-request-id` is the request id.
 
 ### Selection
 
@@ -1746,13 +1831,25 @@ key in the environment alone never selects it. Cassettes are keyed by the engine
 request, so a recording made on TypeSafe replays under any provider and the other way round (the
 Clairic answers are the adapter's).
 
+**Repair and existing records.** A repair request (the library's `<previous_attempt>` and
+`<validation_errors>` blocks after the input) is served as one: the errors, shortened (`loc: msg`, at most
+three), go into the pick instructions ("An earlier answer was rejected (email: not allowed on this
+domain): it is not an option."), and the rejected answer is removed from the options, since offering it
+again would repeat the answer that failed. If nothing else is left (the only candidate was the rejected
+one) the field is a null with no request, rather than an identical paid call. The `<existing>` record is
+**not sent to Jev**: selection reads the input only (an echo of the stored value is caught by the
+input-only cross-check, as for Clairic), so Jev cannot "confirm" a value from the record.
+
 **The Decisions API as the primary for Clef.** `system_one_transport("decisions")` (or
 `TRUSTCALL_S1_CLEF_PROVIDER=decisions`, or `--clef-provider decisions` in the evals) is
 `RoutingTransport({"clef": DecisionsTransport()}, default=CloudflareTransport())`: the Decisions
 API (`gpt-6-luna-decisions` via Experiential Labs, served by OpenAI) answers every Clef request, not
 only after a failure. The same opt-in rule applies (an `EXPERIENTIAL_API_KEY` alone changes nothing), the
 hard-pick cap of 0.8 applies (a bare yes cannot authorise a removal), the question limit is
-`DecisionsTransport`'s 32, and it is a `ValueError` to also ask for the Decisions fallback.
+`DecisionsTransport`'s 32, and it is a `ValueError` to also ask for the Decisions fallback. The Decisions API takes text only, so
+**a Clef request with images goes to the default (Cloudflare)**: `RoutingTransport` asks the routed
+transport's `serves(model, payload)` and hands such a request to the default when it is another
+transport that can serve it (the Decisions API never sees the image).
 So three combinations can be benchmarked: Cloudflare Clairic + Clef (default), Cloudflare Clairic + the
 Decisions API for Clef, and TypeSafe Jev for both.
 
@@ -1760,7 +1857,18 @@ Decisions API for Clef, and TypeSafe Jev for both.
 `clef_provider`, `clef_fallback` and two labels for tabulating: `extraction` (`cloudflare clairic`,
 `typesafe jev`, `scripted world`) and `decisions` (`cloudflare clef`, `experiential clef`,
 `experiential decisions (gpt-6-luna-decisions, hard cap 0.8)`, `typesafe jev`, plus ` + fallback
-decisions`).
+decisions`). **A pure replay says what was recorded, not what would answer**: when nothing is sent the
+labels are `replay (recorded on <label>)`, from the `provider` each recording carries (`unknown` for
+a cassette from before the field existed). `--provider typesafe` together with `--clef-provider` or
+`--clef-fallback` (or the `TRUSTCALL_S1_CLEF_PROVIDER` / `TRUSTCALL_S1_CLEF_FALLBACK` variables) is
+refused, since Jev answers Clef itself; the same goes for `system_one_transport(provider="typesafe")` with an
+explicit `cloudflare=`, `experiential=` or `decisions=` object.
+
+**Cassettes keep provenance.** A recording carries `provider` and `served_model` (and, for Clef, the
+`state_token_budget` its states were narrowed to, as it carries `max_questions`) when the transport knows
+them, and a replay returns them, so a replayed call is accounted under the model that answered. A
+cassette recorded before these fields replays exactly as it did. Cassettes are still keyed by the
+engine's request, so one recorded on any provider replays under any other.
 
 ### Scrubbing
 
@@ -1777,7 +1885,10 @@ error tracker's `before_send`.
 thresholds, the date parts), `test_typesafe_transport.py` (Clef both ways against `clef-*.json`, Clairic
 answers against `clairic-output.json` and `parse_clairic`, errors, retries, the limits, verification and
 the escalation hook), `test_typesafe_select.py` (selection by argument and environment, the contradictions,
-the Decisions provider, scrubbing, the evals and their labels) and `test_typesafe_world.py` (every eval
+the Decisions provider, scrubbing, the evals and their labels) and `test_typesafe_review.py` (the corrections of the review: 529, none-means-null, the state budget and a
+Clef request split to Jev's limits, no user text in errors, cassette provenance, single-flight stitching,
+repair, Decisions with images, partial usage and the deadline, the hook, the evals' refusals) and
+`test_typesafe_world.py` (every eval
 case end to end: `tests/unit/jev_mock.py` plays Jev from the case's `FakeWorld`, validating each request
 against the OpenAPI schema, with the real transport and engine in between: `One` inserts, updates and
 `Many` scenarios). All offline (`httpx.MockTransport`).

@@ -130,7 +130,10 @@ class Prices:
     """Input-token prices in USD per million tokens, keyed by model id.
 
     Keys may be bare names or full ids; they are stored as full ids. The
-    instance is immutable and hashable.
+    instance is immutable and hashable. TypeSafe's Jev has no default price
+    ($0.042 per million input tokens): give the version that answers
+    (``"jev-1.14.0"``, shown in ``Usage.by_model``) or the alias ``"jev-latest"``,
+    which prices any ``jev-*`` version that has no price of its own.
     """
 
     per_million_input: Mapping[str, float] = field(default_factory=_default_prices)
@@ -172,6 +175,9 @@ class Prices:
             if all_reported:
                 reported += used.reported_cost_usd
             price = self.per_million_input.get(model)
+            if price is None and model.startswith("jev-"):
+                # a price for the alias covers every version the alias points to
+                price = self.per_million_input.get("jev-latest")
             if price is not None:
                 total += used.input_tokens * price / 1_000_000
             elif not all_reported:

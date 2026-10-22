@@ -731,14 +731,19 @@ times and durations are read as parts (month, day, year, anchor, weekday) that c
 verified by two yes/no questions and a doubted one comes back as a low-confidence or null answer for the
 usual ladder (or goes to your `escalate` hook). **Jev can only select a value that is among the
 candidates**, so a value no generator finds is never returned, and a Clairic call is a few requests
-(stitch, select, verify), not one. The thresholds are the cookbooks' and have not been tuned for this
-library. See [`docs/DESIGN.md`](https://github.com/siddicky/trustcall-system-one/blob/main/docs/DESIGN.md)
+(stitch, select, verify), not one. A date the text does not fully state (no year, a bare weekday) is
+resolved in code but flagged `needs_review` with its confidence capped at 0.8, so the ladder re-checks it;
+two-digit years, day-first against month-first dates and time zones are not read (see the design doc's
+limits). Jev reads at most 32k tokens of state: the library narrows what it sends to that. The
+thresholds are the cookbooks' and have not been tuned for this library. See [`docs/DESIGN.md`](https://github.com/siddicky/trustcall-system-one/blob/main/docs/DESIGN.md)
 ("TypeSafe-only provider") for the design and its limits.
 
 To compare the three combinations on the evals (live; see the runbook): Cloudflare Clairic and Clef
 (`--provider cloudflare`), Cloudflare Clairic with the Decisions API for Clef (`--clef-provider
-decisions`), and Jev for both (`--provider typesafe`). `results.json` records the combination as
-`extraction` and `decisions` labels.
+decisions`), and Jev for both (`--provider typesafe`, which refuses `--clef-provider` and
+`--clef-fallback`: Jev answers Clef itself). `results.json` records the combination as `extraction` and
+`decisions` labels; a replay of cassettes sends nothing and says what they were recorded on
+(`replay (recorded on typesafe jev)`).
 
 ## Extract one record
 

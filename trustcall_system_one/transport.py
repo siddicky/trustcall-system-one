@@ -45,13 +45,20 @@ from trustcall_system_one._typesafe import (
     EscalationRequest,
     RunStats,
     TypeSafeConfig,
+    estimate_tokens,
     from_jev,
     gather_all,
     run_clairic,
+    safe_loc_parts,
     to_jev_clef,
 )
 from trustcall_system_one._version import __version__
-from trustcall_system_one._wire import body_model, normalize_model_id, parse_clef
+from trustcall_system_one._wire import (
+    ClairicUsage,
+    body_model,
+    normalize_model_id,
+    parse_clef,
+)
 
 __all__ = [
     "DEFAULT_FALLBACK_ON",
@@ -75,6 +82,7 @@ __all__ = [
     "clef_provider_from_env",
     "max_questions",
     "provider_from_env",
+    "state_token_budget",
     "system_one_transport",
 ]
 
@@ -106,6 +114,32 @@ def max_questions(transport: object, model: str) -> int:
     if isinstance(said, int) and not isinstance(said, bool) and said >= 1:
         return said
     return DEFAULT_MAX_QUESTIONS
+
+
+def state_token_budget(transport: object, model: str) -> int | None:
+    """The most tokens of Clef state ``transport`` takes for ``model``, or ``None``.
+
+    A transport says it with a ``state_token_budget`` attribute (an int) or method
+    (``state_token_budget(model)``), as it says its ``max_questions``. Jev reads 32k
+    tokens for the state and one question, so ``TypeSafeTransport`` has one;
+    Cloudflare, Experiential Labs and the Decisions API say nothing (``None``: the
+    library's ``Limits.clef_state_token_budget`` alone applies). A
+    ``RoutingTransport`` answers for the transport serving the model and a
+    ``FallbackTransport`` with the smaller of its two.
+
+    Args:
+        transport: The transport the requests go to.
+        model: The Clef model (full id or bare name).
+
+    Returns:
+        A budget of at least 1, or ``None``.
+    """
+    said = getattr(transport, "state_token_budget", None)
+    if callable(said):
+        said = said(model)
+    if isinstance(said, int) and not isinstance(said, bool) and said >= 1:
+        return said
+    return None
 
 
 @dataclass(frozen=True)
@@ -1697,26 +1731,52 @@ class DecisionsTransport(ExperientialTransport):
 TYPESAFE_URL = "https://api.typesafe.ai"
 TYPESAFE_MODEL = "jev-latest"
 _TYPESAFE_LIMITER_KEY = "typesafe"
+_JEV_STATE_TOKENS = 24_000
+"""Estimated tokens of a Clef state Jev takes with room for the questions: it takes
+32k for the state and one question, 64k for the state and all of them."""
+_JEV_QUESTION_TOKENS = 30_000
+_JEV_REQUEST_TOKENS = 60_000
+_JEV_LONG_TOKENS = 250_000  # 262k with the long-context header
+
+
+def _clean_detail(body: Any) -> Any:
+    """A 422 body without the values that failed.
+
+    ``input`` and ``ctx`` echo the offending value, which can be the user's text, and
+    a ``loc`` past ``criteria`` is an option id, which can be too: the body that is
+    kept on the error has ``type``, ``loc`` (cut at ``criteria``) and ``msg`` only.
+    """
+    if not (isinstance(body, dict) and isinstance(body.get("detail"), list)):
+        return body
+    cleaned: list[Any] = []
+    for entry in body["detail"]:
+        if isinstance(entry, dict):
+            cleaned.append(
+                {
+                    "type": entry.get("type"),
+                    "loc": safe_loc_parts(entry.get("loc", ())),
+                    "msg": str(entry.get("msg"))[:200] if entry.get("msg") else None,
+                }
+            )
+        else:
+            cleaned.append(str(entry)[:100])
+    return {"detail": cleaned}
 
 
 def _typesafe_detail(body: Any) -> str:
-    """The reason in a TypeSafe error body, without echoing the request.
-
-    A 422 body is ``{"detail": [{"loc", "msg", "type", "input", "ctx"}]}``; ``input``
-    is the value that failed and can be the user's text, so only ``loc`` and ``msg``
-    are shown.
-    """
-    if isinstance(body, dict):
-        detail = body.get("detail")
-        if isinstance(detail, list):
-            parts = []
-            for entry in detail[:5]:
-                if isinstance(entry, dict):
-                    where = ".".join(str(p) for p in entry.get("loc", ()))
-                    parts.append(f"{where}: {entry.get('msg', entry.get('type', ''))}")
-                else:
-                    parts.append(str(entry)[:100])
-            return "; ".join(parts)[:400]
+    """The reason in a TypeSafe error body, without echoing the request."""
+    cleaned = _clean_detail(body)
+    if isinstance(cleaned, dict) and isinstance(cleaned.get("detail"), list):
+        parts = []
+        for entry in cleaned["detail"][:5]:
+            if isinstance(entry, dict):
+                parts.append(
+                    f"{'.'.join(entry['loc'])}: "
+                    f"{entry.get('msg') or entry.get('type') or ''}"
+                )
+            else:
+                parts.append(str(entry))
+        return "; ".join(parts)[:400]
     return _error_detail(body)
 
 
@@ -1731,12 +1791,15 @@ class TypeSafeTransport(ExperientialTransport):
 
     The retry policy is that of ``ExperientialTransport`` (a request that may have
     reached the server is never resent: a timeout, a dropped connection, a 408 or a
-    5xx raises ``UncertainOutcomeError``; a connect error is retried), with
-    TypeSafe's own rule for being refused: ``429 Too Many Requests`` and ``529
-    Overloaded`` mean the request was not processed and the API says to retry them
-    with backoff, so they are retried (honouring ``Retry-After`` and
-    ``retry-after-ms``) up to ``max_retries``, within ``call_deadline``. A Clairic
-    call is several Jev requests; an error is that of the request that failed.
+    5xx, **529 Overloaded included**, raises ``UncertainOutcomeError``; a connect
+    error is retried), with TypeSafe's rule for ``429 Too Many Requests``, which the
+    API says to back off and retry: it is retried (honouring ``Retry-After`` and
+    ``retry-after-ms``) up to ``max_retries``, within ``call_deadline``, with or
+    without a hint. A 529 may have been processed (overload can strike after the
+    work), so it is not resent. A Clairic call is several Jev requests: an error is
+    that of the request that failed, carries the tokens of the requests that had
+    answered (``partial_usage``) and counts as ``uncertain`` once any request went
+    out; ``call_deadline`` bounds the whole call, not each request.
 
     A call reports the Jev model that answered (``TransportResponse.served_model``);
     ``usage.passes`` of a Clairic response is its number of requests and ``jev.stages``
@@ -1746,11 +1809,10 @@ class TypeSafeTransport(ExperientialTransport):
     provider = "typesafe"
     _api_name = "TypeSafe API"
     max_questions = 64
-    """Questions one request may carry. The docs state no limit on the number of
-    questions (only the context: 64k tokens per request, 32k per question); 64 is the
-    bound of the Clef request schema the library builds, and a request is split
-    before it exceeds the context budget."""
-    _unprocessed_statuses = frozenset({429, 529})
+    """Questions of a Clef request the engine may put in one request. The docs state
+    no limit on the number of questions (only the context: 64k tokens per request,
+    32k per question); 64 is the bound of the Clef request schema the library builds.
+    The transport itself splits a request by tokens only."""
     _retry_needs_hint = False
 
     def __init__(
@@ -1809,7 +1871,17 @@ class TypeSafeTransport(ExperientialTransport):
         self._config = base
         self._escalate = escalate
         self._long_context = long_context
-        self._stitch_memo: dict[str, dict[str, float]] = {}
+        self._question_tokens = (
+            _JEV_LONG_TOKENS if long_context else _JEV_QUESTION_TOKENS
+        )
+        self._request_tokens = _JEV_LONG_TOKENS if long_context else _JEV_REQUEST_TOKENS
+        self.state_token_budget: int = (
+            _JEV_LONG_TOKENS - 30_000 if long_context else _JEV_STATE_TOKENS
+        )
+        """Estimated tokens of a Clef state this transport takes (the engine narrows a
+        state to ``min(limits.clef_state_token_budget, this)``): Jev reads 32k tokens
+        for the state and one question, so the state keeps room for the question."""
+        self._stitch_memo: dict[str, asyncio.Future[dict[str, float]]] = {}
 
     def serves(self, model: str, payload: Mapping[str, Any] | None = None) -> bool:
         """Whether Jev can answer the request: Clairic or Clef, text only."""
@@ -1828,6 +1900,18 @@ class TypeSafeTransport(ExperientialTransport):
                 for f in fields.values()
             )
         return True
+
+    def classify_failure(self, exc: Exception) -> str | None:
+        """Say whether a failure of ``run`` means that nothing was run.
+
+        A Clairic call that failed after an earlier request of it had answered (or
+        went out) is ``"uncertain"``: it was charged, whatever the last error was.
+        """
+        if isinstance(exc, _NEVER_FALL_BACK):
+            return None
+        if getattr(exc, "maybe_sent", False) or getattr(exc, "partial_usage", None):
+            return "uncertain"
+        return classify_failure(exc)
 
     def _token(self) -> str:
         token = (self._api_key or os.environ.get("TYPESAFE_API_KEY") or "").strip()
@@ -1885,9 +1969,9 @@ class TypeSafeTransport(ExperientialTransport):
     def _error_for_status(
         cls, response: httpx.Response, *, retry_after: float | None
     ) -> TransportError:
-        """Map a non-2xx response: 422 and 400 are ours, 429 and 529 are retried."""
+        """Map a non-2xx response: 429 is retried, 408, 529 and 5xx are uncertain."""
         status = response.status_code
-        body = _json_or_text(response)
+        body = _clean_detail(_json_or_text(response))
         message = f"{cls._api_name} returned HTTP {status}: {_typesafe_detail(body)}"
         request_id = _correlation_id(response)
         if request_id:
@@ -1895,11 +1979,11 @@ class TypeSafeTransport(ExperientialTransport):
         error: TransportError
         if status in (401, 403):
             error = AuthError(message, status_code=status, body=body)
-        elif status in (429, 529):
+        elif status == 429:
             error = RateLimitError(
                 message, status_code=status, body=body, retry_after=retry_after
             )
-        elif status == 408 or status >= 500:
+        elif status == 408 or status >= 500:  # 529 Overloaded too: it may have run
             error = UncertainOutcomeError(
                 f"{message}. {_UNCERTAIN_NOTE}", status_code=status, body=body
             )
@@ -1945,9 +2029,9 @@ class TypeSafeTransport(ExperientialTransport):
             BadRequestError: A model that is not Clairic or Clef, a request Jev
                 cannot serve (images, ``forecast``), or HTTP 3xx/4xx (a 422's
                 ``detail`` is in the message, without the user's text).
-            RateLimitError: HTTP 429 or 529 that outlasted the retries.
+            RateLimitError: HTTP 429 that outlasted the retries.
             UncertainOutcomeError: A timeout, a failure after the request was sent,
-                HTTP 408 or 5xx. Never retried; the call may have been charged.
+                HTTP 408, 529 or 5xx. Never retried; the call may have been charged.
             TransportError: A failure before the request was sent.
             ModelResponseError: A 2xx that is not a valid answer to the questions.
         """
@@ -1959,30 +2043,99 @@ class TypeSafeTransport(ExperientialTransport):
                 f"TypeSafeTransport serves Clairic and Clef, not {model!r}"
             ) from None
         if name != "clairic":
-            request = to_jev_clef(payload, self._model)
+            return await self._clef(payload, timeout)
+        return await self._clairic(payload, timeout)
+
+    async def _clef(
+        self, payload: Mapping[str, Any], timeout: float | None
+    ) -> TransportResponse:
+        """A Clef request: one Jev request, or several when Jev's context needs it."""
+        requests = to_jev_clef(
+            payload,
+            self._model,
+            question_budget=self._question_tokens,
+            request_budget=self._request_tokens,
+        )
+        if len(requests) == 1:
+            (request,) = requests
             return await self._post(
                 _TYPESAFE_LIMITER_KEY, request, request["questions"], timeout=timeout
             )
-        return await self._clairic(payload, timeout)
+        started = time.perf_counter()
+        try:
+            sent = await gather_all(
+                *(
+                    self._post(
+                        _TYPESAFE_LIMITER_KEY, r, r["questions"], timeout=timeout
+                    )
+                    for r in requests
+                )
+            )
+        except BaseException as exc:
+            if getattr(exc, "cancelled_siblings", 0):
+                exc.maybe_sent = True  # type: ignore[attr-defined]
+            raise
+        answers: dict[str, Any] = {}
+        usage = {"input_tokens": 0, "output_tokens": 0}
+        for part in sent:
+            answers.update(part.body["answers"])
+            for key in usage:
+                usage[key] += int(part.body["usage"][key])
+        order = list(payload["questions"])
+        body = {
+            "model": sent[-1].body["model"],
+            "answers": {q: answers[q] for q in order if q in answers},
+            "usage": usage,
+        }
+        merged_response: TransportResponse = dataclasses.replace(
+            sent[0],
+            body=body,
+            retries=sum(p.retries for p in sent),
+            duration_ms=(time.perf_counter() - started) * 1000,
+        )
+        return merged_response
 
     def _batches(
         self, state: Any, questions: Mapping[str, Mapping[str, Any]]
     ) -> list[dict[str, Mapping[str, Any]]]:
-        """Split questions into requests: by the question limit and the context."""
+        """Split questions into requests by the context budget alone.
+
+        There is no question-count cap here: TypeSafe states none, so the stitch,
+        selection and verification requests hold as many questions as fit.
+        """
         budget = self._config.request_token_budget
-        base = len(json.dumps(state, default=str)) / 3.0
+        base = estimate_tokens(state)
         batches: list[dict[str, Mapping[str, Any]]] = [{}]
         used = base
         for qid, question in questions.items():
-            cost = len(json.dumps(question, default=str)) / 3.0
+            cost = estimate_tokens(question)
             current = batches[-1]
-            if current and (len(current) >= self.max_questions or used + cost > budget):
+            if current and used + cost > budget:
                 batches.append({})
                 current = batches[-1]
                 used = base
             current[qid] = question
             used += cost
         return [b for b in batches if b]
+
+    def _annotate(self, exc: BaseException, stats: RunStats) -> None:
+        """Put what the earlier requests of a failed Clairic call cost on its error."""
+        exc.served_model = stats.model or self._model  # type: ignore[attr-defined]
+        siblings = int(getattr(exc, "cancelled_siblings", 0))
+        if stats.requests or siblings:
+            exc.maybe_sent = True  # type: ignore[attr-defined]
+        if stats.requests:
+            exc.partial_usage = ClairicUsage(  # type: ignore[attr-defined]
+                input_tokens=stats.input_tokens,
+                output_tokens=stats.output_tokens,
+                passes=stats.requests,
+            )
+        if siblings and isinstance(exc, TrustcallSystemOneError) and exc.args:
+            exc.args = (
+                f"{exc.args[0]} ({siblings} other request(s) of this call were "
+                "cancelled after they may have been sent; their outcome is unknown)",
+                *exc.args[1:],
+            )
 
     async def _clairic(
         self, payload: Mapping[str, Any], timeout: float | None
@@ -2021,15 +2174,35 @@ class TypeSafeTransport(ExperientialTransport):
                 merged.update(response.answers)
             return merged
 
-        body = await run_clairic(
-            payload,
-            ask=ask,
-            stats=stats,
-            config=self._config,
-            memo=self._stitch_memo,
-            escalate=self._escalate,
-            model_name=self._model,
-        )
+        try:
+            body = await asyncio.wait_for(
+                run_clairic(
+                    payload,
+                    ask=ask,
+                    stats=stats,
+                    config=self._config,
+                    memo=self._stitch_memo,
+                    escalate=self._escalate,
+                    model_name=self._model,
+                ),
+                self._call_deadline,
+            )
+        except asyncio.TimeoutError:
+            note = (
+                f"the Clairic call used up its {self._call_deadline}s deadline after "
+                f"{stats.requests} answered request(s)"
+            )
+            error: TransportError = (
+                UncertainOutcomeError(f"{note}. {_UNCERTAIN_NOTE}")
+                if stats.requests
+                else TransportError(note)
+            )
+            error.maybe_sent = True
+            self._annotate(error, stats)
+            raise error from None
+        except BaseException as exc:
+            self._annotate(exc, stats)
+            raise
         return TransportResponse(
             body=body,
             retries=stats.retries,
@@ -2037,7 +2210,7 @@ class TypeSafeTransport(ExperientialTransport):
             status_code=200,
             request_id=stats.request_ids[0] if stats.request_ids else None,
             provider=self.provider,
-            served_model=stats.model,
+            served_model=stats.model or self._model,
         )
 
 
@@ -2188,6 +2361,18 @@ class FallbackTransport:
         if callable(serves) and not serves(model):
             return limit
         return min(limit, max_questions(self._fallback, model))
+
+    def state_token_budget(self, model: str) -> int | None:
+        """The smaller state budget of the two transports (``None``: none says one)."""
+        found = [
+            b
+            for b in (
+                state_token_budget(self._primary, model),
+                state_token_budget(self._fallback, model),
+            )
+            if b is not None
+        ]
+        return min(found) if found else None
 
     def _falls_back_on(self, exc: Exception) -> bool:
         if isinstance(exc, _NEVER_FALL_BACK):
@@ -2346,6 +2531,10 @@ class RoutingTransport:
         """Questions one request may carry: the limit of the transport serving it."""
         return max_questions(self.transport_for(model), model)
 
+    def state_token_budget(self, model: str) -> int | None:
+        """The state budget of the transport serving the model (``None``: none)."""
+        return state_token_budget(self.transport_for(model), model)
+
     async def run(
         self,
         model: str,
@@ -2354,10 +2543,23 @@ class RoutingTransport:
         meta: CallMeta,
         timeout: float | None = None,
     ) -> TransportResponse:
-        """Run the call on the transport chosen for ``model``."""
-        return await self.transport_for(model).run(
-            model, payload, meta=meta, timeout=timeout
-        )
+        """Run the call on the transport chosen for ``model``.
+
+        A routed transport that says it cannot serve this request (``serves``: the
+        Decisions API takes no images) hands it to the default transport, when the
+        default is another one.
+        """
+        route = self.transport_for(model)
+        serves = getattr(route, "serves", None)
+        if (
+            route is not self._default
+            and callable(serves)
+            and not serves(model, payload)
+        ):
+            other = getattr(self._default, "serves", None)
+            if not callable(other) or other(model, payload):
+                route = self._default
+        return await route.run(model, payload, meta=meta, timeout=timeout)
 
     def _members(self) -> list[Transport]:
         members: list[Transport] = []
@@ -2605,6 +2807,20 @@ def system_one_transport(
     if chosen not in ("cloudflare", "typesafe"):
         raise ValueError(f"unknown provider {chosen!r}")
     if chosen == "typesafe":
+        others = [
+            name
+            for name, given in (
+                ("cloudflare", cloudflare),
+                ("experiential", experiential),
+                ("decisions", decisions),
+            )
+            if given is not None
+        ]
+        if others:
+            raise ValueError(
+                f"the TypeSafe provider uses none of the {others} transports "
+                "you passed: TypeSafe answers both models (pass typesafe=)"
+            )
         explicit_clef = clef_provider_from_env() if clef is None else clef
         if explicit_clef != "cloudflare":
             raise ValueError(

@@ -41,7 +41,7 @@ __all__ = [
 
 MAX_OPTIONS = 254
 """Most candidates one choice can hold: a Jev choice takes 255 options and one is the
-``__none__`` option."""
+``none`` option."""
 
 _MAX_PER_KIND = 4000
 """A guard against pathological input: no generator yields more than this."""
@@ -155,7 +155,7 @@ EMAIL = re.compile(
     r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}"
 )
 URL = re.compile(r"(?:https?://|www\.)[^\s<>\"'()\[\]]+", re.IGNORECASE)
-PHONE = re.compile(r"(?<![\w@./])(?:\+\s?)?\(?\d[\d\s().\-]{5,}\d(?![\w@])")
+PHONE = re.compile(r"(?<![\w@./])(?:\+[ \t]?)?\(?\d[\d \t().\-]{5,}\d(?![\w@])")
 _LABELLED = re.compile(
     r"(?<![\w/])(?P<label>[A-Za-z][A-Za-z0-9 _/\-]{0,30}?):[ \t]+"
     r"(?P<value>(?:[^\n,;]|,(?=\d))*[^\s,;])"
@@ -176,6 +176,10 @@ _NAME_STOP = _words(
     "Could Should May Might Must Let Here There What Which Who Whom Whose Why How "
     "Ok Okay Sure Well Now Today Tomorrow Yesterday Regards Best Cheers Sincerely "
     "Cc To From Subject Re Fwd Mr Mrs Ms Dr Mon Tue Wed Thu Fri Sat Sun "
+    # the verb that opens an instruction ("Call Dana", "Please contact")
+    "Call Contact Reply Send Sent See Note Notes Attn Forward Review Check "
+    "Confirm Remember Ask Tell Get Give Take Make Meet Join Visit Email Phone "
+    "Fax Address Total Date Due Kindly Greetings Attached Enclosed "
     "Monday Tuesday Wednesday Thursday Friday Saturday Sunday January February "
     "March April June July August September October November December"
 )
@@ -381,8 +385,12 @@ def _clauses(text: str) -> list[Candidate]:
         pieces.append((cursor, len(sentence)))
         for a, b in pieces:
             start, end = _trim(text, s_start + a, s_start + b)
-            if end - start >= 2 and any(ch.isalnum() for ch in text[start:end]):
-                out.append(_make(text, start, end, text[start:end], "clause"))
+            piece = text[start:end]
+            balanced = piece.count("(") == piece.count(")") and piece.count(
+                "["
+            ) == piece.count("]")
+            if end - start >= 2 and any(ch.isalnum() for ch in piece) and balanced:
+                out.append(_make(text, start, end, piece, "clause"))
     return out
 
 
@@ -816,20 +824,25 @@ _WEEKDAY_NAMES = "|".join(sorted(WEEKDAYS, key=len, reverse=True))
 _ISO_DATE = re.compile(r"(?<![\d\-/.])\d{4}-\d{2}-\d{2}(?!\d)")
 _SLASH_DATE = re.compile(r"(?<![\d\-/.])\d{1,2}([/.\-])\d{1,2}\1(?:\d{4}|\d{2})(?!\d)")
 _CLOCK = re.compile(
-    r"(?<![\d:.\-/])\d{1,2}:\d{2}(?::\d{2})?(?:\s?(?:a\.?m\.?|p\.?m\.?)(?![A-Za-z]))?",
+    r"(?<![\d:.\-/])\d{1,2}:\d{2}(?::\d{2})?"
+    r"(?:[ \t]?(?:a\.?m\.?|p\.?m\.?)(?![A-Za-z]))?",
     re.IGNORECASE,
 )
+# Every gap is a space or a tab, never a line break: a date does not run across lines.
+_MONTH_ANY = f"(?:{_MONTH_NAMES.title()}|{_MONTH_NAMES.upper()})"
 _DATE_LITERAL = re.compile(
     r"(?<![\d\-/.])\d{4}-\d{2}-\d{2}(?!\d)"
     r"|(?<![\d\-/.])\d{1,2}([/.\-])\d{1,2}\1(?:\d{4}|\d{2})(?!\d)"
-    rf"|\b(?:{_MONTH_NAMES.title()}|{_MONTH_NAMES.upper()})\.?\s+\d{{1,2}}(?:st|nd|rd|th)?(?!\d)"
-    r"(?:(?:,\s*|\s+)\d{4}\b)?"
-    rf"|\b\d{{1,2}}(?:st|nd|rd|th)?\s+(?:of\s+)?(?:{_MONTH_NAMES.title()}|{_MONTH_NAMES.upper()})\.?"
-    r"(?:(?:,\s*|\s+)\d{4}\b)?"
-    r"|\b(?:the\s+day\s+after\s+tomorrow|day\s+after\s+tomorrow|today|tomorrow|yesterday)\b"
-    rf"|\b(?:(?:next|last|this|coming|past)\s+)?(?:{_WEEKDAY_NAMES})\b"
-    r"|\b(?:in\s+(?:\d+|an?|[a-z]+)\s+(?:day|week|month|year)s?"
-    r"|(?:\d+|an?|[a-z]+)\s+(?:day|week|month|year)s?\s+(?:ago|from\s+now))\b",
+    rf"|\b{_MONTH_ANY}\.?[ \t]+\d{{1,2}}(?:st|nd|rd|th)?(?!\d)"
+    r"(?:(?:,[ \t]*|[ \t]+)\d{4}\b)?"
+    rf"|\b\d{{1,2}}(?:st|nd|rd|th)?[ \t]+(?:of[ \t]+)?{_MONTH_ANY}\.?"
+    r"(?:(?:,[ \t]*|[ \t]+)\d{4}\b)?"
+    r"|\b(?:the[ \t]+day[ \t]+after[ \t]+tomorrow|day[ \t]+after[ \t]+tomorrow"
+    r"|today|tomorrow|yesterday)\b"
+    rf"|\b(?:(?:next|last|this|coming|past)[ \t]+)?(?:{_WEEKDAY_NAMES})\b"
+    r"|\b(?:in[ \t]+(?:\d+|an?|[a-z]+)[ \t]+(?:day|week|month|year)s?"
+    r"|(?:\d+|an?|[a-z]+)[ \t]+(?:day|week|month|year)s?"
+    r"[ \t]+(?:ago|from[ \t]+now))\b",
     re.IGNORECASE,
 )
 

@@ -58,9 +58,8 @@ CLEF_OUTPUT = jsonschema.Draft202012Validator(_load("clef-output.json"))
 CLEF_INPUT = jsonschema.Draft202012Validator(_load("clef-input.json"))
 CLAIRIC_OUTPUT = jsonschema.Draft202012Validator(_load("clairic-output.json"))
 PROBE = _load("typesafe-systemone-response.example.json")
-SELECT_REQUEST = _load("typesafe-select-request.example.json")
-SELECT_RESPONSE = _load("typesafe-select-response.example.json")
-NONE_RESPONSE = _load("typesafe-select-none-response.example.json")
+SPAN_REQUEST = _load("typesafe-span-ids-request.example.json")
+SPAN_RESPONSE = _load("typesafe-span-ids-response.example.json")
 ERROR_422 = _load("typesafe-error-422.example.json")
 
 CLEF_PAYLOAD: dict[str, Any] = {
@@ -110,7 +109,7 @@ class Recorder:
 
 
 def make(
-    handler: Callable[[httpx.Request], httpx.Response] | Recorder,
+    handler: Callable[[httpx.Request], Any] | Recorder,
     **kwargs: Any,
 ) -> TypeSafeTransport:
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -320,7 +319,15 @@ def test_422_names_the_field_and_not_the_users_text() -> None:
                 "loc": ["body", "questions", "bad", "choice", "criteria"],
                 "msg": "Dictionary should have at least 1 item after validation, not 0",
                 "input": {"secret": "the user's private words"},
-            }
+            },
+            {
+                "type": "string_too_long",
+                # past `criteria` the keys are option ids: the user's own words
+                "loc": ["body", "questions", "q", "choice", "criteria", "private opt"],
+                "msg": "String should have at most 255 characters",
+                "input": "the user's private words",
+                "ctx": {"max_length": 255, "given": "the user's private words"},
+            },
         ]
     }
     recorder = Recorder(httpx.Response(422, json=body))
@@ -329,9 +336,22 @@ def test_422_names_the_field_and_not_the_users_text() -> None:
     message = str(caught.value)
     assert "body.questions.bad.choice.criteria" in message
     assert "at least 1 item" in message
-    assert "private words" not in message
+    assert "private" not in message
     assert caught.value.status_code == 422
-    assert caught.value.body == body  # the body stays on the error for debugging
+    # the body that stays on the error has type, loc (cut at `criteria`) and msg
+    kept: Any = caught.value.body
+    assert kept["detail"][0]["loc"] == [
+        "body",
+        "questions",
+        "bad",
+        "choice",
+        "criteria",
+    ]
+    assert kept["detail"][1]["loc"] == ["body", "questions", "q", "choice", "criteria"]
+    assert all(set(e) == {"type", "loc", "msg"} for e in kept["detail"])
+    assert "private" not in json.dumps(kept)
+    assert "private" not in json.dumps(caught.value.cf_errors)
+    assert "private" not in repr(caught.value)
     assert len(recorder.requests) == 1
     # the probed body has the same shape
     assert ERROR_422["detail"][0]["loc"][-1] == "criteria"
@@ -355,9 +375,9 @@ def test_429_with_retry_after_ms_is_honoured() -> None:
     assert recorder.delays == [1.5]
 
 
-def test_429_without_a_hint_and_529_are_retried_with_backoff() -> None:
+def test_429_without_a_hint_is_retried_with_backoff() -> None:
     recorder = Recorder(
-        httpx.Response(429, json={}), httpx.Response(529, json={}), ok()
+        httpx.Response(429, json={}), httpx.Response(429, json={}), ok()
     )
     sent = run(
         make(recorder, backoff_base=0.1, backoff_max=1.0).run(
@@ -370,13 +390,25 @@ def test_429_without_a_hint_and_529_are_retried_with_backoff() -> None:
 
 
 def test_a_rate_limit_that_outlasts_the_retries_is_a_rate_limit_error() -> None:
-    recorder = Recorder(httpx.Response(529, json={"detail": "overloaded"}))
+    recorder = Recorder(httpx.Response(429, json={"detail": "slow down"}))
     with pytest.raises(RateLimitError) as caught:
         run(make(recorder, max_retries=2).run(CLEF, CLEF_PAYLOAD, meta=META))
-    assert caught.value.status_code == 529
+    assert caught.value.status_code == 429
     assert caught.value.retries == 2
     assert len(recorder.requests) == 3
     assert classify_failure(caught.value) == "unavailable"  # nothing ran
+
+
+def test_529_may_have_been_run_so_it_is_uncertain_and_never_resent() -> None:
+    """Overloaded is a 5xx: the server may have run the model, and may have charged."""
+    recorder = Recorder(httpx.Response(529, json={"detail": "overloaded"}), ok())
+    with pytest.raises(UncertainOutcomeError) as caught:
+        run(make(recorder).run(CLEF, CLEF_PAYLOAD, meta=META))
+    assert caught.value.status_code == 529
+    assert len(recorder.requests) == 1  # exactly one request: no retry
+    assert recorder.delays == []
+    assert "may have charged" in str(caught.value)
+    assert classify_failure(caught.value) == "uncertain"
 
 
 def test_a_retry_after_longer_than_the_limit_fails_at_once() -> None:
@@ -402,8 +434,9 @@ def test_a_connect_error_is_retried_because_nothing_was_sent() -> None:
         httpx.Response(500, json={"detail": "boom"}),
         httpx.Response(503, json={}),
         httpx.Response(408, json={}),
+        httpx.Response(529, json={}),
     ],
-    ids=["read timeout", "dropped", "read error", "500", "503", "408"],
+    ids=["read timeout", "dropped", "read error", "500", "503", "408", "529"],
 )
 def test_a_request_that_may_have_arrived_is_never_resent(
     failure: httpx.Response | Exception,
@@ -875,10 +908,10 @@ def _part_script(
 
 
 def test_a_date_is_read_as_parts_and_resolved_in_code() -> None:
-    text = "Please return the signed form by August 14."
+    text = "Please return the signed form by August 14, 2026."
     field = {"due": {"type": "date", "instructions": "The deadline to return the form"}}
     script = _part_script(
-        {"mode": "absolute", "month": "August", "day": "14", "year": "none"}
+        {"mode": "absolute", "month": "August", "day": "14", "year": "2026"}
     )
     jev = Jev(script)
     payload = clairic_payload(field, text, reference_date="2026-07-30")
@@ -904,6 +937,20 @@ def test_a_date_is_read_as_parts_and_resolved_in_code() -> None:
     assert "span" not in answer
     assert answer["needs_review"] is False
     assert not list(CLAIRIC_OUTPUT.iter_errors(sent.body))
+
+
+def test_a_year_that_the_text_does_not_state_is_inferred_and_flagged() -> None:
+    text = "Please return the signed form by August 14."
+    field = {"due": {"type": "date", "instructions": "The deadline to return the form"}}
+    script = _part_script(
+        {"mode": "absolute", "month": "August", "day": "14", "year": "none"}
+    )
+    payload = clairic_payload(field, text, reference_date="2026-07-30")
+    answer = clairic(make(Jev(script)), payload).body["answers"]["due"]
+    assert answer["value"] == "2026-08-14"
+    assert answer["needs_review"] is True
+    assert answer["confidence"] == pytest.approx(0.8)  # under the re-ask bar
+    assert "inferred year" in answer["note"]
 
 
 def test_a_relative_date_uses_the_reference_date() -> None:
@@ -1070,7 +1117,7 @@ def test_a_long_input_is_cut_and_reported_truncated() -> None:
     parse_clairic(sent.body)
 
 
-def test_requests_are_split_by_the_question_limit_and_the_context_budget() -> None:
+def test_requests_are_split_by_the_context_budget_alone() -> None:
     text = "\n".join(
         f"Person{i} Name{i} met Person{i + 1} Name{i + 1}." for i in range(60)
     )
@@ -1081,8 +1128,9 @@ def test_requests_are_split_by_the_question_limit_and_the_context_budget() -> No
     )
     clairic(make(jev, config=config), clairic_payload(field, text))
     sizes = [len(r["questions"]) for r in jev.requests]
-    assert len(sizes) > 1
-    assert max(sizes) <= 64
+    # Jev states no limit on the number of questions: they go by the context alone
+    assert len(sizes) == 1
+    assert sizes[0] > 64
     jev2 = Jev(picks())
     tiny = TypeSafeConfig(
         verify_selection=False,
@@ -1291,11 +1339,23 @@ def test_config_is_validated() -> None:
     assert defaults.fire_threshold == 0.7
 
 
-def test_the_probed_selection_example_has_the_shape_the_adapter_reads() -> None:
-    # the live probe: a choice with a `__none__` option; the observed answer
-    answer = SELECT_RESPONSE["answers"]["email"]
-    assert answer["choice"] == "candidate_3"
-    assert answer["probabilities"]["__none__"] == 0.07
-    assert NONE_RESPONSE["answers"]["email"]["choice"] == "__none__"
-    assert not list(JEV_REQUEST.iter_errors(SELECT_REQUEST))
-    assert not list(JEV_RESPONSE.iter_errors(SELECT_RESPONSE))
+def test_the_probed_span_id_example_has_the_shape_the_adapter_reads() -> None:
+    """Probe 6: the shipped scheme, a span as the option id, plus `none`."""
+    request = SPAN_REQUEST["questions"]["phone::pick"]
+    criteria = request["criteria"]
+    assert "(415) 555-0177" in criteria  # the span itself is the id, with spaces
+    assert "+1 415 555 0142" in criteria  # ... and punctuation
+    assert criteria["none"] == "None of these is the requested value."
+    assert list(criteria)[-1] == "none"
+    answer = SPAN_RESPONSE["answers"]["phone::pick"]
+    assert answer["choice"] == "(415) 555-0177"  # it answered with the span, verbatim
+    assert answer["probabilities"]["(415) 555-0177"] == 0.65
+    assert answer["probabilities"]["none"] == 0.28
+    assert answer["confidence"] == 0.6
+    none = SPAN_RESPONSE["answers"]["email::pick"]  # a field the input does not state
+    assert none["choice"] == "none"
+    assert none["probabilities"]["none"] == 1.0
+    assert not list(JEV_REQUEST.iter_errors(SPAN_REQUEST))
+    assert not list(JEV_RESPONSE.iter_errors(SPAN_RESPONSE))
+    parsed = parse_clef(SPAN_RESPONSE)
+    assert set(parsed.answers) == {"phone::pick", "email::pick"}

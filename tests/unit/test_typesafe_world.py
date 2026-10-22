@@ -47,3 +47,37 @@ def test_case_runs_on_scripted_jev(case: Case) -> None:
     assert scored.error is None
     assert scored.passed, problems
     assert backend.requests
+
+
+def test_a_stitch_that_joins_lines_runs_end_to_end() -> None:
+    """A scripted Jev that joins every line to the next: one block, and it runs."""
+    case = next(c for c in CASES if c.id == "readme_people")
+
+    async def go(join: float) -> tuple[CaseResult, list[str]]:
+        assert case.world is not None
+        backend = JevBackend(case.world())
+        backend.join = join  # the stitch answer: above the threshold, lines join
+        client = httpx.AsyncClient(transport=httpx.MockTransport(backend))
+        transport = TypeSafeTransport(api_key=KEY, client=client)
+        extractor = create_extractor(
+            case.schemas(),
+            transport=Bridge(transport, backend),
+            **build_options({}, case.options),
+        )
+        result = await extractor.ainvoke(case.text, existing=case.existing)
+        stitches = [r for r in backend.requests if "L001" in r["questions"]]
+        assert stitches, "the stitch request was never sent"
+        seen = [
+            r["state"]["input"]
+            for r in backend.requests
+            if isinstance(r["state"], dict) and "input" in r["state"]
+        ]
+        return score(case, result), seen
+
+    _, apart = asyncio.run(go(0.04))
+    assert any("B001|" in s for s in apart)  # the lines stay apart: many blocks
+    scored, joined = asyncio.run(go(0.95))
+    assert scored.error is None
+    tagged = [s for s in joined if "B000|" in s]
+    assert tagged
+    assert not any("B001|" in s for s in joined)  # every line joined into one block

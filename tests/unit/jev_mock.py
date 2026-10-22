@@ -8,7 +8,8 @@ the Jev questions the transport really sent so that they say the same:
 
 * a Clef request: the questions must be the engine's, unchanged, and the answer is
   the world's;
-* the stitch questions: no line joins the next (0.04);
+* the stitch questions: no line joins the next (0.04), unless ``join`` says
+  otherwise (the probability that every line joins the next);
 * a ``choice`` of a candidate: the option whose id or description is the value the
   world has, else ``none``;
 * the yes/no of a list candidate: yes for the elements the world lists;
@@ -31,12 +32,10 @@ import jsonschema
 
 from evals.model import WorldLike
 from trustcall_system_one import CLAIRIC, CLEF, CallMeta, Transport, TransportResponse
-from trustcall_system_one._candidates import pattern_candidates
 from trustcall_system_one._dateparts import (
     DATE_PARTS,
     MONTH_NAMES,
 )
-from trustcall_system_one._wire import ClairicField
 
 MODEL = "jev-1.14.0"
 _OPENAPI = json.loads(
@@ -67,6 +66,53 @@ def _choice(options: list[str], pick: str, p: float = 0.95) -> dict[str, Any]:
     }
 
 
+_UNITS = [
+    "zero",
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "ten",
+    "eleven",
+    "twelve",
+    "thirteen",
+    "fourteen",
+    "fifteen",
+    "sixteen",
+    "seventeen",
+    "eighteen",
+    "nineteen",
+]
+_TENS = ["twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+_WORDS = {
+    **{w: i for i, w in enumerate(_UNITS)},
+    **{w: 10 * (i + 2) for i, w in enumerate(_TENS)},
+    "hundred": 100,
+    "thousand": 1000,
+}
+
+
+def _option_number(option: str) -> float | None:
+    """The number an option id (a span of the input) reads as: ``$1,080``, ``12%``,
+    ``3k``, ``three``. Parsed here, not by the library's own candidate finder."""
+    text = option.strip().casefold()
+    if text in _WORDS:
+        return float(_WORDS[text])
+    found = re.fullmatch(r"[^\d\-]*(-?[\d,]*\.?\d+)\s*(k|m|%|[a-z ]*)", text)
+    if found is None:
+        return None
+    try:
+        number = float(found.group(1).replace(",", ""))
+    except ValueError:
+        return None
+    return number * {"k": 1_000.0, "m": 1_000_000.0}.get(found.group(2), 1.0)
+
+
 def _number(text: str) -> float | None:
     cleaned = re.sub(r"[^0-9.\-]", "", text.replace(",", ""))
     try:
@@ -85,6 +131,7 @@ class JevBackend:
             tuple[str, dict[str, Any], CallMeta, dict[str, Any]]
         ] = contextvars.ContextVar("jev_current")
         self.requests: list[dict[str, Any]] = []
+        self.join = 0.04
         self.overrides: dict[
             str, Callable[[dict[str, Any]], dict[str, Any] | None]
         ] = {}
@@ -153,7 +200,7 @@ class JevBackend:
         sentences: dict[str, str],
     ) -> dict[str, Any]:
         if re.fullmatch(r"L\d+", qid):  # stitch
-            return {"type": "noul", "noul": 0.04}
+            return {"type": "noul", "noul": self.join}
         name, _, rest = qid.partition("::")
         if rest in ("hallucinated", "off_target"):
             return {"type": "noul", "noul": 0.05}
@@ -191,8 +238,7 @@ class JevBackend:
                 ):
                     return str(oid)  # a sum: "1080 (the sum of ...)"
             for oid in options:
-                found = pattern_candidates(ClairicField(type="number"), oid)
-                if any(c.text == oid and c.value == value for c in found):
+                if _option_number(oid) == float(value):
                     return str(oid)
         return "none"
 
@@ -221,6 +267,11 @@ class Bridge:
 
     def max_questions(self, model: str) -> int:
         return int(getattr(self.inner, "max_questions", 64))
+
+    @property
+    def state_token_budget(self) -> int | None:
+        budget = getattr(self.inner, "state_token_budget", None)
+        return budget if isinstance(budget, int) else None
 
     async def run(
         self,

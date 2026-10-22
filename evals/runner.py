@@ -123,6 +123,32 @@ def combination(
     return "cloudflare clairic", decisions
 
 
+_RECORDED_ON = {
+    "cloudflare": ("cloudflare clairic", "cloudflare clef"),
+    "typesafe": ("typesafe jev", "typesafe jev"),
+    "experiential": ("experiential clef", "experiential clef"),
+    "decisions": (
+        "experiential decisions",
+        "experiential decisions (gpt-6-luna-decisions, hard cap 0.8)",
+    ),
+}
+
+
+def recorded_labels(snapshot: CassetteTransport) -> tuple[str, str]:
+    """The labels of a pure replay: what the cassettes were recorded on.
+
+    Each recording says who answered it (``provider``); a cassette from before that
+    was recorded says nothing, and its label is ``unknown``.
+    """
+    found = snapshot.providers()
+
+    def label(family: str, index: int) -> str:
+        names = [_RECORDED_ON.get(p, (p, p))[index] for p in found[family]]
+        return f"replay (recorded on {', '.join(names) or 'unknown'})"
+
+    return label("clairic", 0), label("clef", 1)
+
+
 def _have_credentials(
     clef_provider: str = "cloudflare",
     clef_fallback: str = "none",
@@ -268,6 +294,14 @@ async def run_suite(
     Raises:
         RuntimeError: If ``live`` is set without Cloudflare credentials.
     """
+    if _main_provider(settings) == "typesafe" and (
+        _provider(settings) != "cloudflare" or _fallback(settings) != "none"
+    ):  # Jev answers Clef itself: nothing else may be asked for
+        raise ValueError(
+            "--provider typesafe answers Clef with Jev itself: do not combine "
+            "it with --clef-provider or --clef-fallback (or the "
+            "TRUSTCALL_S1_CLEF_PROVIDER / TRUSTCALL_S1_CLEF_FALLBACK variables)"
+        )
     runnable = [c for c in cases if settings.live or c.world is not None]
     skipped = [c.id for c in cases if c not in runnable]
     # Shown in the report whenever a live request is possible: live, or a replay
@@ -299,7 +333,11 @@ async def run_suite(
     gate = asyncio.Semaphore(max(1, settings.concurrency))
     live = None
     if settings.live and main == "typesafe":
-        live = system_one_transport(provider="typesafe")
+        live = system_one_transport(
+            settings.clef_provider,
+            provider="typesafe",
+            clef_fallback=settings.clef_fallback,
+        )
     elif settings.live and provider:
         live = system_one_transport(
             provider,  # type: ignore[arg-type]
@@ -307,11 +345,13 @@ async def run_suite(
             clef_fallback=fallback,
             clef_fallback_on=_fallback_on(settings),
         )
-    if possible:
+    snapshot = CassetteTransport(settings.replay) if settings.replay else None
+    if snapshot is not None and not settings.live:  # nothing is sent: what was recorded
+        extraction, decisions = recorded_labels(snapshot)
+    elif possible:
         extraction, decisions = combination(main, provider, fallback)
     else:
         extraction = decisions = "scripted world"
-    snapshot = CassetteTransport(settings.replay) if settings.replay else None
 
     async def one(case: Case) -> CaseResult:
         async with gate:

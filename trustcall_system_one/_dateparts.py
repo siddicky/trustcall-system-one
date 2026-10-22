@@ -29,6 +29,7 @@ from typing import Any
 
 __all__ = [
     "DATE_PARTS",
+    "INFERRED_CONFIDENCE",
     "REVIEW_BELOW",
     "TIME_PARTS",
     "Assembled",
@@ -45,6 +46,12 @@ __all__ = [
 
 REVIEW_BELOW = 0.60
 """Cookbook gate: a date below this confidence is flagged for a person."""
+
+INFERRED_CONFIDENCE = 0.8
+"""The most confidence a date gets when its year or its week was not stated but
+inferred (a year-less date, a bare weekday). It sits under the library's
+low-confidence bar (0.85), so the ladder re-asks and cross-checks it, and the answer
+is flagged ``needs_review``."""
 
 MONTH_NAMES = [
     "January",
@@ -91,16 +98,15 @@ _SECONDS = {
 }
 _COUNTS = [
     "0.5",
-    *(str(n) for n in range(1, 61)),
-    "90",
-    "100",
-    "120",
+    *(str(n) for n in range(1, 121)),  # every whole count to 120 (90 minutes, 100 ...)
+    "150",
     "180",
     "240",
     "300",
     "360",
     "480",
-]
+    "600",
+]  # beyond 120 only these; any other count is ``out_of_range`` (flagged, not guessed)
 _ABSENT = "The document does not state this, or it is not this kind of date."
 
 
@@ -123,7 +129,10 @@ class Assembled:
         confidence: The lowest confidence among the parts that were used.
         p_null: The probability that the input states no such value.
         note: Why there is no value, or empty.
-        needs_review: No value, or a confidence below ``REVIEW_BELOW``.
+        needs_review: No value, a confidence below ``REVIEW_BELOW``, or a year or
+            week that was inferred and not stated.
+        inferred: What was inferred: ``year`` (a date without a year) or ``week``
+            (a bare weekday).
     """
 
     value: Any
@@ -131,6 +140,7 @@ class Assembled:
     p_null: float
     note: str = ""
     needs_review: bool = False
+    inferred: tuple[str, ...] = ()
 
 
 def _choice(instructions: str, criteria: dict[str, Any]) -> dict[str, Any]:
@@ -168,11 +178,12 @@ def date_questions(role: str) -> dict[str, dict[str, Any]]:
         ),
         "day_anchor": _choice(
             f"If {role} is relative to today, which day is it? 'today', 'tomorrow', "
-            "'day_after' (the day after tomorrow), or 'weekday' (a named day of the "
-            "week).",
+            "'yesterday', 'day_after' (the day after tomorrow), or 'weekday' (a named "
+            "day of the week).",
             {
                 "today": None,
                 "tomorrow": None,
+                "yesterday": None,
                 "day_after": None,
                 "weekday": None,
                 "none": _ABSENT,
@@ -185,9 +196,9 @@ def date_questions(role: str) -> dict[str, dict[str, Any]]:
         "week_offset": _choice(
             f"If {role} names a weekday, which week is it in? 'next' for 'next "
             "Thursday' or 'Thursday next week'; 'current' for 'this Thursday'; "
-            "'none' for a bare weekday with no qualifier (just 'Thursday' / 'on "
-            "Thursday').",
-            {"current": None, "next": None, "none": _ABSENT},
+            "'previous' for 'last Thursday' or 'Thursday last week'; 'none' for a "
+            "bare weekday with no qualifier (just 'Thursday' / 'on Thursday').",
+            {"current": None, "next": None, "previous": None, "none": _ABSENT},
         ),
     }
 
@@ -244,8 +255,13 @@ def _conf(parts: Mapping[str, Part], names: list[str]) -> float | None:
 
 
 def _none_prob(parts: Mapping[str, Part]) -> float:
-    mode = parts.get("mode")
-    return 0.0 if mode is None else float(mode.probabilities.get("none", 0.0))
+    """P(the input states no such value): the larger of the ``mode`` answers.
+
+    A date or time or duration has a ``mode``; a datetime has two (``d.mode``,
+    ``t.mode``), and it is null if either part is not stated.
+    """
+    modes = [parts[k] for k in ("mode", "d.mode", "t.mode") if k in parts]
+    return max((float(m.probabilities.get("none", 0.0)) for m in modes), default=0.0)
 
 
 def _result(
@@ -254,14 +270,26 @@ def _result(
     used: list[str],
     note: str,
     review_below: float,
+    inferred: tuple[str, ...] = (),
 ) -> Assembled:
     confidence = _conf(parts, used)
     if value is None:
         p_null = max(_none_prob(parts), 1.0 - (confidence or 0.0))
+        inferred = ()
     else:
         p_null = _none_prob(parts)
-    review = value is None or confidence is None or confidence < review_below
-    return Assembled(value, confidence, min(1.0, max(0.0, p_null)), note, review)
+    if inferred and confidence is not None:
+        confidence = min(confidence, INFERRED_CONFIDENCE)
+        note = note or "inferred " + " and ".join(inferred) + ", not stated"
+    review = (
+        value is None
+        or confidence is None
+        or confidence < review_below
+        or bool(inferred)
+    )
+    return Assembled(
+        value, confidence, min(1.0, max(0.0, p_null)), note, review, inferred
+    )
 
 
 def _resolve_weekday(today: date, weekday: str, week_offset: str) -> date:
@@ -271,63 +299,70 @@ def _resolve_weekday(today: date, weekday: str, week_offset: str) -> date:
         return monday + timedelta(days=7 + index)
     if week_offset == "current":
         return monday + timedelta(days=index)
+    if week_offset == "previous":
+        return monday + timedelta(days=index - 7)
     return today + timedelta(days=(index - today.weekday()) % 7)
 
 
 def _date_of(
     parts: Mapping[str, Part], today: date
-) -> tuple[date | None, list[str], str]:
-    """The cookbook's ``assemble``: ``(date, parts used, note)``."""
+) -> tuple[date | None, list[str], str, tuple[str, ...]]:
+    """The cookbook's ``assemble``: ``(date, parts used, note, inferred)``.
+
+    ``inferred`` names what the text did not state and code filled in: the ``year``
+    of a year-less date (the reference year, or the next if it is more than 31 days
+    past: a bias to the future), the ``week`` of a bare weekday (the next one on or
+    after the reference date).
+    """
     mode = parts["mode"].choice if "mode" in parts else "none"
     used = ["mode"]
     if mode == "none":
-        return None, used, "no such date stated"
+        return None, used, "no such date stated", ()
     if mode == "absolute":
         used += ["month", "day", "year"]
         month = parts["month"].choice
         day = parts["day"].choice
         year = parts["year"].choice
         if "none" in (month, day) or not day.isdigit() or month not in MONTH_NAMES:
-            return None, used, "absolute date incomplete"
+            return None, used, "absolute date incomplete", ()
         number = MONTH_NAMES.index(month) + 1
         if year == "out_of_range":
-            return None, used, f"year outside {YEAR_WINDOW[0]}-{YEAR_WINDOW[-1]}"
+            return None, used, f"year outside {YEAR_WINDOW[0]}-{YEAR_WINDOW[-1]}", ()
         try:
             if year == "none":
                 resolved = date(today.year, number, int(day))
                 if resolved < today - timedelta(days=31):
                     resolved = date(today.year + 1, number, int(day))
-                return resolved, used, ""
-            return date(int(year), number, int(day)), used, ""
+                return resolved, used, "", ("year",)
+            return date(int(year), number, int(day)), used, "", ()
         except ValueError:
-            return None, used, f"impossible date: {year}-{month}-{day}"
+            return None, used, f"impossible date: {year}-{month}-{day}", ()
     if mode == "relative":
         anchor = parts["day_anchor"].choice
         used.append("day_anchor")
-        offsets = {"today": 0, "tomorrow": 1, "day_after": 2}
+        offsets = {"yesterday": -1, "today": 0, "tomorrow": 1, "day_after": 2}
         if anchor in offsets:
-            return today + timedelta(days=offsets[anchor]), used, ""
+            return today + timedelta(days=offsets[anchor]), used, "", ()
         if anchor == "weekday":
             used += ["weekday", "week_offset"]
             weekday = parts["weekday"].choice
             if weekday not in WEEKDAY_NAMES:
-                return None, used, "relative weekday not read"
-            return (
-                _resolve_weekday(today, weekday, parts["week_offset"].choice),
-                used,
-                "",
-            )
-        return None, used, "relative day not read"
-    return None, used, f"unrecognized mode: {mode}"
+                return None, used, "relative weekday not read", ()
+            offset = parts["week_offset"].choice
+            named = _resolve_weekday(today, weekday, offset)
+            stated = offset in ("next", "current", "previous")
+            return named, used, "", (() if stated else ("week",))
+        return None, used, "relative day not read", ()
+    return None, used, f"unrecognized mode: {mode}", ()
 
 
 def assemble_date(
     parts: Mapping[str, Part], today: date, review_below: float = REVIEW_BELOW
 ) -> Assembled:
     """Resolve the date parts against ``today`` (the reference date)."""
-    resolved, used, note = _date_of(parts, today)
+    resolved, used, note, inferred = _date_of(parts, today)
     value = None if resolved is None else resolved.isoformat()
-    return _result(value, parts, used, note, review_below)
+    return _result(value, parts, used, note, review_below, inferred)
 
 
 def _time_of(parts: Mapping[str, Part]) -> tuple[str | None, list[str], str]:
@@ -358,14 +393,16 @@ def assemble_datetime(
     review_below: float = REVIEW_BELOW,
 ) -> Assembled:
     """Resolve date and time parts together; a date without a time is no datetime."""
-    day, used, note = _date_of(date_parts, today)
+    day, used, note, inferred = _date_of(date_parts, today)
     clock, time_used, time_note = _time_of(time_parts)
     merged: dict[str, Part] = {f"d.{k}": v for k, v in date_parts.items()}
     merged.update({f"t.{k}": v for k, v in time_parts.items()})
     names = [f"d.{n}" for n in used] + [f"t.{n}" for n in time_used]
     if day is None or clock is None:
         return _result(None, merged, names, note or time_note, review_below)
-    return _result(f"{day.isoformat()}T{clock}", merged, names, "", review_below)
+    return _result(
+        f"{day.isoformat()}T{clock}", merged, names, "", review_below, inferred
+    )
 
 
 def assemble_duration(

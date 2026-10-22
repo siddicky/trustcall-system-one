@@ -1,0 +1,33 @@
+{
+    "model": "jev-latest",
+    "state": {
+        "focus": "<focus entity=\"the Person\">\nAnswer only about the Person.\n</focus>",
+        "input": "B000| [S000] From: Dana Whit <dana.whit@acme-corp.com>\nB001| [S001] Call (415) 555-0177 or +1 415 555 0142 about the invoice. [S002] Total due: $1,315.50 incl 15% tax, due next Thursday at 2:30 pm."
+    },
+    "questions": {
+        "phone::pick": {
+            "type": "choice",
+            "instructions": "For the entity named in `focus`, from what `input` states: the Person's mobile phone number to call first. Which option is it? Each option is an exact quoted span of `input`, or the id of a block (B..), sentence (S..) or part of a sentence (S...) listed in `input`. Choose none if `input` does not state it.",
+            "criteria": {
+                "Dana Whit <dana.whit@acme-corp.com>": null,
+                "Call": null,
+                "(415) 555-0177": null,
+                "+1 415 555 0142": null,
+                "S001": "sentence: 'Call (415) 555-0177 or +1 415 555 0142 about the invoice.'",
+                "$1,315.50": "1315.5 USD",
+                "Total due: $1,315.50 incl 15% tax, due next Thursday at 2:30 pm.": null,
+                "none": "None of these is the requested value."
+            }
+        },
+        "email::pick": {
+            "type": "choice",
+            "instructions": "For the entity named in `focus`, from what `input` states: the Person's fax number. Which option is it? Choose none if `input` does not state it.",
+            "criteria": {
+                "Dana Whit <dana.whit@acme-corp.com>": null,
+                "(415) 555-0177": null,
+                "+1 415 555 0142": null,
+                "none": "None of these is the requested value."
+            }
+        }
+    }
+}

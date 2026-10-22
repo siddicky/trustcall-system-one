@@ -18,7 +18,7 @@ from pydantic import BaseModel
 from evals.cases import CASES
 from evals.cli import _parser, _settings
 from evals.cli import main as evals_main
-from evals.report import suite_markdown, write_suite
+from evals.report import write_suite
 from evals.runner import Settings, SuiteResult, combination, run_suite
 from trustcall_system_one import (
     CLEF,
@@ -439,7 +439,7 @@ def test_combination_labels(
 async def test_the_suite_records_which_combination_ran(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A replay with nothing recorded sends nothing, yet knows who would answer."""
+    """A replay says what the cassettes were recorded on, not who would answer."""
     cassettes = tmp_path / "cassettes"
     cassettes.mkdir()
     (cassettes / "empty.jsonl").write_text("")
@@ -451,26 +451,16 @@ async def test_the_suite_records_which_combination_ran(
         "typesafe": Settings(replay=cassettes, provider="typesafe"),
     }.items():
         seen[name] = await run_suite(cases, settings)
-    assert (seen["default"].extraction, seen["default"].decisions) == (
-        "cloudflare clairic",
-        "cloudflare clef",
-    )
-    assert seen["decisions"].decisions.startswith(
-        "experiential decisions (gpt-6-luna-decisions"
-    )
+    unknown = "replay (recorded on unknown)"  # nothing recorded says nothing
+    for suite in seen.values():
+        assert (suite.extraction, suite.decisions) == (unknown, unknown)
     assert seen["decisions"].clef_provider == "decisions"
-    assert (seen["typesafe"].extraction, seen["typesafe"].decisions) == (
-        "typesafe jev",
-        "typesafe jev",
-    )
     assert seen["typesafe"].provider == "typesafe"
     js, md = write_suite(seen["typesafe"], tmp_path / "out")
     data = json.loads(js.read_text())
     assert data["provider"] == "typesafe"
-    assert data["extraction"] == "typesafe jev"
-    assert data["decisions"] == "typesafe jev"
-    assert "Extraction: typesafe jev; decisions: typesafe jev" in md.read_text()
-    assert "Extraction: typesafe jev" in suite_markdown(seen["typesafe"])
+    assert data["extraction"] == unknown
+    assert f"Extraction: {unknown}; decisions: {unknown}" in md.read_text()
 
 
 async def test_an_offline_suite_says_it_was_scripted(tmp_path: Path) -> None:

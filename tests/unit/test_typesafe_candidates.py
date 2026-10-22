@@ -18,6 +18,7 @@ from trustcall_system_one._candidates import (
     pattern_candidates,
 )
 from trustcall_system_one._dateparts import (
+    INFERRED_CONFIDENCE,
     REVIEW_BELOW,
     Part,
     assemble_date,
@@ -474,8 +475,60 @@ def parts(**choices: Any) -> dict[str, Part]:
 def test_the_date_is_resolved_in_code(given: dict[str, str], value: str) -> None:
     result = assemble_date(parts(**given), TODAY)
     assert result.value == value
+    # a year or a week the text did not state is inferred, and says so
+    inferred = given.get("year") == "none" or given.get("week_offset") == "none"
+    assert result.needs_review is inferred
+    assert bool(result.inferred) is inferred
+    assert result.confidence == (INFERRED_CONFIDENCE if inferred else 0.95)
+
+
+@pytest.mark.parametrize(
+    ("given", "value"),
+    [
+        ({"mode": "relative", "day_anchor": "yesterday"}, "2026-07-29"),
+        (
+            {
+                "mode": "relative",
+                "day_anchor": "weekday",
+                "weekday": "Thursday",
+                "week_offset": "previous",
+            },
+            "2026-07-23",
+        ),
+        (
+            {
+                "mode": "relative",
+                "day_anchor": "weekday",
+                "weekday": "Monday",
+                "week_offset": "previous",
+            },
+            "2026-07-20",
+        ),
+    ],
+)
+def test_past_dates_are_stated_not_inferred(given: dict[str, str], value: str) -> None:
+    result = assemble_date(parts(**given), TODAY)
+    assert result.value == value
+    assert result.inferred == ()
     assert result.needs_review is False
     assert result.confidence == 0.95
+
+
+def test_the_options_offer_the_past() -> None:
+    questions = date_questions("the date")
+    assert "yesterday" in questions["day_anchor"]["criteria"]
+    assert "previous" in questions["week_offset"]["criteria"]
+
+
+def test_a_year_less_date_is_flagged_and_kept_under_the_reask_bar() -> None:
+    result = assemble_date(
+        parts(mode="absolute", month="August", day="14", year="none"), TODAY
+    )
+    assert result.inferred == ("year",)
+    assert "inferred year" in result.note
+    assert result.needs_review is True
+    assert result.confidence is not None
+    assert result.confidence < 0.85  # the library's low-confidence bar: re-asked
 
 
 @pytest.mark.parametrize(
@@ -591,3 +644,98 @@ def test_the_part_questions_are_the_cookbooks() -> None:
         for q in group.values():
             assert q["type"] == "choice"
             assert 2 <= len(q["criteria"]) <= 255
+
+
+def _mode(choice: str, none: float) -> Part:
+    return Part(choice, 1 - none, {choice: 1 - none, "none": none})
+
+
+def test_a_datetime_is_null_when_either_part_is_probably_not_stated() -> None:
+    day = {
+        **parts(month="August", day="14", year="2027"),
+        "mode": _mode("absolute", 0.02),
+    }
+    unstated = {**parts(hour="14", minute="30"), "mode": _mode("stated", 0.9)}
+    stated = {**parts(hour="14", minute="30"), "mode": _mode("stated", 0.03)}
+    # a date, and a time that is probably not in the text (the time part says so)
+    missed = assemble_datetime(day, unstated, TODAY)
+    assert missed.p_null == pytest.approx(0.9)
+    # the datetime is stated: the larger of the two small chances
+    sure = assemble_datetime(day, stated, TODAY)
+    assert sure.value == "2027-08-14T14:30:00"
+    assert sure.p_null == pytest.approx(0.03)
+    # ... and the date part is the doubtful one
+    doubtful = {**day, "mode": _mode("absolute", 0.7)}
+    assert assemble_datetime(doubtful, stated, TODAY).p_null == pytest.approx(0.7)
+
+
+def test_a_datetime_without_a_value_is_null_by_its_least_sure_part() -> None:
+    day = {**parts(month="August", day="14", year="2027"), "mode": _mode("none", 0.8)}
+    clock = {**parts(hour="9", minute="0"), "mode": _mode("stated", 0.05)}
+    result = assemble_datetime(day, clock, TODAY)
+    assert result.value is None
+    assert result.p_null >= 0.8
+
+
+def test_the_duration_counts_are_complete_to_120() -> None:
+    counts = duration_questions("x")["hours"]["criteria"]
+    for n in range(1, 121):  # every whole count, 61 to 89 included
+        assert str(n) in counts
+    assert "out_of_range" in counts
+
+
+# --------------------------------------------------------------------------- #
+# Review fixes: line breaks, instructions that are not names, brackets
+# --------------------------------------------------------------------------- #
+
+
+def test_a_phone_number_does_not_run_across_a_line_break() -> None:
+    text = "Order 4155550100\n2024 was the year.\nCall 415 555 0100 now."
+    phones = [
+        c.text for c in pattern_candidates(field("text"), text) if c.kind == "phone"
+    ]
+    assert "415 555 0100" in phones
+    assert not any("\n" in p for p in phones)
+    assert not any("2024" in p for p in phones)
+
+
+@pytest.mark.parametrize(
+    ("text", "joined"),
+    [
+        ("Due August\n14 for all", "August\n14"),
+        ("Due on 14\nAugust 2027 sharp", "14\nAugust"),
+        ("Meet next\nThursday", "next\nThursday"),
+        ("It is 2:30\npm", "2:30\npm"),
+    ],
+)
+def test_a_date_or_time_does_not_run_across_a_line_break(
+    text: str, joined: str
+) -> None:
+    for kind in ("date", "text"):
+        assert not any("\n" in c.text for c in pattern_candidates(field(kind), text))
+    assert joined not in {c.text for c in pattern_candidates(field("date"), text)}
+
+
+def test_a_date_on_one_line_is_still_found() -> None:
+    assert "August 14" in found("date", "Due August 14 for all")
+    assert "2:30 pm" in found("text", "It is 2:30 pm")
+
+
+@pytest.mark.parametrize(
+    "word", ["Call", "Please", "Contact", "Reply", "Send", "Thanks", "Total"]
+)
+def test_the_word_that_opens_an_instruction_is_not_a_name(word: str) -> None:
+    candidates = found("text", f"{word} Dana Whit about it.")
+    assert word not in candidates
+    assert "Dana Whit" in candidates  # the person after the verb is still a name
+    assert f"{word} Dana Whit" not in candidates
+
+
+def test_clauses_never_have_unbalanced_brackets() -> None:
+    text = (
+        "The fee (see the table, section 4) is due, and (as agreed) paid [late, again]."
+    )
+    structure = build_structure(text, to_lines(text), {})
+    for c in structure.candidates:
+        assert c.text.count("(") == c.text.count(")"), c.text
+        assert c.text.count("[") == c.text.count("]"), c.text

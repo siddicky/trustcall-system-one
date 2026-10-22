@@ -340,9 +340,13 @@ free), the wall seconds, and which warnings fired. Per call the log has `provide
   value and the sentence, that is a finding for the candidate generators, not for Jev.
 - Calibration: the library's thresholds were tuned on Cloudflare. Report the attribution
   probabilities (`probabilities` in `results.json`) next to the Cloudflare run before changing any.
-- An `UncertainOutcomeError` (a timeout or a 5xx, never resent: the call may have been charged), a
-  `RateLimitError` after the retries (429 and 529 are retried with backoff), and a 422 (the message names
-  the field; the body is not echoed).
+- An `UncertainOutcomeError` (a timeout, a 408 or any 5xx including 529 Overloaded, never resent: the
+  call may have been charged; a Clairic call that fails after an earlier request answered keeps those
+  tokens in the call log and counts as uncertain), a `RateLimitError` after the retries (only 429 is
+  retried, with backoff), and a 422 (the message names the field; the body and the user's text are not
+  echoed).
+- `needs_review` on a date whose year or week was inferred (confidence capped at 0.8: those are re-asked),
+  and `escalated: hook_error` / `hook_invalid` if you passed an escalation hook.
 - Before committing anything run `grep -rnE "apikey_[0-9a-f]{20,}" . --exclude-dir=.git
   --exclude-dir=.venv`: it must find nothing.
 
