@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
@@ -21,7 +21,6 @@ keywords = [
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
-  "License :: OSI Approved :: The Unlicense (Unlicense)",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
@@ -64,6 +63,21 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["trustcall_system_one"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/trustcall_system_one",
+  "/tests",
+  "/examples",
+  "/evals",
+  "/docs",
+  "/README.md",
+  "/LICENSE",
+  "/CONTRIBUTING.md",
+  "/AGENTS.md",
+  "/Makefile",
+  "/uv.lock",
+]
 
 [tool.ruff]
 line-length = 88

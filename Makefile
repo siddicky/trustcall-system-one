@@ -53,4 +53,4 @@ build:
 # help: Remove build, cache and coverage artifacts
 clean:
 	rm -rf dist build htmlcov .coverage .pytest_cache .mypy_cache .ruff_cache
-	find . -path ./.venv -prune -o -name __pycache__ -type d -exec rm -rf {} +
+	find . \( -path ./.venv -o -path ./.claude -o -path ./.git \) -prune -o -name __pycache__ -type d -exec rm -rf {} +

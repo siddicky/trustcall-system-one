@@ -5,7 +5,7 @@ Guide for contributors and coding agents working in this repository.
 ## What this is
 
 trustcall-system-one is a reimplementation of the ideas behind
-[trustcall](https://github.com/langchain-ai/trustcall): extract structured data
+[trustcall](https://github.com/hinthornw/trustcall): extract structured data
 from text, and update existing structured data through RFC-6902 JSON Patch
 operations. It runs on Cloudflare's System One models: Clairic
 (`@cf/cloudflare/clairic`, typed extraction) and Clef (`@cf/cloudflare/clef`,
@@ -27,8 +27,8 @@ API schemas for both models are in `docs/schemas/`.
 ## Licensing
 
 This repository is public domain under the Unlicense. The reference
-implementation, [trustcall](https://github.com/langchain-ai/trustcall) by
-LangChain, is MIT-licensed. Reimplement its behaviour from the design doc.
+implementation, [trustcall](https://github.com/hinthornw/trustcall) by
+William Fu-Hinthorn (LangChain), is MIT-licensed. Reimplement its behaviour from the design doc.
 Never copy its code, and credit it in the README.
 
 ## Layout

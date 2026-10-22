@@ -1,12 +1,15 @@
 name: CI
 
-# Lint and the unit suite run on every push and pull request. The live smoke
-# test talks to the real Cloudflare API, so it runs only when started by hand
-# (Actions > CI > Run workflow) and needs the repository secrets
-# CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN.
+# Lint and the unit suite run on pushes to main and on every pull request. The
+# live smoke test talks to the real Cloudflare API, so it runs only when started
+# by hand (Actions > CI > Run workflow). Its credentials come from the
+# `cloudflare-live` environment, whose secrets are CLOUDFLARE_ACCOUNT_ID and
+# CLOUDFLARE_API_TOKEN. Required reviewers can be configured on that environment
+# (Settings > Environments) so that a live run waits for approval.
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -14,8 +17,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   lint:
@@ -23,19 +26,18 @@ jobs:
     if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    env:
-      UV_PYTHON: "3.13"
     steps:
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
+          python-version: "3.13"
 
       - name: Install dependencies
-        run: uv sync --all-extras --dev --frozen
+        run: uv sync --all-extras --frozen
 
       - name: Lint
         run: make lint
@@ -49,19 +51,18 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
-    env:
-      UV_PYTHON: ${{ matrix.python-version }}
     steps:
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
+          python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: uv sync --all-extras --dev --frozen
+        run: uv sync --all-extras --frozen
 
       - name: Unit tests
         run: make test
@@ -71,22 +72,24 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    env:
-      UV_PYTHON: "3.13"
-      TRUSTCALL_S1_LIVE: "1"
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+    # Required reviewers are set on this environment, not in this file.
+    environment: cloudflare-live
     steps:
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
+          python-version: "3.13"
 
       - name: Install dependencies
-        run: uv sync --all-extras --dev --frozen
+        run: uv sync --all-extras --frozen
 
       - name: Live smoke tests
+        env:
+          TRUSTCALL_S1_LIVE: "1"
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: make smoke

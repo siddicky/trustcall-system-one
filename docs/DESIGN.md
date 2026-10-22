@@ -2,7 +2,7 @@
 
 ## Context
 
-`trustcall` (reference impl at https://github.com/langchain-ai/trustcall) solves two problems with tool-calling
+`trustcall` (reference impl at https://github.com/hinthornw/trustcall) solves two problems with tool-calling
 LLMs: they fail at populating large nested schemas, and they clobber existing data when asked
 to update it. Its fix is to make the LLM emit **RFC-6902 JSON Patch** tool calls
 (`PatchDoc`, `PatchFunctionErrors`) instead of whole documents, validate every call against
@@ -186,7 +186,7 @@ class Extractor:  # frozen; per-invoke state lives in _Run
 - **`existing`:** trustcall's five shapes (`{name: rec}`, `list[SchemaInstance]`,
   `(id, name, rec)`, `(id, BaseModel)`, bare `list[BaseModel]` with minted ids), `"__any__"`,
   and `existing_schema_policy` True/False/"ignore" — behavioural spec is
-  `_validate_existing` in trustcall's `trustcall/_base.py` (https://github.com/langchain-ai/trustcall).
+  `_validate_existing` in trustcall's `trustcall/_base.py` (https://github.com/hinthornw/trustcall).
 - **Matching:** `match=MatchConfig(accept, min_confidence, render_fields, collision, on_ambiguous,
   delete_threshold)` configures how a `Many` schema's entities are matched to its existing records
   (see "Collection engine", steps 8-9); `on_ambiguous="raise"` raises `AmbiguousMatchError`
@@ -1203,17 +1203,22 @@ README scenario (Many(Person), 3 existing, 4 people + Sunny, ~9 mentions): ~39 r
   carries `tests/`, `examples/`, `evals/` and `docs/`.
 - `Makefile`: `help`, `install`, `test`, `cov`, `smoke`, `record`, `evals`, `lint`, `format`,
   `build`, `clean`.
-- CI (`.github/workflows/ci.yml`): on every push and pull request, `make lint` (on Python 3.13)
-  and `make test` on Python 3.10, 3.11, 3.12 and 3.13. The live smoke test (`make smoke`) runs
-  only from a manual dispatch, with `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` taken from
-  repository secrets. Jobs are capped at 20 minutes and the token is read-only.
-- Release (`.github/workflows/release.yml`): a tag `v*` builds the sdist and wheel, fails unless
-  the tag (without the `v`) equals the `pyproject.toml` version, and publishes to PyPI with
-  trusted publishing (environment `pypi`, `id-token: write`, no stored API token). The one-time
-  pending publisher on pypi.org is: owner `siddicky`, repository `trustcall-system-one`, workflow
+- CI (`.github/workflows/ci.yml`): on pushes to `main`, on every pull request and on manual
+  dispatch. `make lint` (Python 3.13) and `make test` on Python 3.10, 3.11, 3.12 and 3.13 run on
+  pushes and pull requests. A new push cancels the older run of the same pull request. The live
+  smoke test (`make smoke`) runs only from a manual dispatch, in the `cloudflare-live`
+  environment, which holds `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` as secrets and can
+  require reviewers. Jobs are capped at 20 minutes, and the workflow's `GITHUB_TOKEN` is
+  read-only.
+- Release (`.github/workflows/release.yml`): a tag `v*` checks that the tag (without the `v`)
+  equals both `pyproject.toml` `version` and `trustcall_system_one/_version.py` `__version__`,
+  runs the tests, builds the sdist and wheel, and publishes to PyPI with trusted publishing
+  (environment `pypi`, `id-token: write`, no stored API token). The trusted publisher on pypi.org
+  (Manage > Publishing) is: owner `siddicky`, repository `trustcall-system-one`, workflow
   `release.yml`, environment `pypi`.
-- The first PyPI release is `0.1.0a1` (alpha). Install it with `pip install --pre
-  trustcall-system-one` or `uv add --prerelease=allow trustcall-system-one`.
+- Version `0.1.0a1` (alpha) was uploaded by hand with an API token, before the workflow existed.
+  Its install commands are `pip install --pre trustcall-system-one` and
+  `uv add --prerelease=allow trustcall-system-one`. The first workflow-driven release is `0.1.0a2`.
 
 ### Design decisions settled from the examples review
 
@@ -1274,8 +1279,8 @@ everything they would still have to build, next to the same task done with
 generate), quickstart and install/env, `One` insert, the multi-entity scenario printing
 ids/kinds/patches/spans/skipped/untouched, "unmentioned fields never clobbered", type table,
 cardinality rules, verification knobs, request profile, `existing` shapes, testing with
-`FakeWorld`, examples, limitations vs trustcall, credits (trustcall, MIT, by LangChain:
-https://github.com/langchain-ai/trustcall).
+`FakeWorld`, examples, limitations vs trustcall, credits (trustcall, MIT, by William Fu-Hinthorn
+(LangChain): https://github.com/hinthornw/trustcall).
 
 ### Curated examples
 
@@ -1324,14 +1329,12 @@ green. The examples were the acceptance tests for M5 to M9.
 ## Verification
 
 1. `make lint` (ruff + mypy strict) and `make test` (socket-disabled) green after every
-   milestone, run by the milestone's subagent and checked in its report, with the main
-   session reviewing the diff before the next milestone starts.
+   milestone.
 2. The README Emma/Michael/Sarah/Olivia scenario passes on `FakeWorld`, including bleed,
    coreference, collision and zero-entity cases.
-3. If `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN` are available in the session, run
+3. If `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN` are available in the environment, run
    `make smoke` against the live API and record cassettes (`make record`); if not, report that live
    verification was not possible and leave `make smoke` as the documented check. The commands of a
-   live session (smoke, record, evals baseline, threshold and strategy sweeps, and which numbers to
+   live run (smoke, record, evals baseline, threshold and strategy sweeps, and which numbers to
    report) are in `docs/LIVE_RUNBOOK.md`.
-4. A Haiku subagent pushes and opens the draft PR; the main session watches CI and sends
-   fixes to Haiku or Sonnet subagents (per the execution table) until it is green.
+4. CI must be green on the pull request before merge.

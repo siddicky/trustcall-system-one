@@ -7,7 +7,8 @@ lists every target.
 ## Releasing
 
 Releases go to PyPI from a git tag, through PyPI trusted publishing, so no API token is stored in
-the repository or in GitHub.
+the repository or in GitHub. (Version 0.1.0a1 was the exception: it was uploaded by hand with an
+API token. Every release from 0.1.0a2 on goes through the workflow.)
 
 1. Set the new version in `pyproject.toml` (`version`) and in `trustcall_system_one/_version.py`
    (`__version__`). Both must match, and the tag must match both.
@@ -15,15 +16,15 @@ the repository or in GitHub.
 3. Tag that commit and push the tag, for example:
 
    ```bash
-   git tag v0.1.0a1
-   git push origin v0.1.0a1
+   git tag v0.1.0a2
+   git push origin v0.1.0a2
    ```
 
-4. The `Release` workflow (`.github/workflows/release.yml`) builds the sdist and wheel, fails if
-   the tag does not match the `pyproject.toml` version, and publishes with
+4. The `Release` workflow (`.github/workflows/release.yml`) checks that the tag matches both
+   version strings, runs the tests, builds the sdist and wheel, and publishes them with
    `uv publish --trusted-publishing always` in the `pypi` environment.
 
-One-time setup, before the first release: on pypi.org, add a pending trusted publisher for
-`trustcall-system-one` with owner `siddicky`, repository `trustcall-system-one`, workflow
-`release.yml` and environment `pypi`. The GitHub repository needs an environment named `pypi`
-(Settings > Environments).
+One-time setup: on pypi.org, open the project's Manage > Publishing page and add a GitHub trusted
+publisher for `trustcall-system-one` with owner `siddicky`, repository `trustcall-system-one`,
+workflow `release.yml` and environment `pypi`. The GitHub repository needs an environment named
+`pypi` (Settings > Environments).
