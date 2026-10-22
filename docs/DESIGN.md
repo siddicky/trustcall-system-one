@@ -1297,13 +1297,17 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
   - Probabilities are checked: they must be non-negative and sum to 1 within 0.02, else they
     are normalised and the run gets a `decisions_probabilities_normalised` warning (all zero is a
     `ModelResponseError`), and `choice` must be the most probable option (a tie is fine), else
-    `ModelResponseError`. An answer that arrives without probabilities is a hard pick: it carries
-    `"hard": true` and its probability and confidence are capped at `decisions_hard_cap`
-    (default 0.9, range (0.5, 1]; 1.0 gives it full weight). 0.9 passes the 0.85 remove/set-null
-    gates and the 0.75 attribution keep but is visibly not certainty, and the warning counts
-    them. The observed answers had probabilities, but saturated (0.0/1.0, confidence 1.0), so
-    thresholds written for graded Clef answers (keep at 0.75, drop under 0.4, a re-ask between)
-    behave like yes/no on this fallback; those numbers are the API's own and are not capped.
+    `ModelResponseError`; the confidence reported cannot exceed the most probable option's
+    probability (after normalising). **An answer without probabilities, or whose probabilities
+    are all 0 and 1 (the shape the live API sends), is a hard pick**: it carries `"hard": true`
+    and its probability and confidence are capped at `decisions_hard_cap` (default **0.8**,
+    range (0.5, 1]; 1.0 gives it full weight), the rest sharing what is left. 0.8 sits below
+    `gates.remove_threshold` (0.85) and above the add (0.55) and replace (0.6) gates and the
+    attribution keep (0.75): **a bare GPT yes can never authorise a removal or a set-null by
+    itself, but it still passes an add or a replace**, and a bare no is 0.2 (below the 0.4
+    attribution drop). The warning counts hard answers. Graded probabilities (0.1/0.9, say) are
+    the API's own numbers and are left alone; thresholds written for graded Clef answers (a
+    re-ask band between 0.4 and 0.75) behave like yes/no on a fallback that mostly sends picks.
   - `images` are refused (`BadRequestError`) before sending, and `serves(model, payload)` is
     false for them (and for a payload that does not translate), so the primary's error is what
     comes out. Response keys: `provider: "decisions"`, `decisions_model`, `usage.cost` (the
@@ -1327,7 +1331,13 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
     `ExperientialTransport` raises the right type for each. `CloudflareTransport` retries
     timeouts, dropped connections, 408 and 5xx and raises the last failure, so after its retries
     a plain `TransportError` can be either a failed connection (`unavailable`) or a request that
-    was sent and lost (`uncertain`); its `classify_failure` looks at the error and its causes. So
+    was sent and lost (`uncertain`). Only the last attempt is visible in the last error, so
+    `CloudflareTransport.run` keeps a sticky `maybe_sent`: once any attempt failed after the
+    request may have reached the server (a post-send httpx error, a 408, a 5xx) the final error,
+    including a deadline or slot-timeout error, carries `maybe_sent=True` and classifies as
+    `uncertain` whatever the last attempt was (a timeout followed by a refused connection, or by
+    a 429, is a request that may have run); its `classify_failure` also looks at the error and
+    its causes. So
     `system_one_transport(clef="cloudflare", clef_fallback="decisions")` with the default only
     falls back when nothing could have run (a 429, a failed connection), not after a read
     timeout or a 5xx. An unknown transport is classified by type (`ServerError` is `uncertain`).
@@ -1340,7 +1350,11 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
     Clef, images, a payload that does not translate) is not tried and the primary's error comes
     out.
   - A fallback that fails too raises *its own* error (its `__cause__` is untouched) with the
-    primary's in `primary_error`; a fallback cancelled in flight carries it too. Transports
+    primary's in `primary_error`; a fallback cancelled in flight carries it too, and a fallback
+    that answers returns the primary's error on `TransportResponse.primary_error`, so the
+    engine logs the primary's call with its cost, request id, status and retries and adds a
+    charged-but-unusable primary answer to `reported_cost_usd` (primary $0.003 plus fallback
+    $0.001 is $0.004, each record with its request id). Transports
     mark the errors they raise with their `provider`. The engine logs **both calls**, each with
     its provider, whatever the outcome: the primary's failure and the fallback's answer, error
     or cancellation. So `unknown_outcomes` counts a primary timeout followed by a fallback

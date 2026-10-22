@@ -283,7 +283,10 @@ How to read it:
   (`hard_answer` for a bare pick), and a Clairic field it checked has `attribution_by:decisions`
   in `warnings`; the `clef_fallback_used` warning lists up to 8 uses.
 - The fallback is a different model: its answers are not Clef's. Observed probabilities were
-  saturated (0.0 and 1.0, confidence 1.0), so the thresholds' re-ask bands do not fire on it.
+  saturated (0.0 and 1.0, confidence 1.0), which is a bare pick: it is tagged `hard` and capped at
+  0.8 (`decisions_hard_cap`), below the 0.85 remove / set-null gate, so a fallback answer cannot
+  authorise a removal by itself (an add or a replace still passes) and the re-ask bands do not
+  fire on it.
   Compare the quality of a fallback run against a normal one before relying on it; a case that
   only passes because the fallback answered is a finding, not a pass.
 - `images` cannot be sent to the Decisions API: such a request fails with the primary's error.

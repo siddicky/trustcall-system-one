@@ -348,10 +348,22 @@ class Run:
         may have been charged, so both are logged, each with its provider.
         """
         primary = getattr(exc, "primary_error", None)
-        if primary is None:
-            return
+        if primary is not None:
+            self._log_primary(model, meta, n_items, primary)
+
+    def _log_primary(
+        self, model: str, meta: CallMeta, n_items: int, primary: BaseException
+    ) -> None:
+        """Log a primary's failed call, with what it may have cost.
+
+        Its status, retries, request id and provider are recorded, and a cost its
+        response reported (a bad but charged answer) is the call's ``cost_usd`` and
+        is added to the spend.
+        """
+        charged_model = getattr(primary, "served_model", None) or model
+        spent = getattr(primary, "reported_cost", None)
         self._record(
-            model,
+            charged_model,
             meta,
             n_items,
             retries=getattr(primary, "retries", 0),
@@ -359,7 +371,10 @@ class Run:
             error=f"{type(primary).__name__}: {primary}",
             request_id=getattr(primary, "request_id", None),
             provider=getattr(primary, "provider", None),
+            cost=spent,
         )
+        if spent is not None:
+            self.usage.add_spend(charged_model, meta.kind, spent)
 
     async def _send(
         self,
@@ -439,14 +454,17 @@ class Run:
         """
         self.fallback_used += 1
         self.fallback_route = (str(response.provider), str(response.fallback_from))
-        self._record(
-            model,
-            meta,
-            n_items,
-            duration_ms=(time.perf_counter() - started) * 1000,
-            error=response.fallback_error,
-            provider=response.fallback_from,
-        )
+        if response.primary_error is not None:
+            self._log_primary(model, meta, n_items, response.primary_error)
+        else:
+            self._record(
+                model,
+                meta,
+                n_items,
+                duration_ms=(time.perf_counter() - started) * 1000,
+                error=response.fallback_error,
+                provider=response.fallback_from,
+            )
         self._note_fallback_use(meta)
 
     def _note_fallback_use(self, meta: CallMeta) -> None:

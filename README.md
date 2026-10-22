@@ -686,7 +686,10 @@ to OpenAI as well.** A Clef request that its provider certainly did not process 
 timeout or a 5xx the primary may already have run and been charged, so the same question is
 *not* sent again unless you also opt in to that
 (`TRUSTCALL_S1_CLEF_FALLBACK_ON=unavailable,uncertain`): then it can be paid for twice.
-With Clef on Cloudflare the default falls back only for a 429 or a failed connection.
+With Clef on Cloudflare the default falls back only for a 429 or a failed connection, and not
+when any earlier attempt may have run. The Decisions API sends bare picks (probabilities of 0
+and 1): they are capped at `DecisionsTransport(decisions_hard_cap=0.8)`, below the removal
+gate (0.85), so a fallback answer can add or replace a value but cannot remove one by itself.
 
 ## Extract one record
 

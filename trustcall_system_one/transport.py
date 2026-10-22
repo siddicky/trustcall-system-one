@@ -90,6 +90,8 @@ class TransportResponse:
         fallback_from: When a ``FallbackTransport`` had to use its fallback, the
             provider that failed.
         fallback_error: ... and how it failed (error class and message).
+        primary_error: When a fallback answered, the error of the primary that
+            came first (its charge and request id are logged by the engine).
         served_model: The model that answered when it is not the one the request
             named (the Decisions model of a fallback), so that calls are
             accounted under the model that was used.
@@ -104,6 +106,7 @@ class TransportResponse:
     fallback_from: str | None = None
     fallback_error: str | None = None
     served_model: str | None = None
+    primary_error: BaseException | None = None
 
 
 @runtime_checkable
@@ -423,6 +426,8 @@ def _tagged(run: _F) -> _F:
             return await run(self, *args, **kwargs)
         except (asyncio.CancelledError, TrustcallSystemOneError) as exc:
             _tag(exc, self.provider)
+            if getattr(exc, "served_model", None) is None:
+                setattr(exc, "served_model", self._error_model())  # noqa: B010
             raise
 
     return cast(_F, wrapper)
@@ -523,6 +528,10 @@ class _HttpTransport:
             if not client.is_closed:
                 with contextlib.suppress(Exception):  # best effort
                     asyncio.run(client.aclose())
+
+    def _error_model(self) -> str | None:
+        """The model to file a failed call under when it is not the one asked."""
+        return None
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._injected_client is not None:
@@ -642,6 +651,8 @@ class CloudflareTransport(_HttpTransport):
             return None
         if isinstance(exc, ModelResponseError):
             return "bad_response"
+        if getattr(exc, "maybe_sent", False):
+            return "uncertain"  # an earlier attempt may have run, whatever came last
         chain: list[BaseException] = []
         link: BaseException | None = exc
         while link is not None and link not in chain:
@@ -811,6 +822,11 @@ class CloudflareTransport(_HttpTransport):
     ) -> TransportResponse:
         """Run one model call with retries.
 
+        Every ``TransportError`` that comes out says in ``maybe_sent`` whether ANY
+        attempt failed after the request may have reached the server (a post-send
+        httpx error, a 408 or a 5xx), not only the last one: a timeout followed by
+        a refused connection is a request that may have been run.
+
         Args:
             model: Full ``@cf/...`` model id.
             payload: Request body.
@@ -835,6 +851,22 @@ class CloudflareTransport(_HttpTransport):
 
         Every ``TransportError`` raised from here carries ``retries``.
         """
+        sent = [False]  # sticky: an attempt may have reached the server
+        try:
+            return await self._attempts(model, payload, meta, timeout, sent)
+        except TransportError as exc:
+            exc.maybe_sent = exc.maybe_sent or sent[0]
+            raise
+
+    async def _attempts(
+        self,
+        model: str,
+        payload: Mapping[str, Any],
+        meta: CallMeta,
+        timeout: float | None,
+        sent: list[bool],
+    ) -> TransportResponse:
+        """The attempts of ``run``; ``sent[0]`` becomes true once one may have run."""
         url, token = self._url_and_token(model)
         headers = self._headers(token, meta)
         client = self._get_client()
@@ -858,9 +890,15 @@ class CloudflareTransport(_HttpTransport):
                             url, json=payload, headers=headers, **post_kwargs
                         )
                     except _RETRYABLE_ERRORS as exc:
+                        if not isinstance(
+                            exc, (*_PRE_SEND_RETRYABLE, httpx.PoolTimeout)
+                        ):
+                            sent[0] = True
                         failure = TransportError(f"Request to {url} failed: {exc!r}")
                         failure.__cause__ = exc
                     except httpx.HTTPError as exc:
+                        if not isinstance(exc, _PRE_SEND_FATAL):
+                            sent[0] = True
                         error = TransportError(f"Request to {url} failed: {exc!r}")
                         error.retries = retries
                         raise error from exc
@@ -885,6 +923,8 @@ class CloudflareTransport(_HttpTransport):
                         )
                         if status == 429:
                             self.limiter.on_rate_limited(model, generation)
+                        if status == 408 or status >= 500:
+                            sent[0] = True  # it may have been run
                         failure = _error_for_status(response, retry_after=retry_after)
                         if status not in _RETRYABLE_STATUS and status < 500:
                             failure.retries = retries
@@ -1494,11 +1534,13 @@ class DecisionsTransport(ExperientialTransport):
         Args:
             decisions_model: The Decisions model to ask.
             base_url: The endpoint that receives the POST.
-            decisions_hard_cap: The most probability (and confidence) an answer
-                without probabilities is given, in ``(0.5, 1]``. The default 0.9
-                passes the 0.85 remove/set-null gates and the 0.75 attribution
-                keep, but shows in the numbers that the answer is a bare pick and
-                is tagged ``"hard"``; 1.0 gives the answer full weight.
+            decisions_hard_cap: The most probability (and confidence) a hard pick is
+                given, in ``(0.5, 1]``. A hard pick is an answer without
+                probabilities or with only 0 and 1 (the shape the API sends), tagged
+                ``"hard"``. The default 0.8 passes the add (0.55) and replace (0.6)
+                gates and the 0.75 attribution keep, but sits below the 0.85
+                remove / set-null gate, so a bare yes cannot authorise a removal by
+                itself; 1.0 gives it full weight.
             **kwargs: The other settings of ``ExperientialTransport`` (``api_key``,
                 ``client``, ``timeout``, ``max_retries``, ``call_deadline``,
                 ``min_attempt_budget``, ...).
@@ -1532,6 +1574,9 @@ class DecisionsTransport(ExperientialTransport):
 
     def _served_model(self, body: Mapping[str, Any]) -> str | None:
         return str(body.get("decisions_model") or self._decisions_model)
+
+    def _error_model(self) -> str | None:
+        return self._decisions_model
 
     def _prepare(self, payload: Mapping[str, Any]) -> tuple[Mapping[str, Any], Any]:
         body, plans = to_decisions_request(payload, model=self._decisions_model)
@@ -1735,11 +1780,13 @@ class FallbackTransport:
                 fallback_error.primary_error = primary_error  # type: ignore[attr-defined]
                 raise
             failure = f"{type(primary_error).__name__}: {primary_error}"
+            first_error: BaseException = primary_error  # kept past the except block
         return dataclasses.replace(
             answered,
             provider=answered.provider or _provider_name(self._fallback),
             fallback_from=_provider_name(self._primary),
             fallback_error=failure[:600],
+            primary_error=first_error,
         )
 
     def sensitive_values(self) -> tuple[str, ...]:

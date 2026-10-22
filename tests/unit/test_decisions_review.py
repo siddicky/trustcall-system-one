@@ -427,7 +427,7 @@ async def test_hard_answers_are_counted_in_the_warning() -> None:
     run = Run(transport=FallbackTransport(Raises(RateLimitError("429")), backup))
     answers = await run.call_clef(review_questions(), "s", meta=META)
     assert answers["review"].model_extra["hard"] is True  # type: ignore[index]
-    assert answers["review"].confidence == 0.9  # type: ignore[union-attr]
+    assert answers["review"].confidence == 0.8  # type: ignore[union-attr]
     assert run.fallback_hard == 1
     (warning,) = run.warnings
     assert "1 answer(s) came without probabilities" in warning

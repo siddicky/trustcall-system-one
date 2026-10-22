@@ -44,6 +44,10 @@ class TrustcallSystemOneError(Exception):
     """The cost in USD that a response reported although it could not be used."""
     served_model: str | None = None
     """The model that was asked, when it is not the one the request named."""
+    maybe_sent: bool = False
+    """Whether any attempt failed after the request may have reached the server
+    (set by ``CloudflareTransport``, which retries: the last failure alone does not
+    say whether an earlier attempt may have been run)."""
 
 
 class TransportError(TrustcallSystemOneError):

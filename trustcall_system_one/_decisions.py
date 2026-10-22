@@ -55,8 +55,11 @@ __all__ = [
 DECISIONS_MODEL = "gpt-6-luna-decisions"
 """The model the Decisions API serves by default."""
 
-DEFAULT_HARD_CAP = 0.9
-"""Most probability an answer without probabilities (a hard pick) is given."""
+DEFAULT_HARD_CAP = 0.8
+"""Most probability (and confidence) a hard pick is given: an answer without
+probabilities, or with only 0 and 1. 0.8 passes the add (0.55) and replace (0.6)
+gates and the attribution keep (0.75), but never the remove / set-null gate
+(0.85): a bare yes from the fallback cannot authorise a removal by itself."""
 
 YES = "yes"
 NO = "no"
@@ -332,6 +335,7 @@ def _bad(message: str, body: Any) -> ModelResponseError:
 
 _SUM_TOLERANCE = 0.02
 _ARGMAX_TOLERANCE = 1e-9
+_SATURATED = 1e-9
 
 
 def _answer(
@@ -347,15 +351,9 @@ def _answer(
         )
     hard = given.probabilities is None
     others = max(1, len(plan.values) - 1)
-    if given.probabilities is None:
-        # No probabilities: the answer is a hard pick. All of the mass would be
-        # 1.0, which no gate could tell from certainty, so it is capped.
-        probabilities = {
-            v: hard_cap if v == given.choice else (1.0 - hard_cap) / others
-            for v in plan.values
-        }
-        confidence = hard_cap
-    else:
+    probabilities: dict[str, float]
+    confidence: float
+    if given.probabilities is not None:
         reported = {p.value: p.probability for p in given.probabilities}
         unknown = sorted(set(reported) - set(plan.values))
         if unknown:
@@ -381,7 +379,21 @@ def _answer(
                 f"option ({probabilities})",
                 body,
             )
-        confidence = given.confidence if given.confidence is not None else top
+        # the reported confidence cannot be higher than the probabilities say
+        confidence = top if given.confidence is None else min(given.confidence, top)
+        # Probabilities that are all 0 and 1 (what the live API sends) are a pick
+        # that says nothing about how sure it is: a hard answer, like one without.
+        hard = all(
+            p <= _SATURATED or p >= 1.0 - _SATURATED for p in probabilities.values()
+        )
+    if hard:
+        # All of the mass would be 1.0, which no gate could tell from certainty, so
+        # it goes to the cap (below the remove / set-null threshold).
+        probabilities = {
+            v: hard_cap if v == given.choice else (1.0 - hard_cap) / others
+            for v in plan.values
+        }
+        confidence = hard_cap
     answer: dict[str, Any]
     if plan.kind == "noul":
         answer = {"type": "noul", "noul": probabilities[YES]}

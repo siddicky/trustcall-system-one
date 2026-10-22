@@ -353,12 +353,15 @@ def test_the_observed_response_becomes_a_clef_choice_answer() -> None:
     validator("clef-output").validate(clef)
     assert parsed.model == "clef"
     answer = clef["answers"]["review"]
+    # the live answer is saturated (0.0 / 1.0, confidence 1.0): a bare pick, so it is
+    # tagged hard and capped below the remove / set-null gate (0.85)
     assert answer == {
         "type": "choice",
         "choice": "review",
-        "probabilities": {"accept": 0.0, "review": 1.0},
-        "confidence": 1.0,
+        "probabilities": {"accept": pytest.approx(0.2), "review": 0.8},
+        "confidence": 0.8,
         "provider": "decisions",
+        "hard": True,
     }
     assert clef["usage"] == {"input_tokens": 201, "output_tokens": 0, "cost": 0.0}
     assert (clef["provider"], clef["decisions_model"]) == ("decisions", DECISIONS_MODEL)
@@ -395,8 +398,12 @@ def test_noul_is_the_probability_of_yes() -> None:
     assert math.isclose(
         noul(choice="no", probabilities=probs(yes=0.1, no=0.3))["noul"], 0.25
     )
-    # a missing option has probability 0 (and the rest is normalised)
-    assert noul(choice="yes", probabilities=probs(yes=0.6))["noul"] == 1.0
+    # a missing option has probability 0 and the rest is normalised: 1.0 is a bare
+    # yes, which is capped
+    assert noul(choice="yes", probabilities=probs(yes=0.6))["noul"] == 0.8
+    assert noul(choice="yes", probabilities=probs(yes=0.9, no=0.2))[
+        "noul"
+    ] == pytest.approx(0.9 / 1.1)
     # within 0.02 they are left alone
     assert noul(choice="yes", probabilities=probs(yes=0.51, no=0.48))["noul"] == 0.51
 
@@ -417,20 +424,20 @@ def test_an_answer_without_probabilities_is_hard_capped_and_tagged() -> None:
     validator("clef-output").validate(clef)
     assert clef["model"] == "clef-flash"
     answers = clef["answers"]
-    # a bare pick is never 1.0: the cap (0.9) shows in the numbers and in the tag
+    # a bare pick is never 1.0: the cap (0.8) shows in the numbers and in the tag
     assert answers["z_last"] == {
         "type": "noul",
-        "noul": 0.9,
+        "noul": 0.8,
         "provider": "decisions",
         "hard": True,
     }
     assert answers["a_first"]["probabilities"] == {
-        "london": pytest.approx(0.05),
-        "paris": 0.9,
-        "rome": pytest.approx(0.05),
+        "london": pytest.approx(0.1),
+        "paris": 0.8,
+        "rome": pytest.approx(0.1),
     }
-    assert answers["a_first"]["confidence"] == 0.9
-    assert answers["m_score"]["score"] == pytest.approx(0.05 + 1.8)
+    assert answers["a_first"]["confidence"] == 0.8
+    assert answers["m_score"]["score"] == pytest.approx(0.1 + 1.6)
     assert all(a["hard"] is True for a in answers.values())
     no = response_for(
         payload,
@@ -441,7 +448,7 @@ def test_an_answer_without_probabilities_is_hard_capped_and_tagged() -> None:
     )
     assert from_decisions_response(no, plans, clef_model="clef")["answers"]["z_last"][
         "noul"
-    ] == pytest.approx(0.1)
+    ] == pytest.approx(0.2)
     # the cap is a knob; 1.0 gives a bare pick full weight
     full = from_decisions_response(body, plans, clef_model="clef", hard_cap=1.0)
     assert full["answers"]["z_last"]["noul"] == 1.0
