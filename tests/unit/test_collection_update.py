@@ -989,7 +989,7 @@ async def test_no_deletes_unless_enabled() -> None:
 
 async def test_a_record_both_updated_and_deleted_is_a_conflict() -> None:
     world = people_world()
-    world.delete("1", 0.97)  # Michael is matched AND flagged
+    world.delete("1", 0.97)  # Michael is matched AND flagged, and the text changes him
     result = await invoke(world, EXISTING, enable_inserts=True, enable_deletes=True)
     assert [(r.json_doc_id, r.kind) for r in result.records] == [
         ("0", "update"),
@@ -1000,16 +1000,58 @@ async def test_a_record_both_updated_and_deleted_is_a_conflict() -> None:
     assert conflict.entity.label == "Michael Chen"
     assert conflict.candidates == (("1", 0.92),)
     assert "neither updated nor deleted" in conflict.detail
-    assert result.deleted == ()  # no update, no delete
+    assert "operation(s) passed the gate" in conflict.detail
+    assert result.deleted == ()  # an operation went through the gate: no delete
     assert result.untouched == ()  # the conflicting record was dealt with
-    # no extraction was spent on Michael
-    assert not any(
-        m.kind in ("extract", "gate") and m.entity == "e2"
+    # the update ran to find out, and its operations are not in the result
+    michael = [
+        m
         for _, _, m in world.transport().calls
+        if m.kind == "gate" and m.entity == "e2"
+    ]
+    assert michael
+
+
+def silent_michael_world() -> FakeWorld:
+    """Michael is mentioned and matched, but the text says nothing new about him."""
+    fresh = FakeWorld(CONVERSATION)
+    fresh.entity(
+        "Emma Thompson",
+        schema=Person,
+        mentions=["Emma Thompson", "Emma"],
+        fields={"name": "Emma Thompson", "notes": EMMA_NOTES},
+        matches={"name": "Emma Thompson"},
+    )
+    fresh.entity(
+        "Michael Chen",
+        schema=Person,
+        mentions=["Michael Chen", "Michael"],
+        fields={"name": "Michael Chen"},  # no notes: nothing to change
+        matches={"name": "Michael Chen"},
+    )
+    return fresh
+
+
+async def test_a_mentioned_record_with_nothing_to_change_is_deleted() -> None:
+    """ "Please remove Michael": mentioned, matched, flagged, nothing else changes."""
+    world = silent_michael_world()
+    world.delete("1", 0.97)
+    result = await invoke(world, EXISTING, enable_deletes=True)
+    assert [(r.json_doc_id, r.kind) for r in result.records] == [
+        ("0", "update"),
+        ("1", "delete"),
+    ]
+    assert result.deleted == ("1",)
+    assert result.skipped == () or all(
+        s.reason != "conflict_update_delete" for s in result.skipped
+    )
+    # the update was run to find out that nothing survived the gate
+    assert any(
+        m.kind == "extract" and m.entity == "e1" for _, _, m in world.transport().calls
     )
 
 
-async def test_a_matched_flagged_record_is_a_conflict_even_without_updates() -> None:
+async def test_a_matched_flagged_record_is_deleted_when_updates_are_disabled() -> None:
     world = people_world()
     world.delete("1", 0.97)
     result = await invoke(
@@ -1019,10 +1061,14 @@ async def test_a_matched_flagged_record_is_a_conflict_even_without_updates() -> 
         enable_updates=False,
         enable_deletes=True,
     )
-    assert [(r.json_doc_id, r.kind) for r in result.records] == [(None, "insert")]
-    assert result.deleted == ()
+    # no update could change him, so the removal stands; no request was spent on him
+    assert [(r.json_doc_id, r.kind) for r in result.records] == [
+        (None, "insert"),
+        ("1", "delete"),
+    ]
+    assert result.deleted == ("1",)
     reasons = {s.entity.label: s.reason for s in result.skipped}
-    assert reasons["Michael Chen"] == "conflict_update_delete"
+    assert "Michael Chen" not in reasons
     assert reasons["Emma Thompson"] == "updates_disabled"
     assert result.untouched == ()
 

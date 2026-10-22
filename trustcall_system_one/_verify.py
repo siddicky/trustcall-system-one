@@ -911,7 +911,7 @@ def _aligned(answer: ClairicAnswer, anchored: RenderedState) -> ClairicAnswer:
         return text[pair[0] : pair[1]]
 
     if len(spans) == len(value) and all(
-        _fold(item) in _fold(covered(pair)) or _fold(covered(pair)) in _fold(item)
+        _fold(item) == _fold(covered(pair))
         for item, pair in zip(value, spans, strict=True)
     ):
         return answer
@@ -1315,8 +1315,15 @@ def _frame(rendered: RenderedState, pair: Span) -> bool:
     """
     text = rendered.text
     start = rendered.input_span[0]
-    close = text.find("\n</input>", rendered.input_span[1])
-    end = len(text) if close < 0 else close
+    end = len(text)
+    # where the input block ends in the state Clairic read: its closing tag, or,
+    # if the tag is not there as sent, whatever else follows the input
+    for marker in ("\n</input>", "\n<existing"):
+        found = text.find(marker, rendered.input_span[1])
+        if found >= 0:
+            end = min(end, found)
+    if rendered.existing_span is not None:
+        end = min(end, rendered.existing_span[0])
     return pair[0] < start or pair[1] > end
 
 

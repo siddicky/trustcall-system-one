@@ -520,9 +520,14 @@ schema title: "Person").
      They run concurrently with matching. At `>= delete_threshold` the record is
      `ResultRecord(kind="delete", json_doc_id=<id>, before=<record>, after=None, value=None,
      entity=None, delete_p=p)` and `ExtractionResult.deleted` lists its id;
-   * a record both matched (accepted) and flagged for delete → `SkippedEntity(
-     reason="conflict_update_delete", candidates=((id, match p),))`: neither an update nor a
-     delete (and no extraction request), whatever `enable_updates` says;
+   * a record both matched (accepted) and flagged for delete (the input MENTIONS it, as in "please
+     remove X"): the update runs first and decides. If no operation survives the gate (nothing but
+     "remove it" is said about it) the record is deleted (`kind="delete"`); if at least one gated
+     operation exists ("drop the quantity of X to 1" flagged by mistake) the input both changes
+     and removes it, which is `SkippedEntity(reason="conflict_update_delete", candidates=((id,
+     match p),))`: neither an update nor a delete, its operations are not in the result. With
+     `enable_updates=False` nothing could change, so the removal stands without a request; an
+     identity-conflict refusal (a wrong match) is reported as such and holds the delete;
    * a record flagged for delete that an `ambiguous_match` entity most likely is (its best record
      candidate, at 0.25 or more, including an identity-conflict refusal) is not deleted either:
      run warning `match_delete_held`;
@@ -595,12 +600,13 @@ assignment, thresholds, `on_ambiguous`, `match_collision` etc.; then
 * *removal* only with `enable_item_removals` (`create_extractor`): one Clef `noul` per existing
   item, over `{input, records: {r0: <item>, ...}, parent}` ("Does `input` state that `records.r0`
   should be deleted from `parent.label` ..."), at `match.delete_threshold` → `remove /items/<i>`
-  (a mapping: `remove /stock/<key>`); an item both matched and flagged is
-  `SkippedEntity(conflict_update_delete)` with no operation, like at the top level.
+  (a mapping: `remove /stock/<key>`); an item both matched and flagged follows the same rule as a
+  top-level record (step 9): no operation through the gate (the text only says to remove it) →
+  `remove`, otherwise `SkippedEntity(conflict_update_delete)` with no operation.
 
-All operations join the parent's list and follow its rules: replace → remove (highest index first,
-so indexes do not shift) → add (`/-`, in plan order); `apply_ops` knows the nested list pointers
-(`_fix_missing_parents` creates a list the record lacks); the patched parent is validated, an
+All operations join the parent's list and follow its rules (see "Operation order" below);
+`apply_ops` knows the nested list pointers (`_fix_missing_parents` creates a list the record lacks,
+and treats one the record holds as `null` as missing: the `add` of the list replaces the null); the patched parent is validated, an
 operation on the line of a validation error is dropped (`validation`, its path inside the item),
 and an error about an element the record already held is not the update's (`_held_element`: no
 request, the update's operations stay). The items' answers are `fields` of the parent
@@ -614,6 +620,18 @@ has a blue mugs line. For a line the order lacks that is the right quantity; for
 it five") whether `replace quantity 2` stands. There is no arithmetic on the record anywhere in
 the update path. `examples/07_order_line_items.py` and `tests/unit/test_nested_collections.py`
 pin this.
+
+**Textual fallbacks of discovery.** A discovered value no returned span covers (or listed more
+often than spans cover it) takes occurrences of its text by search: all of them when no span covers
+it, else only as many as are missing, standalone ones first (an occurrence followed by a capitalised
+word is probably a longer name); never an occurrence inside the text of a longer listed value;
+and in a nested scope only those near the parent's mentions (the verification windows around them)
+when there are any, else anywhere.
+
+**Required collections** that were not extracted (past `max_depth` / `max_recursion`, or a list of
+a union of models) are `[]` / `{}` in an insert, like one the input says nothing about. For a mapping
+of models `limits.max_recursion` counts the VALUE model on the chain (each level builds its own
+entry class).
 
 **Known limits.** A list of a union of models is not extracted (`unsupported_list_item`). A mapping
 key is its identity and is not renamed. The parent label that scopes a request is the label of
@@ -643,8 +661,8 @@ and their list elements also case-folded with internal whitespace collapsed, so 
 compares exactly) → `replace`;
 equal → nothing; null answer → **no op**, recorded as `RejectedOp(op=None,
 reason="not_mentioned")` (silence is not deletion; opt-in `gates.allow_null_removals`);
-scalar lists use set semantics → `add /notes/-` for new elements only. Order: replace →
-remove (highest array index first) → add (`/-`), a deterministic sort key. Apply with
+scalar lists use set semantics → `add /notes/-` for new elements only. Order (see "Operation
+order"): in place → removals (highest array index first) → appends, a deterministic sort key. Apply with
 `jsonpatch.apply_patch` on a deep copy, op by op; on conflict try `_fix_string_concat`
 then `_fix_missing_parents`, recording `repaired_from`. The full rules are in "Update path".
 
@@ -668,6 +686,14 @@ makes no operation for it.
 Clairic requests always send
 `options.return_state_text=true` so span offsets are re-anchored on sentinel markers;
 `truncated: true` → re-ask the same fields on overlapping chunks that cover the whole input (size from the returned `state_text`, overlap ≥ `verify.window_chars`), concurrently, and merge per field: every non-null scalar is kept as a candidate, ranked by confidence; candidates that agree (normalised equality / text ratio ≥ 0.9 / equal numbers) are one value, disagreeing ones go to a Clef `adjudicate` over the distinct candidates (≥ `verify.adjudicate_min`; one request for all conflicting fields, and a decisive `neither` makes the field null), then to attribution in confidence order (one request, first to pass wins; its probability is handed to the ladder so it is not asked twice), then the most confident stands for the ladder to judge; dates, times, durations, numbers and digit-heavy strings agree only when equal after normalisation, never on text similarity; lists are united in input order and an overlapping span replaces a kept element only if it contains exactly that one (confidence breaks ties for equal spans); an all-null merge reports the lowest `p_null` so the borderline-null check still fires; a chunk that is still truncated is split smaller once, then warn/raise `StateTruncatedError`. Any part of the input that is not sent always produces a warning.
+
+**Operation order (`_diff.sort_changes`).** Operations name array elements by their index in the
+RECORD, and only a removal shifts indexes, so: (1) *in place* first: replacements, then every other
+operation whose path lies inside an existing array element at any level (`add /items/1/sku`,
+`add /items/1/tags/-`, a set-to-null), because `add /items/1/sku` sorted after `remove /items/0`
+would land on the wrong element; (2) *removals*, the highest array index first, and what lies inside
+an element before the element; (3) *appends* (`/-`, a new key), in plan order. Test:
+`test_diff.py` (two levels) and `test_nested_collections.py`.
 
 ## Update path (`One` schema with an existing record)
 
@@ -796,8 +822,9 @@ ones).
 `adjudication_failed`, `null_check`, `attribution`, `attribution_missing`, `none_of_these`
 (list element); update checks `echo_span`, `echo_crosscheck`, `crosscheck_disagree`;
 sub-models `invalid_optional_group`; nested collections `invalid_item` (an item that failed validation,
-left out of the record; its path is the collection's) and `key_fixed` (an operation on the key of a
-mapping entry, which is its identity and is never renamed); `validation` for an error left after the drops. Computed operations that were thrown away (`op` is the
+left out of the record; its path is the collection's), `missing_key` (a mapping entry with no
+key; `duplicate` when it repeats one of the record or of an earlier new entry, the first is kept) and
+`key_fixed` (an operation on the key of a mapping entry, which is its identity and is never renamed); `validation` for an error left after the drops. Computed operations that were thrown away (`op` is the
 operation): `identity_subset`, `duplicate`, `required_field`, `gate_noul`, `gate_missing`
 (no gate answer), `apply_failed`, `validation`; `identity_conflict` (a collection entity whose
 extracted identity shares no name with the record it was matched to: every operation of the

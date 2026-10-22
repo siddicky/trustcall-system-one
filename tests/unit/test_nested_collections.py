@@ -9,7 +9,7 @@ the result is operations inside the parent's patch list.
 # ruff: noqa: UP045 - the schemas deliberately spell Optional
 
 from collections import Counter
-from typing import Annotated, Any, Optional
+from typing import Annotated, Any, Literal, Optional
 
 import pytest
 from pydantic import BaseModel, Field
@@ -763,8 +763,11 @@ def removal_world() -> FakeWorld:
         mentions=["SO-10442"],
         fields={"order_id": "SO-10442"},
     )
-    # the kettle and the spoons are flagged by the removal question; the text
-    # names no entity for them (an entity matched to a flagged line is a conflict)
+    # the way live discovery produces them: the lines to remove ARE mentioned, so
+    # they are entities, matched to their lines and flagged by the removal question;
+    # the text changes nothing about them, so no operation survives the gate
+    add_line(world, "steel kettle", "Steel kettle")
+    add_line(world, "wooden spoon set", "Wooden spoon set")
     add_line(world, "tea towels", "Tea towels", quantity=1)
     world.delete("0", parent="Order").delete("2", parent="Order")
     return world
@@ -791,11 +794,50 @@ async def test_removed_items_go_high_index_first() -> None:
     assert [i["name"] for i in record.after["items"]] == ["Tea towels"]
     assert result.deleted == ()  # an item is not a record: nothing is "deleted"
     assert result.skipped == ()
+    # the mentioned lines were matched and updated first, to find out that nothing
+    # about them survived the gate
+    extracts = [c for c in calls_of(world, "extract") if c[2].scope == "e0/items"]
+    assert len(extracts) == 3
     deletes = calls_of(world, "delete")
     assert deletes and deletes[0][2].scope == "e0/items"
     question = next(iter(deletes[0][1]["questions"].values()))
     assert "from `parent.label`" in question["instructions"]
     assert deletes[0][1]["state"]["parent"]["label"] == "the Order"
+
+
+async def test_one_item_is_changed_and_another_removed_in_one_email() -> None:
+    text = "Order SO-10442: please remove the steel kettle, and make the tea towels 1."
+    world = FakeWorld(text)
+    world.entity(
+        "the Order",
+        schema=Order,
+        mentions=["SO-10442"],
+        fields={"order_id": "SO-10442"},
+    )
+    add_line(world, "steel kettle", "Steel kettle")
+    add_line(world, "tea towels", "Tea towels", quantity=1)
+    world.delete("0", parent="Order")
+    result = await update_order(world, enable_item_removals=True)
+    (record,) = result.records
+    assert [(p.op, p.path) for p in record.patches] == [
+        ("replace", "/items/1/quantity"),
+        ("remove", "/items/0"),
+    ]
+    assert record.after is not None
+    assert [i["name"] for i in record.after["items"]] == [
+        "Tea towels",
+        "Wooden spoon set",
+    ]
+    assert record.after["items"][0]["quantity"] == 1
+    assert result.skipped == ()
+
+
+async def test_mentioned_lines_are_not_removed_without_enable_item_removals() -> None:
+    world = removal_world()
+    result = await update_order(world)
+    (record,) = result.records
+    assert ops(record) == [("replace", "/items/1/quantity", 1)]
+    assert record.after is not None and len(record.after["items"]) == 3
 
 
 async def test_an_item_that_is_matched_and_flagged_for_removal_is_a_conflict() -> None:
@@ -1055,7 +1097,27 @@ async def test_a_mapping_entry_is_replaced_added_and_the_rest_left_alone() -> No
 
 
 async def test_a_mapping_entry_is_removed_with_enable_item_removals() -> None:
-    world = student_world()
+    text = "Dana's math score is now 95, and her physics score is struck off."
+    world = FakeWorld(text)
+    world.entity(
+        "Dana",
+        schema=Student,
+        mentions=["Dana"],
+        fields={"name": "Dana"},
+        matches={"name": "Dana"},
+    )
+    for key, value in (("math", 95), ("physics", None)):
+        fields: Doc = {"key": key}
+        if value is not None:
+            fields["value"] = value
+        world.entity(
+            key,
+            schema="StudentScoresEntry",
+            parent="Dana",
+            mentions=[key],
+            fields=fields,
+            matches={"key": key},
+        )
     world.delete("physics", parent="Dana")
     extractor = create_extractor(
         [Many(Student)],
@@ -1063,10 +1125,15 @@ async def test_a_mapping_entry_is_removed_with_enable_item_removals() -> None:
         enable_inserts=True,
         enable_item_removals=True,
     )
-    result = await extractor.ainvoke(GRADE_UPDATE, existing=[DANA])
+    result = await extractor.ainvoke(text, existing=[DANA])
     (record,) = result.records
-    assert ("remove", "/scores/physics") in [(p.op, p.path) for p in record.patches]
-    assert record.after == {"name": "Dana", "scores": {"math": 95, "chemistry": 80}}
+    # physics is mentioned and matched, and flagged, with nothing to change
+    assert [(p.op, p.path) for p in record.patches] == [
+        ("replace", "/scores/math"),
+        ("remove", "/scores/physics"),
+    ]
+    assert record.after == {"name": "Dana", "scores": {"math": 95}}
+    assert result.skipped == ()
 
 
 async def test_a_mapping_of_models_changes_a_field_inside_the_entry() -> None:
@@ -1380,3 +1447,371 @@ async def test_a_list_that_must_not_be_empty_makes_the_parent_invalid_not_a_cras
     assert record.errors and record.errors[0].startswith("members:")
     assert [s.reason for s in result.skipped] == ["validation_failed"]
     assert kinds(result)["repair"] == 0  # nothing a repair could re-ask
+
+
+# --------------------------------------------------------------------------- #
+# Review fixes: operation order, null holders, keys, limits
+# --------------------------------------------------------------------------- #
+
+
+async def test_an_operation_inside_an_item_is_applied_before_a_lower_removal() -> None:
+    text = (
+        "Order SO-10442: the tea towels have product code TWL-LIN. Cancel the kettle."
+    )
+    world = FakeWorld(text)
+    world.entity(
+        "the Order",
+        schema=Order,
+        mentions=["SO-10442"],
+        fields={"order_id": "SO-10442"},
+    )
+    add_line(world, "tea towels", "Tea towels", sku="TWL-LIN")
+    add_line(world, "kettle", "Steel kettle")
+    world.delete("0", parent="Order")
+    order = {
+        **ORDER,
+        "items": [
+            {"name": "Steel kettle", "quantity": 1, "sku": "KTL"},
+            {"name": "Tea towels", "quantity": 4, "sku": None},
+            {"name": "Wooden spoon set", "quantity": 2, "sku": None},
+        ],
+    }
+    result = await update_order(world, order, enable_item_removals=True)
+    (record,) = result.records
+    # the add names item 1 of the RECORD, so it goes before `remove /items/0`
+    assert [(p.op, p.path) for p in record.patches] == [
+        ("add", "/items/1/sku"),
+        ("remove", "/items/0"),
+    ]
+    assert record.after is not None
+    assert [(i["name"], i["sku"]) for i in record.after["items"]] == [
+        ("Tea towels", "TWL-LIN"),
+        ("Wooden spoon set", None),
+    ]
+
+
+async def test_a_list_the_record_holds_as_null_takes_its_first_item() -> None:
+    class Cart(BaseModel):
+        """A cart."""
+
+        order_id: str
+        items: Annotated[Optional[list[LineItem]], Many(identity="name")] = None
+
+    text = "Order SO-1: please add 2 blue mugs."
+    for record_in in ({"order_id": "SO-1", "items": None}, {"order_id": "SO-1"}):
+        world = FakeWorld(text)
+        world.entity(
+            "the Cart", schema=Cart, mentions=["SO-1"], fields={"order_id": "SO-1"}
+        )
+        world.entity(
+            "blue mugs",
+            schema=LineItem,
+            parent="Cart",
+            mentions=["blue mugs"],
+            fields={"name": "blue mugs", "quantity": 2},
+        )
+        extractor = create_extractor(
+            [One(Cart)], transport=world.transport(), enable_inserts=True
+        )
+        result = await extractor.ainvoke(text, existing=[("c", "Cart", record_in)])
+        (record,) = result.records
+        assert [(p.op, p.path) for p in record.patches] == [
+            ("add", "/items"),
+            ("add", "/items/-"),
+        ]
+        assert record.after == {
+            "order_id": "SO-1",
+            "items": [{"name": "blue mugs", "quantity": 2}],
+        }
+        assert not [r for r in record.rejected if r.reason == "apply_failed"]
+
+
+def escaping_world(text: str) -> FakeWorld:
+    world = FakeWorld(text)
+    world.entity(
+        "Dana",
+        schema=Student,
+        mentions=["Dana"],
+        fields={"name": "Dana"},
+        matches={"name": "Dana"},
+    )
+    return world
+
+
+async def test_mapping_keys_are_escaped_in_the_patch() -> None:
+    text = "Dana: a/b is now 95, c~d got 80, and drop x~1y."
+    world = escaping_world(text)
+    world.entity(
+        "a/b",
+        schema="StudentScoresEntry",
+        parent="Dana",
+        mentions=["a/b"],
+        fields={"key": "a/b", "value": 95},
+        matches={"key": "a/b"},
+    )
+    world.entity(
+        "c~d",
+        schema="StudentScoresEntry",
+        parent="Dana",
+        mentions=["c~d"],
+        fields={"key": "c~d", "value": 80},
+    )
+    world.delete("x~1y", parent="Dana")
+    existing = {"name": "Dana", "scores": {"a/b": 90, "x~1y": 1, "keep": 5}}
+    extractor = create_extractor(
+        [Many(Student)],
+        transport=world.transport(),
+        enable_inserts=True,
+        enable_item_removals=True,
+    )
+    result = await extractor.ainvoke(text, existing=[("d", "Student", existing)])
+    (record,) = result.records
+    assert ops(record) == [
+        ("replace", "/scores/a~1b", 95),
+        ("remove", "/scores/x~01y", None),
+        ("add", "/scores/c~0d", 80),
+    ]
+    assert record.after == {"name": "Dana", "scores": {"a/b": 95, "keep": 5, "c~d": 80}}
+
+
+CHEM = "Dana got 80 in chemistry . Her chem grade, 85, was revised."
+
+
+def chem_world() -> FakeWorld:
+    world = escaping_world(CHEM)
+    world.entity(
+        "chemistry",
+        schema="StudentScoresEntry",
+        parent="Dana",
+        mentions=["chemistry"],
+        fields={"key": "chemistry", "value": 80},
+    )
+    world.entity(
+        "chem",
+        schema="StudentScoresEntry",
+        parent="Dana",
+        mentions=["chem"],
+        fields={"key": " chemistry ", "value": 85},
+    )
+    return world
+
+
+async def test_two_new_entries_with_one_key_keep_the_first_on_update() -> None:
+    existing = {"name": "Dana", "scores": {"math": 90}}
+    extractor = create_extractor(
+        [Many(Student)], transport=chem_world().transport(), enable_inserts=True
+    )
+    result = await extractor.ainvoke(CHEM, existing=[("d", "Student", existing)])
+    (record,) = result.records
+    assert ops(record) == [("add", "/scores/chemistry", 80)]
+    assert [(r.op, r.path, r.reason) for r in record.rejected if r.op] == [
+        ("add", "/scores/chemistry", "duplicate")
+    ]
+    assert record.after == {"name": "Dana", "scores": {"math": 90, "chemistry": 80}}
+
+
+async def test_the_same_holds_on_insert_and_the_key_is_stripped_the_same() -> None:
+    extractor = create_extractor([Many(Student)], transport=chem_world().transport())
+    result = await extractor.ainvoke(CHEM)
+    (record,) = result.records
+    assert record.after == {"name": "Dana", "scores": {"chemistry": 80}}
+    assert [(r.path, r.reason) for r in record.rejected] == [("/scores", "duplicate")]
+
+
+async def test_an_entry_without_a_key_is_a_missing_key_not_an_invalid_item() -> None:
+    world = escaping_world("Dana got 80.")
+    world.entity(
+        "80",
+        schema="StudentScoresEntry",
+        parent="Dana",
+        mentions=["80"],
+        fields={"key": " ", "value": 80},
+    )
+    for existing in (None, [("d", "Student", {"name": "Dana", "scores": {}})]):
+        extractor = create_extractor(
+            [Many(Student)], transport=world.transport(), enable_inserts=True
+        )
+        result = await extractor.ainvoke("Dana got 80.", existing=existing)
+        (record,) = result.records
+        assert [r.reason for r in record.rejected if "scores" in r.path] != []
+        assert {r.reason for r in record.rejected if "scores" in r.path} <= {
+            "missing_key"
+        } | {"not_mentioned"}
+        assert "invalid_item" not in {r.reason for r in record.rejected}
+
+
+async def test_a_required_list_cut_off_by_a_limit_is_empty_not_missing() -> None:
+    class Req(BaseModel):
+        """A tree node."""
+
+        label: str = Field(description="the node's label")
+        children: list["Req"] = Field(description="sub-nodes")  # required
+
+    Req.model_rebuild()
+    text = "Root has Alpha, Alpha has Beta, Beta has Gamma."
+    world = FakeWorld(text)
+    world.entity("Root", schema=Req, mentions=["Root"], fields={"label": "Root"})
+    for label, parent in (("Alpha", "the Req"), ("Beta", "Alpha"), ("Gamma", "Beta")):
+        world.entity(
+            label,
+            schema=Req,
+            parent=parent,
+            mentions=[(label, 0)],
+            fields={"label": label},
+        )
+    result = await create_extractor([One(Req)], transport=world.transport()).ainvoke(
+        text
+    )
+    (record,) = result.records
+    assert record.valid and result.skipped == ()
+    assert record.after == {
+        "label": "Root",
+        "children": [
+            {"label": "Alpha", "children": [{"label": "Beta", "children": []}]}
+        ],
+    }
+    assert not [r for r in record.rejected if r.reason == "invalid_item"]
+
+
+async def test_a_required_list_of_a_union_of_models_is_empty() -> None:
+    class Dog(BaseModel):
+        kind: Literal["dog"] = "dog"
+        name: str
+
+    class Cat(BaseModel):
+        kind: Literal["cat"] = "cat"
+        name: str
+
+    class Home(BaseModel):
+        """A home."""
+
+        owner: str = Field(description="the owner")
+        pets: list[Dog | Cat]
+
+    text = "Ines owns a home."
+    world = FakeWorld(text)
+    world.entity("Ines", schema=Home, mentions=["Ines"], fields={"owner": "Ines"})
+    result = await create_extractor([Home], transport=world.transport()).ainvoke(text)
+    (record,) = result.records
+    assert record.valid and record.after == {"owner": "Ines", "pets": []}
+    assert any("unsupported_list_item" in w for w in result.warnings)
+
+
+async def test_a_schema_with_a_list_of_a_union_of_models_can_be_updated() -> None:
+    class Dog(BaseModel):
+        kind: Literal["dog"] = "dog"
+        name: str
+
+    class Cat(BaseModel):
+        kind: Literal["cat"] = "cat"
+        name: str
+
+    class Owner(BaseModel):
+        """A person."""
+
+        name: str = Field(description="full name")
+        city: Optional[str] = Field(None, description="city")
+        pets: list[Dog | Cat] = Field(default_factory=list)
+
+    text = "Emma Thompson moved to Lyon."
+    world = FakeWorld(text)
+    world.entity(
+        "Emma Thompson",
+        schema=Owner,
+        mentions=["Emma Thompson"],
+        fields={"name": "Emma Thompson", "city": "Lyon"},
+        matches={"name": "Emma Thompson"},
+    )
+    existing = [
+        (
+            "a",
+            "Owner",
+            {
+                "name": "Emma Thompson",
+                "city": "Paris",
+                "pets": [{"kind": "dog", "name": "Rex"}],
+            },
+        )
+    ]
+    result = await create_extractor([Many(Owner)], transport=world.transport()).ainvoke(
+        text, existing=existing
+    )
+    (record,) = result.records
+    assert ops(record) == [("replace", "/city", "Lyon")]
+    assert record.after is not None and record.after["pets"] == [
+        {"kind": "dog", "name": "Rex"}
+    ]
+
+
+def test_a_mapping_of_itself_stops_at_max_recursion_like_a_list() -> None:
+    from trustcall_system_one import Limits, compile_schema
+    from trustcall_system_one._nested import guard, nest_for
+    from trustcall_system_one._run import Run
+    from trustcall_system_one._verify import Ctx, Nest
+
+    class DNode(BaseModel):
+        """A tree node keyed by name."""
+
+        label: str = Field(description="the node's label")
+        kids: dict[str, "DNode"] = Field(default_factory=dict, description="kids")
+
+    class LNode(BaseModel):
+        """A tree node."""
+
+        label: str = Field(description="the node's label")
+        kids: list["LNode"] = Field(default_factory=list, description="kids")
+
+    DNode.model_rebuild()
+    LNode.model_rebuild()
+    levels = {}
+    for model in (LNode, DNode):
+        limits = Limits(max_depth=64)
+        run = Run(transport=FakeTransport(lambda *a: None), limits=limits)
+        plan = compile_schema(model, limits=limits)
+        nest = Nest(0, (model,))
+        count = 0
+        while count < 40:
+            spec = plan.collection_specs()[0]
+            item = plan.collection(spec)
+            ctx = Ctx(run=run, plan=plan, text="", label="x", nest=nest)
+            if guard(ctx, spec, item):
+                break
+            nest = nest_for(ctx, spec, item)
+            plan = item.item
+            count += 1
+        levels[model.__name__] = count
+    assert levels == {"LNode": 2, "DNode": 2}
+
+
+async def test_a_mapping_of_itself_is_extracted_to_max_recursion_and_no_further() -> (
+    None
+):
+    class DNode(BaseModel):
+        """A tree node keyed by name."""
+
+        label: str = Field(description="the node's label")
+        kids: dict[str, "DNode"] = Field(default_factory=dict, description="kids")
+
+    DNode.model_rebuild()
+    text = "Root has Alpha, Alpha has Beta, Beta has Gamma, Gamma has Delta."
+    world = FakeWorld(text)
+    world.entity("Root", schema=DNode, mentions=["Root"], fields={"label": "Root"})
+    result = await create_extractor([One(DNode)], transport=world.transport()).ainvoke(
+        text
+    )
+    assert sum("max_recursion" in w for w in result.warnings) <= 1
+    assert len({c.scope for c in result.calls if c.scope}) <= 3
+
+
+def test_a_parent_can_be_given_as_the_world_entity() -> None:
+    world = FakeWorld(OWNERS)
+    emma = world.entity(
+        "Emma Thompson", schema=Person, mentions=["Emma Thompson"], fields={}
+    )
+    rex = world.entity(
+        "Rex", schema=Pet, parent=emma, mentions=["Rex"], fields={"name": "Rex"}
+    )
+    world.non_entity("Tom", schema=Pet, parent=emma, mentions=["Tom"])
+    world.bleed_item(emma, rex)
+    world.delete("0", parent=emma)
+    assert rex.parent == "Emma Thompson"

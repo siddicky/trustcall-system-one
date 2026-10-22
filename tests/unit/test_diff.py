@@ -759,6 +759,67 @@ def test_a_set_to_null_counts_as_a_removal_in_the_order() -> None:
     assert [c.path for c in ordered] == ["/y", "/x"]
 
 
+def test_everything_inside_an_element_goes_before_the_removals_of_its_list() -> None:
+    ordered = sort_changes(
+        [
+            change("add", "/items/-", {"name": "new"}),
+            change("remove", "/items/0"),
+            change("add", "/items/1/sku", "S"),
+            change("replace", "/items/2/qty", 3),
+            change("remove", "/items/2"),
+            change("replace", "/items/1/note", None),
+        ]
+    )
+    assert [(c.op, c.path) for c in ordered] == [
+        ("replace", "/items/2/qty"),
+        ("replace", "/items/1/note"),
+        ("add", "/items/1/sku"),
+        ("remove", "/items/2"),
+        ("remove", "/items/0"),
+        ("add", "/items/-"),
+    ]
+
+
+def test_the_order_holds_at_every_level() -> None:
+    ordered = sort_changes(
+        [
+            change("remove", "/items/0"),
+            change("add", "/items/1/tags/-", "t"),
+            change("remove", "/items/1/tags/0"),
+            change("add", "/items/1/tags/2/sku", "S"),
+            change("replace", "/items/1/tags/2/qty", 1),
+            change("remove", "/items/1"),
+            change("add", "/home/pets/-", "x"),
+        ]
+    )
+    paths = [(c.op, c.path) for c in ordered]
+    # in place first (at any depth), replacements before additions
+    assert paths[:3] == [
+        ("replace", "/items/1/tags/2/qty"),
+        ("add", "/items/1/tags/-"),
+        ("add", "/items/1/tags/2/sku"),
+    ]
+    # then removals: what lies inside an element before the element, higher index
+    # before lower; appends at the very end
+    assert paths[3:] == [
+        ("remove", "/items/1/tags/0"),
+        ("remove", "/items/1"),
+        ("remove", "/items/0"),
+        ("add", "/home/pets/-"),
+    ]
+
+
+def test_a_null_parent_is_as_good_as_a_missing_one_for_an_add() -> None:
+    result = apply_ops(
+        {"order_id": "o", "items": None},
+        [PatchOp("add", "/items/-", {"n": 1})],
+        lists={"/items"},
+    )
+    assert result.failed == []
+    assert result.doc == {"order_id": "o", "items": [{"n": 1}]}
+    assert [op.path for op in result.applied] == ["/items", "/items/-"]
+
+
 def test_sorting_is_stable_and_deterministic() -> None:
     changes = [change("add", "/notes/-", str(i)) for i in range(5)]
     assert sort_changes(changes) == changes

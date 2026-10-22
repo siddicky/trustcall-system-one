@@ -1737,6 +1737,7 @@ def _mapping_kind(ctx: _Ctx, value: Any) -> _Kind:
     skipped with the reason.
     """
     shape = _strip(value)
+    shape = dataclasses.replace(shape, base=_resolve(ctx, shape.base))
     value_ctx = dataclasses.replace(
         ctx, path=(*ctx.path, "value"), nullable=False, required=True, options={}
     )
@@ -2729,6 +2730,7 @@ class CollectionPlan:
         item: The plan of one item (of one entry, for a mapping).
         typed_dict: Whether the items are ``TypedDict`` values (plain dicts in
             the parent, not model instances).
+        model: For a mapping of models, the value model (see ``recursion_model``).
     """
 
     spec: FieldSpec
@@ -2736,6 +2738,16 @@ class CollectionPlan:
     many: Many
     item: SchemaPlan
     typed_dict: bool = False
+    model: type[BaseModel] | None = None
+
+    @property
+    def recursion_model(self) -> type[BaseModel]:
+        """The model the recursion limit counts: the item model, or the value model.
+
+        A mapping of models builds one synthetic entry class per level, so the
+        entry class never repeats; the model of its values does.
+        """
+        return self.model if self.model is not None else self.item.schema
 
     @property
     def is_dict(self) -> bool:
@@ -2809,14 +2821,20 @@ def _collection_plan(plan: SchemaPlan, spec: FieldSpec) -> CollectionPlan:
         )
     shape = _strip(spec.annotation)
     value = typing_extensions.get_args(shape.base)[1]
+    # the model that declares the field (not the plan's: the field may sit in a
+    # sub-model, and a name in its annotation is looked up where it was written)
+    parent = next((g.model for g in plan.all_groups() if spec in g.specs), plan.schema)
+    if isinstance(value, (str, typing.ForwardRef)):
+        value = _resolve_in(parent, value)
     label = many.label or _singular(str(spec.path[-1]))
-    parent = plan.schema
     entry = _entry_model(parent, str(spec.path[-1]), spec.description, value, label)
+    held = _resolve_in(parent, _strip(value).base)
     return CollectionPlan(
         spec,
         "dict",
         Many(identity=KEY_FIELD, label=label),
         compile_schema(entry, gates=plan.gates, limits=plan.limits),
+        model=_as_model(held) if _is_model(held) else None,
     )
 
 

@@ -844,28 +844,57 @@ def diff_group(
 # Ordering
 # --------------------------------------------------------------------------- #
 
-_RANK: dict[str, int] = {"replace": 0, "remove": 1, "add": 2}
-
 
 def _removal_key(path: str) -> tuple[tuple[int, int, str], ...]:
-    """Sort key putting the highest array index first (other parts in order)."""
+    """Sort key putting the highest array index first (other parts in order).
+
+    A path inside another sorts before it (the closing marker is greater than any
+    step), so the elements of a removed element are removed before it.
+    """
     parts = path.split("/")[1:]
-    return tuple((0, -int(p), "") if p.isdigit() else (1, 0, p) for p in parts)
+    return (
+        *((0, -int(p), "") if p.isdigit() else (1, 0, p) for p in parts),
+        (2, 0, ""),
+    )
+
+
+def _inside_element(path: str) -> bool:
+    """Whether a path lies inside an element of an array (``/items/1/sku``)."""
+    parts = path.split("/")[1:]
+    return any(part.isdigit() for part in parts[:-1])
+
+
+def _phase(change: Change) -> int:
+    """0: in place (replace; any operation inside an element); 1: removal; 2: append."""
+    if change.op == "remove":
+        return 1
+    if _inside_element(change.path):
+        return 0
+    if change.removes:
+        return 1
+    return 0 if change.op == "replace" else 2
 
 
 def sort_changes(changes: Sequence[Change]) -> list[Change]:
-    """Order operations deterministically: replace, remove, add.
+    """Order operations deterministically so that no index shifts under another.
 
-    Replacements come first (they cannot move anything), removals next with the
-    highest array index first (so an earlier removal never shifts a later
-    index), then additions (appends with ``/-``) in plan order. Ties keep the
-    order of ``changes``.
+    1. In place: replacements, and every other operation whose path lies inside an
+       existing array element (``replace /items/1/qty``, ``add /items/1/sku``,
+       ``add /items/1/tags/-``), replacements first. They name elements by their
+       index in the record, so they all come before anything that shifts indexes,
+       at every level of nesting.
+    2. Removals, the highest array index first (and what lies inside an element
+       before the element), so that an earlier removal never shifts a later index.
+    3. Appends (``/-``, a new key), in plan order.
+
+    Ties keep the order of ``changes``.
     """
     indexed = list(enumerate(changes))
     indexed.sort(
         key=lambda pair: (
-            _RANK[pair[1].op] if not pair[1].removes else _RANK["remove"],
-            _removal_key(pair[1].path) if pair[1].removes else (),
+            _phase(pair[1]),
+            1 if _phase(pair[1]) == 0 and pair[1].op != "replace" else 0,
+            _removal_key(pair[1].path) if _phase(pair[1]) == 1 else (),
             pair[0],
         )
     )
@@ -926,12 +955,13 @@ def _fix_missing_parents(
 ) -> list[PatchOp] | None:
     """Add the objects (or the list) an ``add`` needs above its target.
 
-    The missing ancestors are added outermost first, each as ``{}`` (``[]`` when
-    the next step is ``-``); the original operation follows unchanged. Which
-    parent is a list comes from the plan (``lists``, the pointers of the list
-    fields): an all-digit key of an object is not an index. Without a plan only
-    ``-`` says "list". Returns ``None`` if the first existing ancestor cannot
-    hold a child, or if nothing is missing.
+    An ancestor the document holds as ``null`` counts as missing (the ``add`` of
+    the container replaces the null). The missing ancestors are added outermost
+    first, each as ``{}`` (``[]`` when the next step is ``-``); the original
+    operation follows unchanged. Which parent is a list comes from the plan
+    (``lists``, the pointers of the list fields): an all-digit key of an object is
+    not an index. Without a plan only ``-`` says "list". Returns ``None`` if the
+    first existing ancestor cannot hold a child, or if nothing is missing.
     """
     if op.op != "add":
         return None
@@ -942,7 +972,8 @@ def _fix_missing_parents(
     depth = 0
     node: Any = doc
     for part in parts[:-1]:
-        if isinstance(node, dict) and part in node:
+        # a parent that is null is as good as missing: ``add`` replaces it
+        if isinstance(node, dict) and node.get(part) is not None:
             node = node[part]
             depth += 1
         else:

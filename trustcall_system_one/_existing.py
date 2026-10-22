@@ -374,6 +374,8 @@ def _names(owner: Iterable[Any]) -> dict[str, str]:
 
 def _normalise_items(plan: SchemaPlan, spec: FieldSpec, value: Any) -> Any:
     """Normalise the items of a collection or mapping value (else leave it alone)."""
+    if spec.engine == "collection" and len(spec.models) != 1:
+        return value  # a list of a union of models has no item plan: left alone
     item = plan.collection(spec)
     if spec.engine == "collection":
         if not isinstance(value, list):

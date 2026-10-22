@@ -973,6 +973,12 @@ def _fragment(
         _place_union(ctx, union, doc, out, trail)
     for nested in result.collections:
         _place_collection(nested, doc, out)
+    placed = {nested.spec.path for nested in result.collections}
+    for spec in group.specs:
+        # a collection that was not extracted (a limit, a list of a union of
+        # models) is empty, as one the input says nothing about is
+        if spec.engine in COLLECTIONS and spec.path not in placed:
+            _empty_collection(spec, doc)
     return doc
 
 
@@ -992,8 +998,18 @@ def _place_collection(
     value = nested.document()
     if value:
         doc[doc_key(spec)] = value
-    elif not spec.has_default:
-        doc[doc_key(spec)] = None if spec.nullable else value
+    else:
+        _empty_collection(spec, doc)
+
+
+def _empty_collection(spec: FieldSpec, doc: dict[str, Any]) -> None:
+    """A collection field with nothing in it: its default, else empty (or ``None``)."""
+    if not spec.has_default:
+        doc[doc_key(spec)] = None if spec.nullable else _empty_of(spec)
+
+
+def _empty_of(spec: FieldSpec) -> list[Any] | dict[str, Any]:
+    return {} if spec.engine == "mapping" else []
 
 
 def _unsay(out: _Assembly, pretty_path: str) -> None:
@@ -2494,10 +2510,12 @@ def _identity_conflict(
     identity fields the match stands as soon as one of them fits; a field the input
     gave no value for says nothing. A schema without identity never conflicts.
 
-    Any one of the entity's mentions that fits the record's identity settles it:
-    coreference linked the names, so an entity that the input calls both "Sarah
-    Johnson" and "Sarah Miller" is the record "Sarah Johnson", and the new name is
-    left to the change gate.
+    A mention of the entity that fits the record's identity and does NOT fit the
+    extracted one settles it: coreference linked the names, so an entity that the
+    input calls both "Sarah Johnson" and "Sarah Miller" is the record "Sarah
+    Johnson", and the new name is left to the change gate. A short form that fits
+    both ("Emma" next to "Emma Watson", for the record "Emma Thompson") is no
+    evidence.
     """
     seen: list[tuple[str, str, str]] = []
     for name in names:
@@ -2508,8 +2526,13 @@ def _identity_conflict(
         new, old = state.resolved.value, before.get(spec.alias or name)
         if not isinstance(new, str) or not isinstance(old, str):
             continue
+        # a mention that fits the record and does not fit what the input calls the
+        # entity is the other name of the same entity ("Sarah Johnson" next to
+        # "Sarah Miller"); a short form of both ("Emma" for Emma Watson and Emma
+        # Thompson) says nothing
         if identity_compatible(new, old) or any(
-            identity_compatible(mention, old) for mention in mentions
+            identity_compatible(mention, old) and not identity_compatible(mention, new)
+            for mention in mentions
         ):
             return ""
         seen.append((name, new, old))

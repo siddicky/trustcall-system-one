@@ -63,6 +63,7 @@ from trustcall_system_one._render import (
     RenderedState,
     discovery_focus,
     entity_focus,
+    mention_windows,
 )
 from trustcall_system_one._run import CLEF_BATCH, Run, gather
 from trustcall_system_one._types import (
@@ -506,6 +507,36 @@ def _occurrences(source: str, text: str) -> list[Span]:
     return []
 
 
+def _part_of_a_name(source: str, span: Span) -> bool:
+    """Whether a capitalised word follows the span: it is probably a longer name."""
+    after = re.match(r"[ \t][A-Z]", source[span[1] : span[1] + 2])
+    return bool(source[span[0] : span[0] + 1].isupper() and after)
+
+
+def _parent_region(
+    source: str, run: Run | None, scope: Scope | None
+) -> list[Span] | None:
+    """Where the items of a nested list are looked for by text: around the parent.
+
+    The input may talk about other parents elsewhere, and their items must not be
+    taken for this one's. ``None``: no restriction (a top-level collection, or a
+    parent whose mentions are unknown).
+    """
+    if scope is None or scope.parent is None or not scope.parent_spans():
+        return None
+    chars = run.verify.window_chars if run is not None else 600
+    return mention_windows(len(source), scope.parent_spans(), chars)
+
+
+def _search(source: str, text: str, region: Sequence[Span] | None) -> list[Span]:
+    """Occurrences of ``text``, those inside the region first (and alone, if any)."""
+    found = _occurrences(source, text)
+    if region is None:
+        return found
+    inside = [o for o in found if any(a <= o[0] and o[1] <= b for a, b in region)]
+    return inside or found
+
+
 def _answered_spans(
     answer: ClairicAnswer, anchored: RenderedState | None
 ) -> list[Span]:
@@ -565,10 +596,18 @@ def parse_mentions(
         return []
     found: list[Mention] = []
     spans = _answered_spans(answer, anchored)
+    values = {_fold(str(i)): str(i) for i in answer.value if str(i).strip()}
     listed: dict[str, int] = {}
     for item in answer.value:
         if str(item).strip():
             listed[_fold(str(item))] = listed.get(_fold(str(item)), 0) + 1
+    # where the model pointed at a longer listed value: a shorter value's extra
+    # occurrences are not looked for inside it
+    longer: dict[str, list[Span]] = {}
+    for key in values:
+        holders = [other for other in values if len(other) > len(key) and key in other]
+        longer[key] = [s for s in spans if _fold(source[s[0] : s[1]]) in holders]
+    region = _parent_region(source, run, scope)
     used: set[Span] = set()
     done: set[str] = set()
     for item in answer.value:
@@ -579,7 +618,16 @@ def parse_mentions(
         done.add(key)
         covering = [s for s in spans if _fold(source[s[0] : s[1]]) == key]
         if len(covering) < listed[key]:
-            covering = _occurrences(source, text) or covering
+            free = [o for o in _search(source, text, region) if o not in covering]
+            if covering:  # the model pointed at some: only as many more as listed
+                free = [
+                    o
+                    for o in free
+                    if not any(h[0] <= o[0] and o[1] <= h[1] for h in longer[key])
+                ]
+                free.sort(key=lambda o: (_part_of_a_name(source, o), o))
+                free = sorted(free[: listed[key] - len(covering)])
+            covering = [*covering, *free]
         if not covering:
             if run is not None:
                 message = (
@@ -1399,10 +1447,12 @@ async def apply_collection(
        whether the input says to remove it, concurrently;
     3. an entity matched to a record is updated by the full update path of
        ``update_one`` (presence not asked again, attribution scoped to the entity),
-       unless the record is also flagged for deletion (``conflict_update_delete``:
-       neither happens) or ``enable_updates`` is off (``updates_disabled``); a new
+       unless ``enable_updates`` is off (``updates_disabled``); a new
        entity is inserted if ``enable_inserts`` (else ``inserts_disabled``); an
-       entity that could not be matched is ``ambiguous_match``;
+       entity that could not be matched is ``ambiguous_match``. If the record is
+       also flagged for deletion the update runs and decides: with no operation
+       through the gate the record is deleted (the input only says "remove it"),
+       with at least one it is a ``conflict_update_delete`` and neither happens;
     4. the records flagged for deletion are deleted (``kind="delete"``, ``after``
        ``None``), last, in record order; records nothing happened to are untouched.
 
@@ -1479,25 +1529,61 @@ async def apply_collection(
         if p is not None and p >= run.match.delete_threshold
     }
 
+    async def flagged_work(info: EntityInfo, record: ExistingRecord) -> _Work:
+        """An entity matched to a record the input also says to delete.
+
+        The update runs first. If no operation survives the gate (the input says
+        "remove it" and nothing else about it) the record is deleted; if the update
+        has at least one gated operation the input both changes and removes the
+        record, which is a conflict: neither happens. An identity conflict (a wrong
+        match) is reported as such and holds the delete (``match_delete_held``).
+        """
+        handle = (record.schema_name, record.record_id)
+        if not enable_updates:  # nothing could be changed: the removal stands
+            return _Work(info, handled=handle)
+        done = await _update_entity(run, scope, info, record, enable_updates=True)
+        kept = done.record.patches if done.record is not None else ()
+        if done.skipped is not None and done.skipped.reason == "ambiguous_match":
+            return _Work(
+                info,
+                done.record,
+                done.skipped,
+                done.attempts,
+                done.extracted,
+                done.handled,
+                done.nested_skipped,
+            )
+        if not kept:
+            return _Work(
+                info,
+                attempts=done.attempts,
+                extracted=done.extracted,
+                handled=handle,
+            )
+        p = delete_p[record.record_id] or 0.0
+        return _Work(
+            info,
+            skipped=SkippedEntity(
+                plan.name,
+                info,
+                "conflict_update_delete",
+                f"{info.label!r} matches the record {record.record_id!r}, and the "
+                f"input also says that record should be deleted (p={p:.2f}) while "
+                f"changing it ({len(kept)} operation(s) passed the gate); it was "
+                "neither updated nor deleted",
+                ((record.record_id, info.match_probs.get(record.record_id, 0.0)),),
+            ),
+            attempts=done.attempts,
+            extracted=done.extracted,
+            handled=handle,
+        )
+
     async def work(info: EntityInfo) -> _Work:
         target = matched.targets[info.key]
         if target is not None:
             record = by_id[target]
             if target in flagged:
-                p = delete_p[target] or 0.0
-                return _Work(
-                    info,
-                    skipped=SkippedEntity(
-                        plan.name,
-                        info,
-                        "conflict_update_delete",
-                        f"{info.label!r} matches the record {target!r}, and the "
-                        f"input also says that record should be deleted "
-                        f"(p={p:.2f}); it was neither updated nor deleted",
-                        ((target, info.match_probs.get(target, 0.0)),),
-                    ),
-                    handled=(record.schema_name, record.record_id),
-                )
+                return await flagged_work(info, record)
             done = await _update_entity(
                 run, scope, info, record, enable_updates=enable_updates
             )

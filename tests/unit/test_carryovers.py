@@ -436,3 +436,162 @@ async def test_an_optional_list_keeps_its_default_and_an_update_makes_no_op() ->
     )
     (record,) = done.records
     assert record.patches == () and record.after == {"name": "Widget", "tags": ["a"]}
+
+
+# --------------------------------------------------------------------------- #
+# Review fixes of the carry-overs
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_short_form_mention_does_not_defeat_the_identity_guard() -> None:
+    """ "Emma" fits both Emma Watson and Emma Thompson: it proves nothing."""
+    text = "Emma Watson moved to Lyon. Emma loves it there."
+    world = FakeWorld(text)
+    world.entity(
+        "Emma Watson",
+        schema=Person,
+        mentions=["Emma Watson", "Emma"],
+        fields={"name": "Emma Watson", "city": "Lyon"},
+        matches={"name": "Emma Thompson"},
+    )
+    existing = [("a", "Person", {"name": "Emma Thompson", "city": "Paris"})]
+    extractor = create_extractor([Many(Person)], transport=world.transport())
+    result = await extractor.ainvoke(text, existing=existing)
+    (record,) = result.records
+    assert record.patches == () and record.after == record.before
+    assert {r.reason for r in record.rejected} == {"identity_conflict"}
+    assert [s.reason for s in result.skipped] == ["ambiguous_match"]
+
+
+def test_swapped_spans_of_values_that_contain_each_other_are_re_paired() -> None:
+    text = "Sarah Johnson called. Later Sarah Miller wrote."
+    state = render_clairic(text, label="Person", focus=("<focus>", ("x",)))
+    base = state.input_span[0]
+    johnson = (0, 13)
+    miller = (text.index("Sarah Miller"), text.index("Sarah Miller") + 5)
+    answer = ClairicAnswer(
+        type="list",
+        value=["Sarah Johnson", "Sarah"],
+        spans=[
+            [base + miller[0], base + miller[1]],
+            [base + johnson[0], base + johnson[1]],
+        ],
+    )
+    response = ClairicResponse(
+        model="clairic",
+        answers={"f": answer},
+        truncated=False,
+        usage={"input_tokens": 1, "output_tokens": 0},
+    )
+    fixed = align_list_spans(response, state).answers["f"]
+    assert fixed.spans is not None
+    assert [state.text[a:b] for a, b in fixed.spans] == ["Sarah Johnson", "Sarah"]
+
+
+def test_a_value_listed_twice_takes_only_the_missing_occurrence_not_a_longer_name() -> (
+    None
+):
+    text = "Sarah Johnson met Sarah. Then Sarah left."
+    state = render_clairic(text, label="Person", focus=("<focus>", ("x",)))
+    base = state.input_span[0]
+    at = text.index("Sarah", 6)
+    answer = ClairicAnswer(
+        type="list", value=["Sarah", "Sarah"], spans=[[base + at, base + at + 5]]
+    )
+    run = Run(transport=FakeTransport(lambda *a: None))
+    mentions = parse_mentions(text, answer, state, run)
+    # the "Sarah" of "Sarah Johnson" is a different mention than the one missing
+    assert [(m.text, m.span) for m in mentions] == [
+        ("Sarah", (18, 23)),
+        ("Sarah", (30, 35)),
+    ]
+
+
+def test_an_extra_occurrence_is_not_taken_inside_a_longer_listed_name() -> None:
+    text = "Sarah Johnson met Bob. Sarah Johnson left. Sarah came."
+    state = render_clairic(text, label="Person", focus=("<focus>", ("x",)))
+    base = state.input_span[0]
+    johnson = [text.index("Sarah Johnson"), text.rindex("Sarah Johnson")]
+    came = text.index("Sarah came")
+    answer = ClairicAnswer(
+        type="list",
+        value=["Sarah Johnson", "Sarah", "Sarah", "Bob"],
+        spans=[
+            [base + johnson[0], base + johnson[0] + 13],
+            [base + came, base + came + 5],
+            [base + johnson[1], base + johnson[1] + 13],
+        ],
+    )
+    mentions = parse_mentions(text, answer, state)
+    assert [(m.text, m.span) for m in mentions] == [
+        ("Sarah Johnson", (0, 13)),
+        ("Bob", (18, 21)),
+        ("Sarah Johnson", (23, 36)),
+        ("Sarah", (43, 48)),
+    ]
+
+
+def test_a_nested_item_is_looked_for_near_its_parent_only() -> None:
+    from trustcall_system_one import compile_schema
+    from trustcall_system_one._cardinality import Many as ManyMarker
+    from trustcall_system_one._collection import Scope
+    from trustcall_system_one._types import EntityInfo, Mention
+
+    text = (
+        "Emma has a dog called Rex. "
+        + "Filler sentence. " * 80
+        + "Michael has a cat. Later Rex the parrot arrived at Michael's."
+    )
+    parent = EntityInfo(
+        key="e0",
+        label="Emma",
+        mentions=(Mention("Emma", (0, 4)),),
+    )
+    scope = Scope(
+        plan=compile_schema(Person),
+        source=text,
+        cardinality=ManyMarker(),
+        parent=parent,
+        pointer="/pets",
+    )
+    answer = ClairicAnswer(type="list", value=["Rex"])  # no span
+    run = Run(transport=FakeTransport(lambda *a: None))
+    mentions = parse_mentions(text, answer, None, run, scope)
+    # Michael's "Rex" is far from Emma: only the one near her is taken
+    assert [m.span for m in mentions] == [(22, 25)]
+    # at the top level the whole input is searched
+    both = parse_mentions(text, answer, None, run)
+    assert len(both) == 2
+
+
+def test_the_frame_of_a_state_ends_where_the_existing_block_starts() -> None:
+    from trustcall_system_one._coerce import Coerced
+    from trustcall_system_one._render import reanchor
+    from trustcall_system_one._verify import _drop_outside
+
+    source = "Order SO-1:\r\nthe tea towels go to 1.\r\nShip to Paris."
+    sent = render_clairic(
+        source,
+        label="Order",
+        existing='{"city": "Paris", "qty": 4}',
+        focus=('<focus schema="Order">', ("x",)),
+    )
+    for returned in (
+        sent.text.replace("\r\n", "\n"),
+        sent.text.replace("\r\n", "\n").replace("\n</input>", "</input>"),  # mangled
+    ):
+        anchored = reanchor(sent, returned)
+        assert anchored is not None
+        inside = returned.index('"Paris"', returned.index("<existing")) + 1
+        digit = returned.index("4", inside)
+        after_cr = returned.index("Paris", returned.index("<input>"))
+        for value, span, rejected in (
+            ("Paris", (inside, inside + 5), True),
+            (4, (digit, digit + 1), True),
+            ("Paris", (after_cr, after_cr + 5), False),
+        ):
+            notes: list[str] = []
+            _, _, everything, _ = _drop_outside(
+                anchored, Coerced(value=value, ok=True, span=span), source, notes
+            )
+            assert everything is rejected, (value, span, returned[-60:])

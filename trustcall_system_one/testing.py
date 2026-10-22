@@ -721,7 +721,7 @@ class FakeWorld:
         match_odds: Mapping[str, float] | None = None,
         match_confidence: float | None = None,
         descriptive: Sequence[str | tuple[str, int]] = (),
-        parent: str | None = None,
+        parent: "str | WorldEntity | None" = None,
     ) -> WorldEntity:
         def specs(
             items: Sequence[str | tuple[str, int]],
@@ -744,7 +744,7 @@ class FakeWorld:
             real=real,
             matches=matches,
             descriptive=specs(descriptive),
-            parent=parent,
+            parent=None if parent is None else self._label(parent),
         )
         element.odds = None if match_odds is None else dict(match_odds)
         element.odds_confidence = match_confidence
@@ -765,7 +765,7 @@ class FakeWorld:
         match_odds: Mapping[str, float] | None = None,
         match_confidence: float | None = None,
         descriptive: Sequence[str | tuple[str, int]] = (),
-        parent: str | None = None,
+        parent: "str | WorldEntity | None" = None,
     ) -> "WorldEntity":
         """Declare an entity of a schema that the text really contains.
 
@@ -792,7 +792,8 @@ class FakeWorld:
                 (one that allows descriptive references such as "my cousin") finds;
                 the first, plain discovery does not list them.
             parent: For an item of a nested list (``list[Pet]`` of a ``Person``),
-                the label of the entity it belongs to (``"Emma Thompson"``; the
+                the entity it belongs to (the ``WorldEntity`` that ``entity``
+                returned, or its label; ``"Emma Thompson"``; the
                 label of a ``One`` parent is ``"the Order"``, and a leading "the"
                 does not matter). Requests about the items of one parent see only
                 the items declared with it. For a mapping, declare the entry's
@@ -824,7 +825,7 @@ class FakeWorld:
         *,
         schema: Any,
         mentions: Sequence[str | tuple[str, int]],
-        parent: str | None = None,
+        parent: "str | WorldEntity | None" = None,
     ) -> "WorldEntity":
         """Declare something that looks like an entity of a schema and is not.
 
@@ -833,14 +834,16 @@ class FakeWorld:
         """
         return self._add(label, schema, mentions, None, real=False, parent=parent)
 
-    def bleed_item(self, parent: str, item: "WorldEntity | str") -> "FakeWorld":
+    def bleed_item(
+        self, parent: "str | WorldEntity", item: "WorldEntity | str"
+    ) -> "FakeWorld":
         """Inject a fault: discovery for ``parent`` also offers another parent's item.
 
         A model asked for Michael's pets that lists Emma's dog too. Qualification
         ("is this a Pet belonging to Michael?") says no, so the item is skipped
         as ``not_qualified`` and never reaches Michael's record.
         """
-        self._item_bleeds.append((_pfold(parent), self._label(item)))
+        self._item_bleeds.append((_pfold(self._label(parent)), self._label(item)))
         return self
 
     def bleed(
@@ -868,7 +871,11 @@ class FakeWorld:
         return self
 
     def delete(
-        self, record_id: str, p: float = 0.97, *, parent: str | None = None
+        self,
+        record_id: str,
+        p: float = 0.97,
+        *,
+        parent: "str | WorldEntity | None" = None,
     ) -> "FakeWorld":
         """Declare that the text says an existing record should be removed.
 
@@ -878,7 +885,9 @@ class FakeWorld:
         nested list the id is its index in the list (a mapping entry's key) and
         ``parent`` is the label of the entity whose list it is.
         """
-        self._deletes[(_pfold(parent), record_id)] = p
+        self._deletes[
+            (None if parent is None else _pfold(self._label(parent)), record_id)
+        ] = p
         return self
 
     def coref(self, first: str, second: str, p: float) -> "FakeWorld":

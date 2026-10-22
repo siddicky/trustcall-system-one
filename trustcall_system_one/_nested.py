@@ -78,7 +78,7 @@ def guard(ctx: Ctx, spec: FieldSpec, plan: CollectionPlan) -> str:
     if ctx.nest.depth + len(spec.path) + 1 > limits.max_depth:
         return "max_depth"
     chain = ctx.nest.chain or (ctx.plan.schema,)
-    if chain.count(plan.item.schema) > limits.max_recursion:
+    if chain.count(plan.recursion_model) > limits.max_recursion:
         return "max_recursion"
     return ""
 
@@ -93,8 +93,9 @@ def guard_warning(ctx: Ctx, spec: FieldSpec, plan: CollectionPlan, why: str) -> 
             f"limits.max_depth={limits.max_depth}; it is not extracted"
         )
     return (
-        f"{where}: max_recursion: {plan.item.name} reappears on its own ancestor "
-        f"chain more than limits.max_recursion={limits.max_recursion} times; the "
+        f"{where}: max_recursion: {plan.recursion_model.__name__} reappears on its "
+        "own ancestor chain more than "
+        f"limits.max_recursion={limits.max_recursion} times; the "
         "collection is not extracted"
     )
 
@@ -102,7 +103,7 @@ def guard_warning(ctx: Ctx, spec: FieldSpec, plan: CollectionPlan, why: str) -> 
 def nest_for(ctx: Ctx, spec: FieldSpec, plan: CollectionPlan) -> Nest:
     """Where the item plan of a collection field sits in the whole document."""
     chain = ctx.nest.chain or (ctx.plan.schema,)
-    return Nest(ctx.nest.depth + len(spec.path), (*chain, plan.item.schema))
+    return Nest(ctx.nest.depth + len(spec.path), (*chain, plan.recursion_model))
 
 
 def _dotted(path: Path) -> str:
@@ -240,14 +241,16 @@ class NestedInsert:
             key: str | None = None
             if plan.is_dict:
                 raw = getattr(record.value, KEY_FIELD, None)
-                key = raw if isinstance(raw, str) and raw.strip() else None
+                key = raw.strip() if isinstance(raw, str) and raw.strip() else None
                 if key is None or any(key == k for k, _ in out.entries):
                     out.rejected.append(
                         RejectedOp(
                             None,
                             out.pointer,
-                            "duplicate" if key else "invalid_item",
-                            f"the entry {key!r} has no usable key or repeats one",
+                            "duplicate" if key else "missing_key",
+                            f"the entry {key!r} repeats a key of this mapping"
+                            if key
+                            else "the entry has no key",
                         )
                     )
                     continue
@@ -359,6 +362,7 @@ def nested_update(
         out.lists.add(holder)
     field_path = spec.pretty
     appended = 0
+    taken = set(keys)  # the keys of the record, and of the new entries so far
     for record in records:
         if record.kind == "update":
             ident = record.json_doc_id or ""
@@ -414,16 +418,20 @@ def nested_update(
             if plan.is_dict:
                 raw = getattr(record.value, KEY_FIELD, None)
                 key = raw.strip() if isinstance(raw, str) else ""
-                if not key or key in keys:
+                if not key or key in taken:
                     out.rejected.append(
                         RejectedOp(
                             "add",
-                            f"{holder}{pointer([key])}",
-                            "duplicate" if key else "invalid_item",
-                            f"the entry {key!r} is already in the record or has no key",
+                            f"{holder}{pointer([key])}" if key else holder,
+                            "duplicate" if key else "missing_key",
+                            f"the entry {key!r} is already in the record or "
+                            "repeats a new entry; the first one is kept"
+                            if key
+                            else "the entry has no key",
                         )
                     )
                     continue
+                taken.add(key)
                 where = key
                 at = f"{holder}{pointer([key])}"
             else:
