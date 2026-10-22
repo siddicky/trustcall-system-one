@@ -189,12 +189,17 @@ def problems_of(
 def signature(
     plan: SchemaPlan, problems: Sequence[Problem], chosen: Mapping[str, str]
 ) -> Signature:
-    """The normalised set of ``(document pointer, error type)`` of some errors."""
+    """The normalised set of ``(document pointer, error type)`` of some errors.
+
+    List indexes are normalised (``/notes/2`` and ``/notes/3`` are both
+    ``/notes/*``): an error that moves along a list is the same error.
+    """
     found: set[tuple[str, str]] = set()
     for problem in problems:
         path = document_path(plan, problem.loc, chosen)
         if path is not None:
-            found.add((pointer(path), problem.type))
+            normal = tuple("*" if isinstance(p, int) else p for p in path)
+            found.add((pointer(normal), problem.type))
     return frozenset(found)
 
 
@@ -257,17 +262,40 @@ class Hit:
         entry: The field.
         problems: The errors that implicate it.
         direct: Whether an error points at the field itself, rather than at a
-            model that contains it (a model-level check implicates all its
-            fields, and says nothing about which one is wrong).
+            model that contains it (a model-level check implicates its fields,
+            and says nothing about which one is wrong).
+        direct_ids: ``id`` of the errors that point at the field itself.
+        named: Whether the field is implicated because the message of a
+            model-level error names it (as opposed to every field of the model).
     """
 
     entry: Entry
     problems: list[Problem] = field(default_factory=list)
     direct: bool = False
+    direct_ids: set[int] = field(default_factory=set)
+    named: bool = False
 
 
 def _fits(entry: Entry, chosen: Mapping[str, str]) -> bool:
     return all(chosen.get(at, label) == label for at, label in entry.members)
+
+
+def _names_of(entry: Entry) -> set[str]:
+    """What a message may call a field: its name, key, spaced name and title."""
+    name = str(entry.spec.path[-1])
+    names = {name, entry.path[-1], name.replace("_", " ")}
+    info = entry.owner.model_fields.get(name)
+    if info is not None and info.title:
+        names.add(info.title)
+    return {n.lower() for n in names if len(n) >= 3}
+
+
+def _named(entry: Entry, message: str) -> bool:
+    """Whether a message mentions the field (as a whole word)."""
+    return any(
+        re.search(rf"(?<![A-Za-z0-9_]){re.escape(n)}(?![A-Za-z0-9_])", message, re.I)
+        for n in _names_of(entry)
+    )
 
 
 def locate(
@@ -279,7 +307,9 @@ def locate(
     segments dropped, errors of members that were not chosen ignored). The field
     is the longest known prefix of that path (a list index below a list field
     stays with the field). A path that stops at a model (a ``model_validator``,
-    ``loc == ()`` for the root) implicates every field below it.
+    ``loc == ()`` for the root) implicates every field below it, or, when the
+    message of the error names fields (by name, key, spaced name or title), only
+    those.
 
     Args:
         plan: The compiled schema.
@@ -302,11 +332,17 @@ def locate(
         elif problem.type == "missing":
             continue  # a whole sub-model that is absent: nothing inside to re-ask
         else:
-            picked = [(e, False) for e in entries if e.path[: len(path)] == path]
+            below = [e for e in entries if e.path[: len(path)] == path]
+            # a check that names fields in its message is about those fields
+            named = [e for e in below if _named(e, problem.msg)]
+            picked = [(e, False) for e in (named or below)]
         for entry, direct in picked:
             hit = hits.setdefault(id(entry), Hit(entry))
             hit.problems.append(problem)
             hit.direct = hit.direct or direct
+            hit.named = hit.named or (not direct and bool(named))
+            if direct:
+                hit.direct_ids.add(id(problem))
     return [hits[id(e)] for e in entries if id(e) in hits]
 
 
@@ -700,7 +736,14 @@ def _error_objects(target: Target) -> list[dict[str, Any]]:
             "message": problem.msg,
             "type": problem.type,
         }
-        if problem.type != "missing":
+        # The input is shown only where it is the field's own value: a scalar at
+        # a leaf. For a model-level or container error pydantic's input is the
+        # whole document (on an update: the record).
+        if (
+            problem.type != "missing"
+            and id(problem) in target.hit.direct_ids
+            and (problem.input is None or isinstance(problem.input, (str, int, float)))
+        ):
             item["input"] = _clip(problem.input)
         objects.append(item)
     return objects
@@ -872,6 +915,9 @@ class Outcome:
         state: A Clairic answer that stands (it passed the ladder), else ``None``.
         resolved: A Clef answer that stands, else ``None``.
         failfast: The field is not asked again.
+        undo: Put the field's earlier answer back (set by the caller that
+            installed this outcome, ``None`` before).
+        redo: Install this outcome again after an ``undo``.
     """
 
     target: Target
@@ -881,6 +927,8 @@ class Outcome:
     state: FieldState | None = None
     resolved: Resolved | None = None
     failfast: bool = False
+    undo: Callable[[], None] | None = None
+    redo: Callable[[], None] | None = None
 
     @property
     def repaired(self) -> bool:
@@ -1139,4 +1187,46 @@ async def repair_loop(
             break
         state.rounds += 1
         pending = await refresh()
+        tentative = [
+            o
+            for o in outcomes
+            if o.repaired
+            and o.undo is not None
+            and not o.target.hit.direct
+            and not o.target.hit.named
+        ]
+        if tentative:
+            pending = await _settle(plan, sig, pending, tentative, refresh)
     return pending
+
+
+async def _settle(
+    plan: SchemaPlan,
+    before: Signature,
+    pending: Pending,
+    tentative: list[Outcome],
+    refresh: Callable[[], Awaitable[Pending]],
+) -> Pending:
+    """Keep only the answers to a model-level error that were needed.
+
+    A model-level error that names no field does not say which one is wrong, so
+    every field of the model was re-asked and what differs was installed
+    tentatively. If the
+    round removed no error, none of it helped and all of it is taken back. If the
+    record validates now, each tentative answer is taken back in turn and stays
+    back as long as the record still validates without it.
+    """
+    after = signature(plan, pending.problems, pending.chosen)
+    if pending.problems:
+        if before - after:
+            return pending
+        for outcome in tentative:
+            assert outcome.undo is not None
+            outcome.undo()
+        return await refresh()
+    for outcome in tentative:
+        assert outcome.undo is not None and outcome.redo is not None
+        outcome.undo()
+        if (await refresh()).problems:
+            outcome.redo()
+    return await refresh()

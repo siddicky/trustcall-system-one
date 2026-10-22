@@ -458,17 +458,21 @@ max_attempts=5, stop_on_repeat=True, allow_pattern_reask=True)`.
 1. Each error `loc` becomes a document path (`_diff.document_path`: the union member segment is
    dropped, errors of members that were not chosen are ignored) and then the field of the plan it
    implicates, the longest known prefix (a list index stays with its list). A model-level error
-   (`loc == ()`, a `model_validator`) implicates every leaf of that (sub-)model; a `missing` error,
+   (`loc == ()`, a `model_validator`) implicates every leaf of that (sub-)model, or only the fields
+   its message names (by name, key, spaced name or title); a `missing` error,
    and the type error that a null gets (`int_type`, `string_type`, ...: a required leaf with no
    value), implicates that leaf. Errors inside an optional sub-model or union member that was
    dropped as absent are repaired too, before the group is given up. An update re-asks only a
-   field that one of its own operations touched (or a missing required one): an error the record
-   already had is not the update's to repair.
+   field that one of its own operations touched, or a required value that is missing from the record
+   (that one is re-asked input-only, attributed and gated like the rest). Any other error the
+   record already had is not the update's to repair.
 2. ONE narrow request per implicated field, all in parallel (call kind `repair`, `CallMeta.field`
    the wire name): a Clairic request with that one field, whose `state` is the focus header, the
    `<input>` (input only: never the existing record, so a repair cannot echo it) and the blocks
-   `<previous_attempt>` (just that field's rejected value), `<validation_errors>` (pydantic
-   message, type and input) and `<expected_schema>` (the `$defs`-resolved JSON-schema excerpt of
+   `<previous_attempt>` (just that field's rejected answer, never the patched document),
+   `<validation_errors>` (pydantic message and type, and the input only where it is the field's own
+   scalar value at a leaf: for a model-level or container error pydantic's input is the whole
+   document, which on an update holds the record, so it is left out) and `<expected_schema>` (the `$defs`-resolved JSON-schema excerpt of
    the path), or a Clef question when the field is adapted to Clef (its structured state carries
    the same three things as keys). The instructions are the field's rendered instructions plus
    "Must satisfy: {constraint}. The previous answer {old!r} was rejected because: {message}". An
@@ -480,7 +484,16 @@ max_attempts=5, stop_on_repeat=True, allow_pattern_reask=True)`.
    operations the new value changed are judged anew; a Clef answer also gets the `stated` check).
    The input-only cross-check is not needed: a repair state never contains the record.
 4. One repair ROUND (every failing field, in parallel) is ONE attempt, like trustcall's fan-out of
-   repairs. `ExtractionResult.attempts` is 1 plus the rounds of the record that needed the most.
+   repairs. `ExtractionResult.attempts` is 1 plus the rounds of the record that needed the most,
+   so up to `1 + max_attempts`. The error signature normalises list indexes (`/notes/2` and
+   `/notes/3` are `/notes/*`).
+5. Model-level errors repair minimally. When the message names no field, every field of the model
+   is re-asked but what differs is only tentative: if the round removed no error all of it is
+   taken back, and if the record validates, each tentative answer is taken back in turn and stays
+   back while the record still validates. Fields the message names are installed as normal
+   answers. On an update, a repair that comes back to the RECORD's value for a field whose
+   operation was meant to change it is a failed repair: the field keeps the answer the operation
+   came from and the operation is reported `RejectedOp(op, path, "validation")`.
    The loop stops when the record validates, when `max_attempts` rounds are used (a guard against
    a loop that never ends, not a cost cap), when the error signature `frozenset((path, error
    type))` repeats (`stop_on_repeat`), or when every field that is left is out of reach.
@@ -512,7 +525,8 @@ belong in a `Literal`, where Clef chooses among the allowed values and no error 
 (`RejectedOp(reason="validation")`) and the record is validated once more (the M5 rule). Inserts:
 an optional field that still fails goes back to its default (or null) with `RejectedOp(op=None,
 path, reason="validation")` and the record is validated again; if a required field still fails the
-record is `valid=False` (`value=None`, kept out of `responses`) with `SkippedEntity(reason=
+record is `valid=False` (`value=None`, kept out of `responses`; it still appears in `records` as an
+invalid `ResultRecord` AND as a skipped entity) with `SkippedEntity(reason=
 "validation_failed", detail=<the errors>)`; `strict=True` raises `ExtractionValidationError` (with
 the record and the call log, repair calls included). An optional sub-model or union member that
 cannot be repaired is dropped as absent, as before (`invalid_optional_group`). With

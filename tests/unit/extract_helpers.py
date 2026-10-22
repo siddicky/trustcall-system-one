@@ -8,7 +8,6 @@ from typing import Any
 from trustcall_system_one import (
     CallMeta,
     Extractor,
-    RepairConfig,
     create_extractor,
 )
 from trustcall_system_one._wire import CLAIRIC
@@ -98,6 +97,8 @@ class Script:
             follow a validation error): a Clairic answer (see ``ca``) for a Clairic
             request, a Clef answer (see ``pick`` and ``testing.noul``) for a Clef
             one; a list is consumed one call at a time, the last item repeating.
+            A field without an entry replays its ``clairic`` (or ``clef``)
+            answer.
         null_check: Probability by question id for ``null_check`` calls.
         adjudicate: Choice answers by field wire name for ``adjudicate`` calls.
         cross: Clairic answers by wire name for ``crosscheck`` calls (updates); a
@@ -238,7 +239,8 @@ class Script:
         """Answer a repair request: Clairic from its state, Clef as scripted."""
 
         def chosen(name: str) -> Any:
-            spec = self.repair[name]
+            fallback = self.clef if model != CLAIRIC else self.clairic
+            spec = self.repair[name] if name in self.repair else fallback[name]
             if isinstance(spec, list):
                 item = spec[0]
                 if len(spec) > 1:
@@ -330,10 +332,10 @@ def kind_counts(transport: FakeTransport) -> Counter[str]:
 def make_extractor(schemas: list[Any], script: Script, **kwargs: Any) -> Extractor:
     """Create an extractor on the script's fake transport.
 
-    The repair loop is OFF unless ``repair=`` is given: most tests here are about
-    what happens to a record that fails validation *without* a re-ask (the answers
-    of a script are fixed, so a repair request would have to be scripted too).
-    ``tests/unit/test_repair.py`` turns it on.
+    The repair loop is ON, as in production. A script that has no ``repair``
+    answer for a field replays the field's original answer, so a repair "fails"
+    with the same value and the loop stops at the repeated error signature; the
+    tests that assert what an invalid record looks like WITHOUT a re-ask pass
+    ``repair=RepairConfig(enabled=False)``.
     """
-    kwargs.setdefault("repair", RepairConfig(enabled=False))
     return create_extractor(schemas, transport=script.transport, **kwargs)

@@ -1049,7 +1049,11 @@ async def test_validation_failure_is_an_invalid_record() -> None:
     assert record.fields["age"].value == 12
     assert result.responses == ()
     assert result.response_metadata == []
-    assert result.skipped == ()  # (with the repair loop on there is an entry)
+    # the entity that was found but could not be turned into a valid record
+    (skipped,) = result.skipped
+    assert (skipped.schema_name, skipped.reason) == ("Adult", "validation_failed")
+    assert skipped.detail == "; ".join(record.errors)
+    assert skipped.entity is record.entity
 
 
 async def test_strict_validation_failure_raises_with_the_record_and_calls() -> None:
@@ -2000,8 +2004,14 @@ async def test_a_strict_validation_error_has_the_full_call_log() -> None:
     extractor = make_extractor([Adult], adult_script(12), strict=True)
     with pytest.raises(ExtractionValidationError) as info:
         await extractor.ainvoke("Ada is 12.")
-    assert len(info.value.calls) == 3
-    assert info.value.usage is not None and info.value.usage.requests == 3
+    # presence, extract, attribution, and the repair that did not fix the age
+    assert [c.kind for c in info.value.calls] == [
+        "presence",
+        "extract",
+        "attribution",
+        "repair",
+    ]
+    assert info.value.usage is not None and info.value.usage.requests == 4
     assert info.value.cost is not None
 
 
@@ -2030,6 +2040,7 @@ async def test_a_foreign_error_is_reraised_unchanged_with_a_note() -> None:
 
 async def test_abatch_return_exceptions_keeps_the_others() -> None:
     script = adult_script(12)
+    script.repair = {"age": ca("number", 12)}  # the re-ask repeats the first answer
     ages = iter([12, 40])
     original = script._extract
 
@@ -2042,6 +2053,7 @@ async def test_abatch_return_exceptions_keeps_the_others() -> None:
             presence=script._presence,
             extract=extract,
             attribution=script._attribution,
+            repair=script._repair,
         )
     )
     extractor = make_extractor([Adult], script, strict=True)

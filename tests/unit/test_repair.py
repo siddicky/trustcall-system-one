@@ -1145,6 +1145,241 @@ async def test_an_error_below_a_union_member_in_an_update_is_repaired() -> None:
     assert record.fields["pet.tricks"].repaired
 
 
+# --------------------------------------------------------------------------- #
+# The record never reaches a repair request
+# --------------------------------------------------------------------------- #
+
+
+class Plan(BaseModel):
+    name: str
+    tier: Literal["gold", "silver"]
+    seats: int
+
+    @model_validator(mode="after")
+    def _allowed(self) -> "Plan":
+        if self.tier == "silver" and self.seats > 5:
+            raise ValueError("this combination is not allowed")  # names no field
+        return self
+
+
+class NamedPlan(Plan):
+    @model_validator(mode="after")
+    def _named(self) -> "NamedPlan":
+        return self
+
+
+PLAN = {"name": "Acme", "tier": "gold", "seats": 3, "secret_note": "CEO is Zed"}
+PLAN_TEXT = "Acme now has 8 seats on silver."
+
+
+def plan_world(**repair: Any) -> Script:
+    world = Script()
+    world.clairic = {
+        "name": ca("text", "Acme", find="Acme"),
+        "seats": ca("number", 8),
+    }
+    world.clef = {"tier": pick("silver", ["gold", "silver"])}
+    world.repair = {
+        "seats": ca("number", 5),
+        "tier": pick("silver", ["gold", "silver"]),
+    }
+    world.repair.update(repair)
+    return world
+
+
+async def update_plan(world: Script, schema: Any = Plan) -> ExtractionResult:
+    extractor = make_extractor([One(schema)], world, repair=ON)
+    return await extractor.ainvoke(PLAN_TEXT, existing={schema.__name__: PLAN})
+
+
+async def test_a_model_level_error_on_an_update_leaks_no_record_value() -> None:
+    world = plan_world()
+    await update_plan(world)
+    calls = repair_calls(world)
+    assert {c[2].field for c in calls} == {"tier", "seats"}  # Clef and Clairic
+    assert any(c[0] != CLAIRIC for c in calls) and any(c[0] == CLAIRIC for c in calls)
+    for _, payload, _ in calls:
+        text = json.dumps(payload)
+        assert "CEO is Zed" not in text  # not even a key the schema does not know
+        assert "secret_note" not in text
+        # nor the record's own values, as text in a state or as keys of a Clef one
+        assert 'seats\\": 3' not in text and '"seats": 3' not in text
+    # the error is there, without the document that pydantic attaches to it
+    state = request_for(world, "seats")["state"]
+    (error,) = json.loads(
+        state.split("<validation_errors>\n")[1].split("\n</validation_errors>")[0]
+    )
+    assert error["type"] == "value_error" and "input" not in error
+
+
+async def test_the_previous_attempt_of_a_list_is_the_answer_not_the_patched_list() -> (
+    None
+):
+    class Notes(BaseModel):
+        name: str
+        notes: list[str] = Field(default_factory=list, max_length=2)
+
+    world = Script()
+    world.clairic = {
+        "name": ca("text", "Dana", find="Dana"),
+        "notes": ca("list", ["asked about X"], find_all=["asked about X"]),
+    }
+    world.repair = {"notes": ca("list", None, p_null=0.99)}
+    extractor = make_extractor([One(Notes)], world, repair=ON)
+    record = only(
+        await extractor.ainvoke(
+            "Dana asked about X.",
+            existing={"Notes": {"name": "Dana", "notes": ["secret a", "secret b"]}},
+        )
+    )
+    assert not record.valid or record.patches == ()  # three notes do not fit
+    (call,) = repair_calls(world)
+    text = json.dumps(call[1])
+    assert "secret a" not in text and "secret b" not in text
+    state = call[1]["state"]
+    assert '<previous_attempt>\n["asked about X"]\n</previous_attempt>' in state
+
+
+# --------------------------------------------------------------------------- #
+# A model-level error: minimal repairs
+# --------------------------------------------------------------------------- #
+
+
+class Stay(BaseModel):
+    guest: str
+    room: Optional[str] = None
+    start: dt.date
+    end: dt.date
+
+    @model_validator(mode="after")
+    def _order(self) -> "Stay":
+        if self.end < self.start:
+            raise ValueError("the end must not be before the start")
+        return self
+
+
+class VagueStay(Stay):
+    @model_validator(mode="after")
+    def _vague(self) -> "VagueStay":
+        return self
+
+
+class Vague(BaseModel):
+    guest: str
+    room: Optional[str] = None
+    start: dt.date
+    end: dt.date
+
+    @model_validator(mode="after")
+    def _order(self) -> "Vague":
+        if self.end < self.start:
+            raise ValueError("the dates are inconsistent")  # names no field
+        return self
+
+
+STAY = "Ann Lee booked Suite 12 from 1 May 2024 to 10 May 2024."
+
+
+def stay_world(**repair: Any) -> Script:
+    world = Script()
+    world.clairic = {
+        "guest": ca("text", "Ann Lee", find="Ann Lee"),
+        "room": ca("text", "12", find="12"),
+        "start": ca("date", "2024-05-10"),
+        "end": ca("date", "2024-05-01"),
+    }
+    world.repair = {
+        "guest": ca("text", "Ann", find="Ann"),
+        "room": ca("text", "Suite 12", find="Suite 12"),
+        "start": ca("date", "2024-05-01"),
+        "end": ca("date", "2024-05-10"),
+    }
+    world.repair.update(repair)
+    return world
+
+
+async def test_a_message_that_names_fields_re_asks_only_those() -> None:
+    world = stay_world()
+    record = only(await run([Stay], world, STAY))
+    stay = value_of(record, Stay)
+    assert sorted(c[2].field or "" for c in repair_calls(world)) == ["end", "start"]
+    assert (stay.guest, stay.room) == ("Ann Lee", "12")  # unrelated: not touched
+    assert (stay.start, stay.end) == (dt.date(2024, 5, 1), dt.date(2024, 5, 10))
+    assert record.fields["start"].repaired and not record.fields["guest"].repaired
+
+
+async def test_an_unnamed_model_level_error_keeps_only_the_answers_it_needed() -> None:
+    # nothing in the message says which field is wrong: all four are re-asked and
+    # installed, then taken back one by one while the record stays valid
+    world = stay_world(start=ca("date", "2024-05-10"))  # `start` has nothing new
+    record = only(await run([Vague], world, STAY))
+    stay = value_of(record, Vague)
+    assert sorted(c[2].field or "" for c in repair_calls(world)) == [
+        "end",
+        "guest",
+        "room",
+        "start",
+    ]
+    assert (stay.guest, stay.room) == ("Ann Lee", "12")  # the changes were reverted
+    assert stay.end == dt.date(2024, 5, 10)  # the one that fixed it stays
+    assert record.fields["end"].repaired
+    assert not record.fields["guest"].repaired and not record.fields["room"].repaired
+    assert any("reverted" in n for n in record.fields["guest"].warnings)
+
+
+async def test_unneeded_answers_are_taken_back_when_the_error_stays() -> None:
+    # the dates cannot be fixed (their re-asks repeat the first answers): the
+    # changes to the unrelated fields removed no error, so none of them stays
+    world = stay_world(start=ca("date", "2024-05-10"), end=ca("date", "2024-05-01"))
+    record = only(await run([Vague], world, STAY))
+    assert not record.valid
+    assert record.after is not None
+    assert (record.after["guest"], record.after["room"]) == ("Ann Lee", "12")
+    assert not record.fields["guest"].repaired
+    assert any("reverted" in n for n in record.fields["room"].warnings)
+
+
+# --------------------------------------------------------------------------- #
+# An update repair never goes back to the record
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_repair_back_to_the_records_value_keeps_the_operation_rejected() -> (
+    None
+):
+    world = plan_world(tier=pick("gold", ["gold", "silver"]))  # the record's tier
+    record = only(await update_plan(world))
+    refused = [r for r in record.rejected if r.reason == "validation" and r.op]
+    assert [(r.op, r.path) for r in refused] == [("replace", "/tier")]
+    assert "the record's own value" in refused[0].detail
+    tier = record.fields["tier"]
+    assert not tier.repaired
+    assert any("failed" in n for n in tier.warnings)
+    # the seats were repaired to 5, but silver still needs the tier it was given:
+    # the update is valid only with the tier operation, so it stays as asked
+    assert record.valid and record.after is not None
+    assert record.after["tier"] == "silver" and record.after["seats"] == 5
+
+
+async def test_a_repair_that_still_changes_the_value_is_used() -> None:
+    world = plan_world(tier=pick("silver", ["gold", "silver"]))
+    record = only(await update_plan(world))
+    assert record.valid and not [r for r in record.rejected if r.op]
+
+
+# --------------------------------------------------------------------------- #
+# The error signature ignores list positions
+# --------------------------------------------------------------------------- #
+
+
+def test_list_positions_do_not_change_the_error_signature() -> None:
+    plan = compile_schema(Profile)
+    first = [Problem(("tags", 2), "string_too_short", "m")]
+    second = [Problem(("tags", 3), "string_too_short", "m")]
+    assert signature(plan, first, {}) == signature(plan, second, {})
+    assert signature(plan, first, {}) == frozenset({("/tags/*", "string_too_short")})
+
+
 async def test_an_update_with_the_loop_off_drops_the_operation_as_before() -> None:
     world = member_world()
     extractor = make_extractor([One(Member)], world, repair=RepairConfig(enabled=False))

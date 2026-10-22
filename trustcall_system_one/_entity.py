@@ -1237,7 +1237,28 @@ def _note_leaf(leaf: _Leaf, text: str) -> None:
 
 
 def _install(leaf: _Leaf, outcome: Outcome) -> bool:
-    """Put a repair outcome into a leaf. Returns whether a new value went in."""
+    """Put a repair outcome into a leaf. Returns whether a new value went in.
+
+    An outcome that went in can be taken back and put in again through its
+    ``undo`` and ``redo``.
+    """
+    saved = (leaf.spec, leaf.state, leaf.resolved)
+    if _put(leaf, outcome):
+        new = (leaf.spec, leaf.state, leaf.resolved)
+
+        def undo() -> None:
+            leaf.spec, leaf.state, leaf.resolved = saved
+            _note_leaf(leaf, f"reverted, it was not needed: {outcome.note}")
+
+        def redo() -> None:
+            leaf.spec, leaf.state, leaf.resolved = new
+
+        outcome.undo, outcome.redo = undo, redo
+        return True
+    return False
+
+
+def _put(leaf: _Leaf, outcome: Outcome) -> bool:
     if outcome.state is not None:
         earlier = leaf.state
         if earlier is not None and earlier.reject:
@@ -1679,6 +1700,15 @@ class _Eval:
     failure: ValidationError | None
 
 
+def _is_new(spec: FieldSpec, value: Any, old: Any, default: Any) -> bool:
+    """Whether an answer would change the record (add to it or replace a value)."""
+    if value is None:
+        return False
+    if isinstance(value, list):
+        return bool(new_positions(spec, value, old))
+    return is_change(spec, value, old, default)
+
+
 def _change_key(change: Change) -> tuple[str, str, str]:
     """What identifies an operation across evaluations (its kind, place, value)."""
     return (
@@ -1741,24 +1771,69 @@ async def _repair_update(
     before: dict[str, Any],
     cache: dict[tuple[str, str, str], _Verdict],
     ev: _Eval,
-) -> tuple[_Eval, int]:
+) -> tuple[_Eval, int, list[RejectedOp]]:
     """Re-ask the fields an update's validation errors implicate.
 
     A field is re-asked when an operation of this update touches it (the error
-    is the update's own) or a required value is missing; an error that the
-    record already had is left alone. The re-asked value goes through the
+    is the update's own) or a required value is missing (that one is re-asked
+    input-only, attributed and gated like the rest); any other error the record
+    already had is left alone. The re-asked value goes through the
     ladder (``run_round``), then the diff, the near-duplicate check and the
     change gate again (only the operations it changed are judged anew).
 
     Returns:
-        The last evaluation and the number of repair rounds used.
+        The last evaluation, the number of repair rounds used and the
+        operations a repair refused to revert.
     """
     state = RepairState()
+    refused: list[RejectedOp] = []
     leaves = {
         leaf.spec.wire_name: leaf
         for leaf in _all_leaves(root)
         if not leaf.filled and (leaf.state is not None or leaf.resolved is not None)
     }
+
+    def _refuse_reversion(outcome: Outcome) -> None:
+        """A repair that goes back to the record's value is not a repair.
+
+        The field was asked again because the update's operation for it broke
+        validation; an answer that is the record's own value would silently undo
+        what the input said. The repair counts as failed, the field keeps the
+        answer the operation came from, and the operation is reported rejected.
+        """
+        value = (
+            outcome.state.resolved.value
+            if outcome.state is not None
+            else outcome.resolved.value
+            if outcome.resolved is not None
+            else None
+        )
+        if value is None:
+            return
+        entry = outcome.target.hit.entry
+        spec, previous = outcome.target.spec, outcome.target.previous
+        old = lookup(before, entry.path)
+        default = _json_default(entry.owner, entry.spec)
+        if not _is_new(spec, previous, old, default) or _is_new(
+            outcome.spec, value, old, default
+        ):
+            return
+        ops = ops_for_errors(ev.applied.applied, [entry.path])
+        op = ops[0] if ops else None
+        detail = (
+            f"the repair gave {value!r}, the record's own value, for a field the "
+            "update meant to change"
+        )
+        refused.append(
+            RejectedOp(
+                op.op if op else None,
+                op.path if op else pointer(entry.path),
+                "validation",
+                detail,
+            )
+        )
+        outcome.state = outcome.resolved = None
+        outcome.note = f"{outcome.note.split(':')[0]} failed: {detail}"
 
     def pending() -> Pending:
         problems = problems_of(ev.failure) if ev.failure is not None else []
@@ -1771,16 +1846,19 @@ async def _repair_update(
         touched = bool(ops_for_errors(ev.applied.applied, [hit.entry.path]))
         if not touched and not any(p.type == "missing" for p in hit.problems):
             return None
-        current = lookup(ev.applied.doc, hit.entry.path)
-        previous = leaf.final() if current is MISSING else current
+        # the answer the operation came from: never the patched document, which
+        # holds the record
         kind = leaf.state.type_answer if leaf.state is not None else None
-        return Target(hit, leaf.spec, previous, kind)
+        return Target(hit, leaf.spec, leaf.final(), kind)
 
     async def apply(outcomes: list[Outcome]) -> None:
         installed: list[_Leaf] = []
         for outcome in outcomes:
             leaf = leaves.get(outcome.target.wire)
-            if leaf is not None and _install(leaf, outcome):
+            if leaf is None:
+                continue
+            _refuse_reversion(outcome)
+            if _install(leaf, outcome):
                 installed.append(leaf)
         clef = [leaf for leaf in installed if leaf.resolved is not None]
         if not clef:
@@ -1811,7 +1889,7 @@ async def _repair_update(
         target_for=target_for,
         apply=apply,
     )
-    return ev, state.rounds
+    return ev, state.rounds, refused
 
 
 async def _finish_update(
@@ -1830,8 +1908,9 @@ async def _finish_update(
     cache: dict[tuple[str, str, str], _Verdict] = {}
     ev = await _evaluate(ctx, root, before, cache)
     rounds = 0
+    refused: list[RejectedOp] = []
     if run.repair.enabled and ev.failure is not None:
-        ev, rounds = await _repair_update(ctx, root, before, cache, ev)
+        ev, rounds, refused = await _repair_update(ctx, root, before, cache, ev)
     out = _Assembly()
     _answers(root, out, ())
     judged = sorted(
@@ -1842,6 +1921,7 @@ async def _finish_update(
         *ev.diff.rejected,
         *(v.rejection for v in judged if v.rejection is not None),
         *ev.apply_rejected,
+        *refused,
     ]
     verdicts, ordered, lists, chosen = ev.verdicts, ev.ordered, ev.lists, ev.chosen
     applied, reasons = ev.applied, dict(ev.reasons)
