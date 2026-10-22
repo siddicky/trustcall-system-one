@@ -30,7 +30,7 @@ string append and missing parents on the way.
 import copy
 import math
 import re
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from decimal import Decimal, InvalidOperation
@@ -42,7 +42,13 @@ import jsonpointer
 from pydantic import ValidationError
 from pydantic_core import to_jsonable_python
 
-from trustcall_system_one._compile import FieldGroup, FieldSpec, UnionGroup, UnionMember
+from trustcall_system_one._compile import (
+    FieldGroup,
+    FieldSpec,
+    SchemaPlan,
+    UnionGroup,
+    UnionMember,
+)
 from trustcall_system_one._types import PatchOp, RejectedOp
 
 __all__ = [
@@ -56,9 +62,11 @@ __all__ = [
     "apply_ops",
     "build_doc",
     "diff_group",
+    "document_path",
     "is_change",
     "jsonable",
     "leaves_with_old",
+    "list_paths",
     "lookup",
     "new_positions",
     "ops_for_errors",
@@ -89,8 +97,6 @@ MISSING = _Missing()
 
 NEAR_LOW = 0.6
 """Text ratio from which a new list element is a *possible* repeat (Clef decides)."""
-NEAR_HIGH = 0.9
-"""Text ratio from which a new list element is a repeat without asking."""
 
 
 # --------------------------------------------------------------------------- #
@@ -112,6 +118,10 @@ class LeafNode:
         identity: Whether the field identifies the record.
         spans: Spans in the input that support the value (they narrow the input
             of the Clef checks).
+        default: The field's default as a JSON value (``MISSING`` if it has
+            none). An answer equal to it is never *added* to a record: the
+            default already says it.
+        ref: An opaque back-reference for the builder of the tree.
     """
 
     key: str
@@ -120,6 +130,14 @@ class LeafNode:
     handled: bool = False
     identity: bool = False
     spans: tuple[Span, ...] = ()
+    default: Any = MISSING
+    ref: Any = field(default=None, repr=False, compare=False)
+
+    def is_default(self, value: Any) -> bool:
+        """Whether ``value`` is the field's default (after normalisation)."""
+        return self.default is not MISSING and same(
+            _kind(self.spec), jsonable(value), self.default
+        )
 
 
 @dataclass
@@ -347,6 +365,30 @@ def token_subset(new: str, old: str) -> bool:
     return bool(new_tokens) and new_tokens < old_tokens
 
 
+_NEGATION = re.compile(
+    r"\b(?:not|no|never|none|nobody|nothing|neither|nor|without|cannot)\b|n't",
+    re.IGNORECASE,
+)
+_DIGITS = re.compile(r"\d+")
+
+
+def _fold(text: str) -> str:
+    """Case, punctuation and spacing folded away: ``"A, b."`` is ``"a b"``."""
+    return " ".join(re.sub(r"[\W_]+", " ", text.casefold()).split())
+
+
+def _differs(new: str, old: str) -> bool:
+    """Whether two texts differ in a number or in having a negation.
+
+    Such a difference makes a different fact however alike the words are
+    ("Meeting on May 5" and "May 3"; "Allergic to peanuts" and "Not allergic
+    to peanuts").
+    """
+    if sorted(_DIGITS.findall(new)) != sorted(_DIGITS.findall(old)):
+        return True
+    return bool(_NEGATION.search(new)) != bool(_NEGATION.search(old))
+
+
 def _ratio(first: str, second: str) -> float:
     return SequenceMatcher(None, first.casefold(), second.casefold()).ratio()
 
@@ -381,14 +423,22 @@ def new_positions(spec: FieldSpec, value: Any, old: Any) -> list[int]:
     return fresh
 
 
-def is_change(spec: FieldSpec, value: Any, old: Any) -> bool:
-    """Whether a non-null answer would make an operation for this field."""
+def is_change(spec: FieldSpec, value: Any, old: Any, default: Any = MISSING) -> bool:
+    """Whether a non-null answer would make an operation for this field.
+
+    Args:
+        spec: The field.
+        value: The answer (a Python value).
+        old: What the record holds (``MISSING`` or ``None`` for nothing).
+        default: The field's default as a JSON value; an answer equal to it is
+            not added to a record that lacks the field.
+    """
     if value is None:
         return False
     if _is_list_spec(spec):
         return bool(new_positions(spec, value, old))
     if old is MISSING or old is None:
-        return True
+        return default is MISSING or not same(_kind(spec), jsonable(value), default)
     return not same(_kind(spec), jsonable(value), old)
 
 
@@ -427,7 +477,7 @@ def build_doc(node: GroupNode) -> dict[str, Any] | None:
         return None
     doc: dict[str, Any] = {}
     for leaf in node.leaves:
-        if leaf.value is not None:
+        if leaf.value is not None and not leaf.is_default(leaf.value):
             doc[leaf.key] = jsonable(leaf.value)
     for child in node.children:
         sub = build_doc(child)
@@ -616,6 +666,8 @@ class _Differ:
             return
         new = jsonable(leaf.value)
         if old is MISSING or old is None:
+            if leaf.is_default(leaf.value):
+                return  # the default already says it
             self.result.changes.append(
                 Change("add", path, new, None, spec.pretty, (spec.pretty,), leaf.spans)
             )
@@ -686,22 +738,27 @@ class _Differ:
         for index in fresh:
             element = elements[index]
             near: list[tuple[str, float]] = []
+            target = f"{path}/-"
             if spec.item_kind == "str" and isinstance(element, str):
+                folded = _fold(element)
+                twin = next((other for other in held if _fold(other) == folded), None)
+                if twin is not None:
+                    # the same words in other case, punctuation or spacing
+                    self.reject(
+                        "add", target, "duplicate", f"{element!r} repeats {twin!r}", 1.0
+                    )
+                    continue
                 ratios = sorted(
                     ((other, _ratio(element, other)) for other in held),
                     key=lambda pair: -pair[1],
                 )
-                near = [(o, r) for o, r in ratios if r >= NEAR_LOW]
-            target = f"{path}/-"
-            if near and near[0][1] >= NEAR_HIGH:
-                self.reject(
-                    "add",
-                    target,
-                    "duplicate",
-                    f"{element!r} repeats {near[0][0]!r}",
-                    near[0][1],
-                )
-                continue
+                # a changed number or a toggled negation is a different fact: it
+                # is never dropped and not worth asking about
+                near = [
+                    (other, ratio)
+                    for other, ratio in ratios
+                    if ratio >= NEAR_LOW and not _differs(element, other)
+                ]
             span = (leaf.spans[index],) if index < len(leaf.spans) else leaf.spans
             self.result.changes.append(
                 Change(
@@ -821,13 +878,17 @@ def _fix_string_concat(doc: Any, op: PatchOp) -> PatchOp | None:
     return PatchOp("replace", parent, existing + op.value, repaired_from=op.path)
 
 
-def _fix_missing_parents(doc: Any, op: PatchOp) -> list[PatchOp] | None:
+def _fix_missing_parents(
+    doc: Any, op: PatchOp, lists: Collection[str] | None = None
+) -> list[PatchOp] | None:
     """Add the objects (or the list) an ``add`` needs above its target.
 
     The missing ancestors are added outermost first, each as ``{}`` (``[]`` when
-    the next step is an index or ``-``); the original operation follows
-    unchanged. Returns ``None`` if the first existing ancestor cannot hold a
-    child, or if nothing is missing.
+    the next step is ``-``); the original operation follows unchanged. Which
+    parent is a list comes from the plan (``lists``, the pointers of the list
+    fields): an all-digit key of an object is not an index. Without a plan only
+    ``-`` says "list". Returns ``None`` if the first existing ancestor cannot
+    hold a child, or if nothing is missing.
     """
     if op.op != "add":
         return None
@@ -850,7 +911,9 @@ def _fix_missing_parents(doc: Any, op: PatchOp) -> list[PatchOp] | None:
     fixes: list[PatchOp] = []
     for index in range(depth, len(parts) - 1):
         following = parts[index + 1]
-        container: Any = [] if following == "-" or following.isdigit() else {}
+        here = pointer(parts[: index + 1])
+        is_list = following == "-" or (lists is not None and here in lists)
+        container: Any = [] if is_list else {}
         fixes.append(
             PatchOp(
                 "add",
@@ -866,7 +929,12 @@ def _try(doc: Any, ops: Sequence[PatchOp]) -> Any:
     return jsonpatch.apply_patch(doc, [_as_patch(op) for op in ops], in_place=False)
 
 
-def apply_ops(doc: Mapping[str, Any], ops: Sequence[PatchOp]) -> ApplyResult:
+def apply_ops(
+    doc: Mapping[str, Any],
+    ops: Sequence[PatchOp],
+    *,
+    lists: Collection[str] | None = None,
+) -> ApplyResult:
     """Apply operations to a copy of ``doc``, one by one, repairing what it can.
 
     When an operation conflicts with the document, two repairs are tried in
@@ -880,6 +948,8 @@ def apply_ops(doc: Mapping[str, Any], ops: Sequence[PatchOp]) -> ApplyResult:
     Args:
         doc: The document.
         ops: The operations, in the order to apply them.
+        lists: Pointers of the fields the schema says are lists (``list_paths``),
+            to tell a missing list parent from a missing object parent.
 
     Returns:
         The patched copy, the applied operations and the failures.
@@ -900,7 +970,7 @@ def apply_ops(doc: Mapping[str, Any], ops: Sequence[PatchOp]) -> ApplyResult:
                 continue
             except _PATCH_ERRORS as exc:
                 error = str(exc)
-        parents = _fix_missing_parents(result.doc, op)
+        parents = _fix_missing_parents(result.doc, op, lists)
         if parents is not None:
             try:
                 result.doc = _try(result.doc, parents)
@@ -910,6 +980,107 @@ def apply_ops(doc: Mapping[str, Any], ops: Sequence[PatchOp]) -> ApplyResult:
                 error = str(exc)
         result.failed.append((op, error))
     return result
+
+
+def _names_of(item: FieldSpec | FieldGroup | UnionGroup) -> set[str]:
+    """The keys a field answers to in a location: its name and its alias."""
+    names = {str(item.path[-1])}
+    if item.alias is not None:
+        names.add(item.alias)
+    return names
+
+
+def _member_for(union: UnionGroup, tag: str | int) -> UnionMember | None:
+    """The member a location's tag segment names (its label or a tag value)."""
+    text = str(tag)
+    for member in union.members:
+        values = {
+            str(union.option_tags[o]) for o in member.options if o in union.option_tags
+        }
+        if text == member.label or text in values or text in member.options:
+            return member
+    return None
+
+
+def document_path(
+    plan: SchemaPlan,
+    loc: Sequence[str | int],
+    chosen: Mapping[str, str] | None = None,
+) -> tuple[str | int, ...] | None:
+    """Turn a pydantic error location into a path in the document.
+
+    Pydantic puts the union member between a union field and the field below it
+    (``("pet", "Dog", "tricks")``: the model name, or the tag value of a
+    discriminated union), which is not a key of the document (``/pet/tricks``).
+    This walks the plan and drops that segment. Keys may be field names or
+    aliases; what the plan does not know (list indexes, mapping keys, unknown
+    keys) is kept as it is.
+
+    Args:
+        plan: The compiled schema.
+        loc: The ``loc`` of a validation error.
+        chosen: For the unions the update decided, the document pointer of the
+            union (``"/pet"``) to the label of the member that was chosen. An
+            error that is about another member (it was not chosen, so it is not
+            the document's) is ignored.
+
+    Returns:
+        The document path (validation keys, then indexes), or ``None`` for an
+        error about a member that was not chosen.
+    """
+    group: FieldGroup | None = plan.root
+    path: list[str | int] = []
+    parts = list(loc)
+    i = 0
+    while i < len(parts) and group is not None:
+        part = parts[i]
+        key = str(part)
+        union = next((u for u in group.unions if key in _names_of(u)), None)
+        if union is not None:
+            path.append(union.alias if union.alias is not None else str(union.path[-1]))
+            i += 1
+            group = None
+            if i < len(parts):
+                member = _member_for(union, parts[i])
+                if member is not None:
+                    wanted = (chosen or {}).get(pointer(path))
+                    if wanted is not None and member.label != wanted:
+                        return None
+                    group = member.group
+                    i += 1
+            continue
+        child = next((c for c in group.children if key in _names_of(c)), None)
+        if child is not None:
+            path.append(child.alias if child.alias is not None else str(child.path[-1]))
+            group = child
+            i += 1
+            continue
+        spec = next((x for x in group.specs if key in _names_of(x)), None)
+        path.append(spec.alias if spec is not None and spec.alias is not None else part)
+        i += 1
+        group = None
+    path.extend(parts[i:])
+    return tuple(path)
+
+
+def list_paths(root: GroupNode) -> frozenset[str]:
+    """Document pointers of the list fields below a tree (see ``apply_ops``)."""
+    found: set[str] = set()
+
+    def walk(node: GroupNode, base: tuple[str, ...]) -> None:
+        if not node.present:
+            return
+        for leaf in node.leaves:
+            if _is_list_spec(leaf.spec):
+                found.add(pointer((*base, leaf.key)))
+        for child in node.children:
+            walk(child, (*base, child.key))
+        for union in node.unions:
+            if union.member is not None:
+                walk(union.member, (*base, union.key))
+
+    walk(root, ())
+    return frozenset(found)
 
 
 def ops_for_errors(

@@ -444,6 +444,7 @@ class OfflineScript:
             "reask": self._reask,
             "repair": self._repair,
             "null_check": self._null_check,
+            "stated": self._stated,
             "adjudicate": self._adjudicate,
         }
         self.transport = FakeTransport(self._dispatch)
@@ -546,6 +547,10 @@ class OfflineScript:
             qid: _lookup(self.null_check, call.label, qid, "null check")
             for qid in call.ids
         }
+
+    def _stated(self, call: Call) -> Mapping[str, Any]:
+        """ "Does the input state it?" for a Clef answer an update would apply: yes."""
+        return {qid: 0.96 for qid in call.ids}
 
     def _adjudicate(self, call: Call) -> Mapping[str, Any]:
         assert call.meta.field is not None

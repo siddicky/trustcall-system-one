@@ -16,8 +16,9 @@ Clef-engine answers are not verified further; they are decisions already.
 
 import dataclasses
 import enum
+import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time
 from decimal import Decimal
@@ -35,9 +36,11 @@ from trustcall_system_one._chunk import (
 )
 from trustcall_system_one._coerce import Coerced, coerce, coerce_union
 from trustcall_system_one._compile import (
+    FieldGroup,
     FieldSpec,
     Role,
     SchemaPlan,
+    UnionGroup,
     render_instructions,
 )
 from trustcall_system_one._errors import StateTruncatedError
@@ -68,13 +71,16 @@ __all__ = [
     "FieldState",
     "Resolved",
     "accept",
+    "adopt_cross",
     "agree",
     "ask_clairic",
+    "compact_block",
     "crosscheck",
     "display",
     "resolve",
     "resolve_clef",
     "run_ladder",
+    "usable_cross",
 ]
 
 Span = tuple[int, int]
@@ -99,11 +105,15 @@ class ExistingBlock:
         record_id: The record's id (the ``id`` attribute of the block).
         schema_name: The schema name (the ``schema`` attribute).
         text: The record as JSON.
+        data: The record itself (to compact the block, see ``compact_block``).
+        compacted: Whether ``text`` already is a compacted rendering.
     """
 
     record_id: str
     schema_name: str
     text: str
+    data: Mapping[str, Any] | None = None
+    compacted: bool = False
 
 
 @dataclass
@@ -286,6 +296,71 @@ Asked = dict[str, tuple[ClairicAnswer | None, RenderedState | None]]
 """Per field: the answer and the state to map its spans with."""
 
 
+def _root_key(plan: SchemaPlan, name: str) -> str:
+    """The document key of a top-level field (its alias when it has one)."""
+    root = plan.root
+    items: list[FieldSpec | FieldGroup | UnionGroup] = [
+        *root.specs,
+        *root.children,
+        *root.unions,
+    ]
+    for item in items:
+        if str(item.path[-1]) == name:
+            return item.alias if item.alias is not None else name
+    return name
+
+
+def compact_block(ctx: Ctx, fields: Iterable[str]) -> ExistingBlock | None:
+    """The existing block cut down to the identity and the fields being asked.
+
+    Args:
+        ctx: The entity context (it holds the block and the plan).
+        fields: Wire names of the fields of the request.
+
+    Returns:
+        A compacted block (top-level keys of the identity fields and of the
+        asked fields only), or ``None`` when there is nothing to compact or it
+        would not be shorter.
+    """
+    block = ctx.existing
+    if block is None or block.compacted or block.data is None:
+        return None
+    plan = ctx.plan
+    by_wire = {spec.wire_name: spec for spec in plan.all_specs() if spec.wire_name}
+    keep = {_root_key(plan, name) for name in plan.identity}
+    keep.update(
+        _root_key(plan, str(by_wire[wire].path[0]))
+        for wire in fields
+        if wire in by_wire
+    )
+    data = {key: value for key, value in block.data.items() if key in keep}
+    text = json.dumps(data, ensure_ascii=False)
+    if len(text) >= len(block.text):
+        return None
+    return dataclasses.replace(block, text=text, compacted=True)
+
+
+def _record_is_the_problem(
+    ctx: Ctx,
+    rendered: RenderedState,
+    response: ClairicResponse,
+    anchored: RenderedState | None,
+    covered: int,
+) -> bool:
+    """Whether a truncated response was cut by the record, not by the input.
+
+    True when the whole input was read (so the cut is inside the record) or the
+    record takes up at least half of what was read.
+    """
+    block = ctx.existing
+    if block is None or block.compacted or anchored is None:
+        return False
+    if anchored.input_chars >= covered:
+        return True
+    read = _chars_read(rendered, response, anchored)
+    return read is not None and len(block.text) * 2 >= read
+
+
 async def ask_clairic(
     ctx: Ctx,
     fields: dict[str, ClairicField],
@@ -333,6 +408,21 @@ async def ask_clairic(
     ranges = windows or [(0, len(ctx.text))]
     overlap = run.verify.window_chars
     covered = sum(end - start for start, end in ranges)
+    if _record_is_the_problem(ctx, rendered, response, anchored, covered):
+        compact = compact_block(ctx, fields)
+        if compact is not None:
+            run.warn(
+                f"record_compacted: the existing record of {ctx.plan.name} did not "
+                "fit the Clairic request with the input; it was cut down to its "
+                "identity and the fields being asked"
+            )
+            return await ask_clairic(
+                dataclasses.replace(ctx, existing=compact),
+                fields,
+                meta=meta,
+                windows=windows,
+                descriptions=descriptions,
+            )
     reserved = len(ctx.existing.text) if ctx.existing is not None else 0
     size = chunk_size(
         _room(_chars_read(rendered, response, anchored), reserved), covered, overlap
@@ -1511,12 +1601,47 @@ async def _recheck_elements(
 # --------------------------------------------------------------------------- #
 
 
-def _cross_value(st: FieldState) -> Any:
-    """What the input-only pass gave for a field (``None`` if nothing usable)."""
+def _cross_raw(st: FieldState) -> Any:
+    """What the input-only pass gave for a field, whatever its confidence.
+
+    Agreement with the primary answer is judged on this: a hesitant reading that
+    says the same thing still shows the input gives the value.
+    """
+    if st.cross is None or not st.cross.ok:
+        return None
+    return st.cross.value
+
+
+def usable_cross(st: FieldState) -> Resolved | None:
+    """The input-only answer if it passes the answer-level thresholds and is not null.
+
+    Only a usable answer may be taken as a field's value (see ``adopt_cross``).
+    """
     if st.cross is None:
         return None
     checked = _effective(st.spec, st.cross)
-    return None if checked is None else checked.value
+    return checked if checked is not None and checked.value is not None else None
+
+
+def adopt_cross(st: FieldState) -> bool:
+    """Take the input-only reading as the field's answer.
+
+    Used when the primary pass gave nothing usable (null, an echo of the record,
+    or just the record's own value) and the input alone says something. The
+    reason the primary answer was thrown away stays in the field's notes.
+
+    Returns:
+        Whether there was a usable cross-check answer to take.
+    """
+    checked = usable_cross(st)
+    if checked is None:
+        return False
+    if st.reject:
+        st.notes.append(f"{st.reject}: replaced by the input-only reading")
+    _adopt(st, checked)
+    st.crosscheck_agree = False
+    st.notes.append("adopted_from_crosscheck")
+    return True
 
 
 def _cross_list(st: FieldState, new: list[int] | None) -> None:
@@ -1528,7 +1653,7 @@ def _cross_list(st: FieldState, new: list[int] | None) -> None:
     """
     elements = list(st.resolved.value)
     spans = list(st.resolved.spans) if st.resolved.spans else None
-    found = _cross_value(st)
+    found = _cross_raw(st)
     others = list(found) if isinstance(found, list) else []
     fuzzy = _fuzzy(st.spec)
     wanted = range(len(elements)) if new is None else new
@@ -1565,7 +1690,7 @@ def _cross_list(st: FieldState, new: list[int] | None) -> None:
 
 async def _cross_scalar(ctx: Ctx, st: FieldState) -> None:
     spec = st.spec
-    found = _cross_value(st)
+    found = _cross_raw(st)
     if found is None:
         st.crosscheck_agree = False
         st.set_reject(
@@ -1582,9 +1707,9 @@ async def _cross_scalar(ctx: Ctx, st: FieldState) -> None:
     verdict, p = await _adjudicate(ctx, st, st.resolved.value, found)
     if verdict == "a":
         return
-    if verdict == "b" and st.cross is not None:
+    if verdict == "b" and usable_cross(st) is not None:
         st.notes.append("adjudicated_to_crosscheck")
-        _adopt(st, st.cross)
+        adopt_cross(st)
         return
     st.set_reject(
         "crosscheck_disagree",

@@ -22,9 +22,11 @@ from trustcall_system_one._diff import (
     apply_ops,
     build_doc,
     diff_group,
+    document_path,
     is_change,
     jsonable,
     leaves_with_old,
+    list_paths,
     lookup,
     new_positions,
     ops_for_errors,
@@ -41,6 +43,13 @@ from trustcall_system_one._diff import (
 
 def _key(item: Any) -> str:
     return item.alias if item.alias is not None else str(item.path[-1])
+
+
+def _default(group: FieldGroup, spec: Any) -> Any:
+    info = group.model.model_fields.get(str(spec.path[-1]))
+    if info is None or info.is_required():
+        return MISSING
+    return jsonable(info.get_default(call_default_factory=True))
 
 
 def group_node(
@@ -65,6 +74,7 @@ def group_node(
                 handled=spec.pretty in handled,
                 identity=spec.identity or str(spec.path[-1]) in group.identity,
                 spans=((3, 5),) if spec.pretty in values else (),
+                default=_default(group, spec),
             )
         )
     for child in group.children:
@@ -862,3 +872,199 @@ def test_leaves_with_old_does_not_borrow_values_from_another_union_member() -> N
         )
     }
     assert seen["pet.name"] is MISSING  # the cat's name is not the dog's
+
+
+# --------------------------------------------------------------------------- #
+# Near-duplicates never lose a real change
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("new", "old"),
+    [
+        ("Not allergic to peanuts", "Allergic to peanuts"),  # a negation toggled
+        ("Allergic to peanuts", "Not allergic to peanuts"),
+        ("Never eats peanuts", "Eats peanuts"),
+        ("Doesn't eat peanuts", "Eats peanuts"),
+        ("Meeting on May 5", "Meeting on May 3"),  # a number changed
+        ("Three kids, born 2019", "Three kids, born 2018"),
+    ],
+)
+def test_a_changed_number_or_negation_is_never_dropped_and_not_even_asked(
+    new: str, old: str
+) -> None:
+    result = run(Flat, {"notes": [new]}, {"name": "D", "notes": [old]})
+    assert not [r for r in result.rejected if r.reason == "duplicate"]
+    (change,) = result.changes
+    assert (change.op, change.path, change.value) == ("add", "/notes/-", new)
+    assert change.near == []  # a different fact: nothing to ask
+
+
+def test_a_close_rewording_is_asked_not_dropped() -> None:
+    result = run(
+        Flat,
+        {"notes": ["Lived in Austin"]},
+        {"name": "D", "notes": ["Lives in Austin"]},
+    )
+    assert not [r for r in result.rejected if r.reason == "duplicate"]
+    (change,) = result.changes
+    assert [old for old, _ in change.near] == ["Lives in Austin"]
+    assert change.near[0][1] > 0.9  # however alike, Clef decides
+
+
+@pytest.mark.parametrize(
+    ("new", "old"),
+    [
+        ("prefers EMAIL over phone.", "Prefers email over phone"),
+        ("  Prefers   email, over phone!! ", "Prefers email over phone"),
+        ("Prefers e-mail over phone", "Prefers e mail over phone"),
+    ],
+)
+def test_only_the_same_words_in_other_case_punctuation_or_spacing_are_dropped(
+    new: str, old: str
+) -> None:
+    result = run(Flat, {"notes": [new]}, {"name": "D", "notes": [old]})
+    assert result.changes == []
+    (dup,) = [r for r in result.rejected if r.reason == "duplicate"]
+    assert (dup.op, dup.path, dup.p) == ("add", "/notes/-", 1.0)
+
+
+# --------------------------------------------------------------------------- #
+# Defaults are never added
+# --------------------------------------------------------------------------- #
+
+
+class WithDefault(BaseModel):
+    name: str
+    status: str = "open"
+    tags: list[str] = Field(default_factory=list)
+    flagged: bool = False
+
+
+def test_an_answer_equal_to_the_default_is_not_added() -> None:
+    result = run(WithDefault, {"status": "open", "flagged": False}, {"name": "D"})
+    assert result.changes == []
+    # ... but a different value is, and so is the same value over a different one
+    assert summary(run(WithDefault, {"status": "closed"}, {"name": "D"})) == [
+        ("add", "/status", "closed")
+    ]
+    assert summary(
+        run(WithDefault, {"status": "open"}, {"name": "D", "status": "closed"})
+    ) == [("replace", "/status", "open")]
+
+
+def test_the_default_counts_for_a_null_in_the_record_too() -> None:
+    result = run(WithDefault, {"flagged": False}, {"name": "D", "flagged": None})
+    assert result.changes == []
+
+
+def test_build_doc_leaves_out_values_equal_to_the_default() -> None:
+    plan = compile_schema(WithDefault)
+    node = group_node(plan.root, {"name": "N", "status": "open", "flagged": True})
+    assert build_doc(node) == {"name": "N", "flagged": True}
+
+
+def test_is_change_takes_the_default_into_account() -> None:
+    spec = compile_schema(WithDefault).spec(("status",))
+    assert not is_change(spec, "open", MISSING, "open")
+    assert is_change(spec, "open", MISSING)  # no default known
+    assert is_change(spec, "open", "closed", "open")  # a replace is a replace
+
+
+# --------------------------------------------------------------------------- #
+# Missing parents: the schema decides between a list and an object
+# --------------------------------------------------------------------------- #
+
+
+def test_an_all_digit_key_makes_an_object_not_a_list() -> None:
+    result = apply_ops({}, [PatchOp("add", "/years/2024/total", 5)])
+    assert result.doc == {"years": {"2024": {"total": 5}}}
+    assert result.applied[0] == PatchOp(
+        "add", "/years", {}, repaired_from="/years/2024/total"
+    )
+
+
+def test_the_plan_can_say_a_parent_is_a_list() -> None:
+    result = apply_ops({}, [PatchOp("add", "/rows/0", "x")], lists=frozenset({"/rows"}))
+    assert result.doc == {"rows": ["x"]}
+    # a parent that is not known to be a list stays an object, even for a digit
+    other = apply_ops({}, [PatchOp("add", "/rows/0", "x")])
+    assert other.doc == {"rows": {"0": "x"}}
+
+
+def test_list_paths_names_the_list_fields_by_document_key() -> None:
+    class Inner(BaseModel):
+        labels: list[str] = Field(default_factory=list, alias="theLabels")
+
+    class Outer(BaseModel):
+        notes: list[str] = Field(default_factory=list)
+        inner: Optional[Inner] = None
+        name: str = "x"
+
+    plan = compile_schema(Outer)
+    node = group_node(plan.root, {})
+    assert list_paths(node) == frozenset({"/notes", "/inner/theLabels"})
+
+
+# --------------------------------------------------------------------------- #
+# Error locations
+# --------------------------------------------------------------------------- #
+
+
+class StrictCat(BaseModel):
+    kind: Literal["cat"]
+    lives: int
+
+
+class StrictDog(BaseModel):
+    kind: Literal["dog"]
+    tricks: int = Field(alias="trickCount")
+
+
+class StrictOwner(BaseModel):
+    name: str = Field(alias="ownerName")
+    pet: Union[StrictCat, StrictDog]
+    other: Optional[Address] = Field(default=None, alias="otherAddress")
+
+
+def test_document_path_drops_the_union_member_segment() -> None:
+    plan = compile_schema(StrictOwner)
+    assert document_path(plan, ("pet", "StrictDog", "trickCount")) == (
+        "pet",
+        "trickCount",
+    )
+    assert document_path(plan, ("pet", "dog", "trickCount")) == ("pet", "trickCount")
+    assert document_path(plan, ("pet", "StrictCat", "lives")) == ("pet", "lives")
+    assert document_path(plan, ("pet", "StrictDog")) == ("pet",)
+    assert document_path(plan, ("pet",)) == ("pet",)
+
+
+def test_document_path_uses_validation_keys_and_keeps_what_it_does_not_know() -> None:
+    plan = compile_schema(StrictOwner)
+    assert document_path(plan, ("ownerName",)) == ("ownerName",)
+    assert document_path(plan, ("name",)) == ("ownerName",)  # a field name too
+    assert document_path(plan, ("otherAddress", "city")) == ("otherAddress", "city")
+    assert document_path(plan, ("mystery", 3, "x")) == ("mystery", 3, "x")
+    assert document_path(plan, ()) == ()
+
+
+def test_document_path_ignores_errors_of_members_that_were_not_chosen() -> None:
+    plan = compile_schema(StrictOwner)
+    chosen = {"/pet": "StrictDog"}
+    assert document_path(plan, ("pet", "StrictCat", "lives"), chosen) is None
+    assert document_path(plan, ("pet", "cat", "lives"), chosen) is None
+    assert document_path(plan, ("pet", "StrictDog", "trickCount"), chosen) == (
+        "pet",
+        "trickCount",
+    )
+    # a union the update did not decide keeps every member's errors
+    assert document_path(plan, ("pet", "StrictCat", "lives"), {}) == ("pet", "lives")
+
+
+def test_mapped_paths_find_the_operation_that_broke_validation() -> None:
+    plan = compile_schema(StrictOwner)
+    path = document_path(plan, ("pet", "StrictDog", "trickCount"))
+    assert path is not None
+    op = PatchOp("replace", "/pet/trickCount", -2)
+    assert ops_for_errors([op], [path]) == [op]
+    assert ops_for_errors([op], [("pet", "StrictDog", "trickCount")]) == []  # raw loc

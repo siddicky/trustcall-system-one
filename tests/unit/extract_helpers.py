@@ -78,6 +78,8 @@ class Script:
 
     Attributes:
         presence: Probability returned by the presence gate.
+        presence_by_schema: Presence probability by schema name, for a run of
+            several schemas (``presence`` answers the rest).
         group_presence: Probability of an optional sub-model's presence question,
             by the group's dotted path (``0.95`` for the rest).
         clairic: Clairic answers by wire name (see ``ca``) for ``extract`` calls.
@@ -95,6 +97,8 @@ class Script:
         gate: Change-gate probability by the proposed change's JSON Pointer path
             (a list is consumed one call at a time); ``gate_default`` answers
             the rest.
+        stated: ``stated`` probability by question id (``stated.<wire name>``);
+            ``stated_default`` answers the rest.
         dedup: ``list_dedup`` probability by the new element's text;
             ``dedup_default`` answers the rest.
         truncated: Number of ``extract`` calls to flag as truncated.
@@ -105,6 +109,7 @@ class Script:
     """
 
     presence: float | None = 0.95
+    presence_by_schema: dict[str, float] = field(default_factory=dict)
     group_presence: dict[str, float] = field(default_factory=dict)
     clairic: dict[str, dict[str, Any]] = field(default_factory=dict)
     clef: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -118,6 +123,8 @@ class Script:
     cross: dict[str, dict[str, Any]] = field(default_factory=dict)
     gate: dict[str, float | list[float]] = field(default_factory=dict)
     gate_default: float = 0.95
+    stated: dict[str, float] = field(default_factory=dict)
+    stated_default: float = 0.95
     dedup: dict[str, float] = field(default_factory=dict)
     dedup_default: float = 0.05
     truncated: int = 0
@@ -140,6 +147,7 @@ class Script:
                 crosscheck=self._crosscheck,
                 gate=self._gate,
                 list_dedup=self._dedup,
+                stated=self._stated,
             )
         )
 
@@ -156,8 +164,9 @@ class Script:
                     for qid in payload["questions"]
                 }
             )
-        assert self.presence is not None
-        return clef_response({"presence": noul(self.presence)})
+        p = self.presence_by_schema.get(meta.schema, self.presence)
+        assert p is not None
+        return clef_response({"presence": noul(p)})
 
     def _read(self, state: str) -> tuple[str, bool]:
         """The state Clairic reads and whether it had to cut it short."""
@@ -247,6 +256,15 @@ class Script:
             p = value
         return clef_response(
             {qid: noul(p) for qid in payload["questions"]}, model=payload["model"]
+        )
+
+    def _stated(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
+        return clef_response(
+            {
+                qid: noul(self.stated.get(qid, self.stated_default))
+                for qid in payload["questions"]
+            },
+            model=payload["model"],
         )
 
     def _dedup(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:

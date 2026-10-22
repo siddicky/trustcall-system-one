@@ -41,16 +41,21 @@ from trustcall_system_one._compile import (
     UnionMember,
 )
 from trustcall_system_one._diff import (
+    MISSING,
     Change,
     GroupNode,
     LeafNode,
     UnionNode,
     apply_ops,
     diff_group,
+    document_path,
     is_change,
+    jsonable,
     leaves_with_old,
+    list_paths,
     new_positions,
     ops_for_errors,
+    pointer,
     sort_changes,
 )
 from trustcall_system_one._errors import ExtractionValidationError
@@ -74,11 +79,13 @@ from trustcall_system_one._verify import (
     FieldState,
     Resolved,
     accept,
+    adopt_cross,
     ask_clairic,
     crosscheck,
     resolve,
     resolve_clef,
     run_ladder,
+    usable_cross,
 )
 from trustcall_system_one._wire import (
     ChoiceAnswer,
@@ -88,7 +95,13 @@ from trustcall_system_one._wire import (
     NoulQuestion,
 )
 
-__all__ = ["InsertOutcome", "UpdateOutcome", "insert_one", "update_one"]
+__all__ = [
+    "InsertOutcome",
+    "UpdateOutcome",
+    "ask_presence",
+    "insert_one",
+    "update_one",
+]
 
 Span = tuple[int, int]
 Extracted = dict[str, tuple[ClairicAnswer | None, RenderedState | None]]
@@ -162,6 +175,11 @@ async def _presence(ctx: Ctx) -> float:
     answer = answers["presence"]
     assert isinstance(answer, NoulAnswer)
     return answer.noul
+
+
+async def ask_presence(run: Run, plan: SchemaPlan, text: str, label: str) -> float:
+    """Ask Clef how likely the input is to contain an entity of the schema."""
+    return await _presence(Ctx(run=run, plan=plan, text=text, label=label))
 
 
 # --------------------------------------------------------------------------- #
@@ -1111,6 +1129,7 @@ async def insert_one(
     *,
     label: str,
     skip_presence: bool = False,
+    presence: float | None = None,
 ) -> InsertOutcome:
     """Extract one entity of a schema from ``text``.
 
@@ -1126,6 +1145,7 @@ async def insert_one(
         text: The user's input.
         label: How prompts name the entity (``"the Person"``).
         skip_presence: Skip the presence gate (the schema was forced).
+        presence: The presence probability, when it has been asked already.
 
     Returns:
         The outcome: no record when the gate finds no entity, else an insert
@@ -1138,11 +1158,11 @@ async def insert_one(
     """
     ctx = Ctx(run=run, plan=plan, text=text, label=label)
     _note_unsupported(run, plan)
-    qualify_p: float | None = None
-    if not skip_presence:
+    qualify_p: float | None = presence
+    if not skip_presence and qualify_p is None:
         qualify_p = await _presence(ctx)
-        if qualify_p < run.presence.threshold_absent:
-            return InsertOutcome(None, extracted=False)
+    if qualify_p is not None and qualify_p < run.presence.threshold_absent:
+        return InsertOutcome(None, extracted=False)
 
     root = await _run_unit(ctx, plan.root)
     await run_ladder(ctx, list(_leaf_states(root)))
@@ -1164,15 +1184,27 @@ class UpdateOutcome:
             when the presence gate found nothing about the record in the input
             or updates are disabled.
         skipped: The skipped entity, when updates are disabled.
-        handled_id: The existing record's id when the record was dealt with
-            (updated or skipped); ``None`` when it stays untouched.
+        handled: ``(schema name, record id)`` of the existing record when it was
+            dealt with (updated or skipped; the schema name is ``"__any__"`` for
+            such a record); ``None`` when it stays untouched.
         extracted: Whether any extraction request was made.
     """
 
     record: ResultRecord | None
     skipped: SkippedEntity | None
-    handled_id: str | None
+    handled: tuple[str, str] | None
     extracted: bool
+
+
+def _json_default(model: type[BaseModel], spec: FieldSpec) -> Any:
+    """The field's default as a JSON value, or ``MISSING`` when it has none."""
+    default = _default_of(model, spec)
+    if default is PydanticUndefined:
+        return MISSING
+    try:
+        return jsonable(default)
+    except (TypeError, ValueError):
+        return MISSING
 
 
 def _group_node(result: _GroupResult, key: str) -> GroupNode:
@@ -1195,6 +1227,8 @@ def _group_node(result: _GroupResult, key: str) -> GroupNode:
                 handled=handled,
                 identity=spec.identity or str(spec.path[-1]) in group.identity,
                 spans=tuple(state.spans) if state is not None else (),
+                default=_json_default(group.model, spec),
+                ref=leaf,
             )
         )
     for child in result.children:
@@ -1246,6 +1280,17 @@ def _answers(result: _GroupResult, out: _Assembly, base: tuple[str, ...]) -> Non
             answer, rejects = _filled_answer(spec, leaf.value), []
         out.answers[spec.pretty] = answer
         out.rejected.extend(rejects)
+    for spec in group.specs:
+        if spec.engine in _MILESTONE:
+            out.rejected.append(
+                RejectedOp(
+                    None,
+                    json_pointer((*base, _key(spec))),
+                    "unsupported",
+                    f"{spec.engine} fields are not extracted until "
+                    f"{_MILESTONE[spec.engine]}; the record keeps its value",
+                )
+            )
     for child in result.children:
         _answers(child, out, (*base, _key(child.group)))
     for union in result.unions:
@@ -1323,6 +1368,44 @@ async def _judge_changes(
     return verdicts
 
 
+def _dotted(path: tuple[str | int, ...]) -> str:
+    return ".".join(str(part) for part in path) or "(record)"
+
+
+def _chosen_members(node: GroupNode, base: tuple[str, ...]) -> dict[str, str]:
+    """The document pointer of every union the update decided, to its member."""
+    found: dict[str, str] = {}
+    for union in node.unions:
+        below = (*base, union.key)
+        if union.chosen is not None and union.member is not None:
+            found[pointer(below)] = union.chosen.label
+            found.update(_chosen_members(union.member, below))
+    for child in node.children:
+        if child.present:
+            found.update(_chosen_members(child, (*base, child.key)))
+    return found
+
+
+def _problems(
+    plan: SchemaPlan, failure: ValidationError, chosen: dict[str, str]
+) -> list[tuple[tuple[str | int, ...], str]]:
+    """The validation errors as ``(document path, message)``.
+
+    The location of an error below a union of models is mapped to the document
+    (``document_path``) and an error about a member that was not chosen is left
+    out. If that leaves nothing, every error is kept.
+    """
+    mapped: list[tuple[tuple[str | int, ...], str]] = []
+    everything: list[tuple[tuple[str | int, ...], str]] = []
+    for error in failure.errors():
+        loc = tuple(error["loc"])
+        everything.append((loc, error["msg"]))
+        path = document_path(plan, loc, chosen)
+        if path is not None:
+            mapped.append((path, error["msg"]))
+    return mapped or everything
+
+
 def _owner(changes: list[Change], op: PatchOp) -> Change | None:
     """The computed change an applied (possibly repaired) operation came from."""
     path = op.repaired_from or op.path
@@ -1345,7 +1428,8 @@ async def _finish_update(
     verdicts = await _judge_changes(ctx, before, diff.changes, rejected)
     passed = [v.change for v in verdicts if v.reason is None]
     ordered = sort_changes(passed)
-    applied = apply_ops(before, [change.as_op() for change in ordered])
+    lists = list_paths(nodes)
+    applied = apply_ops(before, [change.as_op() for change in ordered], lists=lists)
     reasons: dict[int, str] = {}
     for op, error in applied.failed:
         change = next(
@@ -1354,26 +1438,32 @@ async def _finish_update(
         rejected.append(RejectedOp(op.op, op.path, "apply_failed", error, None))
         if change is not None:
             reasons[id(change)] = "apply_failed"
+    chosen = _chosen_members(nodes, ())
     model, failure = _validate_document(plan, applied.doc)
     if failure is not None:
-        bad = ops_for_errors(applied.applied, [e["loc"] for e in failure.errors()])
+        problems = _problems(plan, failure, chosen)
+        # which error is about which operation
+        bad: list[PatchOp] = []
+        why: dict[int, str] = {}
+        for path, message in problems:
+            for op in ops_for_errors(applied.applied, [path]):
+                if id(op) not in why:
+                    bad.append(op)
+                    why[id(op)] = f"{_dotted(path)}: {message}"
+        for op in bad:
+            rejected.append(RejectedOp(op.op, op.path, "validation", why[id(op)], None))
+            owner = _owner(ordered, op)
+            if owner is not None:
+                reasons[id(owner)] = "validation"
         if bad:
-            for op in bad:
-                detail = next(
-                    (
-                        f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}"
-                        for e in failure.errors()
-                        if e["loc"]
-                    ),
-                    "",
-                )
-                rejected.append(RejectedOp(op.op, op.path, "validation", detail, None))
-                owner = _owner(ordered, op)
-                if owner is not None:
-                    reasons[id(owner)] = "validation"
             keep = [op for op in applied.applied if not any(op is b for b in bad)]
-            applied = apply_ops(before, keep)
+            applied = apply_ops(before, keep, lists=lists)
             model, failure = _validate_document(plan, applied.doc)
+    problems = _problems(plan, failure, chosen) if failure is not None else []
+    for path, message in problems:  # what is still wrong after the drops
+        rejected.append(
+            RejectedOp(None, pointer(path), "validation", f"{_dotted(path)}: {message}")
+        )
     # the fields: how each answer fared
     answers = dict(out.answers)
     for verdict in verdicts:
@@ -1403,6 +1493,8 @@ async def _finish_update(
                 value = _lookup(model, note.spec.path)
         final[note.spec.pretty] = _note_answer(note, value)
     errors = tuple(_error_strings(failure)) if failure is not None else ()
+    if problems:  # the errors of members that were not chosen are noise
+        errors = tuple(f"{_dotted(path)}: {message}" for path, message in problems)
     record = ResultRecord(
         schema_name=plan.name,
         json_doc_id=target.record_id,
@@ -1428,6 +1520,70 @@ async def _finish_update(
     return record
 
 
+def _has_cross_answer(ctx: Ctx, st: FieldState) -> bool:
+    """Whether the input-only pass gave a non-null raw answer for the field."""
+    pair = ctx.crossed.get(st.spec.wire_name)
+    return pair is not None and pair[0] is not None and pair[0].value is not None
+
+
+async def _check_stated(ctx: Ctx, nodes: GroupNode, before: dict[str, Any]) -> None:
+    """Ask whether the input states each Clef answer that would change the record.
+
+    A ``bool``, ``Literal`` or ``Enum`` answer always resolves, whether or not the
+    input says anything about the field, so it cannot be told from the model's
+    default leaning. For every such answer that would change or add to the
+    record, one Clef ``noul`` per group (call kind ``stated``) asks "Does
+    ``input`` state <the field>?"; below ``verify.clef_stated_min`` the answer is
+    made a null (noted ``not_stated``), so it is reported as ``not_mentioned``.
+    """
+    groups: dict[tuple[Any, ...], list[_Leaf]] = {}
+    for node, old in leaves_with_old(nodes, before):
+        leaf = node.ref
+        if not isinstance(leaf, _Leaf) or leaf.filled or leaf.resolved is None:
+            continue
+        resolved = leaf.resolved
+        if not resolved.ok or resolved.value is None or leaf.spec.engine != "clef":
+            continue
+        if is_change(node.spec, resolved.value, old, node.default):
+            key = (node.spec.path[:-1], node.spec.member_labels)
+            groups.setdefault(key, []).append(leaf)
+    if not groups:
+        return
+    minimum = ctx.run.verify.clef_stated_min
+
+    async def one(leaves: list[_Leaf]) -> None:
+        questions = {
+            f"stated.{leaf.spec.wire_name}": NoulQuestion(
+                type="noul",
+                instructions=f"Does `input` state {ctx.desc(leaf.spec)}?",
+                criteria=NoulCriteria(
+                    true="The input states it, directly or by clear implication.",
+                    false="The input does not state it.",
+                ),
+            )
+            for leaf in leaves
+        }
+        answers = await ctx.run.call_clef(
+            questions,
+            ctx.entity_state(),
+            meta=ctx.meta(
+                "stated",
+                field=".".join(str(p) for p in leaves[0].spec.path[:-1]) or None,
+            ),
+        )
+        for leaf in leaves:
+            answer = answers.get(f"stated.{leaf.spec.wire_name}")
+            p = answer.noul if isinstance(answer, NoulAnswer) else None
+            if p is None or p < minimum:
+                resolved = leaf.resolved
+                assert resolved is not None
+                leaf.resolved = dataclasses.replace(
+                    resolved, value=None, notes=(*resolved.notes, "not_stated")
+                )
+
+    await gather(*(one(leaves) for leaves in groups.values()))
+
+
 async def update_one(
     run: Run,
     plan: SchemaPlan,
@@ -1437,6 +1593,7 @@ async def update_one(
     label: str,
     enable_updates: bool = True,
     skip_presence: bool = False,
+    presence: float | None = None,
 ) -> UpdateOutcome:
     """Update one existing record of a schema from ``text``.
 
@@ -1466,6 +1623,8 @@ async def update_one(
         label: How prompts name the entity (``"the Contact"``).
         enable_updates: Whether updating is allowed.
         skip_presence: Skip the presence gate (the schema was forced).
+        presence: The presence probability, when it has been asked already (to
+            decide which schema an ``"__any__"`` record belongs to).
 
     Returns:
         The outcome.
@@ -1477,8 +1636,12 @@ async def update_one(
         TransportError: If a request failed (it is in ``run.calls`` first).
     """
     before = normalise_record(plan, target.data)
+    handle = (target.schema_name, target.record_id)
     block = ExistingBlock(
-        target.record_id, plan.name, json.dumps(before, ensure_ascii=False)
+        target.record_id,
+        plan.name,
+        json.dumps(before, ensure_ascii=False),
+        data=before,
     )
     ctx = Ctx(
         run=run,
@@ -1489,11 +1652,11 @@ async def update_one(
         crosscheck=run.verify.input_only_crosscheck,
     )
     _note_unsupported(run, plan, updating=True)
-    qualify_p: float | None = None
-    if not skip_presence:
+    qualify_p: float | None = presence
+    if not skip_presence and qualify_p is None:
         qualify_p = await _presence(ctx)
-        if qualify_p < run.presence.threshold_absent:
-            return UpdateOutcome(None, None, None, False)
+    if qualify_p is not None and qualify_p < run.presence.threshold_absent:
+        return UpdateOutcome(None, None, None, False)
     entity = EntityInfo(key=ctx.key, label=ctx.label, qualify_p=qualify_p)
     if not enable_updates:
         skipped = SkippedEntity(
@@ -1503,34 +1666,62 @@ async def update_one(
             f"the input is about the existing record {target.record_id!r}, but "
             "enable_updates is off",
         )
-        return UpdateOutcome(None, skipped, target.record_id, False)
+        return UpdateOutcome(None, skipped, handle, False)
 
     root = await _run_unit(ctx, plan.root)
     plain = ctx.input_only()
+    nodes = _group_node(root, "")
     states = list(_leaf_states(root))
     by_wire = {st.spec.wire_name: st for st in states}
     unchanged: set[str] = set()
     new_at: dict[str, list[int]] = {}
-    for leaf, old in leaves_with_old(_group_node(root, ""), before):
+    adoptable: list[tuple[FieldState, Any, LeafNode]] = []
+    for leaf, old in leaves_with_old(nodes, before):
         state = by_wire.get(leaf.spec.wire_name)
-        if state is None or not state.has_value():
+        if state is None:
             continue
-        value = state.resolved.value
-        if isinstance(value, list):
-            fresh = new_positions(leaf.spec, value, old)
-            if fresh:
-                new_at[leaf.spec.wire_name] = fresh
-            else:
+        if state.has_value():
+            value = state.resolved.value
+            if isinstance(value, list):
+                fresh = new_positions(leaf.spec, value, old)
+                if fresh:
+                    new_at[leaf.spec.wire_name] = fresh
+                else:
+                    unchanged.add(leaf.spec.wire_name)
+            elif not is_change(leaf.spec, value, old, leaf.default):
                 unchanged.add(leaf.spec.wire_name)
-        elif not is_change(leaf.spec, value, old):
-            unchanged.add(leaf.spec.wire_name)
+        if not state.has_value() or leaf.spec.wire_name in unchanged:
+            adoptable.append((state, old, leaf))
     candidates = [
         st for st in states if st.has_value() and st.spec.wire_name not in unchanged
     ]
-    if ctx.crosscheck and candidates:
-        await gather(*(_load_cross(plain, st) for st in candidates))
-        await crosscheck(plain, candidates, new_at)
-    await run_ladder(plain, [st for st in states if st.spec.wire_name not in unchanged])
+
+    async def verify_clairic() -> None:
+        if ctx.crosscheck:
+            # the input-only reading of a field is needed to check a change, and
+            # to take over where the primary reading gave nothing new
+            wanted = {
+                id(st): st
+                for st in [*candidates, *(item[0] for item in adoptable)]
+                if _has_cross_answer(ctx, st)
+            }
+            await gather(*(_load_cross(plain, st) for st in wanted.values()))
+            await crosscheck(plain, candidates, new_at)
+            for st, old, leaf in adoptable:
+                found = usable_cross(st)
+                if found is None:
+                    continue
+                if isinstance(found.value, list):
+                    changes = bool(new_positions(leaf.spec, found.value, old))
+                else:
+                    changes = is_change(leaf.spec, found.value, old, leaf.default)
+                if changes and adopt_cross(st):
+                    unchanged.discard(leaf.spec.wire_name)
+        await run_ladder(
+            plain, [st for st in states if st.spec.wire_name not in unchanged]
+        )
+
+    await gather(verify_clairic(), _check_stated(plain, nodes, before))
     _settle(root)
     record = await _finish_update(plain, root, before, target, entity)
-    return UpdateOutcome(record, None, target.record_id, True)
+    return UpdateOutcome(record, None, handle, True)

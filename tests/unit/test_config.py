@@ -240,3 +240,11 @@ def test_the_input_only_crosscheck_is_on_by_default_and_must_be_a_bool() -> None
     assert VerifyConfig(input_only_crosscheck=False).input_only_crosscheck is False
     with pytest.raises(ValueError, match="input_only_crosscheck"):
         VerifyConfig(input_only_crosscheck="yes")  # type: ignore[arg-type]
+
+
+def test_clef_stated_min_defaults_to_0_7_and_is_a_probability() -> None:
+    assert VerifyConfig().clef_stated_min == 0.7
+    with pytest.raises(ValueError, match="clef_stated_min"):
+        VerifyConfig(clef_stated_min=0)
+    with pytest.raises(ValueError, match="clef_stated_min"):
+        VerifyConfig(clef_stated_min=1.5)

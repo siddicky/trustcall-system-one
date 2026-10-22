@@ -337,6 +337,11 @@ class VerifyConfig:
             time with the input alone (no existing record) and reject a changed
             value the input alone does not give (``echo_crosscheck``); two
             different values go to a Clef adjudication.
+        clef_stated_min: Updates only: probability a Clef ``noul`` "does the
+            input state it?" needs before a Clef-typed answer (a ``bool``, a
+            ``Literal`` or an ``Enum``) that would change or add to the record
+            becomes an operation. Such answers always resolve, whether or not
+            the input says anything about the field.
         self_consistency_k: Number of state variants to ask; only 1 is
             supported.
     """
@@ -354,6 +359,7 @@ class VerifyConfig:
     instruction_template: str = "{label}'s {desc}"
     adjudicate_min: float = 0.6
     input_only_crosscheck: bool = True
+    clef_stated_min: float = 0.7
     self_consistency_k: int = 1
 
     def __post_init__(self) -> None:
@@ -372,6 +378,7 @@ class VerifyConfig:
             "null_confirm_yes",
             "null_confirm_no",
             "adjudicate_min",
+            "clef_stated_min",
         ):
             _check_unit(name, getattr(self, name))
         if self.attribution_drop > self.attribution_keep:

@@ -18,6 +18,7 @@ from trustcall_system_one._existing import (
     ANY,
     ExistingSet,
     coerce_existing,
+    fits,
     normalise_record,
     record_json,
     target_for,
@@ -383,3 +384,41 @@ def test_a_union_value_is_normalised_as_the_member_it_validates_as() -> None:
 def test_a_value_that_is_not_an_object_is_left_alone() -> None:
     record = normalise_record(plan(), {"full_name": "A", "home": None})
     assert record == {"fullName": "A", "home": None}
+
+
+# --------------------------------------------------------------------------- #
+# "__any__" claims and untouched records
+# --------------------------------------------------------------------------- #
+
+
+def test_a_schema_sees_an_any_record_only_when_it_claimed_it() -> None:
+    es = coerced(
+        [("a", ANY, REC), ("b", "DummySchema", REC)], known=["DummySchema", "Other"]
+    )
+    claimed = es.without_unclaimed_any("Other", {"a": "Other"})
+    assert [r.record_id for r in claimed.for_schema("Other")] == ["a"]
+    unclaimed = es.without_unclaimed_any("Other", {"a": "DummySchema"})
+    assert unclaimed.for_schema("Other") == []
+    # a schema's own records are always seen
+    assert [r.record_id for r in unclaimed.named("DummySchema")] == ["b"]
+    assert unclaimed.opaque == es.opaque
+
+
+def test_untouched_is_keyed_by_schema_and_id() -> None:
+    es = coerced(
+        [("same", "DummySchema", REC), ("same", ANY, REC), ("x", "Unknown", REC)],
+        False,
+    )
+    assert es.untouched(set()) == ("same", "same", "x")
+    assert es.untouched({("DummySchema", "same")}) == ("same", "x")
+    assert es.untouched({(ANY, "same"), ("Unknown", "x")}) == ("same",)
+
+
+def test_fits_normalises_the_record_before_validating() -> None:
+    class Aliased(BaseModel):
+        full_name: str = Field(alias="fullName")
+
+    plan = compile_schema(Aliased)
+    es = coerced([("a", ANY, {"full_name": "Ada"}), ("b", ANY, {"nope": 1})])
+    first, second = es.records
+    assert fits(plan, first) and not fits(plan, second)

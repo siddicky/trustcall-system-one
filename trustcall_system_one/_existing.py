@@ -35,6 +35,7 @@ __all__ = [
     "ExistingRecord",
     "ExistingSet",
     "coerce_existing",
+    "fits",
     "normalise_record",
     "record_json",
     "target_for",
@@ -91,6 +92,34 @@ class ExistingSet:
     def named(self, schema_name: str) -> list[ExistingRecord]:
         """The records that name this schema."""
         return [r for r in self.records if r.schema_name == schema_name]
+
+    def without_unclaimed_any(
+        self, schema_name: str, claims: Mapping[str, str]
+    ) -> "ExistingSet":
+        """The records as one schema sees them.
+
+        An ``"__any__"`` record is seen only by the schema that claimed it (see
+        ``Extractor._claim_any``); the other schemas see no such record.
+        """
+        kept = tuple(
+            r
+            for r in self.records
+            if r.schema_name != ANY or claims.get(r.record_id) == schema_name
+        )
+        return ExistingSet(kept, self.opaque, self.warnings)
+
+    def untouched(self, handled: Collection[tuple[str, str]]) -> tuple[str, ...]:
+        """Ids of the records that were not dealt with, in input order.
+
+        Args:
+            handled: ``(schema name, record id)`` of the records that got a
+                result (the schema name is ``"__any__"`` for such a record).
+        """
+        return tuple(
+            r.record_id
+            for r in (*self.records, *self.opaque)
+            if (r.schema_name, r.record_id) not in handled
+        )
 
     def for_schema(self, schema_name: str) -> list[ExistingRecord]:
         """The records a schema may update: its own, else the ``__any__`` ones."""
@@ -286,6 +315,15 @@ def coerce_existing(
             "5. list[BaseModel]"
         )
     return build.done()
+
+
+def fits(plan: SchemaPlan, record: ExistingRecord) -> bool:
+    """Whether the record, with its keys normalised, validates as the schema."""
+    try:
+        plan.schema.model_validate(normalise_record(plan, record.data))
+    except ValidationError:
+        return False
+    return True
 
 
 def target_for(

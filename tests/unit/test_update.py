@@ -227,7 +227,7 @@ async def test_an_answer_whose_span_lies_in_the_record_is_rejected() -> None:
     world = script()
     # "Austin" is only in the <existing> block: the span points there
     world.clairic["city"] = ca("text", "Austin", find="Austin", p_null=0.02)
-    world.cross["city"] = ca("text", "Berlin", find="Berlin")
+    world.cross["city"] = ca("text", None, p_null=0.97)  # the input alone has none
     record = only(await update(world))
     assert reasons(record)["/city"] == "echo_span"
     assert record.after is not None and record.after["city"] == "Austin"
@@ -1038,12 +1038,27 @@ async def test_free_text_may_agree_on_similarity() -> None:
     assert record.fields["place"].crosscheck_agree is True
 
 
-async def test_a_cross_check_answer_that_is_too_null_counts_as_nothing() -> None:
+async def test_a_hesitant_cross_check_that_agrees_still_supports_the_change() -> None:
     world = script()
-    # the second pass found a city but says it is probably null: not usable
+    # the second pass found the same city but is unsure (probably null): it still
+    # shows that the input gives the value
     world.cross["city"] = ca("text", "Berlin", find="Berlin", p_null=0.9)
     record = only(await update(world))
-    assert reasons(record)["/city"] == "echo_crosscheck"
+    assert ("replace", "/city") in ops(record)
+    assert "/city" not in reasons(record)
+    assert record.fields["city"].crosscheck_agree is True
+
+
+async def test_a_hesitant_cross_check_is_not_taken_as_the_value() -> None:
+    text = TEXT + " Hamburg is nice."
+    world = script()
+    world.clairic["city"] = ca("text", "Berlin", find="Berlin")
+    world.cross["city"] = ca("text", "Hamburg", find="Hamburg", p_null=0.9)
+    world.adjudicate["city"] = pick("b", ["a", "b", "neither"], p=0.9)
+    record = only(await update(world, text))
+    # the adjudication prefers the second reading, which is too unsure to take
+    assert reasons(record)["/city"] == "crosscheck_disagree"
+    assert record.after is not None and record.after["city"] == "Austin"
 
 
 async def test_nothing_is_cross_checked_when_nothing_would_change() -> None:
@@ -1062,3 +1077,495 @@ async def test_nothing_is_cross_checked_when_nothing_would_change() -> None:
         r for r in record.rejected if r.reason == "echo_crosscheck"
     ]
     assert kind_counts(world.transport)["attribution"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# The cross-check reading is taken when the primary reading gave nothing new
+# --------------------------------------------------------------------------- #
+
+
+class Plain(BaseModel):
+    name: str
+    city: Optional[str] = None
+    age: Optional[int] = None
+
+
+PLAIN_TEXT = "Dana moved to Berlin. She is 41 now."
+PLAIN_RECORD = {"name": "Dana", "city": "Austin", "age": 40}
+
+
+def plain_script() -> Script:
+    world = Script()
+    world.clairic = {
+        "name": ca("text", "Dana", find="Dana"),
+        "city": ca("text", "Austin", find='"Austin"'),  # span in the existing block
+        "age": ca("number", 40),  # equals the record, no span
+    }
+    world.cross = {
+        "city": ca("text", "Berlin", find="Berlin"),
+        "age": ca("number", 41, find="41"),
+    }
+    return world
+
+
+async def run_plain(world: Script, **kwargs: Any) -> ExtractionResult:
+    extractor = make_extractor([One(Plain)], world, **kwargs)
+    return await extractor.ainvoke(PLAIN_TEXT, existing={"Plain": PLAIN_RECORD})
+
+
+async def test_an_echoing_primary_reading_gives_way_to_the_input_only_one() -> None:
+    world = plain_script()
+    record = only(await run_plain(world))
+    # the primary pass echoed the record (a span in <existing>; a value equal to
+    # the record): the input-only pass read the new values, and they are taken
+    assert ops(record) == [("replace", "/city"), ("replace", "/age")]
+    assert record.after == {"name": "Dana", "city": "Berlin", "age": 41}
+    assert not [r for r in record.rejected if r.path in ("/city", "/age")]
+    # taken values still go through attribution and the gate
+    assert kind_counts(world.transport)["gate"] == 2
+    assert kind_counts(world.transport)["attribution"] == 1
+    gated = {c[1]["state"]["proposed_change"]["path"] for c in world.calls("gate")}
+    assert gated == {"/city", "/age"}
+    city = record.fields["city"]
+    assert city.crosscheck_agree is False
+    assert "adopted_from_crosscheck" in city.warnings
+    assert "echo_span: replaced by the input-only reading" in city.warnings
+    assert city.span is not None  # a span in the input, not in the record
+    assert PLAIN_TEXT[city.span[0] : city.span[1]] == "Berlin"
+
+
+async def test_a_null_primary_reading_gives_way_to_the_input_only_one() -> None:
+    world = plain_script()
+    world.clairic["city"] = ca("text", None, p_null=0.98)
+    record = only(await run_plain(world))
+    assert ("replace", "/city") in ops(record)
+    assert record.after is not None and record.after["city"] == "Berlin"
+
+
+async def test_a_list_the_primary_reading_missed_is_taken_from_the_input_only_one() -> (
+    None
+):
+    world = script()
+    world.cross["notes"] = world.clairic["notes"]
+    world.clairic["notes"] = ca("list", None, p_null=0.98)
+    record = only(await update(world))
+    assert ("add", "/notes/-") in ops(record)
+
+
+async def test_an_unusable_input_only_reading_is_not_taken() -> None:
+    world = plain_script()
+    world.cross["city"] = ca("text", "Berlin", find="Berlin", p_null=0.9)
+    record = only(await run_plain(world))
+    assert ops(record) == [("replace", "/age")]
+    assert record.after is not None and record.after["city"] == "Austin"
+
+
+async def test_a_taken_input_only_reading_must_still_be_attributed() -> None:
+    world = plain_script()
+    world.attribution = {"attr.city": 0.05}
+    record = only(await run_plain(world))
+    assert reasons(record)["/city"] == "attribution"
+    assert ops(record) == [("replace", "/age")]
+
+
+async def test_an_input_only_reading_equal_to_the_record_changes_nothing() -> None:
+    world = plain_script()
+    world.cross = {"city": ca("text", "Austin", find="Berlin"), "age": ca("number", 40)}
+    record = only(await run_plain(world))
+    assert record.patches == ()
+    assert "adopted_from_crosscheck" not in record.fields["city"].warnings
+    assert not world.calls("gate")
+
+
+# --------------------------------------------------------------------------- #
+# An "__any__" record belongs to one schema
+# --------------------------------------------------------------------------- #
+
+
+class Owner2(BaseModel):
+    name: str
+    pet: str
+
+
+class Drifter(BaseModel):
+    name: str
+    city: Optional[str] = None
+
+
+class Sailor(BaseModel):
+    name: str
+    ship: Optional[str] = None
+
+
+def any_script() -> Script:
+    world = Script()
+    world.clairic = {
+        "name": ca("text", "Sam", find="Sam"),
+        "city": ca("text", "Oslo", find="Oslo"),
+        "pet": ca("text", None, p_null=0.98),
+        "ship": ca("text", "Maud", find="Maud"),
+    }
+    return world
+
+
+async def test_an_any_record_is_updated_by_the_schema_that_validates_it() -> None:
+    world = any_script()
+    extractor = make_extractor([One(Drifter), One(Owner2)], world)
+    result = await extractor.ainvoke(
+        "Sam moved to Oslo.", existing={"__any__": {"name": "Sam", "city": "Rome"}}
+    )
+    by_schema = {r.schema_name: r for r in result.records}
+    assert by_schema["Drifter"].kind == "update"
+    assert by_schema["Drifter"].json_doc_id == "__any__"
+    assert ops(by_schema["Drifter"]) == [("replace", "/city")]
+    assert (
+        by_schema["Owner2"].kind == "insert" and by_schema["Owner2"].json_doc_id is None
+    )
+    assert [r.json_doc_id for r in result.records if r.kind == "update"] == ["__any__"]
+    warning = next(w for w in result.warnings if "'__any__'" in w)
+    assert "Drifter" in warning and "Owner2" in warning and "validates" in warning
+    assert result.untouched == ()
+
+
+async def test_an_any_record_goes_to_the_most_present_schema_when_several_fit() -> None:
+    world = any_script()
+    world.presence_by_schema = {"Drifter": 0.4, "Sailor": 0.9}
+    extractor = make_extractor([One(Drifter), One(Sailor)], world)
+    result = await extractor.ainvoke(
+        "Sam is on the Maud.", existing={"__any__": {"name": "Sam"}}
+    )
+    by_schema = {r.schema_name: r for r in result.records}
+    assert by_schema["Sailor"].kind == "update"
+    assert by_schema["Drifter"].kind == "insert"
+    presences = [c for c in result.calls if c.kind == "presence"]
+    assert len(presences) == 2  # asked once for each, not again by the passes
+    assert any("Sailor" in w and "most present" in w for w in result.warnings)
+
+
+async def test_a_schema_with_its_own_record_does_not_claim_an_any_record() -> None:
+    world = any_script()
+    extractor = make_extractor([One(Drifter), One(Sailor)], world)
+    result = await extractor.ainvoke(
+        "Sam moved to Oslo, aboard the Maud.",
+        existing=[
+            ("d-1", "Drifter", {"name": "Sam", "city": "Rome"}),
+            ("any-1", "__any__", {"name": "Sam"}),
+        ],
+    )
+    by_schema = {r.schema_name: r for r in result.records}
+    assert by_schema["Drifter"].json_doc_id == "d-1"
+    assert by_schema["Sailor"].json_doc_id == "any-1"
+    assert not [w for w in result.warnings if "'__any__'" in w]  # one candidate
+
+
+async def test_untouched_is_keyed_by_schema_and_id() -> None:
+    world = any_script()
+    world.presence_by_schema = {"Drifter": 0.95, "Sailor": 0.03}
+    extractor = make_extractor([One(Drifter), One(Sailor)], world)
+    result = await extractor.ainvoke(
+        "Sam moved to Oslo.",
+        existing=[
+            ("same", "Drifter", {"name": "Sam", "city": "Rome"}),
+            ("same", "Sailor", {"name": "Sam"}),
+        ],
+    )
+    assert [r.schema_name for r in result.records] == ["Drifter"]
+    assert result.untouched == ("same",)  # the Sailor's record, same id
+
+
+# --------------------------------------------------------------------------- #
+# Validation errors below a union are mapped to the document
+# --------------------------------------------------------------------------- #
+
+
+class StrictCat(BaseModel):
+    kind: Literal["cat"]
+    lives: int = Field(ge=1)
+
+
+class StrictDog(BaseModel):
+    kind: Literal["dog"]
+    tricks: int = Field(ge=0)
+
+
+class StrictOwner(BaseModel):
+    name: str
+    pet: Union[StrictCat, StrictDog]
+
+
+async def test_a_failing_operation_inside_a_union_member_is_dropped() -> None:
+    world = Script()
+    world.clairic = {
+        "name": ca("text", "Sam", find="Sam"),
+        "pet.StrictDog.tricks": ca("number", -2, find="-2"),
+        "pet.StrictCat.lives": ca("number", None, p_null=0.99),
+    }
+    world.clef = {"pet": pick("dog", ["cat", "dog"])}
+    extractor = make_extractor([One(StrictOwner)], world)
+    record = only(
+        await extractor.ainvoke(
+            "Sam's dog now knows -2 tricks.",
+            existing={
+                "StrictOwner": {"name": "Sam", "pet": {"kind": "dog", "tricks": 3}}
+            },
+        )
+    )
+    assert record.valid, record.errors
+    assert record.patches == ()
+    assert record.after == {"name": "Sam", "pet": {"kind": "dog", "tricks": 3}}
+    (bad,) = [r for r in record.rejected if r.reason == "validation"]
+    assert (bad.op, bad.path) == ("replace", "/pet/tricks")
+    assert "pet.tricks" in bad.detail  # the member is not part of the path
+
+
+async def test_the_errors_of_a_record_that_stays_invalid_are_reported_per_path() -> (
+    None
+):
+    world = Script()
+    world.clairic = {
+        "name": ca("text", None, p_null=0.99),
+        "pet.StrictDog.tricks": ca("number", 5, find="5"),
+        "pet.StrictCat.lives": ca("number", None, p_null=0.99),
+    }
+    world.clef = {"pet": pick("dog", ["cat", "dog"])}
+    extractor = make_extractor([One(StrictOwner)], world)
+    # the stored record lacks the required name
+    result = await extractor.ainvoke(
+        "the dog knows 5 tricks",
+        existing={"StrictOwner": {"pet": {"kind": "dog", "tricks": 1}}},
+    )
+    record = only(result)
+    assert not record.valid
+    assert record.errors == ("name: Field required",)  # no noise of the cat member
+    assert (None, "/name", "validation") in [
+        (r.op, r.path, r.reason) for r in record.rejected
+    ]
+    assert ("replace", "/pet/tricks") in ops(record)
+
+
+# --------------------------------------------------------------------------- #
+# Clef answers are not operations unless the input states them
+# --------------------------------------------------------------------------- #
+
+
+class Vip(BaseModel):
+    name: str
+    vip: bool = False
+    city: Optional[str] = None
+
+
+def vip_script(vip: float = 0.05) -> Script:
+    world = Script()
+    world.clairic = {
+        "name": ca("text", "Ann", find="Ann"),
+        "city": ca("text", "Oslo", find="Oslo"),
+    }
+    world.clef = {"vip": noul_answer(vip)}
+    return world
+
+
+async def run_vip(
+    world: Script, record: dict[str, Any], **kwargs: Any
+) -> ExtractionResult:
+    extractor = make_extractor([One(Vip)], world, **kwargs)
+    return await extractor.ainvoke("Ann moved to Oslo.", existing={"Vip": record})
+
+
+async def test_a_silent_bool_does_not_flip_the_record() -> None:
+    world = vip_script()
+    world.stated = {"stated.vip": 0.1}
+    world.gate_default = 0.99  # the gate would pass it
+    record = only(await run_vip(world, {"name": "Ann", "vip": True, "city": "Rome"}))
+    assert ops(record) == [("replace", "/city")]
+    assert record.after is not None and record.after["vip"] is True
+    assert (None, "/vip", "not_mentioned") in [
+        (r.op, r.path, r.reason) for r in record.rejected
+    ]
+    gated = [c[1]["state"]["proposed_change"]["path"] for c in world.calls("gate")]
+    assert "/vip" not in gated
+    assert "not_stated" in record.fields["vip"].warnings
+    (call,) = world.calls("stated")
+    assert call[2].kind == "stated" and list(call[1]["questions"]) == ["stated.vip"]
+    assert "state" in call[1]["questions"]["stated.vip"]["instructions"]
+
+
+async def test_a_stated_bool_becomes_an_operation_and_goes_to_the_gate() -> None:
+    world = vip_script(vip=0.05)
+    world.stated = {"stated.vip": 0.9}
+    record = only(await run_vip(world, {"name": "Ann", "vip": True, "city": "Rome"}))
+    assert ("replace", "/vip") in ops(record)
+    assert record.after is not None and record.after["vip"] is False
+
+
+async def test_the_stated_threshold_is_configurable() -> None:
+    world = vip_script()
+    world.stated = {"stated.vip": 0.75}
+    record = only(
+        await run_vip(
+            world,
+            {"name": "Ann", "vip": True, "city": "Rome"},
+            verify=VerifyConfig(clef_stated_min=0.8),
+        )
+    )
+    assert ("replace", "/vip") not in ops(record)
+
+
+async def test_a_default_is_never_added_to_a_record_that_lacks_the_field() -> None:
+    world = vip_script(vip=0.05)  # answers False: the default
+    record = only(await run_vip(world, {"name": "Ann", "city": "Rome"}))
+    assert ops(record) == [("replace", "/city")]
+    assert not world.calls("stated")  # nothing would change, so nobody asks
+
+
+async def test_a_clef_answer_equal_to_the_record_is_not_asked_about() -> None:
+    world = vip_script(vip=0.95)  # True, and the record says True
+    record = only(await run_vip(world, {"name": "Ann", "vip": True, "city": "Rome"}))
+    assert ops(record) == [("replace", "/city")]
+    assert not world.calls("stated")
+
+
+class Tiered(BaseModel):
+    customer: str
+    tier: Literal["gold", "silver"]
+    active: bool = True
+
+
+async def test_a_silent_required_literal_is_not_changed_by_a_weak_choice() -> None:
+    world = Script()
+    world.clairic = {"customer": ca("text", "Acme", find="Acme")}
+    world.clef = {
+        "tier": pick("silver", ["gold", "silver"], 0.6),
+        "active": noul_answer(0.05),
+    }
+    world.stated = {"stated.tier": 0.2, "stated.active": 0.2}
+    extractor = make_extractor([One(Tiered)], world)
+    record = only(
+        await extractor.ainvoke(
+            "Acme called.",
+            existing={"Tiered": {"customer": "Acme", "tier": "gold", "active": True}},
+        )
+    )
+    assert record.patches == ()
+    # one batched request for the group, one question per Clef field
+    (call,) = world.calls("stated")
+    assert sorted(call[1]["questions"]) == ["stated.active", "stated.tier"]
+
+
+class Addr(BaseModel):
+    city: str
+    verified: bool = False
+
+
+class Resident(BaseModel):
+    name: str
+    addr: Optional[Addr] = None
+
+
+async def run_resident(world: Script) -> ResultRecord:
+    world.clairic = {
+        "name": ca("text", "Ann", find="Ann"),
+        "addr.city": ca("text", "Oslo", find="Oslo"),
+    }
+    world.group_presence = {"addr": 0.9}
+    extractor = make_extractor([One(Resident)], world)
+    return only(
+        await extractor.ainvoke(
+            "Ann lives in Oslo.", existing={"Resident": {"name": "Ann"}}
+        )
+    )
+
+
+async def test_a_new_sub_document_leaves_out_unstated_and_default_values() -> None:
+    world = Script()
+    world.clef = {"addr.verified": noul_answer(0.1)}  # False: the default
+    record = await run_resident(world)
+    assert ops(record) == [("add", "/addr")]
+    assert record.patches[0].value == {"city": "Oslo"}
+    (change,) = [c[1]["state"]["proposed_change"] for c in world.calls("gate")]
+    assert change["to"] == {"city": "Oslo"}
+
+
+async def test_a_new_sub_document_carries_a_stated_non_default_clef_value() -> None:
+    world = Script()
+    world.clef = {"addr.verified": noul_answer(0.95)}
+    record = await run_resident(world)
+    assert record.patches[0].value == {"city": "Oslo", "verified": True}
+
+
+async def test_a_new_sub_document_drops_a_clef_value_the_input_does_not_state() -> None:
+    world = Script()
+    world.clef = {"addr.verified": noul_answer(0.95)}  # True, but...
+    world.stated = {"stated.addr.verified": 0.1}  # ...not stated
+    record = await run_resident(world)
+    assert record.patches[0].value == {"city": "Oslo"}
+
+
+# --------------------------------------------------------------------------- #
+# A record that is too big for the request is compacted, not the input chunked
+# --------------------------------------------------------------------------- #
+
+HISTORY = "history-" * 400  # not a field of the schema, 3200 characters
+
+
+def blob_world() -> Script:
+    world = script()
+    world.clairic = {
+        "name": ca("text", None, p_null=0.98),
+        "email": ca("text", None, p_null=0.98),
+        "phone": ca("text", None, p_null=0.98),
+        "city": ca("text", "Berlin", find="Berlin", confidence=0.95),
+        "age": ca("number", None, p_null=0.98),
+        "notes": ca("list", None, p_null=0.98),
+    }
+    world.limit = lambda state, n: 2500 if len(state) > 2500 else None
+    return world
+
+
+async def test_a_cut_inside_the_record_compacts_it_and_does_not_chunk_the_input() -> (
+    None
+):
+    world = blob_world()
+    record_with_history = {**RECORD, "history": HISTORY}
+    result = await update(world, TEXT, record_with_history)
+    record = only(result)
+    assert ops(record) == [("replace", "/city")]
+    assert any("record_compacted" in w for w in result.warnings)
+    assert not any("clairic_chunked" in w for w in result.warnings)
+    extracts = world.calls("extract")
+    assert len(extracts) == 2  # the cut one, and the same request again
+    full, compact = (c[1]["state"] for c in extracts)
+    assert "history-history" in full
+    assert "history-" not in compact and compact.endswith("</existing>")
+    assert '"name": "Dana Whitfield"' in compact  # the identity is kept
+    assert '"city": "Austin"' in compact  # and the fields that are asked
+    assert record.after is not None and record.after["history"] == HISTORY  # untouched
+
+
+async def test_a_big_record_does_not_shrink_the_chunks_to_the_minimum() -> None:
+    filler = "The weather was mild and nothing else happened. "
+    text = filler * 45 + "Dana moved to Berlin last month. " + filler * 45
+    world = blob_world()
+    result = await update(
+        world,
+        text,
+        {**RECORD, "history": HISTORY},
+        verify=VerifyConfig(window_chars=100),
+    )
+    record = only(result)
+    assert ops(record) == [("replace", "/city")]
+    assert any("record_compacted" in w for w in result.warnings)
+    assert any("clairic_chunked" in w for w in result.warnings)
+    chunked = [
+        c[1]["state"] for c in world.calls("extract") if len(c[1]["state"]) < 2500
+    ]
+    assert chunked and all(len(state) > 1000 for state in chunked)
+    assert all("history-" not in state for state in chunked)
+    assert all(state.endswith("</existing>") for state in chunked)
+
+
+async def test_a_record_with_nothing_to_compact_is_still_sent_whole() -> None:
+    world = blob_world()
+    world.limit = lambda state, n: 150 if len(state) > 150 else None  # cuts anything
+    result = await update(world, TEXT, RECORD)
+    # nothing can be dropped (every field is asked), so the input is chunked as before
+    assert not any("record_compacted" in w for w in result.warnings)

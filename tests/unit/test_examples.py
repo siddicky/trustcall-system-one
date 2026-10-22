@@ -352,9 +352,7 @@ def test_06_attribution_guard(capsys: pytest.CaptureFixture[str]) -> None:
     }
 
 
-# M5 made the update call itself work: the collection of line items is left as the
-# record has it, so the example returns an update with no patch instead of raising.
-@pytest.mark.xfail(raises=AssertionError, strict=True, reason="needs M9")
+@pytest.mark.xfail(strict=True, reason="needs M9")
 def test_07_order_line_items(capsys: pytest.CaptureFixture[str]) -> None:
     module = load("07_order_line_items")
     result = run("07_order_line_items", capsys)
@@ -375,6 +373,22 @@ def test_07_order_line_items(capsys: pytest.CaptureFixture[str]) -> None:
         before["order_id"],
         before["customer"],
     )
+
+
+def test_07_update_path_reports_the_collection_it_cannot_extract_yet(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Until M9 the line items are left as the record has them, and it says so."""
+    result = run("07_order_line_items", capsys)
+    (record,) = result.records
+    assert record.kind == "update" and record.patches == ()
+    assert any(
+        "collection fields are not extracted until M9" in w for w in result.warnings
+    )
+    assert any("left as the record has it" in w for w in result.warnings)
+    unsupported = [r for r in record.rejected if r.reason == "unsupported"]
+    assert [(r.op, r.path) for r in unsupported] == [(None, "/items")]
+    assert record.after == record.before
 
 
 # --------------------------------------------------------------------------- #

@@ -70,6 +70,7 @@ CallKind = Literal[
     "attribution",
     "reask",
     "null_check",
+    "stated",
     "adjudicate",
     "list_dedup",
     "gate",

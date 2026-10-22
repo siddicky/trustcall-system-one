@@ -295,7 +295,7 @@ vs ops inside the parent's patch list such as `add /pets/-`), and removal flag
 | --- | --- | --- |
 | Answer-level thresholds | on | reject if `p_null > null_threshold`, `confidence < 0.5`, span inside `<existing>`, Clef choice < 0.55 |
 | Attribution | on | above |
-| Input-only cross-check (updates) | on (`verify.input_only_crosscheck`) | second Clairic pass per group (call kind `crosscheck`) with the same fields and NO `<existing>` block, for every candidate change: agree (normalised equality; text similarity ≥ 0.9 only for free text) → proceed; null there while the primary answer is not null → reject `echo_crosscheck`; two different values → Clef `choice{a: primary, b: cross-check, neither}` (kind `adjudicate`) at ≥ `verify.adjudicate_min`: `a` keeps, `b` takes the input-only value, anything else rejects `crosscheck_disagree`; a list element must have an agreeing cross-check element or is dropped `echo_crosscheck`. Covers number/date answers that carry no span |
+| Input-only cross-check (updates) | on (`verify.input_only_crosscheck`) | second Clairic pass per group (call kind `crosscheck`) with the same fields and NO `<existing>` block. For a change the primary pass proposed: the raw cross-check value agrees (normalised equality; text similarity ≥ 0.9 only for free text; its own confidence does not matter) → proceed; null there → reject `echo_crosscheck`; two different values → Clef `choice{a: primary, b: cross-check, neither}` (kind `adjudicate`) at ≥ `verify.adjudicate_min`: `a` keeps, `b` takes the input-only value (if it passes the answer thresholds), anything else rejects `crosscheck_disagree`; a list element must have an agreeing cross-check element or is dropped `echo_crosscheck`. Where the primary pass gave nothing new (null, an `echo_span`, or the record's own value) and the cross-check reads a usable different value, that value is taken and goes on through the ladder and the gate. Covers number/date answers that carry no span |
 | Low-confidence re-ask | on (< 0.85) | isolated single-field request on mention windows; disagreement → Clef adjudication |
 | Borderline-null | on (`p_null` 0.25–0.75) | Clef `noul` "does the input state it?" → re-ask or null |
 | List near-duplicate dedup | on | difflib 0.6–0.9 vs record elements → Clef `noul` "same fact?" |
@@ -330,8 +330,10 @@ dict or a model (dumped by alias, JSON mode, so `before`/`after`/patch values ar
 JSON-compatible); ids are non-empty strings, unique per schema. `existing_schema_policy`:
 `True` raises `ValueError` for an unknown schema name; `False` keeps the record as opaque
 context (never shown to a model, never patched, a warning, listed in
-`ExtractionResult.untouched`); `"ignore"` drops it (debug log). `"__any__"` is always known and
-is the record of every schema that has none of its own. Record keys are normalised to the keys the schema
+`ExtractionResult.untouched`); `"ignore"` drops it (debug log). `"__any__"` is always known; it is claimed by at most ONE
+schema among those without a record of their own: the only schema whose model validates it, else
+the one with the highest presence (the presence of every candidate is asked first, in parallel,
+and not asked again), with a warning naming the claimant; the others insert as if no record existed. Record keys are normalised to the keys the schema
 validates (alias where there is one) at every level of sub-models and unions, so diffs,
 patches and validation talk about the same keys. Cardinality: dict form → `One(S)`; an explicit
 `One(S)` with exactly one list-form record of S → that record; several → `ValueError`
@@ -348,9 +350,18 @@ patches and validation talk about the same keys. Cardinality: dict form → `One
    input is ever narrowed or chunked, the record always follows whole). An answer whose span
    lies in the block is rejected `echo_span` (a list element individually; for chunked asks the
    chunk's echo is nulled before the merge). A second, input-only pass per group runs
-   concurrently (kind `crosscheck`).
-4. Candidate changes (a non-null answer that differs from the record) are cross-checked.
-   Answers equal to the record are not (no operation can follow).
+   concurrently (kind `crosscheck`). If Clairic cuts the state inside the record while the whole
+   input was read (or the record is at least half of what was read), the input is not chunked:
+   the record is compacted to its identity and the fields being asked, with a `record_compacted`
+   warning, and the request is repeated once.
+4. Candidate changes (a non-null answer that differs from the record) are cross-checked;
+   answers equal to the record are not. Where the primary answer is null, an echo or equal to
+   the record and the cross-check reads a usable different value, the cross-check value is
+   taken (`adopted_from_crosscheck` in the field's warnings). In parallel, every Clef-typed answer
+   (`bool`, `Literal`, `Enum`) that would change or add to the record is asked about with one
+   Clef `noul` per group (call kind `stated`, "Does `input` state <field>?"): below
+   `verify.clef_stated_min` (0.7) it is made a null (`not_stated`, reported `not_mentioned`),
+   because such an answer always resolves, stated or not.
 5. The verification ladder (low-confidence re-ask, borderline-null, attribution) runs on the
    *input only*: its re-asks never see the record. Fields equal to the record are skipped.
 6. `diff_group` → operations; near-duplicate list elements → `list_dedup`; one gate request
@@ -362,9 +373,13 @@ differs → `replace /field`; paths use the schema's validation keys. An *identi
 existing value ("Dana" for "Dana Whitfield"): `identity_subset`, before any model is asked;
 other identity edits go to the gate. A scalar list the record lacks → one `add /list` of the
 deduplicated list; otherwise one `add /list/-` per new element (elements of the record that the
-answer omits are left alone). A new element that resembles a record element (difflib ratio
-0.6–0.9) goes to one Clef `noul` (kind `list_dedup`, "Is "new" the same fact as "old"?"),
-p ≥ 0.6 drops it as `duplicate`; ratio ≥ 0.9 is a `duplicate` without asking. An optional
+answer omits are left alone). A new element equal to a record element after folding case, punctuation and spacing
+is a `duplicate` without asking. One that resembles a record element (difflib ratio ≥ 0.6)
+goes to one Clef `noul` (kind `list_dedup`, "Is "new" the same fact as "old"?"), p ≥ 0.6 drops
+it as `duplicate`; but a changed number or a toggled negation (not/no/never/n't/without ...)
+makes a different fact: such an element is never dropped and not asked about. An answer
+equal to the field's default is never *added* (the default already says it), and a new
+sub-document leaves out default-equal values and Clef answers that failed the `stated` check. An optional
 (or required) sub-model the input states while the record lacks it → ONE `add` of the whole
 sub-document (gated once); one the record has is diffed leaf by leaf; one the input does not
 state → no operation. A union whose chosen member is not the record's member (found by its
@@ -390,11 +405,14 @@ so the gate is not even asked. A narrowed Clef state cuts `input` only (never th
 `_fix_string_concat` (an `add /f/-` whose `/f` is a string becomes a `replace` of the
 concatenation) then `_fix_missing_parents` (missing ancestors added outermost first, `[]` before
 an `-`/index step, `{}` otherwise; the parents carry `repaired_from`); an operation that still
-fails is `apply_failed`. The patched document is validated (alias-aware); on failure the
-operations whose paths lie on the line of an error location (one path a prefix of the other;
+fails is `apply_failed`. Which parents are lists comes from the plan (`list_paths`), not from digits in a key. The patched document is validated (alias-aware); each error location is mapped to the document
+(`_diff.document_path(plan, loc, chosen)`: pydantic puts the union member between a union field and the
+field below it, which is dropped, and errors of members the update did not choose are ignored); on failure the
+operations whose paths lie on the line of an error (one path a prefix of the other;
 `/list/-` stands for `/list`; a location-less model-wide error implicates none) are dropped
 (`validation`) and the record is validated once more; still failing → `valid=False`,
-`value=None` (the repair loop is M6; `strict` raises `ExtractionValidationError`).
+`value=None` (the repair loop is M6; `strict` raises `ExtractionValidationError`); each remaining error is also a
+`RejectedOp(op=None, path, reason="validation")`.
 
 **Result.** `ResultRecord(kind="update", json_doc_id=<record id>, before=<normalised record>,
 after=<patched document>, patches=<applied operations in applied order>, rejected, fields,
@@ -408,7 +426,8 @@ ones).
 `unstated`, `type_uncertain`, `missing_answer`, `unparseable`, `invalid`; ladder
 `adjudication_failed`, `null_check`, `attribution`, `attribution_missing`, `none_of_these`
 (list element); update checks `echo_span`, `echo_crosscheck`, `crosscheck_disagree`;
-sub-models `invalid_optional_group`. Computed operations that were thrown away (`op` is the
+sub-models `invalid_optional_group`; `unsupported` (a collection or mapping field an update cannot extract before M9;
+the record keeps its value; `validation` for an error left after the drops). Computed operations that were thrown away (`op` is the
 operation): `identity_subset`, `duplicate`, `required_field`, `gate_noul`, `gate_missing`
 (no gate answer), `apply_failed`, `validation`. Paths are JSON Pointers of the document.
 

@@ -34,11 +34,14 @@ from trustcall_system_one._config import (
     Prices,
     VerifyConfig,
 )
-from trustcall_system_one._entity import insert_one, update_one
+from trustcall_system_one._entity import ask_presence, insert_one, update_one
 from trustcall_system_one._errors import TrustcallSystemOneError
 from trustcall_system_one._existing import (
+    ANY,
     ExistingRecord,
+    ExistingSet,
     coerce_existing,
+    fits,
     target_for,
 )
 from trustcall_system_one._run import Run, gather
@@ -316,12 +319,21 @@ def _note_failure(exc: Exception, run: Run) -> None:
 
 
 @dataclass(frozen=True)
+class _Entry:
+    """A schema that runs: its plan, how prompts name it, whether it was a ``One``."""
+
+    plan: SchemaPlan
+    label: str
+    explicit: bool
+
+
+@dataclass(frozen=True)
 class _Done:
     """The outcome of one schema, whether it was inserted or updated."""
 
     record: ResultRecord | None
     skipped: SkippedEntity | None
-    handled_id: str | None
+    handled: tuple[str, str] | None
     extracted: bool
 
 
@@ -582,26 +594,55 @@ class Extractor:
         )
         for warning in records.warnings:
             run.warn(warning)
-        jobs = []
+        entries: list[_Entry] = []
         for item, card in zip(selected, cards, strict=True):
             assert isinstance(card, One)
             plan = self.plan_for(card)
-            label = card.label or f"the {plan.title}"
-            target = target_for(
-                plan.name, records, explicit=isinstance(item, (One, Many))
+            entries.append(
+                _Entry(
+                    plan,
+                    card.label or f"the {plan.title}",
+                    isinstance(item, (One, Many)),
+                )
             )
-            if target is None:
-                jobs.append(
-                    self._insert(run, plan, text, label, skip=schema is not None)
-                )
-            else:
-                jobs.append(
-                    self._update(
-                        run, plan, text, target, label, skip=schema is not None
+
+        async def everything() -> list[_Done]:
+            claims, presences = await self._claim_any(
+                run, records, entries, text, forced=schema is not None
+            )
+            jobs = []
+            for entry in entries:
+                name = entry.plan.name
+                view = records.without_unclaimed_any(name, claims)
+                target = target_for(name, view, explicit=entry.explicit)
+                known = presences.get(name)
+                if target is None:
+                    jobs.append(
+                        self._insert(
+                            run,
+                            entry.plan,
+                            text,
+                            entry.label,
+                            skip=schema is not None,
+                            presence=known,
+                        )
                     )
-                )
+                else:
+                    jobs.append(
+                        self._update(
+                            run,
+                            entry.plan,
+                            text,
+                            target,
+                            entry.label,
+                            skip=schema is not None,
+                            presence=known,
+                        )
+                    )
+            return await gather(*jobs)
+
         try:
-            outcomes = await gather(*jobs)
+            outcomes = await everything()
         except TrustcallSystemOneError as exc:
             exc.calls = tuple(run.calls)
             exc.usage = run.usage
@@ -613,14 +654,14 @@ class Extractor:
         results: list[ResultRecord] = [
             o.record for o in outcomes if o.record is not None
         ]
-        handled = {o.handled_id for o in outcomes if o.handled_id is not None}
+        handled = {o.handled for o in outcomes if o.handled is not None}
         return ExtractionResult(
             records=tuple(results),
             responses=tuple(
                 r.value for r in results if r.valid and r.value is not None
             ),
             skipped=tuple(o.skipped for o in outcomes if o.skipped is not None),
-            untouched=tuple(i for i in records.ids if i not in handled),
+            untouched=records.untouched(handled),
             attempts=1 if any(o.extracted for o in outcomes) else 0,
             usage=run.usage,
             cost=self.prices.cost(run.usage),
@@ -628,11 +669,75 @@ class Extractor:
             warnings=tuple(run.warnings),
         )
 
+    async def _claim_any(
+        self,
+        run: Run,
+        records: ExistingSet,
+        entries: list["_Entry"],
+        text: str,
+        *,
+        forced: bool,
+    ) -> tuple[dict[str, str], dict[str, float]]:
+        """Decide which schema each ``"__any__"`` record belongs to.
+
+        A record that may be of any schema is updated by at most ONE schema, or
+        two schemas would write conflicting patches for it. Among the schemas
+        that have no record of their own: the only one whose model validates the
+        record claims it; else the most present in the input does (the
+        presence of every candidate is asked first, in parallel). The others
+        behave as if the record did not exist. A warning names the claimant.
+
+        Returns:
+            The claimant's schema name by record id, and the presence
+            probabilities that were asked (so they are not asked again).
+        """
+        claims: dict[str, str] = {}
+        presences: dict[str, float] = {}
+        candidates = [e for e in entries if not records.named(e.plan.name)]
+        for record in records.named(ANY):
+            if len(candidates) <= 1:
+                if candidates:
+                    claims[record.record_id] = candidates[0].plan.name
+                continue
+            fitting = [e for e in candidates if fits(e.plan, record)]
+            if len(fitting) == 1:
+                claim, how = fitting[0], "the only schema whose model validates it"
+            else:
+                pool = fitting or candidates
+                missing = [e for e in pool if e.plan.name not in presences]
+                if missing and not forced:
+                    asked = await gather(
+                        *(ask_presence(run, e.plan, text, e.label) for e in missing)
+                    )
+                    presences.update(
+                        {e.plan.name: p for e, p in zip(missing, asked, strict=True)}
+                    )
+                claim = max(pool, key=lambda e: presences.get(e.plan.name, 0.0))
+                how = (
+                    "the schema most present in the input "
+                    f"(p={presences.get(claim.plan.name, 0.0):.2f})"
+                )
+            claims[record.record_id] = claim.plan.name
+            others = [e.plan.name for e in candidates if e is not claim]
+            run.warn(
+                f"the {ANY!r} record {record.record_id!r} was given to "
+                f"{claim.plan.name} ({how}); {', '.join(others)} treat it as absent"
+            )
+        return claims, presences
+
     @staticmethod
     async def _insert(
-        run: Run, plan: SchemaPlan, text: str, label: str, *, skip: bool
+        run: Run,
+        plan: SchemaPlan,
+        text: str,
+        label: str,
+        *,
+        skip: bool,
+        presence: float | None = None,
     ) -> _Done:
-        outcome = await insert_one(run, plan, text, label=label, skip_presence=skip)
+        outcome = await insert_one(
+            run, plan, text, label=label, skip_presence=skip, presence=presence
+        )
         return _Done(outcome.record, None, None, outcome.extracted)
 
     async def _update(
@@ -644,6 +749,7 @@ class Extractor:
         label: str,
         *,
         skip: bool,
+        presence: float | None = None,
     ) -> _Done:
         outcome = await update_one(
             run,
@@ -653,9 +759,10 @@ class Extractor:
             label=label,
             enable_updates=self.enable_updates,
             skip_presence=skip,
+            presence=presence,
         )
         return _Done(
-            outcome.record, outcome.skipped, outcome.handled_id, outcome.extracted
+            outcome.record, outcome.skipped, outcome.handled, outcome.extracted
         )
 
     @overload
