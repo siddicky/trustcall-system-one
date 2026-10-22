@@ -1,6 +1,7 @@
 """FieldTypeRoutingTransport: split a Clairic request by field type, merge exactly."""
 
 import asyncio
+import dataclasses
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
@@ -445,10 +446,14 @@ def test_the_failed_partition_decides_how_the_failure_is_classified() -> None:
             return "mine"
 
     jev, cf = Sorting("typesafe"), Provider("cloudflare")
-    jev.failure = BadRequestError("no")
+    jev.failure = RateLimitError("429")
     transport = router(jev, cf)
-    with pytest.raises(BadRequestError) as caught:
-        run(transport)
+    only_dates = {
+        **PAYLOAD,
+        "fields": {"born": FIELDS["born"]},
+    }  # one request, no siblings
+    with pytest.raises(RateLimitError) as caught:
+        run(transport, only_dates)
     assert transport.classify_failure(caught.value) == "mine"
 
 
@@ -598,3 +603,259 @@ def test_a_split_call_that_fails_after_a_partition_answered_is_never_resent() ->
     assert failed.error is not None and failed.error.startswith("BadRequestError")
     assert failed.usage["input_tokens"] == 30  # what the answered partition used
     assert run.usage.input_tokens == 30
+
+
+# --------------------------------------------------------------------------- #
+# The review: classification, merge failures, state_text, closing, errors
+# --------------------------------------------------------------------------- #
+
+CLAIRIC_OK = {
+    "model": "clairic",
+    "answers": {
+        "name": {"type": "text", "value": "Ada", "p_null": 0.01, "confidence": 0.9},
+        "born": {"type": "date", "value": "1815-12-10", "p_null": 0.01},
+    },
+    "truncated": False,
+    "usage": {"input_tokens": 50, "output_tokens": 5},
+}
+
+
+def http_transport(handler: Any, kind: str) -> Any:
+    import httpx
+
+    from trustcall_system_one import CloudflareTransport, TypeSafeTransport
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    if kind == "cloudflare":
+        return CloudflareTransport(
+            account_id="a", api_token="t", max_retries=0, client=client
+        )
+    return TypeSafeTransport(api_key="k" * 20, max_retries=0, client=client)
+
+
+def test_a_partial_failure_is_uncertain_not_a_bad_response_and_is_not_resent() -> None:
+    """The reviewer's probe: real Cloudflare and TypeSafe transports on mocks."""
+    import httpx
+
+    from trustcall_system_one import FallbackTransport
+
+    sent: list[str] = []
+
+    async def cloudflare(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.05)  # the other partition answers first
+        sent.append("cloudflare")
+        return httpx.Response(
+            200, content=b"<html>not json</html>", headers={"content-type": "text/html"}
+        )
+
+    cf = http_transport(cloudflare, "cloudflare")
+    jev_partition = Provider("typesafe", tokens=7)
+    router = FieldTypeRoutingTransport({"date": jev_partition}, default=cf)
+    with pytest.raises(ModelResponseError) as caught:
+        run(router)
+    error = caught.value
+    assert error.maybe_sent is True and error.partial_usage.input_tokens == 7  # type: ignore[attr-defined]
+    assert classify_failure(error) == "uncertain"  # not "bad_response"
+    assert router.classify_failure(error) == "uncertain"
+    stack = KindRoutingTransport({"clairic": router}, default=cf)
+    assert stack.classify_failure(error) == "uncertain"
+
+    backup = Provider("backup")
+    fallback = FallbackTransport(router, backup, on={"bad_response"})
+    with pytest.raises(ModelResponseError):
+        run(fallback)
+    assert backup.calls == []  # the typesafe partition had answered: nothing is resent
+    assert sent == ["cloudflare", "cloudflare"]  # one request per run, no more
+
+
+def test_a_real_typesafe_partition_that_answers_badly_after_cloudflare_answered() -> (
+    None
+):
+    import httpx
+
+    async def cloudflare(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=CLAIRIC_OK)
+
+    async def typesafe(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.05)
+        return httpx.Response(200, json={"not": "a clef response"})
+
+    cf = http_transport(cloudflare, "cloudflare")
+    jev = http_transport(typesafe, "typesafe")
+    router = FieldTypeRoutingTransport({"datetime": jev}, default=cf)
+    payload = {
+        **PAYLOAD,
+        "fields": {"name": FIELDS["name"], "seen": FIELDS["seen"]},
+    }
+    with pytest.raises(ModelResponseError) as caught:
+        run(router, payload)
+    assert may_have_run(caught.value)
+    assert router.classify_failure(caught.value) == "uncertain"
+    from trustcall_system_one import FallbackTransport
+
+    backup = Provider("backup")
+    fallback = FallbackTransport(router, backup, on={"bad_response", "unavailable"})
+    with pytest.raises(ModelResponseError):
+        run(fallback, payload)
+    assert backup.calls == []
+
+
+def test_a_merge_that_fails_keeps_what_every_partition_cost() -> None:
+    class NoAnswers(Provider):
+        async def run(self, *args: Any, **kwargs: Any) -> TransportResponse:
+            reply = await super().run(*args, **kwargs)
+            body = {k: v for k, v in reply.body.items() if k != "answers"}
+            return dataclasses.replace(reply, body=body)
+
+    jev = NoAnswers("typesafe", tokens=30, cost=0.002, served="jev-1")
+    cf = Provider("cloudflare", tokens=70, cost=0.001)
+    with pytest.raises(ModelResponseError) as caught:
+        run(router(jev, cf))
+    error = caught.value
+    assert error.maybe_sent is True
+    usage = error.partial_usage  # type: ignore[attr-defined]
+    assert (usage.input_tokens, usage.output_tokens) == (100, 2)
+    assert usage.cost == pytest.approx(0.003)  # the reported cost travels in the usage
+    assert classify_failure(error) == "uncertain"
+    assert may_have_run(error)
+    assert "Ada" not in str(error)
+
+
+def test_the_engine_logs_the_usage_of_a_failed_merge() -> None:
+    from trustcall_system_one._render import render_clairic
+    from trustcall_system_one._run import Run
+
+    class NoAnswers(Provider):
+        async def run(self, *args: Any, **kwargs: Any) -> TransportResponse:
+            reply = await super().run(*args, **kwargs)
+            body = {k: v for k, v in reply.body.items() if k != "answers"}
+            return dataclasses.replace(reply, body=body)
+
+    run_ = Run(
+        transport=router(
+            NoAnswers("typesafe", tokens=30), Provider("cloudflare", tokens=70)
+        )
+    )
+    with pytest.raises(ModelResponseError):
+        asyncio.run(
+            run_.call_clairic(
+                mixed_fields(), render_clairic("Ada", label="the Person"), meta=META
+            )
+        )
+    assert run_.usage.input_tokens == 100  # charged, and on the books
+
+
+def test_a_partition_without_state_text_read_the_state_as_it_was_sent() -> None:
+    """The reviewer's probe P3."""
+    other = STATE.replace("Ada", "Ada ")  # differs from what was sent
+    b = Provider("typesafe", state_text=other)
+
+    class Silent(Provider):
+        async def run(self, *args: Any, **kwargs: Any) -> TransportResponse:
+            reply = await super().run(*args, **kwargs)
+            body = {k: v for k, v in reply.body.items() if k != "state_text"}
+            return dataclasses.replace(reply, body=body)
+
+    silent = Silent("cloudflare")
+    reply = run(FieldTypeRoutingTransport({"date": b}, default=silent))
+    assert reply.body["state_text"] == STATE  # the silent first partition's: as sent
+    answers = reply.body["answers"]
+    assert "span" in answers["name"]  # kept: it agrees with the text
+    assert "span" not in answers["born"]  # dropped: that partition's text differs
+    assert any(w.startswith("field_type_routing:") for w in reply.warnings)
+
+
+def test_a_silent_partition_agreeing_with_the_others_changes_nothing() -> None:
+    class Silent(Provider):
+        async def run(self, *args: Any, **kwargs: Any) -> TransportResponse:
+            reply = await super().run(*args, **kwargs)
+            body = {k: v for k, v in reply.body.items() if k != "state_text"}
+            return dataclasses.replace(reply, body=body)
+
+    reply = run(router(Provider("typesafe"), Silent("cloudflare")))
+    assert reply.body["state_text"] == STATE
+    assert not reply.warnings
+
+
+def test_each_partition_record_carries_its_own_fallback_origin() -> None:
+    from trustcall_system_one._render import render_clairic
+    from trustcall_system_one._run import Run
+
+    class FellBack(Provider):
+        async def run(self, *args: Any, **kwargs: Any) -> TransportResponse:
+            reply = await super().run(*args, **kwargs)
+            return dataclasses.replace(
+                reply, fallback_from="cloudflare", fallback_error="Unavailable: 429"
+            )
+
+    run_ = Run(transport=router(FellBack("typesafe"), Provider("cloudflare")))
+    asyncio.run(
+        run_.call_clairic(
+            mixed_fields(), render_clairic("Ada", label="the Person"), meta=META
+        )
+    )
+    first, second = (c for c in run_.calls if c.usage)  # and the primary's failure
+    assert (first.provider, first.fallback_from) == ("cloudflare", None)
+    assert (second.provider, second.fallback_from) == ("typesafe", "cloudflare")
+
+
+def test_the_split_call_annotates_a_copy_not_the_error_another_call_may_share() -> None:
+    shared = BadRequestError("refused")
+    jev, cf = Provider("typesafe", tokens=40), Provider("cloudflare")
+    release = asyncio.Event()
+
+    async def wait() -> None:
+        await release.wait()
+
+    async def done() -> None:
+        release.set()
+
+    cf.gate, jev.gate = wait, done
+    cf.failure = shared
+    with pytest.raises(BadRequestError) as caught:
+        run(router(jev, cf))
+    assert caught.value is not shared
+    assert caught.value.maybe_sent is True  # the one that was raised
+    assert "partial_usage" not in vars(shared) and not shared.maybe_sent
+    assert "_blamed" not in vars(shared)
+    assert caught.value.__cause__ is shared
+
+
+def test_nested_stacks_close_each_provider_once() -> None:
+    """The reviewer's probe P1: a field-type router inside a kind router."""
+    closes: list[str] = []
+
+    class Closing(Provider):
+        async def aclose(self) -> None:
+            closes.append(self.provider)
+
+    cf, jev = Closing("cloudflare"), Closing("typesafe")
+    spec = ComboSpec(
+        extraction="cloudflare",
+        extraction_by_type={"date": "typesafe"},
+        decision="cloudflare",
+        by_kind={"gate": "typesafe"},
+    )
+    stack = build_combo_transport(spec, providers={"cloudflare": cf, "typesafe": jev})
+    asyncio.run(stack.aclose())  # type: ignore[attr-defined]
+    assert sorted(closes) == ["cloudflare", "typesafe"]
+    closes.clear()
+    nested = KindRoutingTransport(
+        {"clairic": router(jev, cf)}, default=KindRoutingTransport({"gate": jev}, cf)
+    )
+    asyncio.run(nested.aclose())
+    assert sorted(closes) == ["cloudflare", "typesafe"]
+
+
+def test_close_reaches_the_innermost_transport_through_wrappers() -> None:
+    closed: list[str] = []
+
+    class Sync(Provider):
+        def close(self) -> None:
+            closed.append(self.provider)
+
+    jev, cf = Sync("typesafe"), Sync("cloudflare")
+    spec = ComboSpec(extraction_by_type={"date": "typesafe"})
+    stack = build_combo_transport(spec, providers={"cloudflare": cf, "typesafe": jev})
+    stack.close()  # type: ignore[attr-defined]
+    assert sorted(closed) == ["cloudflare", "typesafe"]

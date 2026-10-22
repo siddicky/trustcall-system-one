@@ -367,14 +367,23 @@ uv run python -m evals combo --spec spec.json --live --record evals/cassettes --
 uv run python -m evals search --base spec.json --live --providers cloudflare,typesafe,decisions \
     --price cloudflare=P:P --price typesafe=P:P --price decisions=P:P --max-runs 40 --budget-usd 10 \
     --record evals/cassettes --out evals/results/search     # dev suite only
-uv run python -m evals search --base evals/results/search/best.json --calibrate --replay evals/cassettes/BEST \
-    --live --providers cloudflare,typesafe,decisions --out evals/results/search-cal
-uv run python -m evals combo --spec evals/results/search/best.json --suite holdout --live
+# calibration of the winner: record it once, then search the shifts over the raw recording
+uv run python -m evals combo --spec evals/results/search/best.json --live --record evals/cassettes --tag BEST
+uv run python -m evals search --base evals/results/search/best.json --calibrate-only \
+    --replay evals/cassettes/BEST --out evals/results/search-cal         # --live: misses go to the API
+uv run python -m evals combo --spec evals/results/search-cal/best.json --suite holdout --live
 ```
 
 A failed case is reported, never retried; a trial that raises is a row in the leaderboard and the search
-goes on; `--resume DIR` reuses every combination already evaluated there. Hand back `leaderboard.md`,
-`best.json` and the holdout result of the winner.
+goes on; `--resume DIR` reuses the combinations already evaluated there IN THE SAME MODE (an offline
+search resumed with `--live` reuses nothing). `--replay` is for the calibration search alone, and a
+recording only answers the provider that made it: a spec that routes a call elsewhere gets a miss, never
+another provider's answer. A positive shift of `gate`, `null_check` or `delete` raises the probability that
+decides a removal: the search leaves those kinds out unless they are named in `--calibrate-kinds`, tries
+only shifts of 0 or less for them unless `--allow-positive-removal-shift`, and flags them in the
+leaderboard. An improvement has to beat the incumbent by `--min-margin` (default 1 case or 0.02 F1).
+Hand back `leaderboard.md`, `best.json` and the holdout result of the winner (its directory is named
+`...-holdout-...`).
 
 ## 5. What to hand back
 

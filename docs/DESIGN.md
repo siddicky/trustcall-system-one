@@ -1679,10 +1679,20 @@ is the opt-in; no key in the environment ever routes text anywhere, and nothing 
   `gather_all`, the error goes through `_blame` (a sibling that may have run is the error that is raised),
   carries `maybe_sent`, and, when a partition had answered, `partial_usage` = what the answered partitions
   used plus the failed one's own, so the engine neither contains it (`is_size_rejection` is false for a
-  charged request) nor resends the siblings, `classify_failure` says `uncertain` (not for a
-  `BadRequestError`, which never falls back, but `may_have_run` is true) and the engine logs the siblings'
-  errors and cancellations. The failed call is logged as one record with the summed usage, under the failed
-  partition's provider (a per-partition breakdown of a failure is not kept).
+  charged request) nor resends the siblings, and the engine logs the siblings' errors and cancellations.
+  The error is a COPY of the failing one (an error object that another call may share, the stitch memo, is
+  never annotated). **Classification** (`_classify_through`, used by both routers, mirroring
+  `TypeSafeTransport.classify_failure`): `None` for `AuthError` and `BadRequestError` (they never fall
+  back), `uncertain` for anything with `maybe_sent` or `partial_usage` whatever its type, so a
+  `ModelResponseError` of one partition after another answered is not `bad_response` (a
+  `FallbackTransport(router, backup, on={"bad_response"})` does not resend), and only then the transport
+  that raised it. A merge that fails (a partition's body without answers) is annotated the same way with
+  the sum of what every partition used, the reported cost included (it travels in `partial_usage.cost`).
+  The failed call is logged as one record with the summed usage, under the failed partition's provider (a
+  per-partition breakdown of a failure is not kept). A partition that returns no `state_text` while another
+  does read the state as it was sent. `aclose` and `close` of every router and wrapper reach the
+  innermost transports and close each once (`_innermost`: a transport shared by the routers of a nested
+  stack is not closed twice).
 - **`CalibratedTransport(inner, shifts, *, by_provider=None)`** applies a **monotone logit shift** to the
   probabilities of Clef answers of the listed call kinds, so a provider can be calibrated to the thresholds
   the engine was tuned on without changing them (see "Provider calibration" above: Experiential scored a
@@ -1696,8 +1706,17 @@ is the opt-in; no key in the environment ever routes text anywhere, and nothing 
   (a bare pick of the Decisions API is capped at 0.8 on purpose so that it cannot authorise a removal; a
   calibration must not lift it past `gates.remove_threshold`), Clairic answers, anything malformed. The
   default is no shift: a kind without one, or with 0, returns the very same response object. A calibrated
-  response gets the warning `calibration_applied: <kind> logit shift <+x>` (once per run, no text). Shifts
-  are limited to +-10, keys are checked against `CallKind`. `by_provider` (response `provider` to kind to
+  response gets the warning `calibration_applied: <kind> logit shift <+x>` (once per run, no text); a
+  `by_provider` shift that cannot be looked up because a response names no provider says
+  `calibration_skipped` instead of silently doing nothing. Shifts are limited to **+-3** (+3 turns 0.6 into
+  0.95), keys are checked against `CallKind`. **A positive shift on a kind that can authorise a removal
+  makes the engine remove more:** `gate` (a removal or set-null needs `gates.remove_threshold`),
+  `null_check` (`verify.null_confirm_yes` sets a value to null) and `delete` (`match.delete_threshold`) are
+  `combos.REMOVAL_KINDS`. The search leaves them out of the default `--calibrate` kinds, they have to be
+  named in `--calibrate-kinds`, and even then only shifts of 0 or less are tried unless
+  `--allow-positive-removal-shift` is given; `ComboSpec.removal_shifts()` lists such shifts, the leaderboard
+  flags every combination that has one (`[removal shift: ...]` and a section), and `combo` says so before it
+  runs. `by_provider` (response `provider` to kind to
   shift) lets one wrapper calibrate each provider of a router, and **the wrapper can sit outside a
   `RecordingTransport` or `CassetteTransport`** (they keep each provider's raw answer and its `provider`):
   a recording made under one calibration replays under another, which is what makes the calibration search
@@ -1736,8 +1755,20 @@ is the opt-in; no key in the environment ever routes text anywhere, and nothing 
   names (`CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_API_TOKEN`, `EXPERIENTIAL_API_KEY`, `TYPESAFE_API_KEY`; the
   error names the variables, never values). The calibration wraps the recorder and the cassette, as above.
   `--suite holdout` reads `evals/holdout_cases.py` (`CASES`); a missing file is a one-line error, not a
-  traceback. `CaseResult` gained `output_tokens` and `by_provider` (requests and tokens per provider, from
-  the call log, failed calls included) and `aggregate` gained `op_f1` and `output_tokens`.
+  traceback. `CaseResult` gained `output_tokens` and `by_provider` (requests, tokens and reported cost per
+  provider, from the call log, failed calls included, and what the calls answered from a cassette used:
+  `replayed_*`) and `aggregate` gained `op_f1` and `output_tokens`.
+  **A replay is provider-aware.** `request_key` hashes the model and the payload only, so a cassette of one
+  combination would answer the SAME request routed to ANOTHER provider (an attribution routed to the
+  Decisions API answered with the recorded Cloudflare probabilities). In a combination every provider's
+  transport is wrapped on its own (`build_combo_transport(wrap=...)`): a `RecordingTransport` that writes
+  what THAT provider answered, then a `CassetteTransport(provider=...)` that replays only what that provider
+  recorded (a recording by another provider, or by none, is a miss: `cassette miss ... made by another
+  provider`). A miss fails its case, and goes to the provider only with `--live` (`results.json` has
+  `replay`, the `mode` is `replay+live` and `forwarded` counts them). The calibration stays outermost, over
+  the raw answers. Cassettes recorded before this (one recorder over the whole stack) hold the merged
+  Clairic responses and replay nothing for a combination: record again. The limits a replay uses
+  (`max_questions`, `state_token_budget`) are the smallest recorded.
 - **`python -m evals search`** (`evals/search.py`): a greedy coordinate search from `--base spec.json` over
   the dimensions of `--order` (default: presence/qualify/count, coref, match/match_confirm,
   attribution/stated/null_check, gate/novelty/list_dedup/relative_edit, clef_fields, verify
@@ -1745,32 +1776,52 @@ is the opt-in; no key in the environment ever routes text anywhere, and nothing 
   named too). For each dimension it tries each candidate of `--providers` (applied to the kinds it can
   serve) from the CURRENT best and keeps the one that improves the objective: **more cases passed, then
   op F1, then value accuracy, then fewer bleed + wrong deletes; bleed or wrong deletes going up is a veto**
-  whatever else improved. **Dev suite only** (`--suite holdout` is refused: check the winner with `combo
+  whatever else improved; and **an improvement must beat the incumbent by a margin** (`--min-margin
+  CASES[:F1]`, default one passed case, or, with as many passed, 0.02 of op F1 or of value accuracy; fewer
+  bleed and wrong deletes with no loss needs none), so that a one-case swing within the noise of two live
+  runs is not kept; `--repeats N` evaluates a candidate that wins narrowly (under two cases and 0.05 of F1)
+  N times in all and keeps it only if every run beats the incumbent (each run is paid for).
+  **Dev suite only** (`--suite holdout` is refused for `search`, and for `sweep`: check the winner with `combo
   --spec <out>/best.json --suite holdout`). `--max-runs` (new evaluations) and `--budget-usd` stop BETWEEN
   trials (the budget compares spent + the dearest trial so far; the base always runs; with `--live` it
   needs a `--price provider=IN:OUT` per candidate, USD per million tokens, since a budget that cannot be
-  priced cannot bind). Cost = tokens per provider x price, plus the cost the providers reported when some
-  provider has no price (`~` in the table when a used provider has neither). **Nothing is retried:** a case
+  priced cannot bind). Cost, per provider: its tokens x its price when it has one, else the cost it
+  reported (Experiential does), and `~` in the table whenever a provider that spent tokens has neither;
+  calls answered from a cassette are not spend. **Nothing is retried:** a case
   that fails is a failed case with its error in the table, a trial that raises is an `error` row and the
   search goes on (the base's failure ends it: there is nothing to compare with), and a combination
   (`spec.key()`) is run once, also across `--resume DIR`, which reloads `search.json` (a different suite or
-  case list is refused) and replays the same decisions from the cache. `--live` needs `--providers`
+  case list is refused) and replays the same decisions from the cache. **A trial is reused only in the
+  mode it ran in** (`offline`, `live`, `replay:<dir>`, `live+replay:<dir>`, stored on each trial): an
+  offline search resumed with `--live` reuses nothing and runs the base for real. A trial that errored is
+  reported again, not run again, unless `--retry-errors`. `--live` needs `--providers`
   (naming them is the opt-in). Output: `search.json`, `leaderboard.md` (every spec tried: result, pass,
   op F1, value accuracy, bleed, wrong deletes, requests, tokens, cost, seconds per case; the failures of the
   best; what was not run and why), `best.json` (a spec file), and `trials/NN-<change>/results.json`.
-  **`--calibrate`** then grid-searches a logit shift per (provider, kind) (`--grid -1.5:1.5:0.5`,
-  `--calibrate-kinds`), the provider being the one that answers the kind in the best spec; the first shift
-  that improves the objective is kept. With `--replay` of the best combination's cassettes the raw answers
-  are replayed and only the requests that the shift changes go live.
+  **`--calibrate`** then grid-searches a logit shift per (provider, kind) (`--grid=-1.5:1.5:0.5`,
+  `--calibrate-kinds`, the removal kinds as above), the provider being the one that answers the kind in
+  the best spec; the first shift that improves the objective by the margin is kept. `--calibrate-only`
+  (or `--order none --calibrate`) skips the routing dimensions (`--order ""` is an error, not "all").
+  **`--replay` is accepted by the calibration search alone**: a routing search runs each combination for
+  real, because a different routing is a different question. Replay the recording of the combination that
+  is calibrated (`combo --record DIR --tag NAME`, then `--base <that spec> --calibrate-only --replay
+  DIR/NAME`): the raw answers are replayed and only the requests that a shift changes go to a provider
+  (with `--live`; otherwise they miss).
 - **Left out on purpose:** a `FallbackTransport` in a spec; per-kind (not per-model) `max_questions` (the
   engine sizes a request before it knows its kind, so the smallest limit among candidates applies to all
   Clef requests of the stack: Decisions in the mix limits every Clef request to 32 questions and Jev to
   24k tokens of state); a per-partition breakdown of a failed split call; calibrating Clairic's `p_null`;
   a search over `options`; a PyYAML dependency (JSON needs nothing).
-- **Tests:** `test_kind_routing.py`, `test_field_type_routing.py`, `test_calibration.py`, `test_combos.py`
-  and `test_evals_combo.py` (the search picks, from scripted providers that are each wrong about
-  different kinds, the provider that is right for each; the veto, the budget, `--max-runs`, resume,
-  no retry, the calibration grid, the suite and its missing file).
+- **Gold that needs a report.** `Case.expect_skipped=[(reason, record id)]` (scored: `n_skipped`,
+  `skipped_found`) makes a case whose right answer is "do nothing, and say why" fail for a combination that
+  does nothing: `update_and_delete_conflict` expects `conflict_update_delete` for `acct-2`.
+- **Tests:** `test_kind_routing.py`, `test_field_type_routing.py`, `test_calibration.py`, `test_combos.py`,
+  `test_evals_combo.py` and `test_evals_review.py`. The search picks, from scripted providers that are each
+  wrong about different kinds, the provider that is right for each; the veto, the margin and its repeats,
+  the budget, `--max-runs`, resume by mode, no retry, the calibration grid and its removal kinds, the
+  suite and its missing file; and the regressions of the review: a replay answers only from the provider
+  it was routed to, classification and annotation of a partial failure, a failed merge, the closing of
+  nested stacks, the cost of a replay.
 
 ## TypeSafe-only provider (`TypeSafeTransport`, `_typesafe.py`)
 

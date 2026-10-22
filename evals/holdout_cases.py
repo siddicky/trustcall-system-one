@@ -1513,9 +1513,9 @@ def meeting_transcript() -> Case:
 
 def crm_two_leads() -> Case:
     text = (
-        "Leads 3/12: J. Okafor - buyer, pre-appr. $450k, wants 3BR+, N. side pref. "
-        "M. Brandt - buyer, no pre-appr yet, budget ~$620k, 2BR ok. VM left for "
-        "both; f/u Fri."
+        "Leads 3/12: J. Okafor - buyer, budget $450k, pre-appr., wants 3BR+, N. side "
+        "pref. M. Brandt - buyer, no pre-appr yet, budget ~$620k, min 2BR. VM left "
+        "for both; f/u Fri."
     )
 
     def world() -> FakeWorld:
@@ -1572,7 +1572,8 @@ def crm_two_leads() -> Case:
         tags=("realestate", "insert", "many", "abbreviations", "bleed", "crm"),
         world=world,
         note="A CRM note in shorthand: '$450k' is 450000, '3BR+' is at least 3 "
-        "bedrooms, 'pre-appr.' / 'no pre-appr yet' are true / false, names with "
+        "bedrooms and 'min 2BR' is at least 2, 'pre-appr.' / 'no pre-appr yet' are "
+        "true / false, names with "
         "initials. The numbers and the area of one lead never land on the other; "
         "'VM left', '3/12' and 'f/u Fri' are not facts about either field.",
     )
@@ -2078,6 +2079,9 @@ def update_and_delete_conflict() -> Case:
         # (SkippedEntity conflict_update_delete): neither the delete nor the update is
         # applied. A careful reader agrees: the message contradicts itself.
         expect_ops=[],
+        # the conflict must be REPORTED: a combination that does nothing at all
+        # (no match, no delete) is not the right answer to this input
+        expect_skipped=[("conflict_update_delete", "acct-2")],
         must_not=[
             MustNot.delete(),
             MustNot.op("replace"),

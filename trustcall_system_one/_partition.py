@@ -137,14 +137,17 @@ def merge_bodies(
     order: Sequence[str],
     parts: Sequence[tuple[Sequence[str], Mapping[str, Any]]],
     labels: Sequence[Mapping[str, Any]],
+    sent: Any = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Merge the Clairic response bodies of the partitions of one request.
 
     Args:
         order: Every field name, in the order the request asked.
         parts: ``(field names, response body)`` per partition.
-        labels: One ``{"provider", "served_model"}`` per partition, copied into the
-            ``routing`` note of the merged body.
+        labels: One ``{"provider", "served_model", ...}`` per partition, copied into
+            the ``routing`` note of the merged body.
+        sent: The ``state`` the request carried. A partition that returns no
+            ``state_text`` while another does read the state as it was sent.
 
     Returns:
         ``(body, notes)``: the merged body and what was reconciled on the way (the
@@ -156,8 +159,8 @@ def merge_bodies(
     """
     notes: list[str] = []
     answers: dict[str, Any] = {}
-    texts: list[str] = []
     truncated = False
+    returned: list[str | None] = []
     for names, body in parts:
         got = body.get("answers")
         if not isinstance(got, Mapping):
@@ -167,8 +170,7 @@ def merge_bodies(
                 answers[name] = got[name]
         truncated = truncated or bool(body.get("truncated"))
         text = body.get("state_text")
-        if isinstance(text, str):
-            texts.append(text)
+        returned.append(text if isinstance(text, str) else None)
     merged: dict[str, Any] = {
         "model": next((str(b["model"]) for _, b in parts if b.get("model")), "clairic"),
         "answers": {name: answers[name] for name in order if name in answers},
@@ -176,17 +178,21 @@ def merge_bodies(
         "usage": sum_usage([b.get("usage") for _, b in parts]),
         "routing": {"partitions": [dict(label) for label in labels]},
     }
-    if texts:
-        shortest = min(texts, key=len)
-        if all(t.startswith(shortest) for t in texts):
+    if any(t is not None for t in returned):
+        # a partition that sent no text read the state as it was sent
+        fill = sent if isinstance(sent, str) else None
+        texts = [t if t is not None else fill for t in returned]
+        known = [t for t in texts if t is not None]
+        shortest = min(known, key=len)
+        if all(t.startswith(shortest) for t in known):
             # equal, or some partition read only the beginning of the input: the
             # shared prefix is the text every span can be mapped through
             merged["state_text"] = shortest
         else:
-            first = texts[0]
+            first = known[0]
             merged["state_text"] = first
-            for names, body in parts:
-                if body.get("state_text") != first:
+            for (names, _), text in zip(parts, texts, strict=True):
+                if text != first:
                     for name in names:
                         entry = merged["answers"].get(name)
                         if isinstance(entry, Mapping):

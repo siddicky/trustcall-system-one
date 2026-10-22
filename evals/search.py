@@ -38,6 +38,7 @@ from evals.runner import SuiteResult, aggregate
 from trustcall_system_one.combos import (
     CLAIRIC_PROVIDERS,
     PROVIDERS,
+    REMOVAL_KINDS,
     ComboSpec,
 )
 from trustcall_system_one.testing import scrub
@@ -47,6 +48,7 @@ __all__ = [
     "DEFAULT_ORDER",
     "DIMENSIONS",
     "GRID",
+    "Margin",
     "Objective",
     "SearchResult",
     "Trial",
@@ -137,12 +139,37 @@ class Objective:
         )
 
 
-def compare(candidate: Objective, best: Objective) -> tuple[bool, str]:
+@dataclass(frozen=True)
+class Margin:
+    """How much better than the incumbent a candidate must be to be kept.
+
+    A difference of one case, or of a few hundredths of F1, is within what two runs of
+    the same combination can differ by live; a search that keeps such a "win" walks
+    towards noise. ``passed`` is a number of cases (at least 1), ``f1`` the op F1
+    (and the value accuracy) by which a candidate has to beat the incumbent when
+    the passed cases are equal.
+    """
+
+    passed: int = 1
+    f1: float = 0.02
+
+
+def compare(
+    candidate: Objective, best: Objective, margin: Margin | None = None
+) -> tuple[bool, str]:
     """Whether ``candidate`` replaces ``best``, and why or why not.
 
-    Bleed or wrong deletes going up is a veto; otherwise the candidate must be
-    strictly better on the lexicographic order.
+    Bleed or wrong deletes going up is a veto. Otherwise the candidate has to pass at
+    least ``margin.passed`` more cases; or the same or more and an op F1, or a value
+    accuracy, higher by at least ``margin.f1``; or lose nothing and have fewer bleed
+    and wrong deletes (a safety gain needs no margin).
+
+    Args:
+        candidate: The objective of the candidate.
+        best: The incumbent's.
+        margin: The margin (default: one case, or 0.02 of F1).
     """
+    margin = margin or Margin()
     if candidate.bleed > best.bleed:
         return False, f"veto: bleed {best.bleed} -> {candidate.bleed}"
     if candidate.wrong_deletes > best.wrong_deletes:
@@ -150,8 +177,27 @@ def compare(candidate: Objective, best: Objective) -> tuple[bool, str]:
             False,
             f"veto: wrong deletes {best.wrong_deletes} -> {candidate.wrong_deletes}",
         )
-    if candidate.rank > best.rank:
+    need = max(margin.passed, 1)
+    if candidate.passed >= best.passed + need:
         return True, "improves the objective"
+    if candidate.passed >= best.passed:
+        step = max(margin.f1, 1e-6)
+        if candidate.f1 - best.f1 >= step - _EPS:
+            return True, "improves the objective"
+        no_worse = candidate.f1 >= best.f1 - _EPS
+        if no_worse and candidate.value_accuracy - best.value_accuracy >= step - _EPS:
+            return True, "improves the objective"
+        safer = candidate.bleed + candidate.wrong_deletes < (
+            best.bleed + best.wrong_deletes
+        )
+        if (
+            no_worse
+            and safer
+            and candidate.value_accuracy >= best.value_accuracy - _EPS
+        ):
+            return True, "improves the objective"
+    if candidate.rank > best.rank:
+        return False, "better, but by less than the margin"
     return False, "no gain"
 
 
@@ -160,11 +206,12 @@ def estimate_cost(
 ) -> tuple[float, bool]:
     """The cost of a suite in USD, estimated from its usage, and whether it is partial.
 
-    Each provider that has a price (``(input, output)`` USD per million tokens) is
-    charged for its tokens; the cost the providers reported (Experiential Labs
-    reports one per call) is added when some provider has no price, since it then
-    stands for that provider's calls. The estimate is ``partial`` when a provider
-    that was used has neither a price nor a reported cost.
+    Per provider (``CaseResult.by_provider``): when it has a price (``(input,
+    output)`` USD per million tokens) its tokens are charged at it; when it has none
+    but reported a cost (Experiential Labs reports one per call) that cost is added.
+    Calls answered from a cassette are not counted (a replay spends nothing). The
+    estimate is ``partial`` whenever a provider that spent tokens has neither a
+    price nor a reported cost.
 
     Args:
         results: The case results.
@@ -174,24 +221,25 @@ def estimate_cost(
     Returns:
         ``(usd, partial)``.
     """
-    totals: dict[str, tuple[int, int]] = {}
+    totals: dict[str, list[float]] = {}
     for r in results:
         for label, row in r.by_provider.items():
             name = _LABEL_TO_PROVIDER.get(label, label)
-            inp, out = totals.get(name, (0, 0))
-            totals[name] = (inp + row["input_tokens"], out + row["output_tokens"])
-    reported = sum(r.reported_cost_usd for r in results)
-    estimated = 0.0
-    unpriced = False
-    for name, (inp, out) in totals.items():
+            used = totals.setdefault(name, [0.0, 0.0, 0.0])
+            used[0] += row["input_tokens"] - row.get("replayed_input_tokens", 0)
+            used[1] += row["output_tokens"] - row.get("replayed_output_tokens", 0)
+            used[2] += row.get("cost_usd", 0.0) - row.get("replayed_cost_usd", 0.0)
+    usd = 0.0
+    partial = False
+    for name, (inp, out, reported) in totals.items():
         if name in prices:
             low, high = prices[name]
-            estimated += inp * low / 1e6 + out * high / 1e6
-        elif inp or out:
-            unpriced = True
-    if unpriced:
-        return estimated + reported, reported <= 0
-    return estimated, False
+            usd += inp * low / 1e6 + out * high / 1e6
+        elif reported > 0:
+            usd += reported
+        elif inp > 0 or out > 0:
+            partial = True
+    return usd, partial
 
 
 @dataclass
@@ -214,6 +262,9 @@ class Trial:
         cached: Whether it came from a resumed results directory.
         error: What stopped the trial, if it did.
         path: The directory of its ``results.json``.
+        mode: How it ran (``offline``, ``live``, ``replay:<dir>``,
+            ``live+replay:<dir>``): a trial is only reused by a search in the same
+            mode, so an offline result never stands in for a live one.
     """
 
     n: int
@@ -229,6 +280,7 @@ class Trial:
     cached: bool = False
     error: str | None = None
     path: str | None = None
+    mode: str = ""
 
     @property
     def objective(self) -> Objective:
@@ -352,6 +404,11 @@ async def run_search(
     calibrate: bool = False,
     grid: Sequence[float] = GRID,
     calibrate_kinds: Sequence[str] | None = None,
+    allow_positive_removal_shift: bool = False,
+    mode: str = "offline",
+    retry_errors: bool = False,
+    margin: Margin | None = None,
+    repeats: int = 1,
     on_trial: Callable[[Trial, SuiteResult | None, SearchResult], None] | None = None,
     log: Callable[[str], None] | None = None,
 ) -> SearchResult:
@@ -368,11 +425,25 @@ async def run_search(
             past this (the estimate is the dearest trial so far). The total counts
             the trials of ``previous``.
         previous: Trials of an earlier search (``load_previous``): a combination
-            that was evaluated is taken from here instead of being run again.
+            that was evaluated, IN THE SAME ``mode``, is taken from here instead of
+            being run again; so is one that errored, unless ``retry_errors``.
         calibrate: After the routing, grid-search a logit shift per (provider, kind).
         grid: The shifts to try.
-        calibrate_kinds: The call kinds to calibrate (default: every Clef kind of
-            ``DIMENSIONS``).
+        calibrate_kinds: The call kinds to calibrate. The default is every Clef kind
+            of ``DIMENSIONS`` EXCEPT those that can authorise a removal
+            (``REMOVAL_KINDS``: ``gate``, ``null_check``, ``delete``), which must be
+            listed here, and then only shifts of 0 or less are tried unless
+            ``allow_positive_removal_shift``.
+        allow_positive_removal_shift: Try positive shifts of the removal kinds too.
+        mode: How the evaluations run (``offline``, ``live``, ``replay:<dir>``...),
+            recorded on each trial and matched when ``previous`` is reused.
+        retry_errors: Run again the trials of ``previous`` that errored.
+        margin: How much better than the incumbent a candidate must be to be kept
+            (see ``Margin``; default one case or 0.02 of F1).
+        repeats: A candidate that wins narrowly (less than two cases and 0.05 of F1
+            ahead) is evaluated this many times in all and kept only if every run
+            beats the incumbent by the margin (each run counts for ``max_runs`` and
+            the budget).
         on_trial: Called once a trial's outcome is known, with the trial, its suite
             (``None`` for a cached or failed one) and the search so far, to write it
             down as the search goes.
@@ -390,7 +461,12 @@ async def run_search(
         raise ValueError(f"unknown provider(s) {unknown}; expected one of {PROVIDERS}")
     price = dict(prices or {})
     note = log or (lambda line: None)
-    cache = {t.spec.key(): t for t in previous if t.error is None and t.aggregate}
+    margin = margin or Margin()
+    cache = {
+        t.spec.key(): t
+        for t in previous
+        if t.mode == mode and (t.aggregate or (t.error and not retry_errors))
+    }
     trials: list[Trial] = []
     seen: set[str] = set()
     not_run: list[str] = []
@@ -431,12 +507,16 @@ async def run_search(
                 spec=spec,
                 dimension=dimension,
                 change=change,
-                outcome="rejected",
+                outcome="error" if old.error else "rejected",
                 note="",
                 cached=True,
             )
             trials.append(trial)
-            note(f"[{n}] {change}: cached ({_summary(trial)})")
+            note(
+                f"[{n}] {change}: cached ("
+                + (f"error {trial.error}" if trial.error else _summary(trial))
+                + ")"
+            )
             return trial, None
         stop = refuse()
         if stop and not first:  # the base always runs: there is nothing to compare with
@@ -456,6 +536,7 @@ async def run_search(
                 outcome="error",
                 note="the trial raised; it was not retried",
                 error=scrub(f"{type(exc).__name__}: {str(exc)[:200]}"),
+                mode=mode,
             )
             trials.append(trial)
             note(f"[{n}] {change}: error {trial.error}")
@@ -471,6 +552,7 @@ async def run_search(
             cost_usd=usd,
             cost_partial=partial,
             failures=_failures(suite.results),
+            mode=mode,
         )
         state["spent"] += usd
         dearest[0] = max(dearest[0], usd)
@@ -481,6 +563,28 @@ async def run_search(
     best: Trial | None = None
     stopped = ""
 
+    async def confirm(spec: ComboSpec, trial: Trial, label: str) -> str:
+        """Evaluate a narrow winner again; "" if every repeat beat the incumbent."""
+        assert best is not None
+        for again in range(2, repeats + 1):
+            stop = refuse()
+            if stop:
+                return f"not confirmed: {stop}"
+            state["runs"] += 1
+            try:
+                suite = await evaluate(spec, f"{label}-repeat{again}")
+            except Exception as exc:
+                return f"not confirmed: repeat {again} raised {type(exc).__name__}"
+            usd, _ = estimate_cost(suite.results, price)
+            state["spent"] += usd
+            dearest[0] = max(dearest[0], usd)
+            ok, why = compare(
+                Objective.of(aggregate(suite.results)), best.objective, margin
+            )
+            if not ok:
+                return f"won once but not on repeat {again} ({why})"
+        return ""
+
     async def consider(spec: ComboSpec, dimension: str, change: str) -> None:
         nonlocal best
         assert best is not None
@@ -489,8 +593,12 @@ async def run_search(
             return
         trial, suite = found
         if trial.error is None:
-            ok, why = compare(trial.objective, best.objective)
+            ok, why = compare(trial.objective, best.objective, margin)
             trial.note = why
+            if ok and repeats > 1 and _narrow(trial.objective, best.objective):
+                refused = await confirm(spec, trial, f"{trial.n:02d}-{_slug(change)}")
+                if refused:
+                    ok, trial.note = False, refused
             if ok:
                 trial.outcome = "kept"
                 best = trial
@@ -524,8 +632,18 @@ async def run_search(
                     current = cal.get(provider, {}).get(kind, 0.0)
                     if abs(shift - current) < _EPS:
                         continue
-                    cal[provider] = {**cal.get(provider, {}), kind: shift}
                     change = f"cal {provider}.{kind}{shift:+g}"
+                    if (
+                        kind in REMOVAL_KINDS
+                        and shift > 0
+                        and not allow_positive_removal_shift
+                    ):
+                        not_run.append(
+                            f"{change}: {kind} can authorise a removal; a positive "
+                            "shift needs --allow-positive-removal-shift"
+                        )
+                        continue
+                    cal[provider] = {**cal.get(provider, {}), kind: shift}
                     try:
                         spec = best.spec.replace(calibration=cal)
                     except ValueError as exc:
@@ -539,12 +657,23 @@ async def run_search(
     return SearchResult(trials, best, stopped, state["spent"], not_run)
 
 
+def _narrow(candidate: Objective, best: Objective) -> bool:
+    """Whether a candidate is ahead by little: under two cases and 0.05 of F1."""
+    return candidate.passed - best.passed < 2 and candidate.f1 - best.f1 < 0.05
+
+
 def _calibration_pairs(
     spec: ComboSpec, kinds: Sequence[str] | None
 ) -> Iterator[tuple[str, str]]:
-    """``(kind, provider)`` of the Clef kinds to calibrate, as the spec routes them."""
+    """``(kind, provider)`` of the Clef kinds to calibrate, as the spec routes them.
+
+    Without ``kinds``, the kinds that can authorise a removal are left out.
+    """
     wanted = kinds or [
-        k for group in DIMENSIONS.values() for k in group if k not in CLAIRIC_KINDS
+        k
+        for group in DIMENSIONS.values()
+        for k in group
+        if k not in CLAIRIC_KINDS and k not in REMOVAL_KINDS
     ]
     for kind in dict.fromkeys(wanted):
         if kind in CLAIRIC_KINDS:
@@ -578,6 +707,12 @@ def _cost(trial: Trial) -> str:
     return f"{'~' if trial.cost_partial else ''}${trial.cost_usd:.4f}"
 
 
+def _flag(trial: Trial) -> str:
+    """A marker for a combination that calibrates a removal kind upwards."""
+    shifts = trial.spec.removal_shifts()
+    return f" **[removal shift: {', '.join(shifts)}]**" if shifts else ""
+
+
 def leaderboard_markdown(result: SearchResult) -> str:
     """A Markdown leaderboard of every combination tried, best first.
 
@@ -607,13 +742,13 @@ def leaderboard_markdown(result: SearchResult) -> str:
         outcome = f"{star}{t.outcome}" + (" (cached)" if t.cached else "")
         if not agg:
             lines.append(
-                f"| {t.n} | `{t.spec.describe()}` | {t.change} | {outcome}: "
+                f"| {t.n} | `{t.spec.describe()}`{_flag(t)} | {t.change} | {outcome}: "
                 f"{t.error or t.note} | - | - | - | - | - | - | - | - | - |"
             )
             continue
         per_case = agg["wall_s"] / agg["cases"] if agg["cases"] else 0.0
         lines.append(
-            f"| {t.n} | `{t.spec.describe()}` | {t.change} | {outcome} "
+            f"| {t.n} | `{t.spec.describe()}`{_flag(t)} | {t.change} | {outcome} "
             f"| {agg['passed']}/{agg['cases']} | {_pct(agg.get('op_f1'))} "
             f"| {_pct(agg.get('value_accuracy'))} | {agg['bleed']} "
             f"| {agg['wrong_deletes']} | {agg['requests']} "
@@ -629,6 +764,18 @@ def leaderboard_markdown(result: SearchResult) -> str:
                 :200
             ]
             for f in t.failures
+        ]
+    risky = [t for t in result.trials if t.spec.removal_shifts()]
+    if risky:
+        lines += [
+            "",
+            "## Removal shifts",
+            "",
+            "These combinations raise the probability that decides a removal, a "
+            "set-null or a delete (`gate`, `null_check`, `delete`): they make the "
+            "engine remove more data. Check them before trusting the numbers.",
+            "",
+            *(f"- trial {t.n}: {', '.join(t.spec.removal_shifts())}" for t in risky),
         ]
     if result.not_run:
         lines += ["", "## Not run", ""] + [f"- {line}" for line in result.not_run]

@@ -367,7 +367,11 @@ def test_a_partial_usage_and_maybe_sent_pass_through_on_the_same_error() -> None
     assert caught.value is boom
     assert (boom.maybe_sent, boom.served_model) == (True, "jev-9")
     assert not is_size_rejection(boom)  # a charged request is never contained
-    assert router.classify_failure(boom) == "primary-says-uncertain"
+    # a BadRequestError never falls back, whoever raised it
+    assert router.classify_failure(boom) is None
+    maybe = UncertainOutcomeError("x")  # anything else that may have run is uncertain
+    maybe.maybe_sent = True
+    assert router.classify_failure(maybe) == "uncertain"
 
 
 def test_failures_are_classified_by_the_transport_that_raised_them() -> None:

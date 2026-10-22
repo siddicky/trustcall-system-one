@@ -273,6 +273,11 @@ class Case:
         expect_values: Values the final records must hold.
         expect_rejected: Rejections the result must report (a near-duplicate that
             was recognised as such, not merely never proposed).
+        expect_skipped: Entities the result must report as skipped, as ``(reason,
+            record id)``: ``("conflict_update_delete", "acct-2")``. The record id is
+            one of the records the skip names (its ``candidates``), or ``None``
+            for any. A case whose right answer is "do nothing, and say why" needs
+            this, or a combination that does nothing would pass it.
         must_not: Things that must not happen.
         tags: Groups for ``--tag`` (``notes``, ``bleed``, ``update``, ...).
         world: Builds the scripted ground truth that answers the case offline
@@ -290,6 +295,7 @@ class Case:
     allow_ops: Sequence[Op] = ()
     expect_values: Sequence[Val] = ()
     expect_rejected: Sequence[Rejected] = ()
+    expect_skipped: Sequence[tuple[str, str | None]] = ()
     must_not: Sequence[MustNot] = ()
     tags: Sequence[str] = ()
     world: Callable[[], WorldLike] | None = None
@@ -327,15 +333,21 @@ class CaseResult:
             precision).
         n_rejections: Expected rejections.
         rejections_found: How many were reported.
+        n_skipped: Expected skipped entities (``Case.expect_skipped``).
+        skipped_found: How many were reported.
         unknown_outcomes: Calls that may have been run and charged although no
             answer came back: ``UncertainOutcomeError`` (a timeout, a dropped
             connection, a 5xx) and calls cancelled after they may have been sent.
         reported_cost_usd: The cost in USD that responses reported (Experiential
             Labs reports one per call); it covers the calls that answered.
         output_tokens: Output tokens over all requests.
-        by_provider: Requests and tokens per provider that answered (``requests``,
-            ``input_tokens``, ``output_tokens``), from the call log (failed calls
-            included), so that a combination's cost can be estimated from prices.
+        by_provider: Requests, tokens and reported cost per provider that answered
+            (``requests``, ``input_tokens``, ``output_tokens``, ``cost_usd``), from
+            the call log (failed calls included), and, for a replay, what the calls
+            answered from the cassette used (``replayed_requests``,
+            ``replayed_input_tokens``, ``replayed_output_tokens``,
+            ``replayed_cost_usd``): the replay spends none of it, so a combination's
+            cost is estimated from the rest.
         probabilities: The attribution and change-gate probabilities behind the
             result, keyed ``"<record> <field> attribution"`` / ``"... gate"``
             (a list field has one attribution per element). These are the margins
@@ -367,10 +379,12 @@ class CaseResult:
     allowed: int = 0
     n_rejections: int = 0
     rejections_found: int = 0
+    n_skipped: int = 0
+    skipped_found: int = 0
     unknown_outcomes: int = 0
     reported_cost_usd: float = 0.0
     output_tokens: int = 0
-    by_provider: dict[str, dict[str, int]] = field(default_factory=dict)
+    by_provider: dict[str, dict[str, float]] = field(default_factory=dict)
 
     @property
     def precision(self) -> float:
@@ -391,6 +405,7 @@ class CaseResult:
             and self.matched_actual == self.n_actual
             and self.values_correct == self.n_values
             and self.rejections_found == self.n_rejections
+            and self.skipped_found == self.n_skipped
             and not self.violations
         )
 

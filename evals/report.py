@@ -96,6 +96,17 @@ def suite_markdown(suite: SuiteResult) -> str:
         )
     if suite.skipped:
         lines += ["", f"Skipped (no offline world): {', '.join(suite.skipped)}"]
+    if suite.replay:
+        lines += [
+            "",
+            f"Replay of `{suite.replay}`: a call is answered only by a recording of "
+            "the provider it is routed to (a combination), and "
+            + (
+                "a call with no such recording went to its provider (--live)."
+                if suite.mode == "replay+live"
+                else "a call with none failed its case (nothing is sent)."
+            ),
+        ]
     if agg["forwarded"]:
         lines += ["", f"Requests sent live during the replay: {agg['forwarded']}"]
     if agg["unknown_outcomes"]:
@@ -153,6 +164,7 @@ def write_suite(suite: SuiteResult, out: Path) -> tuple[Path, Path]:
         "clef_fallback": suite.clef_fallback,
         "suite": suite.suite,
         "tag": suite.tag,
+        "replay": suite.replay,
         "combo": combo_record(suite),
         "overrides": dict(suite.overrides),
         "aggregate": aggregate(suite.results),

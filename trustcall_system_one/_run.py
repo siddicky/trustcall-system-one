@@ -261,6 +261,7 @@ def _partitions(response: ClairicResponse) -> list[dict[str, Any]]:
                 "retries": int(item.get("retries") or 0),
                 "status_code": item.get("status_code"),
                 "request_id": item.get("request_id"),
+                "fallback_from": item.get("fallback_from"),
             }
         )
     return parts
@@ -742,7 +743,7 @@ class Run:
                     status_code=part["status_code"],
                     request_id=part["request_id"],
                     provider=part["provider"],
-                    fallback_from=sent.fallback_from,
+                    fallback_from=part["fallback_from"],
                 )
             return response
         # a stand-in provider's calls are filed under the model that answered

@@ -26,6 +26,7 @@ from evals.runner import Settings, SuiteResult, aggregate, run_suite
 from evals.search import (
     DEFAULT_ORDER,
     GRID,
+    Margin,
     SearchResult,
     Trial,
     leaderboard_markdown,
@@ -267,7 +268,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     search.add_argument(
         "--order",
-        help="the dimensions to search, in order, comma separated (default: "
+        help="the dimensions to search, in order, comma separated, or none (default: "
         f"{','.join(DEFAULT_ORDER)}; also: extract, other)",
     )
     search.add_argument("--max-runs", type=int, help="stop after this many evaluations")
@@ -299,11 +300,49 @@ def _parser() -> argparse.ArgumentParser:
         "--grid",
         default=None,
         metavar="LOW:HIGH:STEP",
-        help="the shifts to try (default -1.5:1.5:0.5)",
+        help="the shifts to try (default -1.5:1.5:0.5); write --grid=LOW:HIGH:STEP "
+        "so that a negative LOW is not read as an option",
+    )
+    search.add_argument(
+        "--calibrate-only",
+        action="store_true",
+        help="skip the routing dimensions: run the base, then the calibration grid "
+        "(the only search that may replay recordings: --order none --calibrate)",
     )
     search.add_argument(
         "--calibrate-kinds",
-        help="the call kinds to calibrate, comma separated (default: every Clef kind)",
+        help="the call kinds to calibrate, comma separated (default: every Clef kind "
+        "except gate, null_check and delete, which can authorise a removal and must "
+        "be listed here; their positive shifts are only tried with "
+        "--allow-positive-removal-shift)",
+    )
+    search.add_argument(
+        "--allow-positive-removal-shift",
+        action="store_true",
+        help="also try positive shifts of gate, null_check and delete: they raise the "
+        "probability that decides a removal",
+    )
+    search.add_argument(
+        "--retry-errors",
+        action="store_true",
+        help="with --resume, run again the trials that raised (default: they are "
+        "reported again, not retried)",
+    )
+    search.add_argument(
+        "--min-margin",
+        default="1:0.02",
+        metavar="CASES[:F1]",
+        help="how much better than the incumbent a candidate must be to be kept: "
+        "that many more passed cases, or (with as many) that much more op F1 or "
+        "value accuracy (default 1:0.02)",
+    )
+    search.add_argument(
+        "--repeats",
+        type=int,
+        default=1,
+        metavar="N",
+        help="evaluate a candidate that wins narrowly N times in all, and keep it "
+        "only if every run beats the incumbent by the margin (each run is paid for)",
     )
     list_ = sub.add_parser("list", help="list the cases")
     _suite_arg(list_)
@@ -314,6 +353,9 @@ def _out_dir(args: argparse.Namespace, name: str) -> Path:
     if args.out is not None:
         return Path(args.out)
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
+    suite = getattr(args, "suite", DEFAULT_SUITE)
+    if suite != DEFAULT_SUITE:  # a holdout result never lands among the dev ones
+        name = f"{suite}-{name}"
     return Path("evals") / "results" / f"{stamp}-{name}"
 
 
@@ -366,6 +408,12 @@ def _run(args: argparse.Namespace) -> int:
 
 
 def _sweep(args: argparse.Namespace) -> int:
+    if args.suite != DEFAULT_SUITE:
+        raise ValueError(
+            "a sweep chooses thresholds by what scores best: on the holdout that "
+            "would make it a dev set. Sweep on the dev suite (--suite default) and "
+            "check the chosen values with `python -m evals run --suite holdout`"
+        )
     cases = select_cases(_split(args.cases), _split(args.tag), args.suite)
     base = _base_overrides(args)
     grid: dict[str, list[Any]] = {}
@@ -425,6 +473,29 @@ def _disclose(spec: ComboSpec, live: bool) -> None:
         )
 
 
+def _notes(spec: ComboSpec, args: argparse.Namespace) -> None:
+    """What the user should know before the run starts."""
+    if spec.removal_shifts():
+        print(
+            "note: this combination raises the probability that decides a removal "
+            f"({', '.join(spec.removal_shifts())}): it makes the engine remove more",
+            file=sys.stderr,
+        )
+    if args.replay is not None and args.live:
+        print(
+            "note: with --live, a request the cassettes do not hold for the provider "
+            "it is routed to goes to that provider; results.json says how many "
+            "(forwarded) and the summary lists them",
+            file=sys.stderr,
+        )
+    elif args.replay is not None:
+        print(
+            "note: a request the cassettes do not hold for the provider it is routed "
+            "to is a miss and fails its case; without --live nothing is sent",
+            file=sys.stderr,
+        )
+
+
 def _combo(args: argparse.Namespace) -> int:
     spec = load_combo(args.spec)
     cases = select_cases(_split(args.cases), _split(args.case_tag), args.suite)
@@ -432,6 +503,7 @@ def _combo(args: argparse.Namespace) -> int:
     overrides = {**spec.options, **parse_overrides(args.set)}
     spec = spec.replace(options=overrides)
     _disclose(spec, args.live)
+    _notes(spec, args)
     settings = Settings(
         overrides=overrides,
         live=args.live,
@@ -482,6 +554,40 @@ def _grid(text: str | None) -> tuple[float, ...]:
     return tuple(round(low + i * step, 6) for i in range(count))
 
 
+def _order(args: argparse.Namespace) -> list[str]:
+    """The dimensions to search: ``--order``, ``--calibrate-only`` or the default."""
+    if args.calibrate_only:
+        if args.order not in (None, "none"):
+            raise ValueError("--calibrate-only skips the routing: do not give --order")
+        args.calibrate = True
+        return []
+    if args.order is None:
+        return list(DEFAULT_ORDER)
+    if args.order.strip().lower() == "none":
+        if not args.calibrate:
+            raise ValueError("--order none searches nothing without --calibrate")
+        return []
+    order = _split([args.order])
+    if not order:
+        raise ValueError(
+            "--order names no dimension: list them, or say none (with --calibrate)"
+        )
+    return order
+
+
+def _margin(text: str) -> Margin:
+    cases, _, f1 = text.partition(":")
+    try:
+        margin = Margin(int(cases), float(f1) if f1 else Margin().f1)
+        if margin.passed < 0 or margin.f1 < 0:
+            raise ValueError
+    except ValueError:
+        raise ValueError(
+            f"--min-margin is CASES[:F1] (numbers >= 0), got {text!r}"
+        ) from None
+    return margin
+
+
 def _search(args: argparse.Namespace) -> int:
     if args.suite != DEFAULT_SUITE:
         raise ValueError(
@@ -498,7 +604,14 @@ def _search(args: argparse.Namespace) -> int:
                 f"send text to them (of {', '.join(PROVIDERS)})"
             )
         providers = list(PROVIDERS)
-    order = _split([args.order]) if args.order else list(DEFAULT_ORDER)
+    order = _order(args)
+    if args.replay is not None and (order or not args.calibrate):
+        raise ValueError(
+            "--replay answers a call from what the recorded combination's providers "
+            "said, which is only the same question when the routing is unchanged: it "
+            "is for the calibration search alone (--calibrate-only, or --order none "
+            "--calibrate). A routing search runs each combination for real"
+        )
     prices = _prices(args.price)
     if args.budget_usd is not None and args.live:
         unpriced = sorted((set(providers) | set(base.providers())) - set(prices))
@@ -509,15 +622,24 @@ def _search(args: argparse.Namespace) -> int:
             )
     cases = select_cases(_split(args.cases), _split(args.case_tag), args.suite)
     out = Path(args.resume or args.out or _out_dir(args, "search"))
+    mode = ("live+" if args.live else "") + (
+        f"replay:{args.replay}" if args.replay is not None else ""
+    )
+    mode = mode.rstrip("+") or "offline"
     header = {
         "suite": args.suite,
         "cases": [c.id for c in cases],
         "providers": providers,
         "order": order,
         "live": bool(args.live),
+        "replay": str(args.replay) if args.replay is not None else "",
+        "mode": mode,
         "calibrate": bool(args.calibrate),
         "grid": list(_grid(args.grid)),
     }
+    margin = _margin(args.min_margin)
+    if args.repeats < 1:
+        raise ValueError("--repeats is at least 1")
     previous: list[Trial] = []
     if args.resume:
         old, previous = load_previous(Path(args.resume))
@@ -527,6 +649,13 @@ def _search(args: argparse.Namespace) -> int:
                     f"cannot resume: the earlier search ran another {name} "
                     f"({old.get(name)!r}); a result is only reused on the same cases"
                 )
+    if args.resume and any(t.mode != mode for t in previous):
+        print(
+            f"note: the trials of {args.resume} that ran in another mode "
+            f"({', '.join(sorted({t.mode or 'unknown' for t in previous} - {mode}))}) "
+            f"are not reused: this search runs in mode {mode}",
+            file=sys.stderr,
+        )
     if args.live:
         every = list(dict.fromkeys([*base.providers(), *providers]))
         print(
@@ -572,6 +701,11 @@ def _search(args: argparse.Namespace) -> int:
                 [args.calibrate_kinds] if args.calibrate_kinds else None
             )
             or None,
+            allow_positive_removal_shift=args.allow_positive_removal_shift,
+            mode=mode,
+            retry_errors=args.retry_errors,
+            margin=margin,
+            repeats=args.repeats,
             on_trial=on_trial,
             log=lambda line: print(line, file=sys.stderr),
         )

@@ -2855,10 +2855,42 @@ def _sensitive_of(members: Iterable[Transport]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
 
 
-async def _aclose_all(members: Iterable[Transport]) -> None:
-    """Close every member, even if one fails; the first error is raised afterwards."""
-    first: Exception | None = None
+def _innermost(members: Iterable[Transport]) -> list[Transport]:
+    """The transports under routers and wrappers, each once (by identity).
+
+    A router's ``_members()`` and a wrapper's ``_inner`` are looked through, so that
+    a transport shared by several routers of a nested stack (a combination with a
+    field-type router inside a kind router) is one entry, and is closed once.
+    """
+    seen: set[int] = set()
+    found: list[Transport] = []
+
+    def walk(transport: Transport) -> None:
+        if id(transport) in seen:
+            return
+        seen.add(id(transport))
+        listing = getattr(transport, "_members", None)
+        inner = getattr(transport, "_inner", None)
+        if callable(listing):
+            for member in listing():
+                walk(member)
+        elif inner is not None:
+            walk(inner)
+        else:
+            found.append(transport)
+
     for transport in members:
+        walk(transport)
+    return found
+
+
+async def _aclose_all(members: Iterable[Transport]) -> None:
+    """Close the innermost transports once each, even if one fails.
+
+    The first error is raised afterwards.
+    """
+    first: Exception | None = None
+    for transport in _innermost(members):
         closer = getattr(transport, "aclose", None)
         if callable(closer):
             try:
@@ -2870,7 +2902,7 @@ async def _aclose_all(members: Iterable[Transport]) -> None:
 
 
 def _close_all(members: Iterable[Transport]) -> None:
-    for transport in members:
+    for transport in _innermost(members):
         closer = getattr(transport, "close", None)
         if callable(closer):
             with contextlib.suppress(Exception):
@@ -2889,7 +2921,18 @@ def _mark(exc: BaseException, transport: object) -> None:
 
 
 def _classify_through(exc: Exception) -> str | None:
-    """The category of a failure, asked of the transport that raised it."""
+    """The category of a failure, asked of the transport that raised it.
+
+    Like ``TypeSafeTransport.classify_failure``: ``AuthError`` and
+    ``BadRequestError`` never fall back, an error that says a request may have gone
+    out and been charged (``maybe_sent``: a call of several requests that failed
+    part-way; ``partial_usage``) is ``"uncertain"`` whatever its type or the transport
+    that raised it, and only then is the transport that raised it asked.
+    """
+    if isinstance(exc, _NEVER_FALL_BACK):
+        return None
+    if getattr(exc, "maybe_sent", False) or getattr(exc, "partial_usage", None):
+        return "uncertain"
     source = getattr(exc, "_routed_through", None)
     classify = getattr(source, "classify_failure", None)
     if callable(classify):
@@ -3338,6 +3381,38 @@ class FieldTypeRoutingTransport:
             )
         return await self._run_parts(model, payload, parts, meta, timeout)
 
+    @staticmethod
+    def _annotate_failure(
+        error: BaseException, answered: Sequence[TransportResponse]
+    ) -> None:
+        """Say what the partitions that answered cost, and that more than one ran.
+
+        ``maybe_sent`` is set when a partition answered or a sibling was cancelled
+        in flight; ``partial_usage`` is what the answered partitions used (the
+        reported cost included), added to the failed partition's own.
+        """
+        siblings = int(getattr(error, "cancelled_siblings", 0))
+        if answered or siblings:
+            error.maybe_sent = True  # type: ignore[attr-defined]
+        if answered:  # those partitions were run, and charged
+            own = getattr(error, "partial_usage", None)
+            error.partial_usage = ClairicUsage(  # type: ignore[attr-defined]
+                **sum_usage(
+                    [
+                        *(r.body.get("usage") for r in answered),
+                        own.model_dump() if own is not None else None,
+                    ]
+                )
+            )
+            models = {r.served_model for r in answered}
+            known = getattr(error, "served_model", None)
+            if known:
+                models.add(known)
+            error.served_model = (  # type: ignore[attr-defined]
+                models.pop() if len(models) == 1 else None
+            )
+        _note_siblings(error, siblings)
+
     async def _run_parts(
         self,
         model: str,
@@ -3359,28 +3434,10 @@ class FieldTypeRoutingTransport:
         try:
             sent = await gather_all(*(one(t, sub) for t, _, sub in parts))
         except BaseException as exc:
-            error = _blame(exc)
-            siblings = int(getattr(error, "cancelled_siblings", 0))
-            if answered or siblings:
-                error.maybe_sent = True  # type: ignore[attr-defined]
-            if answered:  # those partitions were run, and charged
-                own = getattr(error, "partial_usage", None)
-                error.partial_usage = ClairicUsage(  # type: ignore[attr-defined]
-                    **sum_usage(
-                        [
-                            *(r.body.get("usage") for r in answered),
-                            own.model_dump() if own is not None else None,
-                        ]
-                    )
-                )
-                models = {r.served_model for r in answered}
-                known = getattr(error, "served_model", None)
-                if known:
-                    models.add(known)
-                error.served_model = (  # type: ignore[attr-defined]
-                    models.pop() if len(models) == 1 else None
-                )
-            _note_siblings(error, siblings)
+            # a copy, so that an error object another call may share is never
+            # annotated; a cancellation is the caller's own and stays as it is
+            error = _blame(_copy_of(exc) if isinstance(exc, Exception) else exc)
+            self._annotate_failure(error, answered)
             if error is exc:
                 raise
             raise error from exc
@@ -3394,14 +3451,21 @@ class FieldTypeRoutingTransport:
                 "duration_ms": round(r.duration_ms, 1),
                 "status_code": r.status_code,
                 "request_id": r.request_id,
+                "fallback_from": r.fallback_from,
             }
             for (t, names, _), r in zip(parts, sent, strict=True)
         ]
-        body, notes = merge_bodies(
-            list(payload["fields"]),
-            [(names, r.body) for (_, names, _), r in zip(parts, sent, strict=True)],
-            labels,
-        )
+        try:
+            body, notes = merge_bodies(
+                list(payload["fields"]),
+                [(names, r.body) for (_, names, _), r in zip(parts, sent, strict=True)],
+                labels,
+                sent=payload.get("state"),
+            )
+        except Exception as exc:
+            # every partition was run and charged: the failure to merge says so
+            self._annotate_failure(exc, sent)
+            raise
         providers = list(dict.fromkeys(str(label["provider"]) for label in labels))
         served = {r.served_model for r in sent}
         fell_back = next((r for r in sent if r.fallback_from is not None), None)
@@ -3445,8 +3509,9 @@ class FieldTypeRoutingTransport:
         _close_all(self._members())
 
 
-MAX_SHIFT = 10.0
-"""The largest logit shift (either way) a ``CalibratedTransport`` accepts."""
+MAX_SHIFT = 3.0
+"""The largest logit shift (either way) a ``CalibratedTransport`` accepts: +3 turns
+0.6 into 0.95, which is as far as a calibration should reach."""
 
 
 def _checked_shifts(shifts: Mapping[str, float], what: str) -> dict[str, float]:
@@ -3554,7 +3619,23 @@ class CalibratedTransport(_Wrapping):
             clef = body_model(model) != "clairic"
         except ValueError:
             clef = False
-        if not shift or not clef:
+        if not clef:
+            return reply
+        if (
+            not shift
+            and reply.provider is None
+            and any(meta.kind in table for table in self._by_provider.values())
+        ):
+            # a per-provider shift is looked up by the provider a response names:
+            # one that names none is not calibrated, and the run should say so
+            note = (
+                f"calibration_skipped: a {meta.kind} answer named no provider, so "
+                "no per-provider shift was applied"
+            )
+            return dataclasses.replace(
+                reply, warnings=tuple(dict.fromkeys([*reply.warnings, note]))
+            )
+        if not shift:
             return reply
         body, changed = calibrate_body(reply.body, shift)
         if not changed:

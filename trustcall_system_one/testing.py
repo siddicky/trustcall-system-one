@@ -2450,6 +2450,10 @@ _ERRORS: dict[str, type[Exception]] = {
 }
 
 
+def _no_usage() -> dict[str, float]:
+    return {"requests": 0, "input_tokens": 0, "output_tokens": 0, "cost": 0.0}
+
+
 class CassetteTransport:
     """A ``Transport`` that replays recorded calls by request key.
 
@@ -2471,6 +2475,9 @@ class CassetteTransport:
         misses: ``(model, payload, meta)`` of each call that was not found
             (whether it then fell through or raised).
         forwarded: Calls the inner transport answered.
+        replayed: What the calls answered from the cassette used (``requests``,
+            ``input_tokens``, ``output_tokens`` and the ``cost`` they reported): a
+            replay spends none of it, which a cost estimate must not count.
     """
 
     def __init__(
@@ -2479,6 +2486,7 @@ class CassetteTransport:
         *,
         strict: bool = True,
         inner: Transport | None = None,
+        provider: str | None = None,
     ) -> None:
         """Load a cassette.
 
@@ -2487,6 +2495,11 @@ class CassetteTransport:
             strict: Raise on a miss. When false, a miss goes to ``inner``.
             inner: Where a miss goes when ``strict`` is false. Without one, a
                 miss raises even when not strict.
+            provider: Replay only what this provider recorded (the ``provider`` of
+                the recording): a request is a miss when only another provider (or
+                a provider-less, older recording) answered it. For a cassette that
+                stands in for ONE provider of a routed stack, so that a spec that
+                routes a call elsewhere never gets another provider's answer.
 
         Raises:
             FileNotFoundError: If a path does not exist.
@@ -2494,6 +2507,7 @@ class CassetteTransport:
         """
         self.strict = strict
         self._inner = inner
+        self._provider = provider
         self._entries: dict[str, list[dict[str, Any]]] = {}
         self._cursor: dict[str, int] = {}
         self._lock = threading.Lock()
@@ -2501,6 +2515,7 @@ class CassetteTransport:
         self._recorded_budgets: dict[str, int] = {}
         self.hits = 0
         self.forwarded = 0
+        self.replayed: dict[str, float] = _no_usage()
         self.misses: list[tuple[str, dict[str, Any], CallMeta]] = []
         paths = [path] if isinstance(path, (str, os.PathLike)) else list(path)
         for entry in paths:
@@ -2580,6 +2595,11 @@ class CassetteTransport:
                 found.append(inner)
         return min(found) if found else None
 
+    @property
+    def provider(self) -> str | None:
+        """The provider this cassette stands for (``None``: it replays any)."""
+        return self._provider
+
     def providers(self) -> dict[str, tuple[str, ...]]:
         """Who answered the recorded calls: ``{"clairic": (...), "clef": (...)}``.
 
@@ -2601,7 +2621,11 @@ class CassetteTransport:
         return {k: tuple(sorted(v)) for k, v in found.items()}
 
     def fork(
-        self, *, strict: bool | None = None, inner: Transport | None = None
+        self,
+        *,
+        strict: bool | None = None,
+        inner: Transport | None = None,
+        provider: str | None = None,
     ) -> "CassetteTransport":
         """A new cassette over the same recordings, replaying from the start.
 
@@ -2611,16 +2635,20 @@ class CassetteTransport:
         Args:
             strict: Raise on a miss; defaults to this cassette's setting.
             inner: Where a miss goes when not strict; defaults to this cassette's.
+            provider: Replay only what this provider recorded (see the constructor);
+                defaults to this cassette's.
         """
         other = CassetteTransport.__new__(CassetteTransport)
         other.strict = self.strict if strict is None else strict
         other._inner = self._inner if inner is None else inner
+        other._provider = self._provider if provider is None else provider
         other._entries = self._entries
         other._recorded_limit = self._recorded_limit
         other._recorded_budgets = dict(self._recorded_budgets)
         other._cursor = {}
         other._lock = threading.Lock()
         other.hits = other.forwarded = 0
+        other.replayed = _no_usage()
         other.misses = []
         return other
 
@@ -2633,6 +2661,7 @@ class CassetteTransport:
         with self._lock:
             self._cursor.clear()
             self.hits = self.forwarded = 0
+            self.replayed = _no_usage()
             self.misses.clear()
 
     def unused(self) -> list[dict[str, Any]]:
@@ -2676,7 +2705,12 @@ class CassetteTransport:
         body = json.loads(json.dumps(payload, allow_nan=False))
         key = request_key(model, body)
         with self._lock:
-            entries = self._entries.get(key, [])
+            everything = self._entries.get(key, [])
+            entries = (
+                everything
+                if self._provider is None
+                else [e for e in everything if e.get("provider") == self._provider]
+            )
             index = self._cursor.get(key, 0)
             # with a live fallback a recorded failure is a transient accident, not
             # an answer: it is skipped and the request goes to the inner transport
@@ -2695,7 +2729,9 @@ class CassetteTransport:
             if not self.strict and self._inner is not None:
                 self.forwarded += 1
                 return await self._inner.run(model, payload, meta=meta, timeout=timeout)
-            raise self._miss(model, key, meta, len(entries))
+            raise self._miss(
+                model, key, meta, len(entries), other=len(everything) - len(entries)
+            )
         error = entry.get("error")
         if error:
             cls = _ERRORS.get(error.get("type", ""), TransportError)
@@ -2703,6 +2739,7 @@ class CassetteTransport:
             if isinstance(failure, TransportError):
                 failure.status_code = entry.get("status")
             raise failure
+        self._count_replayed(entry["response"])
         return TransportResponse(
             body=copy.deepcopy(entry["response"]),
             retries=0,
@@ -2713,14 +2750,33 @@ class CassetteTransport:
             warnings=tuple(str(w) for w in entry.get("warnings") or ()),
         )
 
+    def _count_replayed(self, body: Any) -> None:
+        usage = body.get("usage") if isinstance(body, dict) else None
+        if not isinstance(usage, dict):
+            return
+        with self._lock:
+            self.replayed["requests"] += 1
+            for key in ("input_tokens", "output_tokens"):
+                value = usage.get(key)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    self.replayed[key] += value
+            cost = usage.get("cost")
+            if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+                self.replayed["cost"] += float(cost)
+
     @staticmethod
-    def _miss(model: str, key: str, meta: CallMeta, recorded: int) -> CassetteMissError:
+    def _miss(
+        model: str, key: str, meta: CallMeta, recorded: int, other: int = 0
+    ) -> CassetteMissError:
         what = f"a {meta.kind!r} call" + (
             f" about field {meta.field!r}" if meta.field else ""
         )
         why = (
             f"all {recorded} recording(s) of it were already replayed"
             if recorded
+            else f"{other} recording(s) of it were made by another provider, not "
+            "the one this call is routed to"
+            if other
             else "no call with this request was recorded"
         )
         return CassetteMissError(

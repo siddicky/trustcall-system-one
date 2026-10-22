@@ -46,7 +46,7 @@ is refused, so a sweep over candidates can never send text elsewhere.
 import dataclasses
 import importlib
 import json
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any, Literal
 
@@ -89,13 +89,17 @@ __all__ = [
     "OPTION_FLAGS",
     "OPTION_GROUPS",
     "PROVIDERS",
+    "REMOVAL_KINDS",
     "ComboSpec",
     "Provider",
     "build_combo_transport",
     "calibrate_transport",
     "companies",
+    "create_provider_transports",
     "extractor_options",
+    "label_provider",
     "load_combo",
+    "provider_label",
 ]
 
 Provider = Literal["cloudflare", "experiential-clef", "decisions", "typesafe"]
@@ -108,6 +112,13 @@ PROVIDERS: tuple[str, ...] = (
 """The providers a spec may name."""
 CLAIRIC_PROVIDERS: frozenset[str] = frozenset({"cloudflare", "typesafe"})
 """The providers that can answer Clairic (typed extraction) requests."""
+
+REMOVAL_KINDS: frozenset[str] = frozenset({"gate", "null_check", "delete"})
+"""The call kinds whose Clef answers can authorise a removal: ``gate`` (a removal or
+set-null needs ``gates.remove_threshold``), ``null_check`` (``verify.null_confirm_yes``
+sets a value to null) and ``delete`` (``match.delete_threshold``). A positive logit
+shift on them makes the engine remove more, so a calibration of them is refused by
+the search unless asked for twice."""
 
 _LABEL = {
     "cloudflare": "cloudflare",
@@ -365,6 +376,20 @@ class ComboSpec(BaseModel):
 
     # -- what the spec names -------------------------------------------------- #
 
+    def removal_shifts(self) -> list[str]:
+        """The positive calibration shifts of kinds that can authorise a removal.
+
+        ``provider.kind+shift`` for each (``gate``, ``null_check`` and ``delete``
+        raise the probability that decides to remove or delete): they move the
+        engine towards removing data, so a report flags them.
+        """
+        return [
+            f"{provider}.{kind}{shift:+g}"
+            for provider, table in sorted(self.calibration.items())
+            for kind, shift in sorted(table.items())
+            if kind in REMOVAL_KINDS and shift > 0
+        ]
+
     def providers(self) -> tuple[str, ...]:
         """The providers the spec names anywhere, in a stable order."""
         found = [
@@ -534,6 +559,27 @@ def _create(provider: str, concurrency: ConcurrencyConfig | None) -> Transport:
     return TypeSafeTransport(concurrency=concurrency)
 
 
+def create_provider_transports(
+    spec: ComboSpec, concurrency: ConcurrencyConfig | None = None
+) -> dict[str, Transport]:
+    """One new transport for each provider the spec names (and for no other).
+
+    For a caller that shares them between several stacks (``providers=`` of
+    ``build_combo_transport``); credentials are read when a request is sent.
+    """
+    return {p: _create(p, concurrency) for p in spec.providers()}
+
+
+def provider_label(provider: str) -> str:
+    """A provider as ``TransportResponse.provider`` (and a recording) names it."""
+    return _LABEL[provider]
+
+
+def label_provider(transport: Transport, provider: str) -> Transport:
+    """``transport``, naming ``provider`` on a response that names none."""
+    return _Labelled(transport, _LABEL[provider])
+
+
 def calibrate_transport(spec: ComboSpec, transport: Transport) -> Transport:
     """Wrap a transport in the spec's calibration (``transport`` itself without one).
 
@@ -555,6 +601,7 @@ def build_combo_transport(
     providers: Mapping[str, Transport] | None = None,
     concurrency: ConcurrencyConfig | None = None,
     calibrate: bool = True,
+    wrap: Callable[[str, Transport], Transport] | None = None,
 ) -> Transport:
     """Build the transport stack of a spec.
 
@@ -578,6 +625,10 @@ def build_combo_transport(
         concurrency: Concurrency limits for the transports created here.
         calibrate: ``False`` leaves the calibration out (see ``calibrate_transport``,
             to put it outside a recorder).
+        wrap: Wraps the transport of each provider (``wrap(provider, transport)``),
+            under the routers: a recorder or a cassette that sees, and can tell apart,
+            the calls each provider gets (a replay then answers a call only from what
+            that provider recorded).
 
     Returns:
         The transport, for ``create_extractor(..., transport=...)``; close it with
@@ -602,6 +653,8 @@ def build_combo_transport(
         else _create(p, concurrency)
         for p in named
     }
+    if wrap is not None:
+        members = {p: wrap(p, t) for p, t in members.items()}
     clairic: Transport = members[spec.extraction]
     if spec.extraction_by_type:
         clairic = FieldTypeRoutingTransport(

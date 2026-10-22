@@ -25,6 +25,8 @@ from trustcall_system_one.combos import (
     ComboSpec,
     build_combo_transport,
     calibrate_transport,
+    create_provider_transports,
+    provider_label,
 )
 from trustcall_system_one.testing import CassetteTransport, RecordingTransport, scrub
 
@@ -123,6 +125,8 @@ class SuiteResult:
             provider settings); it is written, with its labels, to ``results.json``.
         suite: The case suite (``default`` or ``holdout``).
         tag: The label of the run.
+        replay: The cassette directory the run replayed from (empty: none). With
+            ``mode`` ``replay+live`` the requests that were not recorded went live.
     """
 
     config: str
@@ -138,6 +142,7 @@ class SuiteResult:
     combo: ComboSpec | None = None
     suite: str = "default"
     tag: str = ""
+    replay: str = ""
 
 
 def combination(
@@ -210,18 +215,94 @@ def missing_credentials(spec: ComboSpec) -> list[str]:
     return missing
 
 
-def usage_by_provider(calls: Sequence[Any]) -> dict[str, dict[str, int]]:
-    """Requests and tokens per provider, from a call log (failed calls included)."""
-    out: dict[str, dict[str, int]] = {}
+def usage_by_provider(
+    calls: Sequence[Any], replayed: Mapping[str, Mapping[str, float]] | None = None
+) -> dict[str, dict[str, float]]:
+    """Requests, tokens and reported cost per provider, from a call log.
+
+    Failed calls are included. ``replayed`` (``_replayed``) is what each provider's
+    calls answered from a cassette used: it is added as ``replayed_requests``,
+    ``replayed_input_tokens``, ``replayed_output_tokens`` and ``replayed_cost_usd``,
+    so that a cost estimate can leave it out (a replay spends nothing).
+    """
+    out: dict[str, dict[str, float]] = {}
     for call in calls:
         row = out.setdefault(
             str(call.provider or "unknown"),
-            {"requests": 0, "input_tokens": 0, "output_tokens": 0},
+            {"requests": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
         )
         row["requests"] += 1
         row["input_tokens"] += int(call.usage.get("input_tokens", 0))
         row["output_tokens"] += int(call.usage.get("output_tokens", 0))
+        row["cost_usd"] += float(call.cost_usd or 0.0)
+    for label, used in (replayed or {}).items():
+        row = out.setdefault(
+            label,
+            {"requests": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
+        )
+        row["replayed_requests"] = used["requests"]
+        row["replayed_input_tokens"] = used["input_tokens"]
+        row["replayed_output_tokens"] = used["output_tokens"]
+        row["replayed_cost_usd"] = used["cost"]
     return out
+
+
+def _replayed(cassettes: Sequence[CassetteTransport]) -> dict[str, dict[str, float]]:
+    """What the calls answered from the cassettes used, by provider."""
+    out: dict[str, dict[str, float]] = {}
+    for cassette in cassettes:
+        label = cassette.provider
+        if label is None or not cassette.replayed["requests"]:
+            continue
+        row = out.setdefault(label, dict.fromkeys(cassette.replayed, 0.0))
+        for key, value in cassette.replayed.items():
+            row[key] += value
+    return out
+
+
+def _combo_stack(
+    case: Case,
+    settings: Settings,
+    spec: ComboSpec,
+    shared: Mapping[str, Transport] | None,
+    snapshot: CassetteTransport | None,
+    cassettes: list[CassetteTransport],
+    name: str,
+) -> Transport:
+    """The transport of a combination for one case.
+
+    Each provider's transport (shared real ones live, the case's scripted ones
+    offline) is wrapped on its own: a recorder that writes what THAT provider
+    answered, then a cassette that replays only what that provider recorded
+    (``CassetteTransport(provider=...)``), so a spec that routes a call to another
+    provider never gets the answer of the one that was recorded; a call with no
+    recording is a miss, and goes live only when ``--live`` was given (the cassette's
+    ``forwarded`` says how many did). The calibration is outermost, over the raw
+    answers.
+    """
+    if shared is not None:
+        providers: Mapping[str, Transport] = shared
+    else:
+        assert case.world is not None
+        scripted = settings.members(case) if settings.members is not None else None
+        providers = scripted or {p: case.world().transport() for p in spec.providers()}
+
+    def wrap(provider: str, member: Transport) -> Transport:
+        if settings.record is not None:
+            member = RecordingTransport(member, settings.record / f"{name}.jsonl")
+        if settings.replay is not None:
+            source = snapshot or CassetteTransport(settings.replay)
+            cassette = source.fork(
+                strict=not settings.live,
+                inner=member if settings.live else None,
+                provider=provider_label(provider),
+            )
+            cassettes.append(cassette)
+            return cassette
+        return member
+
+    stack = build_combo_transport(spec, providers=providers, calibrate=False, wrap=wrap)
+    return calibrate_transport(spec, stack)
 
 
 _RECORDED_ON = {
@@ -324,47 +405,44 @@ async def _run_case(
     settings: Settings,
     live: Transport | None,
     snapshot: CassetteTransport | None = None,
+    shared: Mapping[str, Transport] | None = None,
 ) -> CaseResult:
     options = build_options(settings.overrides, case.options)
     spec = settings.combo.canonical() if settings.combo is not None else None
-    base: Transport
-    if settings.live:
-        assert live is not None
-        base = live
-    elif spec is not None:
-        assert case.world is not None
-        scripted = settings.members(case) if settings.members is not None else None
-        base = build_combo_transport(
-            spec,
-            providers=scripted
-            or {p: case.world().transport() for p in spec.providers()},
-            calibrate=False,
+    name = _SAFE.sub("_", case.id)
+    cassettes: list[CassetteTransport] = []
+    transport: Transport
+    if spec is not None:
+        transport = _combo_stack(
+            case, settings, spec, shared, snapshot, cassettes, name
         )
     else:
-        assert case.world is not None
-        base = case.world().transport()
-    name = _SAFE.sub("_", case.id)
-    cassette: CassetteTransport | None = None
-    if settings.record is not None:
-        base = RecordingTransport(base, settings.record / f"{name}.jsonl")
-    transport: Transport = base
-    if settings.replay is not None:
-        # one snapshot of the directory per suite: cases record into it while
-        # others replay from it
-        source = snapshot or CassetteTransport(settings.replay)
-        cassette = source.fork(
-            strict=not settings.live, inner=base if settings.live else None
-        )
-        transport = cassette
-    if spec is not None:
-        # outside the recorder and the cassette, which keep each provider's raw
-        # answers: a recording made under one calibration replays under another
-        transport = calibrate_transport(spec, transport)
+        base: Transport
+        if settings.live:
+            assert live is not None
+            base = live
+        else:
+            assert case.world is not None
+            base = case.world().transport()
+        if settings.record is not None:
+            base = RecordingTransport(base, settings.record / f"{name}.jsonl")
+        transport = base
+        if settings.replay is not None:
+            # one snapshot of the directory per suite: cases record into it while
+            # others replay from it
+            source = snapshot or CassetteTransport(settings.replay)
+            cassettes.append(
+                source.fork(
+                    strict=not settings.live, inner=base if settings.live else None
+                )
+            )
+            transport = cassettes[0]
     started = time.perf_counter()
     secrets: tuple[str, ...] = ()
-    sensitive = getattr(live, "sensitive_values", None)
-    if callable(sensitive):
-        secrets = tuple(sensitive())
+    for owner in (live, *(shared or {}).values()):
+        sensitive = getattr(owner, "sensitive_values", None)
+        if callable(sensitive):
+            secrets = tuple(dict.fromkeys([*secrets, *sensitive()]))
     try:
         extractor = create_extractor(case.schemas(), transport=transport, **options)
         result = await extractor.ainvoke(case.text, existing=case.existing)
@@ -376,24 +454,24 @@ async def _run_case(
         spent = getattr(exc, "usage", None)
         failed.reported_cost_usd = getattr(spent, "reported_cost_usd", 0.0)
         failed.output_tokens = getattr(spent, "output_tokens", 0)
-        failed.by_provider = usage_by_provider(getattr(exc, "calls", ()))
+        failed.by_provider = usage_by_provider(
+            getattr(exc, "calls", ()), _replayed(cassettes)
+        )
         # an error message can carry the request URL, and with it the account id
         failed.error = scrub(f"{type(exc).__name__}: {str(exc)[:300]}", secrets)
         failed.wall_s = time.perf_counter() - started
         failed.n_expected = len(case.expect_ops)
         failed.n_values = len(case.expect_values)
-        if cassette is not None:
-            failed.forwarded = cassette.forwarded
+        failed.forwarded = sum(c.forwarded for c in cassettes)
         return failed
     scored = score(case, result)
     scored.unknown_outcomes = count_unknown_outcomes(result.calls)
     scored.reported_cost_usd = result.usage.reported_cost_usd
     scored.output_tokens = result.usage.output_tokens
-    scored.by_provider = usage_by_provider(result.calls)
+    scored.by_provider = usage_by_provider(result.calls, _replayed(cassettes))
     scored.warnings = [scrub(w, secrets) for w in scored.warnings]
     scored.wall_s = time.perf_counter() - started
-    if cassette is not None:
-        scored.forwarded = cassette.forwarded
+    scored.forwarded = sum(c.forwarded for c in cassettes)
     return scored
 
 
@@ -535,7 +613,9 @@ async def _run_combo(
     if settings.record is not None:
         settings.record.mkdir(parents=True, exist_ok=True)
     gate = asyncio.Semaphore(max(1, settings.concurrency))
-    live = build_combo_transport(spec, calibrate=False) if settings.live else None
+    # one transport per provider, shared by the cases (each case stacks its own
+    # recorder and cassette on top of them)
+    shared = create_provider_transports(spec) if settings.live else None
     snapshot = CassetteTransport(settings.replay) if settings.replay else None
     if snapshot is not None and not settings.live:
         extraction, decisions = recorded_labels(snapshot)
@@ -549,14 +629,15 @@ async def _run_combo(
 
     async def one(case: Case) -> CaseResult:
         async with gate:
-            return await _run_case(case, settings, live, snapshot)
+            return await _run_case(case, settings, None, snapshot, shared)
 
     try:
         results = list(await asyncio.gather(*(one(c) for c in runnable)))
     finally:
-        closer = getattr(live, "aclose", None)
-        if callable(closer):
-            await closer()
+        for member in (shared or {}).values():
+            closer = getattr(member, "aclose", None)
+            if callable(closer):
+                await closer()
     return SuiteResult(
         config,
         dict(settings.overrides),
@@ -568,6 +649,7 @@ async def _run_combo(
         combo=settings.combo,
         suite=settings.suite,
         tag=settings.tag,
+        replay=str(settings.replay) if settings.replay is not None else "",
     )
 
 

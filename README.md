@@ -786,6 +786,10 @@ uv run python -m evals search --base spec.json --live --providers cloudflare,typ
 ```
 
 `--price` is USD per million input and output tokens of a provider (a `--budget-usd` needs one for each).
+`--replay` is for the calibration search alone (`--calibrate-only`), and a recording answers only the
+provider that made it; `--resume` reuses a trial only in the mode (offline, live, replay) it ran in; a gain
+must beat the incumbent by `--min-margin` (default one case or 0.02 F1); `gate`, `null_check` and `delete`
+can authorise a removal, so they are not calibrated upwards unless asked twice.
 `search` walks the decision kinds in groups and the field types, keeps a provider when more cases pass
 (then op F1, then value accuracy, then fewer bleed and wrong deletes; a rise in either is a veto), never
 retries a failed case, and prints a leaderboard of every spec it tried (dev suite only; check the winner

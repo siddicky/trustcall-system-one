@@ -387,3 +387,46 @@ def test_a_calibrated_run_reports_it_and_a_zero_shift_changes_nothing() -> None:
     ]
     assert not [w for w in plain.warnings if w.startswith("calibration_applied")]
     assert any(w.startswith("calibration_applied: attribution") for w in moved.warnings)
+
+
+def test_a_shift_beyond_three_logits_is_refused() -> None:
+    CalibratedTransport(Scripted({}), {"attribution": 3.0})
+    CalibratedTransport(Scripted({}), {"attribution": -3.0})
+    for bad in (3.5, -3.5, 10.0):
+        with pytest.raises(ValueError, match=r"within \+-3"):
+            CalibratedTransport(Scripted({}), {"attribution": bad})
+        with pytest.raises(ValueError, match=r"within \+-3"):
+            CalibratedTransport(Scripted({}), by_provider={"typesafe": {"gate": bad}})
+    from trustcall_system_one.combos import ComboSpec
+
+    with pytest.raises(ValueError, match="within"):
+        ComboSpec.model_validate(
+            {"decision": "typesafe", "calibration": {"typesafe": {"gate": 3.5}}}
+        )
+
+
+def test_an_answer_that_names_no_provider_is_not_silently_uncalibrated() -> None:
+    """The reviewer's probe P5."""
+    body = body_of(q=noul(0.6))
+    unlabelled = Scripted(body, provider=None)
+    only_by_provider = CalibratedTransport(
+        unlabelled, by_provider={"decisions": {"gate": 1.5}}
+    )
+    reply = run(only_by_provider, "gate")
+    assert answers(reply.body)["q"]["noul"] == 0.6  # nothing could be applied
+    assert any(
+        w.startswith("calibration_skipped: a gate answer") for w in reply.warnings
+    )
+    # no warning for a kind that has no shift, or when a general shift applies
+    assert not [w for w in run(only_by_provider, "presence").warnings if "skipped" in w]
+    both = CalibratedTransport(
+        unlabelled, {"gate": 0.5}, by_provider={"decisions": {"gate": 1.5}}
+    )
+    assert answers(run(both, "gate").body)["q"]["noul"] > 0.6
+    # a labelled answer is calibrated, and says nothing about skipping
+    labelled = CalibratedTransport(
+        Scripted(body, provider="decisions"), by_provider={"decisions": {"gate": 1.5}}
+    )
+    reply = run(labelled, "gate")
+    assert answers(reply.body)["q"]["noul"] > 0.6
+    assert not [w for w in reply.warnings if "skipped" in w]

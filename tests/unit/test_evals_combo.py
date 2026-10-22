@@ -27,6 +27,7 @@ from evals.runner import (
 from evals.search import (
     DEFAULT_ORDER,
     GRID,
+    Margin,
     Objective,
     SearchResult,
     Trial,
@@ -401,15 +402,29 @@ def obj(
 
 def test_the_objective_is_lexicographic() -> None:
     best = obj(10, 0.9, 0.9)
-    assert compare(obj(11, 0.1, 0.1), best)[0]  # passes first
-    assert compare(obj(10, 0.91, 0.1), best)[0]  # then F1
-    assert compare(obj(10, 0.9, 0.91), best)[0]  # then value accuracy
-    assert not compare(obj(10, 0.9, 0.9), best)[0]  # a tie is not an improvement
+    plain = Margin(0, 0.0)  # no margin: any gain counts
+    assert compare(obj(11, 0.1, 0.1), best, plain)[0]  # passes first
+    assert compare(obj(10, 0.91, 0.1), best, plain)[0]  # then F1
+    assert compare(obj(10, 0.9, 0.91), best, plain)[0]  # then value accuracy
+    assert not compare(obj(10, 0.9, 0.9), best, plain)[0]  # a tie is not a gain
+    assert not compare(obj(9, 1.0, 1.0), best, plain)[0]
+    fewer = compare(obj(10, 0.9, 0.9, bleed=0), obj(10, 0.9, 0.9, bleed=1), plain)
+    assert fewer[0]
+    assert compare(obj(10, 0.9, 0.9, wd=0), obj(10, 0.9, 0.9, wd=2), plain)[0]
+
+
+def test_a_gain_must_beat_the_incumbent_by_the_margin() -> None:
+    best = obj(10, 0.90, 0.90)
+    ok, why = compare(obj(10, 0.91, 0.9), best)  # the default margin: 0.02 of F1
+    assert not ok and why == "better, but by less than the margin"
+    assert compare(obj(10, 0.92, 0.9), best)[0]
+    assert compare(obj(11, 0.80, 0.8), best)[0]  # one case is the margin in cases
+    assert not compare(obj(11, 0.9, 0.9), best, Margin(2, 0.02))[0]
+    assert compare(obj(12, 0.9, 0.9), best, Margin(2, 0.02))[0]
+    assert not compare(obj(10, 0.9, 0.915), best)[0]  # value accuracy, same margin
+    assert compare(obj(10, 0.9, 0.93), best)[0]
+    assert compare(obj(10, 0.9, 0.9, wd=0), obj(10, 0.9, 0.9, wd=1))[0]  # safety: none
     assert not compare(obj(9, 1.0, 1.0), best)[0]
-    assert compare(obj(10, 0.9, 0.9, bleed=0), obj(10, 0.9, 0.9, bleed=1))[
-        0
-    ]  # fewer bleed
-    assert compare(obj(10, 0.9, 0.9, wd=0), obj(10, 0.9, 0.9, wd=2))[0]
 
 
 def test_bleed_or_wrong_deletes_going_up_is_a_veto() -> None:
@@ -441,37 +456,73 @@ def test_the_objective_reads_an_aggregate() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def result(by_provider: dict[str, dict[str, int]], reported: float = 0.0) -> CaseResult:
+def result(
+    by_provider: dict[str, dict[str, float]], reported: float = 0.0
+) -> CaseResult:
     return CaseResult(case="c", by_provider=by_provider, reported_cost_usd=reported)
+
+
+def row(
+    inp: int = 0, out: int = 0, cost: float = 0.0, **replayed: float
+) -> dict[str, float]:
+    return {
+        "requests": 1,
+        "input_tokens": inp,
+        "output_tokens": out,
+        "cost_usd": cost,
+        **replayed,
+    }
 
 
 def test_cost_is_estimated_from_tokens_and_prices() -> None:
     rows = [
-        result(
-            {"typesafe": {"requests": 1, "input_tokens": 2_000_000, "output_tokens": 0}}
-        ),
-        result(
-            {
-                "cloudflare": {
-                    "requests": 1,
-                    "input_tokens": 1_000_000,
-                    "output_tokens": 500_000,
-                }
-            }
-        ),
+        result({"typesafe": row(2_000_000)}),
+        result({"cloudflare": row(1_000_000, 500_000)}),
     ]
     prices = {"typesafe": (1.0, 2.0), "cloudflare": (0.1, 0.4)}
     usd, partial = estimate_cost(rows, prices)
     assert usd == pytest.approx(2.0 + 0.1 + 0.2) and partial is False
 
 
-def test_an_unpriced_provider_makes_the_estimate_partial_unless_it_reported() -> None:
-    use = {"experiential": {"requests": 1, "input_tokens": 100, "output_tokens": 10}}
-    assert estimate_cost([result(use)], {}) == (0.0, True)
-    usd, partial = estimate_cost([result(use, reported=0.5)], {})
-    assert (usd, partial) == (0.5, False)  # it reported its own price
-    priced = estimate_cost([result(use, reported=0.5)], {"decisions": (1.0, 1.0)})
-    assert priced[1] is True or priced[0] == 0.5  # an unrelated price changes nothing
+def test_reported_cost_counts_only_for_a_provider_without_a_price() -> None:
+    use = {"experiential": row(100, 10, cost=0.5)}
+    assert estimate_cost([result(use)], {}) == (0.5, False)  # its own price
+    # with a price the tokens are charged, and the reported cost is not added on top
+    usd, partial = estimate_cost([result(use)], {"experiential-clef": (1e6, 0.0)})
+    assert usd == pytest.approx(100.0) and partial is False
+
+
+def test_a_provider_with_neither_a_price_nor_a_reported_cost_makes_it_partial() -> None:
+    both = result({"typesafe": row(100, 10), "experiential": row(100, 10, cost=0.25)})
+    usd, partial = estimate_cost([both], {})
+    assert usd == 0.25 and partial is True  # the typesafe tokens are unpriced
+    usd, partial = estimate_cost([both], {"typesafe": (1.0, 1.0)})
+    assert partial is False and usd == pytest.approx(0.25 + 110e-6)
+    assert estimate_cost([result({"cloudflare": row()})], {}) == (
+        0.0,
+        False,
+    )  # no tokens
+
+
+def test_replayed_calls_are_not_spend() -> None:
+    replayed = row(
+        1000,
+        100,
+        cost=0.4,
+        replayed_input_tokens=1000,
+        replayed_output_tokens=100,
+        replayed_cost_usd=0.4,
+    )
+    assert estimate_cost([result({"typesafe": replayed})], {}) == (0.0, False)
+    half = row(
+        1_000_000,
+        0,
+        replayed_input_tokens=400_000,
+        replayed_output_tokens=0,
+        replayed_cost_usd=0.0,
+    )
+    usd, _ = estimate_cost([result({"typesafe": half})], {"typesafe": (1.0, 1.0)})
+    assert usd == pytest.approx(0.6)  # only what was sent live is paid for
 
 
 # --------------------------------------------------------------------------- #
@@ -650,9 +701,9 @@ def flat(cost: float = 0.0) -> Callable[[ComboSpec, str], Any]:
     async def evaluate(spec: ComboSpec, label: str) -> SuiteResult:
         usage = {
             "cloudflare": {
-                "requests": 1,
+                "requests": 1.0,
                 "input_tokens": int(cost * 1e6),
-                "output_tokens": 0,
+                "output_tokens": 0.0,
             }
         }
         row = CaseResult(case="c", n_expected=0, by_provider=usage)
@@ -801,6 +852,7 @@ def test_the_calibration_search_finds_the_shift_that_undoes_a_shy_provider() -> 
             order=[],
             calibrate=True,
             calibrate_kinds=["attribution", "gate"],
+            allow_positive_removal_shift=True,  # gate decides removals: asked for
         )
     )
     cal = result.best.spec.calibration["typesafe"]
