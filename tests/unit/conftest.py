@@ -19,6 +19,13 @@ def _offline() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def _no_provider_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the developer's Clef provider settings out of the tests."""
+    monkeypatch.delenv("TRUSTCALL_S1_CLEF_PROVIDER", raising=False)
+    monkeypatch.delenv("EXPERIENTIAL_API_KEY", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _requests_match_published_schemas(monkeypatch: pytest.MonkeyPatch) -> None:
     """Validate every ``to_payload()`` result against ``docs/schemas/*-input.json``."""
     pairs: list[tuple[type[Any], str]] = [

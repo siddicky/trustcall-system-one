@@ -186,14 +186,57 @@ What to report from each sweep, from its `sweep.md` table (one row per point):
   attributed to the wrong person (`notes_people_insert`).
 - Any case with `error` set (a transport error, a `CassetteMissError`): the message.
 
+## 4b. Clef on Experiential Labs
+
+Clairic stays on Cloudflare; only the Clef requests go to Experiential Labs
+(`POST https://api.experientiallabs.ai/v1/systemone`). Everything above works unchanged with
+the provider switched.
+
+```bash
+# in addition to the Cloudflare variables of section 0 (from the environment only):
+export EXPERIENTIAL_API_KEY=...                  # never write it to a file; do not echo it
+test -n "$EXPERIENTIAL_API_KEY" && echo set      # enough to check it
+export TRUSTCALL_S1_CLEF_PROVIDER=experiential   # optional: the key alone selects it too
+
+make smoke 2>&1 | tee /tmp/smoke-experiential.txt
+uv run python -m evals run --live --clef-provider experiential --config default \
+    --replay evals/cassettes --record evals/cassettes --out evals/results/experiential-default
+```
+
+Which provider serves Clef: `--clef-provider` (evals only), else `TRUSTCALL_S1_CLEF_PROVIDER`
+(`cloudflare` or `experiential`), else Experiential when `EXPERIENTIAL_API_KEY` is set, else
+Cloudflare. `results.json` records it as `clef_provider` and `summary.md` prints it. Cassettes
+are keyed by the model id and the request body, so a cassette recorded on Cloudflare replays
+under Experiential and the other way round; to compare the providers fairly, record into
+separate directories (`--record evals/cassettes-experiential`), or leave `--replay` out.
+
+No request to Experiential is ever retried once it may have reached the server. A timeout, a
+dropped connection or a 5xx fails the case with `UncertainOutcomeError` after exactly one
+request, and that call may have been charged. In the report:
+
+- count the cases that ended in `UncertainOutcomeError` (their `error` starts with that name) and
+  give each message, with the `correlation id` it carries when the server sent one: that is what
+  to quote when asking Experiential Labs whether the call was charged;
+- do not re-run just those cases to "fix" the table without saying so: each re-run is a new
+  charge. A 429 with `Retry-After` and a failed connection are retried inside the transport and
+  appear as `retries` in the call log only;
+- start with `--concurrency 2` and raise it only while there is no 429.
+
+Before the first full run, send one request and check the response shape (see
+`docs/DESIGN.md`, Transport): the success body has not been recorded yet. Save the scrubbed
+body as `docs/schemas/experiential-clef-response.example.json` (a response holds no credential,
+but run `grep -rn "xpl_" . --exclude-dir=.git` before committing).
+
 ## 5. What to hand back
 
 1. The commit hash, the date, and whether the working tree was clean.
 2. The smoke result (section 1) and the recorded file list (section 2).
 3. The baseline table and the three strategy tables (section 3), with the failing cases.
 4. The sweep tables (section 4) and the recommendations for the defaults above.
-5. The paths of `evals/results/*` and `evals/cassettes/` (not committed) and of
+5. If Clef ran on Experiential Labs (section 4b): the provider, the count of uncertain
+   outcomes with their messages and correlation ids, and the response shape.
+6. The paths of `evals/results/*` and `evals/cassettes/` (not committed) and of
    `tests/recorded/smoke_*.jsonl`.
-6. Anything that surprised you: an HTTP error, a rate limit, a warning that appears in every run,
+7. Anything that surprised you: an HTTP error, a rate limit, a warning that appears in every run,
    a request count far from the offline one (offline: `uv run python -m evals run`, 190 requests for
    the 24 cases).

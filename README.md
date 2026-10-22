@@ -649,6 +649,33 @@ read on the first request, so building an extractor needs none (tests build them
 For development: `make install`, `make format`, `make lint`, `make test` (`make help` lists every
 target). See [`CONTRIBUTING.md`](https://github.com/siddicky/trustcall-system-one/blob/main/CONTRIBUTING.md) for releases.
 
+### Using Clef from Experiential Labs
+
+Clef can be served by Experiential Labs while Clairic stays on Cloudflare. Set `EXPERIENTIAL_API_KEY` (and keep the Cloudflare variables for Clairic): Clef then
+goes there by default, and `TRUSTCALL_S1_CLEF_PROVIDER=cloudflare|experiential` overrides that.
+Or choose it in code:
+
+```python
+from trustcall_system_one import (
+    CloudflareTransport,
+    ExperientialTransport,
+    One,
+    RoutingTransport,
+    create_extractor,
+)
+
+transport = RoutingTransport(
+    {"clef": ExperientialTransport()},  # key from EXPERIENTIAL_API_KEY
+    default=CloudflareTransport(),  # Clairic
+)
+extractor = create_extractor([One(Contact)], transport=transport)
+# or: system_one_transport("experiential")
+```
+
+`ExperientialTransport` sends each request once. After a timeout, a dropped connection or a 5xx it
+may already have run, and been charged, so it raises `UncertainOutcomeError` instead of retrying;
+only a failed connection and a 429 with `Retry-After` are retried.
+
 ## Extract one record
 
 Schemas are plain pydantic models (also `TypedDict`s, JSON Schemas or annotated

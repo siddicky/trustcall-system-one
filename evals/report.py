@@ -39,6 +39,7 @@ def suite_markdown(suite: SuiteResult) -> str:
     lines = [
         f"# Evals: config `{suite.config}` ({suite.mode})",
         "",
+        *([f"Clef provider: {suite.clef_provider}", ""] if suite.clef_provider else []),
         f"Overrides: `{dict(suite.overrides)}`"
         if suite.overrides
         else "Overrides: none",
@@ -83,6 +84,7 @@ def write_suite(suite: SuiteResult, out: Path) -> tuple[Path, Path]:
     payload = {
         "config": suite.config,
         "mode": suite.mode,
+        "clef_provider": suite.clef_provider,
         "overrides": dict(suite.overrides),
         "aggregate": aggregate(suite.results),
         "skipped": suite.skipped,

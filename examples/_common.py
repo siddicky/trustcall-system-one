@@ -33,6 +33,7 @@ from trustcall_system_one import (
     PatchOp,
     ResultRecord,
     VerifyConfig,
+    clef_provider_from_env,
     create_extractor,
 )
 
@@ -116,7 +117,15 @@ def print_banner(offline: bool, *, live_hint: bool = True) -> None:
     else:
         print(
             paint(
-                "LIVE — requests go to Cloudflare (Clairic and Clef)", "green", "bold"
+                "LIVE — requests go to Cloudflare (Clairic) and "
+                + (
+                    "Experiential Labs"
+                    if clef_provider_from_env() == "experiential"
+                    else "Cloudflare"
+                )
+                + " (Clef)",
+                "green",
+                "bold",
             )
         )
     print()
@@ -148,8 +157,10 @@ def build_extractor(
         # a request of its own (verify.isolate_decisions, the default).
         options.setdefault("verify", VerifyConfig(isolate_decisions=False))
         return create_extractor(schemas, transport=script.transport, **options)
-    # No transport given: the extractor creates a CloudflareTransport() from the
-    # environment on first use and closes it with the extractor.
+    # No transport given: the extractor creates one from the environment on first
+    # use and closes it with the extractor: Cloudflare for both models, or Clef on
+    # Experiential Labs when TRUSTCALL_S1_CLEF_PROVIDER=experiential (or
+    # EXPERIENTIAL_API_KEY is set and the variable is not).
     return create_extractor(schemas, **options)
 
 

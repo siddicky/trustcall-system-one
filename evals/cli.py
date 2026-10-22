@@ -59,6 +59,15 @@ def _common(parser: argparse.ArgumentParser) -> None:
         help="send requests to Cloudflare (needs CLOUDFLARE_ACCOUNT_ID and "
         "CLOUDFLARE_API_TOKEN); the default answers from each case's scripted world",
     )
+    parser.add_argument(
+        "--clef-provider",
+        choices=("cloudflare", "experiential"),
+        default=None,
+        help="who serves Clef on live requests (Clairic stays on Cloudflare); "
+        "default: TRUSTCALL_S1_CLEF_PROVIDER, else experiential when "
+        "EXPERIENTIAL_API_KEY is set, else cloudflare. experiential needs "
+        "EXPERIENTIAL_API_KEY and never retries an uncertain request",
+    )
     parser.add_argument("--record", type=Path, help="write cassettes to this directory")
     parser.add_argument(
         "--replay",
@@ -123,6 +132,7 @@ def _settings(args: argparse.Namespace, overrides: dict[str, Any]) -> Settings:
         record=args.record,
         replay=args.replay,
         concurrency=args.concurrency,
+        clef_provider=args.clef_provider,
     )
 
 

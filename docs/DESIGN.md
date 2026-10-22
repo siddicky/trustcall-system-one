@@ -139,7 +139,7 @@ own), `field` = one per field.
 | `__init__.py` | public exports only |
 | `_errors.py`, `_types.py`, `_config.py` | exceptions; result types, `SchemaInstance`, `Mention`/`Entity`; all config dataclasses |
 | `_cardinality.py` | `Many`/`One` wrappers + `Annotated` markers; default resolution |
-| `transport.py` (public) | `Transport` protocol, `CloudflareTransport`, adaptive per-model limiter |
+| `transport.py` (public) | `Transport` protocol, `CloudflareTransport`, `ExperientialTransport`, `RoutingTransport`, `system_one_transport`, adaptive per-model limiter |
 | `_wire.py` | exact Clairic/Clef request+response pydantic models |
 | `_schemas.py` | coerce BaseModel / TypedDict / JSON Schema / callable → BaseModel |
 | `_names.py` | path ↔ wire-name map, deterministic blake2s shortening |
@@ -161,7 +161,7 @@ own), `field` = one per field.
 ```python
 def create_extractor(
     schemas: Sequence[SchemaLike | Many | One], *,
-    transport: Transport | None = None,            # default CloudflareTransport()
+    transport: Transport | None = None,            # default: system_one_transport() (env-driven)
     clairic_model: str = CLAIRIC, clef_model: str = CLEF, gate_model: str = CLEF,
     enable_inserts=False, enable_updates=True, enable_deletes=False, enable_item_removals=False,
     existing_schema_policy: bool | Literal["ignore"] = True,
@@ -1109,6 +1109,48 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
   caps each attempt's timeout and raises a `TransportError` when the next wait or attempt would not fit; unwraps the REST `{success, result, errors, messages}` envelope and
   accepts bare objects; errors `AuthError`, `BadRequestError` (with CF `errors[]`),
   `RateLimitError`, `ServerError`, `ModelResponseError`.
+- **Second Clef provider: `ExperientialTransport`** (Experiential Labs, `POST
+  https://api.experientiallabs.ai/v1/systemone`, configurable `base_url`). Same Clef request
+  body as for Cloudflare (`model` `clef` or `clef-flash`, `state`, `questions`; `images` is part of
+  the same schema), `Authorization: Bearer <key>`, key from `api_key=` or
+  `EXPERIENTIAL_API_KEY` (read on each `run`; missing is `AuthError`). It serves Clef only (any
+  other model is a `BadRequestError` before anything is sent) and never sends `CallMeta`. A 2xx body
+  is unwrapped (a bare `{model, answers, usage}`, or the same inside a `{success, result}` /
+  `{data}` envelope; `success: false` or an `error` object is a `BadRequestError`), validated with
+  `parse_clef` (`ModelResponseError` on a mismatch) and returned as the bare dict the Clef parsing
+  already expects. Answers are read by question id (`answers["review"]`). **Observed so far:** an
+  error is `{"error": {"message", "type", "param", "code"}}` (OpenAI style, shown in the exception
+  message) with an `x-correlation-id` response header, which is put in error messages so a charge
+  can be disputed. The shape of a successful response has not been recorded yet: the bare shape
+  above is the published Clef schema and the envelope handling is defensive. Re-check it against
+  the first live run and save the scrubbed body as
+  `docs/schemas/experiential-clef-response.example.json`.
+- **Retry policy of `ExperientialTransport` (deliberately unlike Cloudflare's).** A request that
+  may have reached the server is never retried: a timeout can leave a call that was run and
+  charged with the result lost. Timeouts (read, write), read/write/protocol errors, a connection
+  dropped after sending, 408 and every 5xx raise `UncertainOutcomeError(TransportError)` after
+  exactly one request; its message says the outcome is unknown and may have been charged, and
+  `status_code`/`body` are kept. The only retries are the ones that cannot double a charge:
+  `ConnectError`/`ConnectTimeout` (nothing was sent; jittered backoff) and 429 *with*
+  `Retry-After` (refused unprocessed; waits that long, at most `max_retry_after`), both bounded by
+  `max_retries` (6) and `call_deadline` (300 s) and releasing the limiter slot while waiting. A
+  429 without `Retry-After`, 401/403 (`AuthError`), other 4xx and 3xx (`BadRequestError`, with the
+  error object in `cf_errors`), a pool timeout and a proxy error are not retried. The engine does
+  not retry a failed call either, so an `UncertainOutcomeError` ends the invoke with the usage so
+  far attached; whether to ask again is the caller's decision.
+- **Routing.** `RoutingTransport(routes, default)` picks a transport by model: keys are `clairic`,
+  `clef`, `clef-flash` or full ids; `clef` covers `clef-flash` unless that has its own key;
+  `run` passes `model`, `payload`, `meta` and `timeout` through unchanged, so `CallMeta` still
+  reaches fakes, recorders and AI Gateway metadata. It aggregates `sensitive_values()` and closes
+  its members. `system_one_transport(clef=None | "cloudflare" | "experiential", cloudflare=,
+  experiential=, concurrency=)` builds the usual setup: `"cloudflare"` is a plain
+  `CloudflareTransport`, `"experiential"` is `RoutingTransport({"clef": ExperientialTransport()},
+  default=CloudflareTransport())`. `None` reads the environment through `clef_provider_from_env()`:
+  `TRUSTCALL_S1_CLEF_PROVIDER=cloudflare|experiential`, else `experiential` when
+  `EXPERIENTIAL_API_KEY` is set, else `cloudflare` (an unknown value is a `ValueError`). That is also
+  the extractor's default transport, `examples/_common.py`, `tests/live/conftest.py` and the evals
+  (`--clef-provider cloudflare|experiential`, recorded in `results.json` as `clef_provider`).
+  Cassettes are keyed by model id and payload, so they replay under either provider.
 - Concurrency: 64 in flight per transport per event loop (shared across invokes and batch),
   32 per model, adaptive (halve on 429, at most once per generation so a burst of 429s halves
   once, +1 per 20 successes). The slot is released while a retry backs off. Limiter state and
@@ -1143,9 +1185,10 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
   of the model id and the canonical JSON of the payload (sorted keys, no whitespace), so equal
   requests always share a key and any change to a request is a new one. The transport never sees
   headers; as a second line of defence `testing.scrub` replaces by `<redacted>` the values of
-  `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_AUTH_TOKEN`, the account id and
-  token given explicitly to the wrapped `CloudflareTransport` (`sensitive_values()`), any `Bearer`
-  token, and the id in an `accounts/<id>` URL path or a gateway `/v1/<id>/` path (an error message
+  `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_AUTH_TOKEN` and
+  `EXPERIENTIAL_API_KEY`, the account id, token and key given explicitly to the wrapped
+  `CloudflareTransport` / `ExperientialTransport` / `RoutingTransport` (`sensitive_values()`), any
+  `Bearer` token, any `xpl_...` key, and the id in an `accounts/<id>` URL path or a gateway `/v1/<id>/` path (an error message
   quotes the request URL). The evals scrub the case errors and warnings and the reports they write
   with the same function (tests: `test_recording.py` and `test_evals_harness.py` set the ids and
   tokens in the environment and explicitly, with and without a gateway, and grep the files). `CassetteTransport(path, *, strict=True, inner=None)` loads a file, a

@@ -58,7 +58,13 @@ from trustcall_system_one._types import (
     Usage,
 )
 from trustcall_system_one._wire import CLAIRIC, CLEF
-from trustcall_system_one.transport import CloudflareTransport, Transport
+from trustcall_system_one.transport import (
+    CloudflareTransport,
+    RoutingTransport,
+    Transport,
+    clef_provider_from_env,
+    system_one_transport,
+)
 
 __all__ = ["ExtractionInput", "Extractor", "create_extractor"]
 
@@ -113,7 +119,7 @@ class _Core:
     ) -> None:
         self._given = transport
         self._concurrency = concurrency
-        self._owned: CloudflareTransport | None = None
+        self._owned: CloudflareTransport | RoutingTransport | None = None
         self._lock = threading.RLock()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
@@ -129,7 +135,12 @@ class _Core:
             return self._given
         with self._lock:
             if self._owned is None:
-                self._owned = CloudflareTransport(concurrency=self._concurrency)
+                cloudflare = CloudflareTransport(concurrency=self._concurrency)
+                self._owned = system_one_transport(
+                    clef_provider_from_env(),
+                    cloudflare=cloudflare,
+                    concurrency=self._concurrency,
+                )
             return self._owned
 
     # -- the bridge loop --------------------------------------------------- #

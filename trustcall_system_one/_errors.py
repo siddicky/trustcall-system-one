@@ -13,6 +13,7 @@ __all__ = [
     "StateTruncatedError",
     "TransportError",
     "TrustcallSystemOneError",
+    "UncertainOutcomeError",
 ]
 
 
@@ -98,6 +99,17 @@ class BadRequestError(TransportError):
 
 class ServerError(TransportError):
     """Server failed (5xx) after retries were exhausted."""
+
+
+class UncertainOutcomeError(TransportError):
+    """The request may have reached the server, so its outcome is unknown.
+
+    Raised by transports that never retry after a request could have been
+    received (``ExperientialTransport``): a timeout, a connection that broke
+    after the request was sent, or a 5xx. The server may have run the model and
+    may have charged for it. Retrying is the caller's decision, because it can
+    double the charge.
+    """
 
 
 class ModelResponseError(TrustcallSystemOneError):

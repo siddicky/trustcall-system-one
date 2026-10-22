@@ -7,12 +7,17 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from evals.configs import build_options
 from evals.model import Case, CaseResult
 from evals.scoring import score
-from trustcall_system_one import CloudflareTransport, Transport, create_extractor
+from trustcall_system_one import (
+    Transport,
+    clef_provider_from_env,
+    create_extractor,
+    system_one_transport,
+)
 from trustcall_system_one.testing import CassetteTransport, RecordingTransport, scrub
 
 __all__ = ["Settings", "SuiteResult", "aggregate", "run_suite"]
@@ -34,6 +39,10 @@ class Settings:
             a request that is not recorded goes to the live API; without it,
             such a request fails the case (``CassetteMissError``).
         concurrency: Cases run at the same time.
+        clef_provider: Who serves Clef when requests go live: ``cloudflare`` or
+            ``experiential``. ``None`` decides from ``TRUSTCALL_S1_CLEF_PROVIDER``
+            and ``EXPERIENTIAL_API_KEY`` (Cloudflare when neither is set).
+            Clairic always goes to Cloudflare.
     """
 
     overrides: Mapping[str, Any] = field(default_factory=dict)
@@ -41,6 +50,7 @@ class Settings:
     record: Path | None = None
     replay: Path | None = None
     concurrency: int = 4
+    clef_provider: Literal["cloudflare", "experiential"] | None = None
 
 
 @dataclass
@@ -53,6 +63,7 @@ class SuiteResult:
         results: One score per case that ran.
         skipped: Ids of cases that could not run (no offline world).
         mode: ``offline``, ``live``, ``replay`` or ``replay+live``.
+        clef_provider: Who served the live Clef requests (empty without ``live``).
     """
 
     config: str
@@ -60,14 +71,23 @@ class SuiteResult:
     results: list[CaseResult]
     skipped: list[str]
     mode: str
+    clef_provider: str = ""
 
 
-def _have_credentials() -> bool:
+def _have_credentials(clef_provider: str = "cloudflare") -> bool:
+    """Cloudflare credentials (Clairic) and, for Experiential Clef, its key."""
     account = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
     token = os.environ.get("CLOUDFLARE_API_TOKEN") or os.environ.get(
         "CLOUDFLARE_AUTH_TOKEN"
     )
+    if clef_provider == "experiential" and not os.environ.get("EXPERIENTIAL_API_KEY"):
+        return False
     return bool(account and token)
+
+
+def _provider(settings: Settings) -> Literal["cloudflare", "experiential"]:
+    """The provider that serves Clef: the setting, else the environment."""
+    return settings.clef_provider or clef_provider_from_env()
 
 
 def mode_of(settings: Settings) -> str:
@@ -148,15 +168,21 @@ async def run_suite(
     """
     runnable = [c for c in cases if settings.live or c.world is not None]
     skipped = [c.id for c in cases if c not in runnable]
-    if settings.live and not _have_credentials():
+    provider = _provider(settings) if settings.live else ""
+    if settings.live and not _have_credentials(provider):
         raise RuntimeError(
             "--live needs CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN in the "
             "environment"
+            + (
+                ", and EXPERIENTIAL_API_KEY for --clef-provider experiential"
+                if provider == "experiential"
+                else ""
+            )
         )
     if settings.record is not None:
         settings.record.mkdir(parents=True, exist_ok=True)
     gate = asyncio.Semaphore(max(1, settings.concurrency))
-    live = CloudflareTransport() if settings.live else None
+    live = system_one_transport(provider or None) if settings.live else None
     snapshot = CassetteTransport(settings.replay) if settings.replay else None
 
     async def one(case: Case) -> CaseResult:
@@ -169,7 +195,12 @@ async def run_suite(
         if live is not None:
             await live.aclose()
     return SuiteResult(
-        config, dict(settings.overrides), results, skipped, mode_of(settings)
+        config,
+        dict(settings.overrides),
+        results,
+        skipped,
+        mode_of(settings),
+        provider,
     )
 
 

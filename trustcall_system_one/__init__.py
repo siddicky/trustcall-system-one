@@ -36,6 +36,7 @@ from trustcall_system_one._errors import (
     StateTruncatedError,
     TransportError,
     TrustcallSystemOneError,
+    UncertainOutcomeError,
 )
 from trustcall_system_one._extractor import (
     ExtractionInput,
@@ -61,8 +62,12 @@ from trustcall_system_one._wire import CLAIRIC, CLEF, CLEF_FLASH
 from trustcall_system_one.transport import (
     CallMeta,
     CloudflareTransport,
+    ExperientialTransport,
+    RoutingTransport,
     Transport,
     TransportResponse,
+    clef_provider_from_env,
+    system_one_transport,
 )
 
 __all__ = [
@@ -82,6 +87,7 @@ __all__ = [
     "CostReport",
     "DiscoveryConfig",
     "EntityInfo",
+    "ExperientialTransport",
     "ExtractionInput",
     "ExtractionResult",
     "ExtractionValidationError",
@@ -104,6 +110,7 @@ __all__ = [
     "RejectedOp",
     "RepairConfig",
     "ResultRecord",
+    "RoutingTransport",
     "SchemaInstance",
     "SchemaPlan",
     "ServerError",
@@ -113,12 +120,15 @@ __all__ = [
     "TransportError",
     "TransportResponse",
     "TrustcallSystemOneError",
+    "UncertainOutcomeError",
     "UnionGroup",
     "UnionMember",
     "Usage",
     "VerifyConfig",
     "__version__",
+    "clef_provider_from_env",
     "compile_schema",
     "create_extractor",
     "s1_field",
+    "system_one_transport",
 ]

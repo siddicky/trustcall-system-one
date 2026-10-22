@@ -40,7 +40,7 @@ Planned modules, from the "Package layout" table in `docs/DESIGN.md`:
 - `trustcall_system_one/_types.py`: result types, `SchemaInstance`, `Mention` and `Entity`.
 - `trustcall_system_one/_config.py`: all config dataclasses.
 - `trustcall_system_one/_cardinality.py`: `Many` and `One` wrappers, `Annotated` markers, default resolution.
-- `trustcall_system_one/transport.py` (public): `Transport` protocol, `CloudflareTransport`, adaptive per-model limiter.
+- `trustcall_system_one/transport.py` (public): `Transport` protocol, `CloudflareTransport`, `ExperientialTransport` (Clef on Experiential Labs, never retries an uncertain outcome), `RoutingTransport`, `system_one_transport`, adaptive per-model limiter.
 - `trustcall_system_one/_wire.py`: exact Clairic and Clef request and response pydantic models.
 - `trustcall_system_one/_schemas.py`: coerces BaseModel, TypedDict, JSON Schema or callable into a BaseModel.
 - `trustcall_system_one/_names.py`: path to wire-name map, with deterministic blake2s shortening.
