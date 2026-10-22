@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic import BaseModel, ValidationError
+from pydantic_core import PydanticUndefined
 
 from trustcall_system_one._compile import (
     FieldGroup,
@@ -35,7 +36,7 @@ from trustcall_system_one._compile import (
 from trustcall_system_one._errors import ExtractionValidationError
 from trustcall_system_one._names import Path
 from trustcall_system_one._render import RenderedState
-from trustcall_system_one._run import Answer, Run, both, gather
+from trustcall_system_one._run import Answer, Run, gather
 from trustcall_system_one._types import (
     EntityInfo,
     FieldAnswer,
@@ -350,7 +351,10 @@ async def _run_group(
     presence_f = ensure(_ask_presences(ctx, optional, group)) if optional else None
 
     async def leaves_flow() -> list[_Leaf]:
-        extracted, clef_answers = await both(extract_f, clef_f)
+        # awaited one after the other and never cancelled here: the union flow
+        # waits on the same futures, and the outer cleanup stops them
+        extracted = await extract_f
+        clef_answers = await clef_f
         leaves: list[_Leaf] = []
         pending: list[tuple[FieldSpec, int]] = []
         for spec in group.specs:
@@ -504,20 +508,43 @@ def _leaf_states(result: _GroupResult) -> Iterator[FieldState]:
             yield from _leaf_states(member)
 
 
-def _count(result: _GroupResult) -> int:
-    """How many verified, non-null Clairic values stand below a group.
+def _default_of(model: type[BaseModel], spec: FieldSpec) -> Any:
+    """The field's default, or ``PydanticUndefined`` when it has none."""
+    info = model.model_fields.get(str(spec.path[-1]))
+    if info is None or info.is_required():
+        return PydanticUndefined
+    return info.get_default(call_default_factory=True)
 
-    Clef-typed fields and filled-in constants are no evidence: a ``bool`` answers
-    itself and a required ``Literal`` always picks something, whether or not the
-    input says anything about the group.
+
+def _evidence(leaf: _Leaf, model: type[BaseModel]) -> bool:
+    """Whether a leaf says the input is about this group.
+
+    A verified, non-null Clairic value does. A Clef answer does only when it is
+    not the answer the field would have anyway: a field with a default whose
+    answer differs from the default, or a nullable field that was answered
+    rather than left ``unstated``. A required Clef field (a ``bool`` or
+    ``Literal`` that always resolves) never does, and neither does a constant.
     """
+    if leaf.state is not None:
+        return leaf.state.value is not None
+    resolved = leaf.resolved
+    if resolved is None or not resolved.ok or resolved.value is None or leaf.filled:
+        return False
+    spec = leaf.spec
+    if "unstated" in resolved.notes:
+        return False
+    if spec.has_default:
+        default = _default_of(model, spec)
+        if default is not PydanticUndefined and resolved.value != default:
+            return True
+    return spec.nullable
+
+
+def _count(result: _GroupResult) -> int:
+    """How many pieces of evidence stand below a group (see ``_evidence``)."""
     if not result.present:
         return 0
-    total = sum(
-        1
-        for leaf in result.leaves
-        if leaf.state is not None and leaf.state.value is not None
-    )
+    total = sum(_evidence(leaf, result.group.model) for leaf in result.leaves)
     total += sum(_count(child) for child in result.children)
     for union in result.unions:
         if union.chosen is not None:
@@ -677,6 +704,15 @@ class _Assembly:
     errors: list[str] = field(default_factory=list)
     fatal: set[tuple[Any, ...]] = field(default_factory=set)
 
+    def mark(self) -> tuple[int, frozenset[tuple[Any, ...]]]:
+        """Where the errors stand, to undo what a dropped fragment added."""
+        return len(self.errors), frozenset(self.fatal)
+
+    def rollback(self, mark: tuple[int, frozenset[tuple[Any, ...]]]) -> None:
+        """Forget the errors a fragment raised once it is dropped."""
+        del self.errors[mark[0] :]
+        self.fatal = set(mark[1])
+
 
 def _key(spec: FieldSpec | FieldGroup | UnionGroup) -> str:
     """The key ``model_validate`` expects for a field."""
@@ -775,6 +811,7 @@ def _fragment(
     for leaf in result.leaves:
         _emit_leaf(leaf, doc, out)
     for child in result.children:
+        mark = out.mark()
         sub = _fragment(ctx, child, out, (*trail, _key(child.group)))
         if sub is None:
             _absent(doc, child.group)
@@ -789,6 +826,7 @@ def _fragment(
                 optional=True,
             )
             if instance is None:
+                out.rollback(mark)  # what was wrong inside it goes with it
                 _absent(doc, child.group)
                 _unsay(out, child.group.pretty)
             else:
@@ -840,6 +878,7 @@ def _place_union(
     if chosen is None:
         _absent(doc, union)
         return
+    mark = out.mark()
     member = _fragment(ctx, result.members[chosen.label], out, (*trail, _key(union)))
     assert member is not None
     instance = _validated(
@@ -858,6 +897,7 @@ def _place_union(
         )
         return
     if union.optional:
+        out.rollback(mark)
         _absent(doc, union)
         _unsay(out, spec.pretty)
     else:
@@ -873,9 +913,9 @@ def _lookup(model: BaseModel, path: Path) -> Any:
 
 
 def _plain(value: Any) -> Any:
-    """Turn the model instances in a document back into dicts."""
+    """Turn the model instances in a document back into dicts, keyed by alias."""
     if isinstance(value, BaseModel):
-        return value.model_dump()
+        return value.model_dump(by_alias=True)
     if isinstance(value, dict):
         return {key: _plain(item) for key, item in value.items()}
     return value

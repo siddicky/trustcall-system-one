@@ -105,7 +105,24 @@ own), `field` = one per field.
   dicts). An optional sub-model that fails validation is treated as absent (`None`/default) with
   a warning and `RejectedOp(path=<group>, reason="invalid_optional_group")`, and the leaf
   answers it held are reported as dropped; a required union member that fails makes the record
-  invalid with its errors under the union's path.
+  invalid with its errors under the union's path. What is wrong inside a dropped group goes
+  with it: its errors do not invalidate the record. An optional sub-model that can never
+  validate (a required field of it was skipped by `max_depth`/`max_recursion`) is skipped at
+  compile time (one `unviable_group` warning, no presence question, no extraction).
+  Known limits: (1) a parent's `model_validator(mode="before")` now receives model *instances*
+  for optional sub-models and union members, not dicts; (2) a union of `TypedDict` members is
+  validated as plain dicts by the parent, so pydantic's smart-union can still pick another
+  member whose keys overlap; (3) `CallMeta.field` of a batched request (sibling presence
+  questions, chunk adjudication/attribution of several fields) holds comma-joined paths or
+  names.
+* *Evidence.* A Clairic value counts when verified and non-null. A Clef answer counts only when
+  it resolved ok, was not `unstated` and is not what the field would have anyway: a field with
+  a default whose answer differs from it, or a nullable field that was answered. A required
+  Clef field (`bool`, `Literal`) and a filled-in const never count. The same rule decides the
+  borderline-absent check and the required-union fallback.
+* *Errors* raised in any concurrent step propagate as themselves: `_run.gather` re-raises the
+  first real exception (never a sibling's `CancelledError`), and a flow never cancels a future
+  that another flow awaits.
 * All leaves of all groups share one verification ladder run, so the attribution check is one
   request over every leaf. Ladder questions carry `FieldSpec.scoped` (`city (author → address)`).
   Assembly builds the nested document level by level (`unflatten(..., plan=, members=)` renames

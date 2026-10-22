@@ -61,15 +61,24 @@ async def gather(*awaitables: Awaitable[T]) -> list[T]:
 
     Unlike a bare ``asyncio.gather`` this does not leave the siblings of a failed
     call running in the background (and so still spending requests) after the
-    error has propagated.
+    error has propagated, and the error that propagates is the one that was
+    raised: a sibling that ends up cancelled (by this very cleanup, or because
+    something it awaited was cancelled) never hides it behind a
+    ``CancelledError``.
     """
     tasks = [asyncio.ensure_future(item) for item in awaitables]
     try:
         return list(await asyncio.gather(*tasks))
-    except BaseException:
+    except BaseException as exc:
         for task in tasks:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+        if isinstance(exc, asyncio.CancelledError):
+            for outcome in outcomes:  # a sibling's cancellation got here first
+                if isinstance(outcome, BaseException) and not isinstance(
+                    outcome, asyncio.CancelledError
+                ):
+                    raise outcome from None
         raise
 
 
