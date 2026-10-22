@@ -43,9 +43,20 @@ from trustcall_system_one._wire import (
     parse_clairic,
     parse_clef,
 )
-from trustcall_system_one.transport import CallMeta, Transport
+from trustcall_system_one.transport import CallMeta, Transport, TransportResponse
 
-__all__ = ["CANCELLED_AFTER_SEND", "CLEF_BATCH", "Answer", "Question", "Run", "gather"]
+__all__ = [
+    "CANCELLED_AFTER_SEND",
+    "CLEF_BATCH",
+    "FALLBACK_WARNING",
+    "Answer",
+    "Question",
+    "Run",
+    "gather",
+]
+
+FALLBACK_WARNING = "clef_fallback_used"
+"""Start of the warning that says a fallback answered."""
 
 CANCELLED_AFTER_SEND = "cancelled after send; outcome unknown"
 """``CallRecord.error`` of a call cancelled while it may have been on the wire."""
@@ -147,6 +158,9 @@ class _Sent:
     duration_ms: float
     status_code: int | None
     request_id: str | None = None
+    provider: str | None = None
+    fallback_from: str | None = None
+    fallback_error: str | None = None
 
 
 @dataclass
@@ -184,6 +198,8 @@ class Run:
             ``"statements"``), asked of Clef once per schema and field in this run.
         clef_memo: The answers to the Clef requests sent so far, by request: a
             byte-identical request is answered from here, not sent again.
+        fallback_used: How many requests a fallback transport answered after
+            its primary failed (also reported as the ``clef_fallback_used`` warning).
     """
 
     transport: Transport
@@ -211,6 +227,7 @@ class Run:
         default_factory=dict
     )
     clef_memo: "dict[str, dict[str, Answer]]" = field(default_factory=dict)
+    fallback_used: int = 0
 
     def warn(self, message: str) -> None:
         """Record a warning once."""
@@ -233,6 +250,8 @@ class Run:
         status_code: int | None = None,
         error: str | None = None,
         request_id: str | None = None,
+        provider: str | None = None,
+        fallback_from: str | None = None,
     ) -> None:
         """Append one ``CallRecord`` (and the usage, for a successful call)."""
         counted: dict[str, int] = {}
@@ -261,6 +280,8 @@ class Run:
                 status_code=status_code,
                 request_id=request_id,
                 cost_usd=cost_usd,
+                provider=provider,
+                fallback_from=fallback_from,
             )
         )
 
@@ -301,13 +322,52 @@ class Run:
                 request_id=getattr(exc, "request_id", None),
             )
             raise
+        if response.fallback_from is not None:
+            self._note_fallback(model, meta, n_items, response, started)
         return _Sent(
             body=response.body,
             retries=response.retries,
             duration_ms=response.duration_ms or (time.perf_counter() - started) * 1000,
             status_code=response.status_code,
             request_id=response.request_id,
+            provider=response.provider,
+            fallback_from=response.fallback_from,
+            fallback_error=response.fallback_error,
         )
+
+    def _note_fallback(
+        self,
+        model: str,
+        meta: CallMeta,
+        n_items: int,
+        response: TransportResponse,
+        started: float,
+    ) -> None:
+        """Log the primary's failed attempt and count the fallback in a warning.
+
+        The primary may have run the request (an uncertain outcome), so its
+        failure is a ``CallRecord`` of its own, with the error it raised and the
+        provider that raised it; ``clef_fallback_used`` says how many requests the
+        fallback answered.
+        """
+        self.fallback_used += 1
+        self._record(
+            model,
+            meta,
+            n_items,
+            duration_ms=(time.perf_counter() - started) * 1000,
+            error=response.fallback_error,
+            provider=response.fallback_from,
+        )
+        message = (
+            f"{FALLBACK_WARNING}: {self.fallback_used} Clef request(s) were answered "
+            f"by the fallback ({response.provider}) because {response.fallback_from} "
+            "could not answer them"
+        )
+        self.warnings[:] = [
+            w for w in self.warnings if not w.startswith(FALLBACK_WARNING)
+        ]
+        self.warnings.append(message)
 
     def _unparsable(
         self, model: str, meta: CallMeta, n_items: int, sent: _Sent, exc: Exception
@@ -321,6 +381,8 @@ class Run:
             status_code=sent.status_code,
             error=f"{type(exc).__name__}: {exc}",
             request_id=sent.request_id,
+            provider=sent.provider,
+            fallback_from=sent.fallback_from,
         )
 
     async def call_clairic(
@@ -375,6 +437,8 @@ class Run:
             retries=sent.retries,
             status_code=sent.status_code,
             request_id=sent.request_id,
+            provider=sent.provider,
+            fallback_from=sent.fallback_from,
         )
         return response
 
@@ -494,6 +558,8 @@ class Run:
             retries=sent.retries,
             status_code=sent.status_code,
             request_id=sent.request_id,
+            provider=sent.provider,
+            fallback_from=sent.fallback_from,
         )
         if response.usage.input_tokens >= _TRUNCATION_RATIO * _CLEF_CONTEXT_TOKENS:
             self.warn(

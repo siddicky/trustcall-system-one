@@ -10,6 +10,7 @@ from trustcall_system_one import (
     CloudflareTransport,
     RoutingTransport,
     Transport,
+    clef_fallback_from_env,
     clef_provider_from_env,
     system_one_transport,
 )
@@ -24,14 +25,18 @@ def credentials_present() -> bool:
 
     Clairic always needs the Cloudflare account id and an API token. With Clef on
     Experiential Labs (``TRUSTCALL_S1_CLEF_PROVIDER=experiential``) its key is
-    needed too.
+    needed too, as it is for the Decisions fallback
+    (``TRUSTCALL_S1_CLEF_FALLBACK=decisions``).
     """
     token = os.environ.get("CLOUDFLARE_API_TOKEN") or os.environ.get(
         "CLOUDFLARE_AUTH_TOKEN"
     )
     if not (os.environ.get("CLOUDFLARE_ACCOUNT_ID") and token):
         return False
-    if clef_provider_from_env() == "experiential":
+    if (
+        clef_provider_from_env() == "experiential"
+        or clef_fallback_from_env() == "decisions"
+    ):
         return bool((os.environ.get("EXPERIENTIAL_API_KEY") or "").strip())
     return True
 

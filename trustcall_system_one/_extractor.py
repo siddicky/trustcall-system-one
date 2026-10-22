@@ -62,6 +62,7 @@ from trustcall_system_one.transport import (
     CloudflareTransport,
     RoutingTransport,
     Transport,
+    clef_fallback_from_env,
     clef_provider_from_env,
     system_one_transport,
 )
@@ -118,7 +119,9 @@ class _Core:
         self, transport: Transport | None, concurrency: ConcurrencyConfig | None
     ) -> None:
         if transport is None:
-            clef_provider_from_env()  # a bad TRUSTCALL_S1_CLEF_PROVIDER fails here
+            # a bad TRUSTCALL_S1_CLEF_PROVIDER or ..._FALLBACK fails here
+            clef_provider_from_env()
+            clef_fallback_from_env()
         self._given = transport
         self._concurrency = concurrency
         self._owned: CloudflareTransport | RoutingTransport | None = None
@@ -140,6 +143,7 @@ class _Core:
                 cloudflare = CloudflareTransport(concurrency=self._concurrency)
                 self._owned = system_one_transport(
                     clef_provider_from_env(),
+                    clef_fallback=clef_fallback_from_env(),
                     cloudflare=cloudflare,
                     concurrency=self._concurrency,
                 )

@@ -160,7 +160,8 @@ def build_extractor(
     # No transport given: the extractor creates one from the environment on first
     # use and closes it with the extractor: Cloudflare for both models, or Clef on
     # Experiential Labs only when TRUSTCALL_S1_CLEF_PROVIDER=experiential (an
-    # EXPERIENTIAL_API_KEY alone never moves Clef).
+    # EXPERIENTIAL_API_KEY alone never moves Clef), and with the Decisions API as
+    # its fallback only when TRUSTCALL_S1_CLEF_FALLBACK=decisions.
     return create_extractor(schemas, **options)
 
 

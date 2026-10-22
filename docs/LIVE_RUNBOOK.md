@@ -243,17 +243,53 @@ Experiential Labs reports it, and the library sums it as `usage.reported_cost_us
 (`result.cost.reported_usd`), apart from the token-price estimate. Before committing anything,
 run `grep -rnE "xpl_[A-Za-z0-9_-]{16,}" . --exclude-dir=.git`: it must find nothing.
 
+## 4c. Decisions API as the Clef fallback
+
+`DecisionsTransport` answers Clef requests with the Decisions API
+(`POST https://api.experientiallabs.ai/v1/decisions`, model `gpt-6-luna-decisions`, the same
+`EXPERIENTIAL_API_KEY`), and `FallbackTransport` uses it when the Clef provider (Experiential or
+Cloudflare) could not answer. It sends text to Experiential Labs, so it is opt-in:
+
+```bash
+export EXPERIENTIAL_API_KEY=...                  # from the environment only
+export TRUSTCALL_S1_CLEF_FALLBACK=decisions      # required: a key alone enables nothing
+make smoke 2>&1 | tee /tmp/smoke-fallback.txt
+uv run python -m evals run --live --clef-provider experiential --clef-fallback decisions \
+    --config default --out evals/results/fallback-default
+```
+
+How to read it:
+
+- A request the fallback answered has `provider` `decisions` and `fallback_from` in its call
+  record, the result carries the warning `clef_fallback_used: N Clef request(s) ...`, and
+  `summary.md` prints "Clef provider: experiential + fallback decisions". Report N per case. A
+  run with a clean primary should have none; every one is a primary failure to explain.
+- The primary's failed attempt is a record of its own. If it was an `UncertainOutcomeError` it
+  counts in `unknown_outcomes` (the primary may have been charged, and the fallback is charged as
+  well). To fall back only when the primary certainly did not process the request, set the
+  triggers in code (`FallbackTransport(..., on={"unavailable"})`); the environment switch uses the
+  default (all three categories).
+- The fallback is a different model: its answers are not Clef's. Observed probabilities were
+  saturated (0.0 and 1.0, confidence 1.0), so the thresholds' re-ask bands do not fire on it.
+  Compare the quality of a fallback run against a normal one before relying on it; a case that
+  only passes because the fallback answered is a finding, not a pass.
+- `images` cannot be sent to the Decisions API: such a request fails with the primary's error.
+- Never re-run only the failed cases quietly: each request that reached either provider may have
+  been charged.
+
 ## 5. What to hand back
 
 1. The commit hash, the date, and whether the working tree was clean.
 2. The smoke result (section 1) and the recorded file list (section 2).
 3. The baseline table and the three strategy tables (section 3), with the failing cases.
 4. The sweep tables (section 4) and the recommendations for the defaults above.
-5. If Clef ran on Experiential Labs (section 4b): the provider, the count of uncertain
+5. If the Decisions fallback was on (section 4c): the number of fallback answers per case, the
+   warnings, and which primary errors caused them.
+6. If Clef ran on Experiential Labs (section 4b): the provider, the count of uncertain
    outcomes with their messages and correlation ids, and any response that differs from the
    saved example.
-6. The paths of `evals/results/*` and `evals/cassettes/` (not committed) and of
+7. The paths of `evals/results/*` and `evals/cassettes/` (not committed) and of
    `tests/recorded/smoke_*.jsonl`.
-7. Anything that surprised you: an HTTP error, a rate limit, a warning that appears in every run,
+8. Anything that surprised you: an HTTP error, a rate limit, a warning that appears in every run,
    a request count far from the offline one (offline: `uv run python -m evals run`, 190 requests for
    the 24 cases).

@@ -140,6 +140,7 @@ own), `field` = one per field.
 | `_errors.py`, `_types.py`, `_config.py` | exceptions; result types, `SchemaInstance`, `Mention`/`Entity`; all config dataclasses |
 | `_cardinality.py` | `Many`/`One` wrappers + `Annotated` markers; default resolution |
 | `transport.py` (public) | `Transport` protocol, `CloudflareTransport`, `ExperientialTransport`, `RoutingTransport`, `system_one_transport`, adaptive per-model limiter |
+| `_decisions.py` | Clef body <-> Decisions API request/response translation (the Clef fallback) |
 | `_wire.py` | exact Clairic/Clef request+response pydantic models |
 | `_schemas.py` | coerce BaseModel / TypedDict / JSON Schema / callable → BaseModel |
 | `_names.py` | path ↔ wire-name map, deterministic blake2s shortening |
@@ -1165,6 +1166,56 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
   cloudflare|experiential`, recorded in `results.json` as `clef_provider`; shown in the report of a
   live run and of a replay, and a note is printed when the flag is given without `--live`).
   Cassettes are keyed by model id and payload, so they replay under either provider.
+- **Decisions API as a fallback for Clef (`DecisionsTransport`, `FallbackTransport`).**
+  `POST https://api.experientiallabs.ai/v1/decisions` (same key) takes `{model, input,
+  questions: [{type, name, instructions, choices: [{value, description}]}]}` and answers `{model,
+  answers: [{type, name, choice, probabilities: [{value, probability}], confidence}], usage
+  {input_tokens, output_tokens, cost, ...}, provider}` (a live probe is saved as
+  `docs/schemas/experiential-decisions-response.example.json`; `model` is
+  `gpt-6-luna-decisions`, configurable). Only the `choice` question type has been observed, so
+  `DecisionsTransport` (a subclass of `ExperientialTransport`: same key, limiter, deadline and
+  **same no-retry policy**) sends every Clef question as one and translates the answer back to a
+  Clef-shaped response that `parse_clef` accepts (`_decisions.py`, validated both ways: the
+  Clef request, the Decisions request, the Decisions response and the Clef result):
+  `state` becomes `input`: a string as it is, an object as one `## key` section per key (strings
+  verbatim, other values as indented JSON), because the questions refer to the keys (`input`,
+  `entity`, `record`, `proposed_change`) and the user's text should stay unescaped; `questions`
+  become a list in the same order with `name` = the question id; `choice` criteria become
+  `choices` (id kept, description a string or rendered JSON, none when null); **`noul`** becomes
+  two choices `yes`/`no` and `noul = P(yes)` (normalised over the two, 1/0 by the choice when
+  both are 0); **`score`** becomes one choice per level (`"0"`...) and `score` is the
+  probability-weighted level with the legend from the rubric. An answer that arrives without
+  probabilities is hard (1.0 on the choice) and carries `"hard": true`; the observed ones had
+  them, but they were saturated (0.0/1.0, confidence 1.0), so thresholds written for graded Clef
+  answers (keep at 0.75, drop under 0.4, a re-ask between) behave like yes/no on this fallback.
+  `images` are refused (`BadRequestError`) before sending. Response keys: `provider:
+  "decisions"`, `decisions_model`, `usage.cost` (the reported price, which is 0.0 in the probe).
+- `FallbackTransport(primary, fallback, *, on={"unavailable", "uncertain", "bad_response"})`:
+  when the primary raises an error selected by `on`, the same request goes to the fallback
+  **once**, and the response comes back with `provider`, `fallback_from` and `fallback_error`
+  set. Categories: `unavailable` (`RateLimitError` after its bounded retries, `ServerError`, a
+  plain `TransportError` such as a failed connection or a deadline), `uncertain`
+  (`UncertainOutcomeError`: a timeout, a 408 or 5xx of Experiential Labs, a connection dropped
+  after sending; **the primary may have charged for the request and the fallback is charged
+  too**, so `on={"unavailable", "bad_response"}` excludes it), `bad_response`
+  (`ModelResponseError`); exception classes may be listed too. `AuthError` and `BadRequestError`
+  never fall back (listing them is a `ValueError`), nor does a cancellation. A fallback is a
+  different request to a different model, not a resend of the primary's: the primary and the
+  fallback each see at most one request (plus a failed connection or a 429 with `Retry-After`
+  inside it), and a fallback that fails too raises its own error chained to the primary's. A
+  fallback that cannot serve the model (`serves()`, Clef only) leaves the primary's error. The
+  call log: `CallRecord.provider` (who answered) and `fallback_from`; the primary's failed
+  attempt is logged as a record of its own (its error, `provider` of the primary) so an uncertain
+  outcome is counted (`unknown_outcomes`); `Run.fallback_used` and the warning
+  `clef_fallback_used: N Clef request(s) were answered by the fallback (...)`.
+  Setup: `system_one_transport(clef=..., clef_fallback="decisions"|"none"|None)` builds
+  `RoutingTransport({"clef": FallbackTransport(<Experiential or Cloudflare>,
+  DecisionsTransport())}, default=CloudflareTransport())`; `None` reads
+  `TRUSTCALL_S1_CLEF_FALLBACK=decisions|none` (`clef_fallback_from_env()`; unset is none, a bad
+  value is a `ValueError` when the extractor is created). **Opt-in only**, like the provider: the
+  fallback sends the text to Experiential Labs, so a key in the environment never enables it;
+  that also applies when Clef itself stays on Cloudflare. The evals take `--clef-fallback
+  decisions|none`, recorded as `clef_fallback`.
 - Two transports mean two limiters: `RoutingTransport` does not share one, so the in-flight caps
   (64 per transport, 32 per model) apply to Cloudflare and to Experiential separately, and a 429
   from one lowers only that provider's limit. Pass `concurrency=` to lower both.

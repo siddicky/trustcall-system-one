@@ -14,6 +14,7 @@ from evals.model import Case, CaseResult
 from evals.scoring import score
 from trustcall_system_one import (
     Transport,
+    clef_fallback_from_env,
     clef_provider_from_env,
     create_extractor,
     system_one_transport,
@@ -43,6 +44,9 @@ class Settings:
             ``experiential``. ``None`` decides from ``TRUSTCALL_S1_CLEF_PROVIDER``
             (Cloudflare when it is unset; an ``EXPERIENTIAL_API_KEY`` alone never
             selects Experiential). Clairic always goes to Cloudflare.
+        clef_fallback: ``decisions`` adds the Decisions API as the fallback of
+            Clef on live requests; ``None`` reads ``TRUSTCALL_S1_CLEF_FALLBACK``
+            (no fallback when it is unset).
     """
 
     overrides: Mapping[str, Any] = field(default_factory=dict)
@@ -51,6 +55,7 @@ class Settings:
     replay: Path | None = None
     concurrency: int = 4
     clef_provider: Literal["cloudflare", "experiential"] | None = None
+    clef_fallback: Literal["decisions", "none"] | None = None
 
 
 @dataclass
@@ -64,6 +69,7 @@ class SuiteResult:
         skipped: Ids of cases that could not run (no offline world).
         mode: ``offline``, ``live``, ``replay`` or ``replay+live``.
         clef_provider: Who served the live Clef requests (empty without ``live``).
+        clef_fallback: ``decisions`` when the Decisions API was the fallback.
     """
 
     config: str
@@ -72,20 +78,26 @@ class SuiteResult:
     skipped: list[str]
     mode: str
     clef_provider: str = ""
+    clef_fallback: str = ""
 
 
-def _have_credentials(clef_provider: str = "cloudflare") -> bool:
+def _have_credentials(
+    clef_provider: str = "cloudflare", clef_fallback: str = "none"
+) -> bool:
     """Cloudflare credentials (Clairic) and, for Experiential Clef, its key."""
     account = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
     token = os.environ.get("CLOUDFLARE_API_TOKEN") or os.environ.get(
         "CLOUDFLARE_AUTH_TOKEN"
     )
-    if (
-        clef_provider == "experiential"
-        and not (os.environ.get("EXPERIENTIAL_API_KEY") or "").strip()
-    ):
+    needs_key = clef_provider == "experiential" or clef_fallback == "decisions"
+    if needs_key and not (os.environ.get("EXPERIENTIAL_API_KEY") or "").strip():
         return False
     return bool(account and token)
+
+
+def _fallback(settings: Settings) -> Literal["decisions", "none"]:
+    """The Clef fallback: the setting, else the environment."""
+    return settings.clef_fallback or clef_fallback_from_env()
 
 
 def _provider(settings: Settings) -> Literal["cloudflare", "experiential"]:
@@ -199,20 +211,25 @@ async def run_suite(
     # Shown in the report whenever a live request is possible: live, or a replay
     # that sends the requests it has no recording for.
     provider = _provider(settings) if settings.live or settings.replay else ""
-    if settings.live and not _have_credentials(provider or "cloudflare"):
+    fallback = _fallback(settings) if provider else "none"
+    if settings.live and not _have_credentials(provider or "cloudflare", fallback):
         raise RuntimeError(
             "--live needs CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN in the "
             "environment"
             + (
-                ", and EXPERIENTIAL_API_KEY for --clef-provider experiential"
-                if provider == "experiential"
+                ", and EXPERIENTIAL_API_KEY for Experiential or the Decisions fallback"
+                if provider == "experiential" or fallback == "decisions"
                 else ""
             )
         )
     if settings.record is not None:
         settings.record.mkdir(parents=True, exist_ok=True)
     gate = asyncio.Semaphore(max(1, settings.concurrency))
-    live = system_one_transport(provider) if settings.live and provider else None
+    live = (
+        system_one_transport(provider, clef_fallback=fallback)
+        if settings.live and provider
+        else None
+    )
     snapshot = CassetteTransport(settings.replay) if settings.replay else None
 
     async def one(case: Case) -> CaseResult:
@@ -231,6 +248,7 @@ async def run_suite(
         skipped,
         mode_of(settings),
         provider,
+        fallback if provider and fallback != "none" else "",
     )
 
 

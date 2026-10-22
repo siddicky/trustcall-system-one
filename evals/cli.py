@@ -60,6 +60,15 @@ def _common(parser: argparse.ArgumentParser) -> None:
         "CLOUDFLARE_API_TOKEN); the default answers from each case's scripted world",
     )
     parser.add_argument(
+        "--clef-fallback",
+        choices=("decisions", "none"),
+        default=None,
+        help="on live requests, answer a Clef request that the provider could "
+        "not answer with the Decisions API (same key; may be charged twice "
+        "after an uncertain outcome); default: TRUSTCALL_S1_CLEF_FALLBACK, "
+        "else none",
+    )
+    parser.add_argument(
         "--clef-provider",
         choices=("cloudflare", "experiential"),
         default=None,
@@ -127,10 +136,11 @@ def _out_dir(args: argparse.Namespace, name: str) -> Path:
 
 
 def _settings(args: argparse.Namespace, overrides: dict[str, Any]) -> Settings:
-    if args.clef_provider and not args.live:
+    if (args.clef_provider or args.clef_fallback) and not args.live:
         print(
-            "note: --clef-provider has no effect without --live: nothing is sent, "
-            "requests are answered offline or from the cassettes",
+            "note: --clef-provider and --clef-fallback have no effect without "
+            "--live: nothing is sent, requests are answered offline or from the "
+            "cassettes",
             file=sys.stderr,
         )
     return Settings(
@@ -140,6 +150,7 @@ def _settings(args: argparse.Namespace, overrides: dict[str, Any]) -> Settings:
         replay=args.replay,
         concurrency=args.concurrency,
         clef_provider=args.clef_provider,
+        clef_fallback=args.clef_fallback,
     )
 
 

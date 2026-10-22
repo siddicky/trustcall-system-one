@@ -2,21 +2,27 @@
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import math
 import os
 import random
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import timezone
 from email.utils import parsedate_to_datetime
-from typing import Any, Literal, Protocol, TypeVar, runtime_checkable
+from typing import Any, Literal, Protocol, TypeVar, Union, runtime_checkable
 
 import httpx
 
 from trustcall_system_one._config import ConcurrencyConfig
+from trustcall_system_one._decisions import (
+    DECISIONS_MODEL,
+    from_decisions_response,
+    to_decisions_request,
+)
 from trustcall_system_one._errors import (
     AuthError,
     BadRequestError,
@@ -35,10 +41,13 @@ __all__ = [
     "CallKind",
     "CallMeta",
     "CloudflareTransport",
+    "DecisionsTransport",
     "ExperientialTransport",
+    "FallbackTransport",
     "RoutingTransport",
     "Transport",
     "TransportResponse",
+    "clef_fallback_from_env",
     "clef_provider_from_env",
     "system_one_transport",
 ]
@@ -70,6 +79,11 @@ class TransportResponse:
         status_code: HTTP status of the successful response, if there was one.
         request_id: The id the server gave the request (a correlation or request
             id header), if it sent one.
+        provider: Who answered (``cloudflare``, ``experiential`` or
+            ``decisions``), if the transport says.
+        fallback_from: When a ``FallbackTransport`` had to use its fallback, the
+            provider that failed.
+        fallback_error: ... and how it failed (error class and message).
     """
 
     body: dict[str, Any]
@@ -77,6 +91,9 @@ class TransportResponse:
     duration_ms: float = 0.0
     status_code: int | None = None
     request_id: str | None = None
+    provider: str | None = None
+    fallback_from: str | None = None
+    fallback_error: str | None = None
 
 
 @runtime_checkable
@@ -578,6 +595,8 @@ class CloudflareTransport(_HttpTransport):
     used for every loop and is the caller's to manage.
     """
 
+    provider = "cloudflare"
+
     def __init__(
         self,
         *,
@@ -795,6 +814,7 @@ class CloudflareTransport(_HttpTransport):
                                 retries=retries,
                                 duration_ms=(time.perf_counter() - started) * 1000,
                                 status_code=status,
+                                provider="cloudflare",
                             )
                         retry_after = _parse_retry_after(
                             response.headers.get("Retry-After")
@@ -1059,6 +1079,24 @@ class ExperientialTransport(_HttpTransport):
         read = client.timeout.read
         return 0.0 if read is None else float(read)
 
+    provider = "experiential"
+    _api_name = "Experiential Labs API"
+
+    def serves(self, model: str) -> bool:
+        """Whether this transport can answer ``model`` (Clef only)."""
+        try:
+            return body_model(model) in _EXPERIENTIAL_MODELS
+        except ValueError:
+            return False
+
+    def _prepare(self, payload: Mapping[str, Any]) -> tuple[Mapping[str, Any], Any]:
+        """The body to send and what is needed to read the answer back."""
+        return payload, None
+
+    def _read_success(self, response: httpx.Response, context: Any) -> dict[str, Any]:
+        """The Clef response in a 2xx."""
+        return self._unwrap(response)
+
     def sensitive_values(self) -> tuple[str, ...]:
         """The API key that was passed in explicitly.
 
@@ -1133,6 +1171,7 @@ class ExperientialTransport(_HttpTransport):
         """
         del meta  # nothing about the call leaves the process
         self._check_model(model)
+        outgoing, context = self._prepare(payload)
         token = self._token()
         url = self._base_url
         headers = self._headers(token)
@@ -1162,7 +1201,7 @@ class ExperientialTransport(_HttpTransport):
                     # Built outside the try: a payload that cannot be encoded
                     # fails here, before anything is sent, and is not uncertain.
                     request = client.build_request(
-                        "POST", url, json=payload, headers=headers, **post_kwargs
+                        "POST", url, json=outgoing, headers=headers, **post_kwargs
                     )
                     try:
                         response = await client.send(request)
@@ -1190,7 +1229,7 @@ class ExperientialTransport(_HttpTransport):
                         if response.is_success:
                             request_id = _correlation_id(response)
                             try:
-                                body = self._unwrap(response)
+                                body = self._read_success(response, context)
                             except (TransportError, ModelResponseError) as exc:
                                 if isinstance(exc, TransportError):
                                     exc.retries = retries
@@ -1203,6 +1242,7 @@ class ExperientialTransport(_HttpTransport):
                                 duration_ms=(time.perf_counter() - started) * 1000,
                                 status_code=status,
                                 request_id=request_id,
+                                provider=self.provider,
                             )
                         retry_after = _parse_retry_after(
                             response.headers.get("Retry-After")
@@ -1251,14 +1291,14 @@ class ExperientialTransport(_HttpTransport):
                 previous_delay = delay
             await self._sleep(delay)
 
-    @staticmethod
+    @classmethod
     def _error_for_status(
-        response: httpx.Response, *, retry_after: float | None
+        cls, response: httpx.Response, *, retry_after: float | None
     ) -> TransportError:
         """Map a non-2xx response to an exception."""
         status = response.status_code
         body = _json_or_text(response)
-        message = f"Experiential Labs API returned HTTP {status}: {_error_detail(body)}"
+        message = f"{cls._api_name} returned HTTP {status}: {_error_detail(body)}"
         correlation = _correlation_id(response)
         if correlation:
             message += f" (correlation id {correlation})"
@@ -1317,6 +1357,280 @@ class ExperientialTransport(_HttpTransport):
             )
         parse_clef(body)  # ModelResponseError if it is not a valid Clef response
         return body
+
+
+# --------------------------------------------------------------------------- #
+# Decisions API
+# --------------------------------------------------------------------------- #
+
+DECISIONS_URL = "https://api.experientiallabs.ai/v1/decisions"
+
+
+class DecisionsTransport(ExperientialTransport):
+    """Answers Clef requests with Experiential Labs' Decisions API.
+
+    A different model (``gpt-6-luna-decisions`` by default) behind another endpoint
+    (``POST /v1/decisions``), meant as a *fallback* for Clef (see
+    ``FallbackTransport``). It takes the Clef request bodies the library builds,
+    translates them into a Decisions request, and translates the answer back into
+    a Clef response that ``parse_clef`` accepts, so nothing above the transport
+    changes. The translation is in ``trustcall_system_one._decisions``:
+
+    * ``state`` becomes ``input``: a string as it is, an object as one
+      ``## key`` section per key (strings verbatim, other values as indented JSON).
+    * ``questions`` become a list in the same order, ``name`` being the question id.
+    * ``choice``: its options are the choices, ids and descriptions kept.
+      ``noul``: two choices, ``yes`` and ``no``, and ``noul`` is the probability of
+      ``yes``. ``score``: one choice per level (``"0"``, ``"1"``, ...) and the score
+      is the probability-weighted level.
+    * Only the ``choice`` question type of the Decisions API has been observed, so
+      every question is sent as one. Probabilities come from the API; an answer
+      without any is *hard* (all the probability on the chosen option) and tagged
+      ``"hard": true``. Probabilities seen so far were often 0 and 1, so thresholds
+      written for Clef's graded answers behave more like yes/no here.
+    * ``images`` are refused (``BadRequestError``) before anything is sent.
+
+    The retry policy is that of ``ExperientialTransport``: one request, never
+    resent once it may have arrived (``UncertainOutcomeError``), retried only
+    before it was sent and after a 429 with ``Retry-After``. The key is the same
+    (``EXPERIENTIAL_API_KEY``).
+    """
+
+    provider = "decisions"
+    _api_name = "Experiential Labs Decisions API"
+
+    def __init__(
+        self,
+        *,
+        decisions_model: str = DECISIONS_MODEL,
+        base_url: str = DECISIONS_URL,
+        **kwargs: Any,
+    ) -> None:
+        """Create a transport.
+
+        Args:
+            decisions_model: The Decisions model to ask.
+            base_url: The endpoint that receives the POST.
+            **kwargs: The other settings of ``ExperientialTransport`` (``api_key``,
+                ``client``, ``timeout``, ``max_retries``, ``call_deadline``,
+                ``min_attempt_budget``, ...).
+
+        Raises:
+            ValueError: If ``decisions_model`` is empty or a setting is out of range.
+        """
+        super().__init__(base_url=base_url, **kwargs)
+        if not decisions_model.strip():
+            raise ValueError("decisions_model must not be empty")
+        self._decisions_model = decisions_model
+
+    def _prepare(self, payload: Mapping[str, Any]) -> tuple[Mapping[str, Any], Any]:
+        body, plans = to_decisions_request(payload, model=self._decisions_model)
+        return body, (plans, str(payload.get("model", "clef")).strip())
+
+    def _read_success(self, response: httpx.Response, context: Any) -> dict[str, Any]:
+        plans, clef_model = context
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise ModelResponseError(
+                f"{self._api_name} returned a non-JSON success response",
+                raw=response.text,
+            ) from exc
+        failed = isinstance(body, dict) and "answers" not in body
+        if failed and (body.get("success") is False or _is_error_object(body)):
+            raise BadRequestError(
+                f"{self._api_name} reported failure: " + _error_detail(body),
+                status_code=response.status_code,
+                body=body,
+                cf_errors=[body["error"]] if _is_error_object(body) else [],
+            )
+        return from_decisions_response(body, plans, clef_model=clef_model)
+
+
+# --------------------------------------------------------------------------- #
+# Fallback
+# --------------------------------------------------------------------------- #
+
+
+class _Unsent(Exception):
+    """Marker: a plain ``TransportError`` (nothing was run) triggers the fallback."""
+
+
+FallbackTrigger = Union[str, "type[Exception]"]
+FALLBACK_CATEGORIES: Mapping[str, tuple[type[Exception], ...]] = {
+    # no answer, and the request was refused or never sent (a plain TransportError,
+    # such as a failed connection or a deadline, is added in FallbackTransport)
+    "unavailable": (RateLimitError, ServerError, _Unsent),
+    # the request may have been run, and charged
+    "uncertain": (UncertainOutcomeError,),
+    # an answer that is not one
+    "bad_response": (ModelResponseError,),
+}
+DEFAULT_FALLBACK_ON: frozenset[str] = frozenset(FALLBACK_CATEGORIES)
+_NEVER_FALL_BACK = (AuthError, BadRequestError)
+
+
+def _provider_name(transport: object) -> str:
+    return str(getattr(transport, "provider", None) or type(transport).__name__.lower())
+
+
+class FallbackTransport:
+    """Sends a request to a fallback once if the primary could not answer it.
+
+    ``run`` tries ``primary``. If it raises an error that ``on`` selects, the same
+    request goes to ``fallback`` exactly once and its answer is returned, with
+    ``provider`` and ``fallback_from`` / ``fallback_error`` set on the response so
+    the call log shows who answered. Neither transport is resent by this class,
+    and the built-in ones never resend a request that may have arrived, so every
+    provider sees a request at most once (plus the retries of a failed connection
+    or a 429 inside it).
+
+    ``on`` is a set of categories and exception classes. The categories:
+
+    * ``"unavailable"``: no answer and nothing was run: ``RateLimitError`` (after the
+      bounded retries), ``ServerError``, and a plain ``TransportError`` (a failed
+      connection, a request that was not sent, a deadline).
+    * ``"uncertain"``: ``UncertainOutcomeError``, a timeout, a dropped connection
+      after the request was sent, a 408 or 5xx of Experiential Labs. **The primary
+      may have run the request and charged for it, so falling back can mean two
+      charges.** Leave this category out (``on={"unavailable", "bad_response"}``,
+      or ``on={"unavailable"}``) to fall back only when the primary certainly did
+      not process the request.
+    * ``"bad_response"``: ``ModelResponseError``, an answer that is not valid.
+
+    The default is all three. ``AuthError`` and ``BadRequestError`` never fall back
+    (a rejected key or a request we built wrongly would fail the same way), and
+    listing them is a ``ValueError``. A cancellation is never caught. If the
+    fallback fails too, its error is raised, chained (``__cause__``) to the
+    primary's. A fallback that cannot serve the model (``serves``) is not tried and
+    the primary's error is raised.
+    """
+
+    def __init__(
+        self,
+        primary: Transport,
+        fallback: Transport,
+        *,
+        on: Iterable[FallbackTrigger] | str = DEFAULT_FALLBACK_ON,
+    ) -> None:
+        """Create a fallback pair.
+
+        Args:
+            primary: The transport tried first.
+            fallback: The transport that gets the request if the primary fails.
+            on: Categories (``"unavailable"``, ``"uncertain"``, ``"bad_response"``)
+                and/or exception classes that trigger the fallback.
+
+        Raises:
+            ValueError: If ``on`` names an unknown category or ``AuthError`` /
+                ``BadRequestError`` (or a subclass), or selects nothing.
+        """
+        triggers: list[type[Exception]] = []
+        for item in (on,) if isinstance(on, (str, type)) else on:
+            if isinstance(item, str):
+                if item not in FALLBACK_CATEGORIES:
+                    raise ValueError(
+                        f"unknown fallback trigger {item!r}; expected one of "
+                        f"{sorted(FALLBACK_CATEGORIES)} or an exception class"
+                    )
+                triggers.extend(FALLBACK_CATEGORIES[item])
+            elif isinstance(item, type) and issubclass(item, Exception):
+                if issubclass(item, _NEVER_FALL_BACK) or any(
+                    issubclass(never, item) for never in _NEVER_FALL_BACK
+                ):
+                    raise ValueError(
+                        f"{item.__name__} never falls back: it would fail the same way"
+                    )
+                triggers.append(item)
+            else:
+                raise ValueError(f"not a fallback trigger: {item!r}")
+        if not triggers:
+            raise ValueError("on selects no error")
+        self._triggers = tuple(triggers)
+        self._primary = primary
+        self._fallback = fallback
+
+    def _falls_back_on(self, exc: Exception) -> bool:
+        if isinstance(exc, _NEVER_FALL_BACK):
+            return False
+        for trigger in self._triggers:
+            if trigger is _Unsent:
+                # a plain TransportError: a connection that failed, a request that
+                # was not sent, a deadline; not one of its more specific subclasses
+                if type(exc) is TransportError:
+                    return True
+            elif isinstance(exc, trigger):
+                return True
+        return False
+
+    async def run(
+        self,
+        model: str,
+        payload: Mapping[str, Any],
+        *,
+        meta: CallMeta,
+        timeout: float | None = None,
+    ) -> TransportResponse:
+        """Run the call on the primary, else once on the fallback."""
+        try:
+            return await self._primary.run(model, payload, meta=meta, timeout=timeout)
+        except Exception as primary_error:
+            if not self._falls_back_on(primary_error):
+                raise
+            serves = getattr(self._fallback, "serves", None)
+            if callable(serves) and not serves(model):
+                raise
+            try:
+                answered = await self._fallback.run(
+                    model, payload, meta=meta, timeout=timeout
+                )
+            except Exception as fallback_error:
+                raise fallback_error from primary_error
+            failure = f"{type(primary_error).__name__}: {primary_error}"
+        return dataclasses.replace(
+            answered,
+            provider=answered.provider or _provider_name(self._fallback),
+            fallback_from=_provider_name(self._primary),
+            fallback_error=failure[:600],
+        )
+
+    def sensitive_values(self) -> tuple[str, ...]:
+        """The credentials passed explicitly to the two transports."""
+        values: list[str] = []
+        for transport in (self._primary, self._fallback):
+            getter = getattr(transport, "sensitive_values", None)
+            if callable(getter):
+                values.extend(getter())
+        return tuple(dict.fromkeys(values))
+
+    async def __aenter__(self) -> "FallbackTransport":
+        """Enter the async context."""
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        """Close both transports on exit."""
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        """Close both transports; the first error is raised after both ran."""
+        first: Exception | None = None
+        for transport in (self._primary, self._fallback):
+            closer = getattr(transport, "aclose", None)
+            if callable(closer):
+                try:
+                    await closer()
+                except Exception as exc:
+                    first = first or exc
+        if first is not None:
+            raise first
+
+    def close(self) -> None:
+        """Close both transports from synchronous code, best effort."""
+        for transport in (self._primary, self._fallback):
+            closer = getattr(transport, "close", None)
+            if callable(closer):
+                with contextlib.suppress(Exception):
+                    closer()
 
 
 # --------------------------------------------------------------------------- #
@@ -1480,36 +1794,89 @@ def clef_provider_from_env(environ: Mapping[str, str] | None = None) -> ClefProv
     )
 
 
+ClefFallback = Literal["decisions", "none"]
+
+
+def clef_fallback_from_env(environ: Mapping[str, str] | None = None) -> ClefFallback:
+    """Whether Clef has a fallback, from the environment.
+
+    ``TRUSTCALL_S1_CLEF_FALLBACK=decisions`` adds the Decisions API as the fallback
+    of Clef (see ``FallbackTransport``); unset, empty or ``none`` means no fallback.
+    It is an explicit opt-in, like the provider: an ``EXPERIENTIAL_API_KEY`` alone
+    never sends text to a second provider.
+
+    Args:
+        environ: The environment to read; defaults to ``os.environ``.
+
+    Returns:
+        ``"decisions"`` or ``"none"``.
+
+    Raises:
+        ValueError: If the variable holds anything else.
+    """
+    env = os.environ if environ is None else environ
+    value = (env.get("TRUSTCALL_S1_CLEF_FALLBACK") or "").strip().lower()
+    if value in ("", "none"):
+        return "none"
+    if value == "decisions":
+        return "decisions"
+    raise ValueError(
+        f"TRUSTCALL_S1_CLEF_FALLBACK must be 'decisions' or 'none', not {value!r}"
+    )
+
+
 def system_one_transport(
     clef: ClefProvider | None = None,
     *,
+    clef_fallback: ClefFallback | None = None,
     cloudflare: CloudflareTransport | None = None,
     experiential: ExperientialTransport | None = None,
+    decisions: DecisionsTransport | None = None,
     concurrency: ConcurrencyConfig | None = None,
 ) -> CloudflareTransport | RoutingTransport:
     """Build the usual transport: Clairic on Cloudflare, Clef where you choose.
 
     Args:
-        clef: ``"cloudflare"`` returns a plain ``CloudflareTransport``;
-            ``"experiential"`` returns a ``RoutingTransport`` that sends Clef to
-            ``ExperientialTransport`` and everything else to Cloudflare. ``None``
-            decides from the environment (see ``clef_provider_from_env``).
+        clef: ``"cloudflare"`` serves Clef from Cloudflare; ``"experiential"`` from
+            ``ExperientialTransport``. ``None`` decides from the environment (see
+            ``clef_provider_from_env``).
+        clef_fallback: ``"decisions"`` wraps Clef in a ``FallbackTransport`` whose
+            fallback is ``DecisionsTransport`` (the Decisions API, same key); this
+            sends text to Experiential Labs when the primary fails, also if Clef
+            itself is on Cloudflare. ``"none"`` adds nothing. ``None`` decides from
+            the environment (see ``clef_fallback_from_env``).
         cloudflare: The Cloudflare transport to use; by default a new one.
         experiential: The Experiential transport to use; by default a new one.
+        decisions: The Decisions transport to use; by default a new one.
         concurrency: Concurrency limits for the transports created here.
 
     Returns:
-        A transport for ``create_extractor(..., transport=...)``. Close it with
+        A plain ``CloudflareTransport`` when Clef is on Cloudflare without a
+        fallback; otherwise a ``RoutingTransport`` that sends Clef to the chosen
+        transport (wrapped in the fallback, if any) and everything else to
+        Cloudflare. For ``create_extractor(..., transport=...)``; close it with
         ``aclose`` or ``close`` when you are done.
 
     Raises:
-        ValueError: If ``clef`` or the environment names an unknown provider.
+        ValueError: If an argument or the environment names an unknown provider or
+            fallback.
     """
     provider = clef_provider_from_env() if clef is None else clef
     if provider not in ("cloudflare", "experiential"):
         raise ValueError(f"unknown Clef provider {provider!r}")
+    fallback = clef_fallback_from_env() if clef_fallback is None else clef_fallback
+    if fallback not in ("decisions", "none"):
+        raise ValueError(f"unknown Clef fallback {fallback!r}")
     base = cloudflare or CloudflareTransport(concurrency=concurrency)
-    if provider == "cloudflare":
+    if provider == "cloudflare" and fallback == "none":
         return base
-    clef_transport = experiential or ExperientialTransport(concurrency=concurrency)
+    clef_transport: Transport = (
+        base
+        if provider == "cloudflare"
+        else experiential or ExperientialTransport(concurrency=concurrency)
+    )
+    if fallback == "decisions":
+        clef_transport = FallbackTransport(
+            clef_transport, decisions or DecisionsTransport(concurrency=concurrency)
+        )
     return RoutingTransport({"clef": clef_transport}, default=base)

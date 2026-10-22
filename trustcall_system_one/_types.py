@@ -189,8 +189,11 @@ class CallRecord:
     success) and ``status_code`` the HTTP status when one was received.
     ``request_id`` is the id the server gave the request (a correlation or
     request id header) and ``cost_usd`` the price the response reported, when
-    the provider gives them. A call cancelled after it may have been sent has
-    ``error="cancelled after send; outcome unknown"``: it may have been charged.
+    the provider gives them. ``provider`` is who answered (``cloudflare``,
+    ``experiential`` or ``decisions``) and ``fallback_from`` the provider whose
+    failure made a ``FallbackTransport`` use its fallback. A call cancelled after
+    it may have been sent has ``error="cancelled after send; outcome unknown"``:
+    it may have been charged.
     """
 
     model: str
@@ -207,6 +210,8 @@ class CallRecord:
     status_code: int | None = None
     request_id: str | None = None
     cost_usd: float | None = None
+    provider: str | None = None
+    fallback_from: str | None = None
 
 
 # --------------------------------------------------------------------------- #

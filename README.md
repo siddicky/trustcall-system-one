@@ -677,6 +677,12 @@ may already have run, and been charged, so it raises `UncertainOutcomeError` ins
 only a failed connection and a 429 with `Retry-After` are retried. Experiential reports the price
 of each call: see `result.usage.reported_cost_usd` and `result.cost.reported_usd`.
 
+As a fallback for Clef you can also opt in to Experiential's Decisions API
+(`TRUSTCALL_S1_CLEF_FALLBACK=decisions`, or `system_one_transport(clef_fallback="decisions")`):
+a Clef request that its provider could not answer is sent once to the Decisions API (a
+different model; after a timeout both may have been charged), and the result carries the
+warning `clef_fallback_used`.
+
 ## Extract one record
 
 Schemas are plain pydantic models (also `TypedDict`s, JSON Schemas or annotated

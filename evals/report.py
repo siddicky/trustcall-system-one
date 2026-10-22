@@ -42,6 +42,7 @@ def suite_markdown(suite: SuiteResult) -> str:
         *(
             [
                 f"Clef provider: {suite.clef_provider}"
+                + (f" + fallback {suite.clef_fallback}" if suite.clef_fallback else "")
                 + (
                     " (replay only: nothing was sent)" if suite.mode == "replay" else ""
                 ),
@@ -103,6 +104,7 @@ def write_suite(suite: SuiteResult, out: Path) -> tuple[Path, Path]:
         "config": suite.config,
         "mode": suite.mode,
         "clef_provider": suite.clef_provider,
+        "clef_fallback": suite.clef_fallback,
         "overrides": dict(suite.overrides),
         "aggregate": aggregate(suite.results),
         "skipped": suite.skipped,
