@@ -17,6 +17,7 @@ from trustcall_system_one._config import (
     DiscoveryConfig,
     GateConfig,
     Limits,
+    MatchConfig,
     PassesConfig,
     PresenceConfig,
     Prices,
@@ -24,6 +25,7 @@ from trustcall_system_one._config import (
     VerifyConfig,
 )
 from trustcall_system_one._errors import (
+    AmbiguousMatchError,
     AuthError,
     BadRequestError,
     ExtractionValidationError,
@@ -66,6 +68,7 @@ __all__ = [
     "CLAIRIC",
     "CLEF",
     "CLEF_FLASH",
+    "AmbiguousMatchError",
     "AuthError",
     "BadRequestError",
     "CallKind",
@@ -87,6 +90,7 @@ __all__ = [
     "GateConfig",
     "Limits",
     "Many",
+    "MatchConfig",
     "Mention",
     "ModelResponseError",
     "One",

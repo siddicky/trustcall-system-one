@@ -3,6 +3,7 @@
 from typing import Any
 
 __all__ = [
+    "AmbiguousMatchError",
     "AuthError",
     "BadRequestError",
     "ExtractionValidationError",
@@ -134,3 +135,31 @@ class ExtractionValidationError(TrustcallSystemOneError):
 
 class StateTruncatedError(TrustcallSystemOneError):
     """Model reported truncated state and narrowing did not fix it."""
+
+
+class AmbiguousMatchError(TrustcallSystemOneError):
+    """An entity could not be matched to an existing record (``on_ambiguous="raise"``).
+
+    Raised after matching and before any extraction request of the entities, so
+    nothing was written.
+
+    Attributes:
+        schema_name: The schema whose entity was ambiguous.
+        label: The entity's label.
+        candidates: ``(record id or "__new__", probability)`` of the options, the
+            most likely first.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        schema_name: str = "",
+        label: str = "",
+        candidates: tuple[tuple[str, float], ...] = (),
+    ) -> None:
+        """Create an ambiguous match error."""
+        super().__init__(message)
+        self.schema_name = schema_name
+        self.label = label
+        self.candidates = candidates

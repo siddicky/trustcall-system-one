@@ -279,33 +279,26 @@ def test_a_schema_takes_its_own_records_else_the_any_ones() -> None:
 
 def test_dict_form_is_the_target_of_a_one_schema() -> None:
     es = coerced({"DummySchema": REC})
-    target = target_for("DummySchema", es, explicit=False)
+    target = target_for("DummySchema", es)
     assert target is not None and target.record_id == "DummySchema"
-    assert target_for("DummySchema", es, explicit=True) == target
 
 
 def test_an_explicit_one_takes_the_single_list_form_record() -> None:
     es = coerced([("rid", "DummySchema", REC)])
-    target = target_for("DummySchema", es, explicit=True)
+    target = target_for("DummySchema", es)
     assert target is not None and target.record_id == "rid"
 
 
 def test_one_with_several_records_suggests_many() -> None:
     es = coerced([("a", "DummySchema", REC), ("b", "DummySchema", REC)])
     with pytest.raises(ValueError, match="Many"):
-        target_for("DummySchema", es, explicit=True)
-
-
-def test_list_form_records_without_a_wrapper_imply_many_which_is_m7_m8() -> None:
-    es = coerced([("a", "DummySchema", REC)])
-    with pytest.raises(NotImplementedError, match="M8"):
-        target_for("DummySchema", es, explicit=False)
+        target_for("DummySchema", es)
 
 
 def test_no_record_means_no_target() -> None:
-    assert target_for("DummySchema", ExistingSet(), explicit=False) is None
+    assert target_for("DummySchema", ExistingSet()) is None
     es = coerced({"Other": {"baz": "x"}}, known=["Other", "DummySchema"])
-    assert target_for("DummySchema", es, explicit=True) is None
+    assert target_for("DummySchema", es) is None
 
 
 # --------------------------------------------------------------------------- #

@@ -15,6 +15,7 @@ __all__ = [
     "DiscoveryConfig",
     "GateConfig",
     "Limits",
+    "MatchConfig",
     "PassesConfig",
     "PresenceConfig",
     "Prices",
@@ -600,3 +601,52 @@ class CorefConfig:
         _check_int("max_pairwise_mentions", self.max_pairwise_mentions, 2)
         _check_int("context_chars", self.context_chars, 0)
         _check_int("all_pairs_below", self.all_pairs_below, 0)
+
+
+@dataclass(frozen=True)
+class MatchConfig:
+    """Settings of matching entities to existing records (``Many`` with ``existing``).
+
+    The instance is immutable and hashable.
+
+    Attributes:
+        accept: Probability an assigned option (a record, or ``__new__``) needs
+            for its entity to be updated or inserted; below it the entity is
+            ``ambiguous_match``.
+        min_confidence: The match answer's confidence needed as well.
+        render_fields: Non-null scalar fields a record keeps (next to its identity
+            fields and the first 3 elements of each list) when the records are
+            rendered compactly to fit the Clef state budget.
+        collision: What to do when two entities both claim one record with
+            probability 0.5 or more: ``"warn"`` keeps the assignment's winner and
+            warns (``match_collision``); ``"merge"`` first asks whether the two
+            entities are one (the coreference merge check) and merges them if so.
+        on_ambiguous: What to do with an ambiguous entity: ``"skip"`` it
+            (``SkippedEntity(reason="ambiguous_match")``), ``"insert"`` it as a
+            new record, or ``"raise"`` ``AmbiguousMatchError``.
+        delete_threshold: Probability of "does the input say this record should be
+            removed?" from which a record is deleted (``enable_deletes``).
+    """
+
+    accept: float = 0.6
+    min_confidence: float = 0.5
+    render_fields: int = 4
+    collision: Literal["warn", "merge"] = "warn"
+    on_ambiguous: Literal["skip", "insert", "raise"] = "skip"
+    delete_threshold: float = 0.85
+
+    def __post_init__(self) -> None:
+        """Validate every setting."""
+        _check_unit("accept", self.accept)
+        _check_unit("min_confidence", self.min_confidence)
+        _check_unit("delete_threshold", self.delete_threshold)
+        _check_int("render_fields", self.render_fields, 0)
+        if self.collision not in ("warn", "merge"):
+            raise ValueError(
+                f"collision must be 'warn' or 'merge', got {self.collision!r}"
+            )
+        if self.on_ambiguous not in ("skip", "insert", "raise"):
+            raise ValueError(
+                "on_ambiguous must be 'skip', 'insert' or 'raise', got "
+                f"{self.on_ambiguous!r}"
+            )

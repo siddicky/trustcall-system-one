@@ -326,33 +326,22 @@ def fits(plan: SchemaPlan, record: ExistingRecord) -> bool:
     return True
 
 
-def target_for(
-    schema_name: str, existing: ExistingSet, *, explicit: bool
-) -> ExistingRecord | None:
+def target_for(schema_name: str, existing: ExistingSet) -> ExistingRecord | None:
     """The record a ``One`` schema updates, if there is one.
 
     Args:
         schema_name: The schema.
         existing: The coerced ``existing``.
-        explicit: Whether the schema was given as an explicit ``One(...)``.
 
     Returns:
         The record, or ``None`` when ``existing`` has none for the schema (the
         schema is then extracted as an insert).
 
     Raises:
-        NotImplementedError: For list-form records of a schema without an
-            explicit wrapper: that implies ``Many`` (M8).
-        ValueError: For several records under an explicit ``One``.
+        ValueError: For several records of a ``One`` schema (list-form records of
+            a schema without a wrapper imply ``Many`` and never get here).
     """
     records = existing.for_schema(schema_name)
-    named = existing.named(schema_name)
-    if not explicit and any(r.listed for r in named):
-        raise NotImplementedError(
-            f"list-form existing records of {schema_name} imply Many({schema_name}); "
-            "matching several records arrives in M8. Wrap the schema in "
-            f"One({schema_name}) to update a single record"
-        )
     if len(records) > 1:
         raise ValueError(
             f"One({schema_name}) was given {len(records)} existing records; "

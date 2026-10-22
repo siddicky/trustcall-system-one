@@ -2198,6 +2198,9 @@ async def update_one(
     enable_updates: bool = True,
     skip_presence: bool = False,
     presence: float | None = None,
+    entity: EntityInfo | None = None,
+    focus: Focus | None = None,
+    focus_plain: Focus | None = None,
 ) -> UpdateOutcome:
     """Update one existing record of a schema from ``text``.
 
@@ -2229,6 +2232,13 @@ async def update_one(
         skip_presence: Skip the presence gate (the schema was forced).
         presence: The presence probability, when it has been asked already (to
             decide which schema an ``"__any__"`` record belongs to).
+        entity: The entity of a collection that was matched to this record
+            (``label`` then is its name): its key and mentions go into the
+            prompts and the record, so attribution and the change gate are about
+            that entity only. The presence gate is not asked for it.
+        focus: The focus header of the Clairic requests (a collection entity's).
+        focus_plain: The same without offsets, for requests that carry only
+            windows of the input.
 
     Returns:
         The outcome.
@@ -2255,17 +2265,33 @@ async def update_one(
         existing=block,
         crosscheck=run.verify.input_only_crosscheck,
     )
+    if entity is not None:
+        ctx = dataclasses.replace(
+            ctx,
+            key=entity.key,
+            mentions=tuple(dict.fromkeys(m.text for m in entity.mentions)),
+            info=entity,
+            focus=focus,
+            focus_plain=focus_plain,
+        )
+        skip_presence = True
     _note_unsupported(run, plan, updating=True)
     qualify_p: float | None = presence
+    if entity is not None and qualify_p is None:
+        qualify_p = entity.qualify_p
     if not skip_presence and qualify_p is None:
         qualify_p = await _presence(ctx)
-    if qualify_p is not None and qualify_p < run.presence.threshold_absent:
+    if (
+        entity is None
+        and qualify_p is not None
+        and qualify_p < run.presence.threshold_absent
+    ):
         return UpdateOutcome(None, None, None, False)
-    entity = EntityInfo(key=ctx.key, label=ctx.label, qualify_p=qualify_p)
+    info = entity or EntityInfo(key=ctx.key, label=ctx.label, qualify_p=qualify_p)
     if not enable_updates:
         skipped = SkippedEntity(
             plan.name,
-            entity,
+            info,
             "updates_disabled",
             f"the input is about the existing record {target.record_id!r}, but "
             "enable_updates is off",
@@ -2342,5 +2368,5 @@ async def update_one(
 
     await gather(verify_clairic(), _check_stated(plain, nodes, before))
     _settle(root)
-    record, rounds = await _finish_update(plain, root, before, target, entity)
+    record, rounds = await _finish_update(plain, root, before, target, info)
     return UpdateOutcome(record, None, handle, True, 1 + rounds)

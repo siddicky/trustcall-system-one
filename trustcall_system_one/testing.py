@@ -462,7 +462,8 @@ class WorldEntity:
         mentions: The mention specs it was declared with.
         fields: The field values it was declared with.
         real: ``True`` for an entity, ``False`` for a non-entity.
-        matches: The existing record it matches (stored for M8).
+        matches: The existing record it is (see ``FakeWorld.entity``), or ``None``
+            for an entity that is new.
         descriptive: Mentions that only a broadened discovery finds (see
             ``FakeWorld.entity``).
         flat: The field values by dotted path.
@@ -624,8 +625,17 @@ class FakeWorld:
     * ``gate`` (Clef ``gate``): 0.9 if ``proposed_change.to`` is new compared to
       ``record`` (not equal to what the record holds at the path, nor an element
       of the list it is appended to), else 0.05.
-    * ``match`` (choice): ``__new__`` (matching arrives with M8; the ``matches=``
-      given to ``entity()`` is only stored) and ``delete`` (0.03).
+    * ``match`` (Clef choice, question id ``match``): the state is ``{input, entity:
+      {label, mentions}}`` (the focused entity is found as for every Clef request)
+      and the options are ``rec_<i>``, whose criteria is the existing record as a
+      JSON object, plus ``__new__``. The entity's ``matches=`` picks the option: the
+      record it describes gets 0.92 and the other options share the rest; an entity
+      without ``matches=`` gets ``__new__`` at 0.92. A ``matches=`` that fits no
+      offered record, or several, is an ``AssertionError`` (see ``entity``).
+    * ``delete`` (Clef ``noul``): questions ``delete.<k>`` over the state ``{input,
+      record}``; ``CallMeta.entity`` holds the ids of the records of the request,
+      comma-joined, in question order. The probability is the one declared with
+      ``delete(record_id, p)``, else 0.05.
     """
 
     def __init__(self, text: str, *, check_state: bool = True) -> None:
@@ -646,6 +656,7 @@ class FakeWorld:
         self._doubts: list[tuple[str, str, float]] = []
         self._bleeds: list[tuple[str, str, Any]] = []
         self._low: list[tuple[str, str, float]] = []
+        self._deletes: dict[str, float] = {}
         self._ready = False
         self._transport: FakeTransport | None = None
 
@@ -712,8 +723,11 @@ class FakeWorld:
             schema: The schema (class or its name) the entity belongs to.
             mentions: The surface forms the text uses (see the class docstring).
             fields: The true value of each field, by dotted path.
-            matches: The existing record this entity is (used by M8's matching;
-                stored only).
+            matches: The existing record this entity is, for the ``match`` calls
+                (which show a record's content, never its id): a pydantic model
+                or a dict (every key it names must equal the record's), or a
+                string that occurs in the record's JSON text ("Emma"). Left out
+                (``None``), the entity is new: ``__new__`` is its match.
             descriptive: Mentions of the entity that only a broadened discovery
                 (one that allows descriptive references such as "my cousin") finds;
                 the first, plain discovery does not list them.
@@ -767,6 +781,16 @@ class FakeWorld:
         a re-ask (``reask``) is confident and gives the true value.
         """
         self._low.append((self._label(entity), field_, confidence))
+        return self
+
+    def delete(self, record_id: str, p: float = 0.97) -> "FakeWorld":
+        """Declare that the text says an existing record should be removed.
+
+        ``delete`` calls about the record with this id answer ``p`` instead of the
+        default 0.05 (a ``delete`` request names the ids of its records in
+        ``CallMeta.entity``, comma-joined).
+        """
+        self._deletes[record_id] = p
         return self
 
     def coref(self, first: str, second: str, p: float) -> "FakeWorld":
@@ -1487,21 +1511,56 @@ class FakeWorld:
             model=payload["model"],
         )
 
-    # matching (M8) --------------------------------------------------------- #
+    # matching and deletes --------------------------------------------------- #
+
+    @staticmethod
+    def _is_record(spec: Any, record: Any) -> bool:
+        """Whether a ``matches=`` declaration describes a record."""
+        if isinstance(spec, BaseModel):
+            spec = spec.model_dump(mode="json")
+        if isinstance(spec, Mapping):
+            return isinstance(record, Mapping) and all(
+                key in record and _fold(record[key]) == _fold(value)
+                for key, value in spec.items()
+            )
+        return _fold(spec) in _fold(json.dumps(record, ensure_ascii=False))
 
     def _match(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
-        return clef_response(
-            {
-                qid: _pick("__new__", list(question["criteria"]), 0.95)
-                for qid, question in payload["questions"].items()
-            },
-            model=payload["model"],
-        )
+        element = self._focus(payload, meta)
+        answers: dict[str, Any] = {}
+        for qid, question in payload["questions"].items():
+            options = dict(question["criteria"])
+            chosen = "__new__"
+            if element is not None and element.matches is not None:
+                found = [
+                    option
+                    for option, record in options.items()
+                    if option != "__new__" and self._is_record(element.matches, record)
+                ]
+                if len(found) != 1:
+                    raise AssertionError(
+                        f"FakeWorld: matches={element.matches!r} of "
+                        f"{element.label!r} fits {len(found)} of the "
+                        f"{len(options) - 1} records offered (it must fit exactly "
+                        "one; was it cut by the prefilter?)"
+                    )
+                chosen = found[0]
+            answers[qid] = _pick(chosen, list(options), 0.92)
+        return clef_response(answers, model=payload["model"])
 
     def _delete(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
-        return clef_response(
-            {qid: noul(0.03) for qid in payload["questions"]}, model=payload["model"]
-        )
+        ids = (meta.entity or "").split(",")
+        questions = list(payload["questions"])
+        if len(ids) != len(questions):
+            raise AssertionError(
+                f"FakeWorld: a delete request names {len(questions)} question(s) "
+                f"but CallMeta.entity {meta.entity!r} holds {len(ids)} record id(s)"
+            )
+        answers = {
+            qid: noul(self._deletes.get(rid, 0.05))
+            for qid, rid in zip(questions, ids, strict=True)
+        }
+        return clef_response(answers, model=payload["model"])
 
 
 def _pick(option: str, options: Sequence[str], p: float) -> dict[str, Any]:

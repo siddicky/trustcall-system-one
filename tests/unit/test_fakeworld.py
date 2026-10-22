@@ -788,21 +788,169 @@ async def test_the_gate_says_yes_to_what_is_new_compared_to_the_record() -> None
     assert await p("/nickname", "Em") == 0.9  # the record lacks the key
 
 
-async def test_match_and_delete_are_stubbed_for_m8() -> None:
-    world = people()
-    state = attribution_state("Emma Thompson")
-    options = {"r0": "a record", "__new__": "none"}
-    matched = await ask(
+def match_world() -> FakeWorld:
+    world = FakeWorld(TEXT)
+    world.entity(
+        "Emma Thompson",
+        schema=Person,
+        mentions=["Emma Thompson", "Emma"],
+        fields={"name": "Emma Thompson"},
+        matches={"name": "Emma Thompson"},
+    )
+    world.entity(
+        "Michael Chen",
+        schema=Person,
+        mentions=["Michael Chen"],
+        fields={"name": "Michael Chen"},
+        matches="chen",  # a string that occurs in the record's JSON text
+    )
+    world.entity(
+        "Newcomer",
+        schema=Person,
+        mentions=["Sunny"],
+        fields={"name": "Newcomer"},
+    )
+    return world
+
+
+def match_state(label: str, start: int, end: int) -> Body:
+    return {
+        "input": TEXT,
+        "entity": {"label": label, "mentions": [{"text": label, "span": [start, end]}]},
+    }
+
+
+RECORDS = {
+    "rec_0": {"name": "Michael Chen", "notes": []},
+    "rec_1": {"name": "Emma Thompson", "notes": ["x"]},
+    "rec_2": {"name": "Zed", "notes": []},
+    "__new__": "A Person not among the listed records",
+}
+
+
+async def test_a_match_picks_the_record_the_entity_declares() -> None:
+    world = match_world()
+    questions = {"match": question("?", "choice", criteria=RECORDS)}
+    start = TEXT.index("Emma Thompson")
+    emma = await ask(
         world,
         "match",
-        state=state,
-        questions={"match": question("?", "choice", criteria=options)},
+        state=match_state("Emma Thompson", start, start + 13),
+        questions=questions,
     )
-    assert matched["match"]["choice"] == "__new__"
-    deleted = await ask(
-        world, "delete", state=state, questions={"delete": question("?")}
+    assert emma["match"]["choice"] == "rec_1"
+    assert emma["match"]["probabilities"]["rec_1"] == 0.92
+    assert emma["match"]["probabilities"]["rec_0"] == pytest.approx(0.08 / 3)
+    start = TEXT.index("Michael Chen")
+    michael = await ask(
+        world,
+        "match",
+        state=match_state("Michael Chen", start, start + 12),
+        questions=questions,
     )
-    assert deleted["delete"]["noul"] == 0.03
+    assert michael["match"]["choice"] == "rec_0"
+
+
+async def test_an_entity_without_matches_is_new() -> None:
+    world = match_world()
+    start = TEXT.index("Sunny")
+    new = await ask(
+        world,
+        "match",
+        state=match_state("Newcomer", start, start + 5),
+        questions={"match": question("?", "choice", criteria=RECORDS)},
+    )
+    assert new["match"]["choice"] == "__new__"
+    assert new["match"]["probabilities"]["__new__"] == 0.92
+
+
+async def test_a_declared_match_that_fits_no_offered_record_is_an_error() -> None:
+    world = match_world()
+    start = TEXT.index("Emma Thompson")
+    offered = {k: v for k, v in RECORDS.items() if k != "rec_1"}
+    with pytest.raises(AssertionError, match="fits 0 of the 2 records offered"):
+        await ask(
+            world,
+            "match",
+            state=match_state("Emma Thompson", start, start + 13),
+            questions={"match": question("?", "choice", criteria=offered)},
+        )
+
+
+async def test_a_declared_match_that_fits_two_records_is_an_error() -> None:
+    world = match_world()
+    start = TEXT.index("Michael Chen")
+    two = {**RECORDS, "rec_3": {"name": "Michael Chen", "notes": ["again"]}}
+    with pytest.raises(AssertionError, match="fits 2 of the 4 records offered"):
+        await ask(
+            world,
+            "match",
+            state=match_state("Michael Chen", start, start + 12),
+            questions={"match": question("?", "choice", criteria=two)},
+        )
+
+
+async def test_a_match_state_that_names_another_entitys_span_is_an_error() -> None:
+    world = match_world()
+    start = TEXT.index("Michael Chen")
+    with pytest.raises(AssertionError, match="belong to"):
+        await ask(
+            world,
+            "match",
+            state=match_state("Emma Thompson", start, start + 12),
+            questions={"match": question("?", "choice", criteria=RECORDS)},
+        )
+
+
+async def test_a_model_or_dict_matches_by_the_keys_it_names() -> None:
+    world = FakeWorld(TEXT)
+    world.entity(
+        "Emma Thompson",
+        schema=Person,
+        mentions=["Emma Thompson"],
+        fields={"name": "Emma Thompson"},
+        matches=Person(name="Emma Thompson", notes=["x"]),
+    )
+    start = TEXT.index("Emma Thompson")
+    full = {
+        "rec_0": {"name": "Emma Thompson", "relationship": None, "notes": []},
+        "rec_1": {"name": "Emma Thompson", "relationship": None, "notes": ["x"]},
+        "__new__": "none",
+    }
+    answers = await ask(
+        world,
+        "match",
+        state=match_state("Emma Thompson", start, start + 13),
+        questions={"match": question("?", "choice", criteria=full)},
+    )
+    assert answers["match"]["choice"] == "rec_1"
+
+
+async def delete_asks(world: FakeWorld, ids: str, count: int) -> Body:
+    transport = world.transport()
+    response = await transport.run(
+        CLEF,
+        {
+            "model": "clef",
+            "state": {"input": TEXT, "record": {"name": "x"}},
+            "questions": {f"delete.{k}": question("?") for k in range(count)},
+        },
+        meta=CallMeta(kind="delete", schema="Person", entity=ids),
+    )
+    answers: Body = response.body["answers"]
+    return answers
+
+
+async def test_a_delete_is_unlikely_unless_the_world_declares_it() -> None:
+    world = people()
+    world.delete("r2", 0.93).delete("r3")
+    answers = await delete_asks(world, "r1,r2,r3", 3)
+    assert [answers[f"delete.{k}"]["noul"] for k in range(3)] == [0.05, 0.93, 0.97]
+
+
+async def test_a_delete_request_must_name_one_record_id_per_question() -> None:
+    with pytest.raises(AssertionError, match="record id"):
+        await delete_asks(people(), "r1", 2)
 
 
 async def test_a_call_kind_the_world_cannot_answer_is_an_error() -> None:

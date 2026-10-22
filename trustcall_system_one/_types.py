@@ -233,7 +233,10 @@ class EntityInfo:
         first_mention: The mention that orders entities.
         qualify_p: Probability from the presence or qualification check, when
             one ran.
-        match_probs: Probability of each existing record as the match (updates).
+        match_probs: Probability of each existing record as the match, by record
+            id, and ``"__new__"`` for "none of them" (a ``Many`` schema with
+            existing records; empty otherwise). A deleted record's entity holds
+            ``{record id: probability that the input says to remove it}``.
         parent: Key of the parent entity for nested items.
     """
 
@@ -349,7 +352,9 @@ class ResultRecord:
         json_doc_id: Id of the existing record (``None`` for inserts).
         kind: ``"insert"``, ``"update"`` or ``"delete"``. An update that applies
             no operation is still ``"update"``, with empty ``patches`` and
-            ``after == before``.
+            ``after == before``. A delete (a ``Many`` schema with
+            ``enable_deletes``) names the record in ``json_doc_id``, keeps it as
+            ``before`` and has no ``value`` and no ``after``.
         value: The validated model, or ``None`` when validation failed.
         before: The record before the change (updates and deletes).
         after: The document after the change; for an invalid insert, the
@@ -387,7 +392,10 @@ class SkippedEntity:
             ``not_qualified``, ``conflict_update_delete``, ``validation_failed``
             or ``empty_after_verification``.
         detail: A longer explanation.
-        candidates: Existing record ids with their match probability.
+        candidates: Options with their match probability, the most likely first
+            (``ambiguous_match``: existing record ids and ``"__new__"``;
+            ``conflict_update_delete`` and ``inserts_disabled``: the record or
+            records involved).
     """
 
     schema_name: str

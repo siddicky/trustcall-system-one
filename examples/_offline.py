@@ -34,10 +34,13 @@ at the bottom of this file answer exactly those:
   ``<focus schema="..." entity="Emma Thompson">`` (Clairic) or ``state.entity.label``
   (Clef), which is what ``"<label>::<wire name>"`` keys are matched against.
 
-Kinds that arrive with M8 (``match``, ``delete``) are still written against the
-request shapes in ``docs/DESIGN.md``: they look at ``CallMeta``, the question ids
-and the structured Clef state defensively; adjust the helpers at the bottom of this
-file when that milestone fixes the exact shapes.
+* ``match`` (Clef, M8): one request per entity, state ``{"input", "entity":
+  {"label", "mentions"}}`` and ONE ``choice`` question, id ``match``, whose options
+  are ``rec_<i>`` (the description is the existing record as a JSON object) and
+  ``__new__``.
+* ``delete`` (Clef, M8, ``enable_deletes``): one ``noul`` per existing record, ids
+  ``delete.<k>``, state ``{"input", "record"}``; ``CallMeta.entity`` holds the
+  record ids of the request, comma-joined.
 """
 
 import json
@@ -594,8 +597,8 @@ class OfflineScript:
 # they keep working if the exact ids change; the shapes they read (the
 # ``mentions`` object of a coref state with its ``m0``, ``m1`` ... ids, the
 # ``criteria`` of a match question, the ``proposed_change`` of a gate state) are
-# the documented ones; the discovery, count, coreference and qualification shapes
-# are the ones the engine sends since M7.
+# the ones the engine sends: discovery, count, coreference and qualification since
+# M7, matching since M8.
 # --------------------------------------------------------------------------- #
 
 

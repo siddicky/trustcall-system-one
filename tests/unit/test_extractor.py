@@ -1179,17 +1179,6 @@ async def test_an_empty_existing_is_the_same_as_none() -> None:
         assert record.kind == "insert" and result.untouched == ()
 
 
-async def test_many_with_existing_records_is_m8_and_fails_at_invoke_not_creation() -> (
-    None
-):
-    script = person_script()
-    extractor = make_extractor([Many(Person, identity="name")], script)
-    existing = [("rec-1", "Person", {"name": "Ada Lovelace"})]
-    with pytest.raises(NotImplementedError, match="M8"):
-        await extractor.ainvoke(PERSON_TEXT, existing=existing)
-    assert script.transport.calls == []
-
-
 async def test_many_with_an_unknown_identity_field_fails_at_creation() -> None:
     with pytest.raises(ValueError, match="no field of"):
         make_extractor([Many(Person, identity="nickname")], person_script())

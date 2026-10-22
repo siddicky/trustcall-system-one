@@ -1,0 +1,836 @@
+"""Matching entities to existing records, one-to-one, and flagging deletes.
+
+Steps 8 and 9 of "Collection engine" in ``docs/DESIGN.md``:
+
+1. every entity gets ONE Clef ``choice`` (call kind ``match``, question id
+   ``match``) over the existing records and ``__new__``; its state is the
+   entity-anchored ``{input, entity: {label, mentions}}`` and the records are the
+   options' descriptions (``rec_<i>``: the record as a JSON object). More than 254
+   records are cut to the 254 most similar to the entity by identity
+   (``match_prefiltered``); a request that would be over the Clef state budget
+   renders the records compactly and, if that is not enough, offers fewer of them
+   (``match_compacted``);
+2. the answers are turned into ONE assignment of entities to records by the
+   Hungarian algorithm over ``-log p`` (``hungarian``, ``assign``), with a
+   ``__new__`` column per entity so that any number of them can be new. Two
+   entities that both claim a record with probability 0.5 or more are a collision
+   (``match_collision``): the loser takes its best feasible alternative, or, with
+   ``match.collision="merge"``, the two are first checked for being one entity;
+3. an assignment stands only if its option's probability reaches
+   ``match.accept`` and the answer's confidence ``match.min_confidence``; else the
+   entity is ambiguous (``match.on_ambiguous``);
+4. deletes: one Clef ``noul`` per existing record, "does the input state that this
+   record should be removed?" (call kind ``delete``).
+
+``hungarian`` and ``assign`` are pure and tested against brute force.
+"""
+
+import difflib
+import itertools
+import json
+import math
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
+from typing import Any
+
+from trustcall_system_one._compile import SchemaPlan
+from trustcall_system_one._coref import (
+    NEW,
+    canonical_label,
+    nicknames,
+    normalise,
+)
+from trustcall_system_one._errors import AmbiguousMatchError
+from trustcall_system_one._render import estimate_tokens
+from trustcall_system_one._run import Run, gather
+from trustcall_system_one._types import EntityInfo, Mention, SkippedEntity
+from trustcall_system_one._verify import Ctx
+from trustcall_system_one._wire import (
+    ChoiceAnswer,
+    ChoiceQuestion,
+    NoulAnswer,
+    NoulCriteria,
+    NoulQuestion,
+)
+from trustcall_system_one.transport import CallMeta
+
+__all__ = [
+    "MAX_OPTIONS",
+    "NEW",
+    "Candidate",
+    "MatchAnswer",
+    "MatchOutcome",
+    "assign",
+    "collisions",
+    "compact_record",
+    "flag_deletes",
+    "hungarian",
+    "identity_keys",
+    "match_entities",
+    "similarity",
+    "token_set_ratio",
+]
+
+MAX_OPTIONS = 254
+"""Records one match question offers (Clef allows 255 options; ``__new__`` is one)."""
+CLAIM_MIN = 0.5
+"""Probability from which an entity's most likely record counts as its claim."""
+_FLOOR = 1e-9
+_TIE_EPS = 1e-12
+_LIST_ELEMENTS = 3
+_TEXT_CHARS = 160
+_SHOWN_CANDIDATES = 10
+_NOTICEABLE = 0.01
+_DIMINUTIVE = 0.9
+_PRUNE = 1e-3
+"""Records no entity gives this probability are no columns of the assignment."""
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """An existing record, as matching sees it.
+
+    Attributes:
+        record_id: The record's id.
+        data: The record with its keys normalised to the schema's validation keys.
+    """
+
+    record_id: str
+    data: Mapping[str, Any] = field(hash=False)
+
+
+@dataclass(frozen=True)
+class MatchAnswer:
+    """One entity's match answer.
+
+    Attributes:
+        probs: Probability of each option the model was offered: a record id, or
+            ``"__new__"``. Empty when the model gave no answer.
+        confidence: The answer's confidence (``None`` without an answer).
+    """
+
+    probs: Mapping[str, float] = field(default_factory=dict, hash=False)
+    confidence: float | None = None
+
+    def p(self, option: str) -> float:
+        """The probability of an option (0 for one that was not offered)."""
+        return self.probs.get(option, 0.0)
+
+
+@dataclass(frozen=True)
+class MatchOutcome:
+    """What matching decided.
+
+    Attributes:
+        entities: The entities after any collision merges, each with its
+            ``match_probs`` filled in, in order of first mention.
+        targets: The existing record id each entity is to update, or ``None`` for
+            an entity that is new, by entity key. An ambiguous entity is only here
+            (as new) with ``on_ambiguous="insert"``.
+        skipped: The ambiguous entities (``ambiguous_match``).
+    """
+
+    entities: tuple[EntityInfo, ...] = ()
+    targets: Mapping[str, str | None] = field(default_factory=dict, hash=False)
+    skipped: tuple[SkippedEntity, ...] = ()
+
+
+# --------------------------------------------------------------------------- #
+# Assignment
+# --------------------------------------------------------------------------- #
+
+
+def hungarian(cost: Sequence[Sequence[float]]) -> list[int]:
+    """Minimum-cost assignment of rows to distinct columns (Kuhn-Munkres).
+
+    The matrix may be rectangular as long as it has at least as many columns as
+    rows. Pure Python, O(rows^2 * columns); the result is deterministic.
+
+    Args:
+        cost: ``cost[i][j]`` is the cost of giving column ``j`` to row ``i``.
+
+    Returns:
+        For each row the column it gets.
+
+    Raises:
+        ValueError: If there are more rows than columns, or the rows differ in
+            length.
+    """
+    rows = len(cost)
+    if rows == 0:
+        return []
+    cols = len(cost[0])
+    if any(len(row) != cols for row in cost):
+        raise ValueError("every row of the cost matrix must have the same length")
+    if rows > cols:
+        raise ValueError(f"{rows} rows cannot take distinct columns of only {cols}")
+    inf = math.inf
+    # 1-based potentials and matching; column 0 is a sentinel
+    u = [0.0] * (rows + 1)
+    v = [0.0] * (cols + 1)
+    owner = [0] * (cols + 1)
+    way = [0] * (cols + 1)
+    for row in range(1, rows + 1):
+        owner[0] = row
+        col0 = 0
+        slack = [inf] * (cols + 1)
+        used = [False] * (cols + 1)
+        while True:
+            used[col0] = True
+            current = owner[col0]
+            delta, col1 = inf, 0
+            for col in range(1, cols + 1):
+                if used[col]:
+                    continue
+                reduced = cost[current - 1][col - 1] - u[current] - v[col]
+                if reduced < slack[col]:
+                    slack[col], way[col] = reduced, col0
+                if slack[col] < delta:
+                    delta, col1 = slack[col], col
+            for col in range(cols + 1):
+                if used[col]:
+                    u[owner[col]] += delta
+                    v[col] -= delta
+                else:
+                    slack[col] -= delta
+            col0 = col1
+            if owner[col0] == 0:
+                break
+        while col0:
+            previous = way[col0]
+            owner[col0] = owner[previous]
+            col0 = previous
+    result = [-1] * rows
+    for col in range(1, cols + 1):
+        if owner[col]:
+            result[owner[col] - 1] = col - 1
+    return result
+
+
+def assign(
+    probabilities: Sequence[Mapping[str, float]],
+    records: Sequence[str],
+    *,
+    prune: float = 0.0,
+) -> list[str]:
+    """One-to-one assignment of entities to records, any number of them new.
+
+    The cost of giving an entity an option is ``-log(max(p, 1e-9))``. The columns
+    are the records plus one ``__new__`` column per entity (so every entity can be
+    new, and ``__new__`` costs each entity its own ``__new__`` probability); a
+    record goes to at most one entity, and the entity that loses a contested record
+    takes the best option that is still free. Exact ties go to the earlier entity
+    and the earlier record, so the result never depends on dictionary order.
+
+    Args:
+        probabilities: For each entity the probability of each option (a record id
+            or ``"__new__"``); an option that is missing has probability 0.
+        records: The record ids that are columns, in order.
+        prune: Leave out the records that no entity gives a probability of at
+            least this much (they cost every entity the same and are never worth
+            taking; with hundreds of records this keeps the matrix small). The
+            default keeps them all, so the result is exactly optimal.
+
+    Returns:
+        For each entity the record id it gets, or ``"__new__"``.
+    """
+    n = len(probabilities)
+    if n == 0:
+        return []
+    ids = [
+        rid
+        for rid in records
+        if prune <= 0 or any(probs.get(rid, 0.0) >= prune for probs in probabilities)
+    ]
+    matrix: list[list[float]] = []
+    for i, probs in enumerate(probabilities):
+        row = [-math.log(max(probs.get(rid, 0.0), _FLOOR)) for rid in ids]
+        new = -math.log(max(probs.get(NEW, 0.0), _FLOOR))
+        row.extend([new] * n)
+        # break exact ties towards the earlier entity (the lower column)
+        weight = (n - i) * _TIE_EPS
+        matrix.append([c + weight * j for j, c in enumerate(row)])
+    return [ids[j] if j < len(ids) else NEW for j in hungarian(matrix)]
+
+
+def collisions(
+    probabilities: Sequence[Mapping[str, float]], claim_min: float = CLAIM_MIN
+) -> dict[str, list[int]]:
+    """The records that two or more entities claim.
+
+    An entity claims its most likely option when that is a record and has
+    probability ``claim_min`` or more.
+
+    Args:
+        probabilities: For each entity the probability of each option.
+        claim_min: The probability a claim needs.
+
+    Returns:
+        The claimants (entity positions) of each contested record id.
+    """
+    claims: dict[str, list[int]] = {}
+    for index, probs in enumerate(probabilities):
+        if not probs:
+            continue
+        best = max(probs, key=lambda option: (probs[option], option == NEW))
+        if best != NEW and probs[best] >= claim_min:
+            claims.setdefault(best, []).append(index)
+    return {rid: who for rid, who in claims.items() if len(who) > 1}
+
+
+# --------------------------------------------------------------------------- #
+# Similarity and rendering
+# --------------------------------------------------------------------------- #
+
+
+def _tokens(text: str) -> list[str]:
+    return normalise(text).replace("-", " ").split()
+
+
+def token_set_ratio(first: str, second: str) -> float:
+    """How alike two texts are as sets of words, from 0 to 1.
+
+    The words both have are compared with each text's own extra words, so
+    "Sarah" fits "Sarah Johnson" fully and word order does not matter.
+    """
+    a, b = set(_tokens(first)), set(_tokens(second))
+    if not a or not b:
+        return 0.0
+    both = " ".join(sorted(a & b))
+    left = " ".join(filter(None, [both, *sorted(a - b)]))
+    right = " ".join(filter(None, [both, *sorted(b - a)]))
+
+    def ratio(x: str, y: str) -> float:
+        return difflib.SequenceMatcher(None, x, y).ratio() if x and y else 0.0
+
+    return max(ratio(both, left), ratio(both, right), ratio(left, right))
+
+
+def similarity(values: Sequence[str], mentions: Sequence[str]) -> float:
+    """How well a record's identity values fit an entity's mentions, from 0 to 1.
+
+    The best token-set ratio over every value and mention; two words that are
+    forms of one given name (Bob and Robert) count as 0.9.
+
+    Args:
+        values: The record's identity value(s).
+        mentions: The texts the input uses for the entity.
+    """
+    best = 0.0
+    for value in values:
+        mine = _tokens(value)
+        for mention in mentions:
+            score = token_set_ratio(value, mention)
+            if score < _DIMINUTIVE and any(
+                nicknames(x, y) for x in mine for y in _tokens(mention)
+            ):
+                score = _DIMINUTIVE
+            best = max(best, score)
+    return best
+
+
+def identity_keys(plan: SchemaPlan, names: Sequence[str]) -> tuple[str, ...]:
+    """The keys of a normalised record that hold the identity fields."""
+    keys: list[str] = []
+    for name in names:
+        spec = next((s for s in plan.specs if s.path == (name,)), None)
+        keys.append(spec.alias if spec is not None and spec.alias else name)
+    return tuple(keys)
+
+
+def _identity_values(data: Mapping[str, Any], keys: Sequence[str]) -> list[str]:
+    """The record's identity values as text (else its first text values)."""
+    values: list[str] = []
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, str):
+            values.append(value)
+        elif isinstance(value, (list, tuple)):
+            values.extend(str(v) for v in value if isinstance(v, (str, int, float)))
+        elif value is not None and not isinstance(value, (dict, bool)):
+            values.append(str(value))
+    if values:
+        return values
+    return [v for v in data.values() if isinstance(v, str)][:6]
+
+
+def _clip(value: Any) -> Any:
+    if isinstance(value, str) and len(value) > _TEXT_CHARS:
+        return value[:_TEXT_CHARS] + "…"
+    return value
+
+
+def compact_record(
+    data: Mapping[str, Any], identity: Sequence[str], render_fields: int
+) -> dict[str, Any]:
+    """A record cut down to what tells it apart.
+
+    Keeps the identity fields, up to ``render_fields`` further non-null scalar
+    fields, and the first 3 elements of every list; long texts are shortened.
+
+    Args:
+        data: The record (normalised keys).
+        identity: Keys of the identity fields.
+        render_fields: How many non-identity scalar fields to keep.
+
+    Returns:
+        A new dict in the record's own key order.
+    """
+    out: dict[str, Any] = {}
+    kept = 0
+    for key, value in data.items():
+        if key in identity:
+            out[key] = (
+                [_clip(v) for v in value[:_LIST_ELEMENTS]]
+                if isinstance(value, list)
+                else _clip(value)
+            )
+        elif isinstance(value, list):
+            out[key] = [_clip(v) for v in value[:_LIST_ELEMENTS]]
+        elif value is not None and not isinstance(value, dict) and kept < render_fields:
+            out[key] = _clip(value)
+            kept += 1
+    return out
+
+
+def _size(value: Any) -> float:
+    return estimate_tokens(value)
+
+
+# --------------------------------------------------------------------------- #
+# Asking
+# --------------------------------------------------------------------------- #
+
+
+def _option(index: int) -> str:
+    return f"rec_{index}"
+
+
+@dataclass
+class _Report:
+    """What the requests had to do to fit, for one warning per kind."""
+
+    prefiltered: int = 0
+    compacted: int = 0
+    dropped: int = 0
+    offered: list[int] = field(default_factory=list)
+
+
+class _Matcher:
+    """Asks the match question of each entity of one collection."""
+
+    def __init__(
+        self,
+        run: Run,
+        plan: SchemaPlan,
+        text: str,
+        noun: str,
+        candidates: Sequence[Candidate],
+        identity: Sequence[str],
+    ) -> None:
+        self.run, self.plan, self.text, self.noun = run, plan, text, noun
+        self.candidates = list(candidates)
+        self.identity = tuple(identity)
+        self.report = _Report()
+        self._values = [_identity_values(c.data, self.identity) for c in candidates]
+        self._full = [dict(c.data) for c in candidates]
+        self._small = [
+            compact_record(c.data, self.identity, run.match.render_fields)
+            for c in candidates
+        ]
+
+    def ctx(self, info: EntityInfo) -> Ctx:
+        """The entity-anchored context a match state is built from."""
+        return Ctx(
+            run=self.run,
+            plan=self.plan,
+            text=self.text,
+            label=info.label,
+            key=info.key,
+            mentions=tuple(dict.fromkeys(m.text for m in info.mentions)),
+            info=info,
+        )
+
+    def _ranked(self, info: EntityInfo) -> list[int]:
+        """Record indexes, the most similar to the entity first (ties: input order)."""
+        mentions = [info.label, *(m.text for m in info.mentions)]
+        scores = [similarity(values, mentions) for values in self._values]
+        return sorted(range(len(scores)), key=lambda i: (-scores[i], i))
+
+    def _question(self, options: Mapping[str, Any]) -> ChoiceQuestion:
+        return ChoiceQuestion(
+            type="choice",
+            instructions="Which listed record is `entity.label`?",
+            criteria=dict(options),
+        )
+
+    def _criteria(self, indexes: Sequence[int], rows: Sequence[Any]) -> dict[str, Any]:
+        options: dict[str, Any] = {_option(i): rows[i] for i in sorted(indexes)}
+        options[NEW] = f"A {self.plan.title} not among the listed records"
+        return options
+
+    async def ask(self, info: EntityInfo) -> MatchAnswer:
+        """Ask which record an entity is (or ``__new__``)."""
+        budget = self.run.limits.clef_state_token_budget
+        ctx = self.ctx(info)
+        keep = self._ranked(info)
+        if len(keep) > MAX_OPTIONS:
+            self.report.prefiltered = max(self.report.prefiltered, len(keep))
+            keep = keep[:MAX_OPTIONS]
+        state = ctx.fitted()
+        instructions = "Which listed record is `entity.label`?"
+        base = _size({"state": state, "instructions": instructions}) + _size(
+            {NEW: f"A {self.plan.title} not among the listed records"}
+        )
+        rows: Sequence[Any] = self._full
+        total = base + sum(_size({_option(i): self._full[i]}) for i in keep)
+        if total > budget:
+            rows = self._small
+            self.report.compacted += 1
+            sizes = [_size({_option(i): self._small[i]}) for i in keep]
+            running, fitting = base, 0
+            for size in sizes:  # keep is in rank order: the best fit first
+                if running + size > budget:
+                    break
+                running += size
+                fitting += 1
+            if fitting == 0:  # one record is always offered
+                running, fitting = base + sizes[0], 1
+            if fitting < len(keep):
+                self.report.dropped += 1
+                keep = keep[:fitting]
+            if running > budget:
+                # not even one record fits beside the whole state: narrow the input
+                room = budget - (running - base) - _size(instructions)
+                state = ctx.fitted(budget=max(1_000, int(room)))
+        self.report.offered.append(len(keep))
+        answers = await self.run.call_clef(
+            {"match": self._question(self._criteria(keep, rows))},
+            state,
+            meta=CallMeta(kind="match", schema=self.plan.name, entity=info.key),
+        )
+        answer = answers.get("match")
+        if not isinstance(answer, ChoiceAnswer):
+            return MatchAnswer()
+        probs: dict[str, float] = {}
+        for index in sorted(keep):
+            probs[self.candidates[index].record_id] = answer.probabilities.get(
+                _option(index), 0.0
+            )
+        probs[NEW] = answer.probabilities.get(NEW, 0.0)
+        return MatchAnswer(probs, answer.confidence)
+
+    def warnings(self) -> list[str]:
+        """One warning per thing the requests had to do to fit."""
+        report, name, total = self.report, self.plan.name, len(self.candidates)
+        out: list[str] = []
+        if report.prefiltered:
+            out.append(
+                f"match_prefiltered: {report.prefiltered} existing {name} records "
+                f"are more than the {MAX_OPTIONS} options of one Clef choice; each "
+                f"entity was matched against its {MAX_OPTIONS} most similar records "
+                "by identity"
+            )
+        if report.compacted:
+            out.append(
+                f"match_compacted: the {total} existing {name} records did not fit "
+                "one Clef request in full, so they were rendered compactly (the "
+                "identity fields, a few other fields and the first elements of "
+                "each list)"
+                + (
+                    f"; for {report.dropped} entity(ies) only the most similar "
+                    f"records were offered (as few as {min(report.offered)})"
+                    if report.dropped
+                    else ""
+                )
+            )
+        return out
+
+
+# --------------------------------------------------------------------------- #
+# Matching a collection
+# --------------------------------------------------------------------------- #
+
+MergeCheck = Callable[[EntityInfo, EntityInfo], Awaitable[float | None]]
+
+
+def _merged(group: Sequence[EntityInfo]) -> EntityInfo:
+    """One entity made of several: their mentions in order, the earliest key."""
+    mentions: list[Mention] = sorted(
+        {m for e in group for m in e.mentions}, key=lambda m: (m.span or (0, 0), m.text)
+    )
+    first = min(
+        group,
+        key=lambda e: e.first_mention.span or (0, 0) if e.first_mention else (0, 0),
+    )
+    return EntityInfo(
+        key=first.key,
+        label=canonical_label([m.text for m in mentions]),
+        mentions=tuple(mentions),
+        first_mention=mentions[0] if mentions else first.first_mention,
+        qualify_p=first.qualify_p,
+        parent=first.parent,
+    )
+
+
+def _name(info: EntityInfo) -> str:
+    return f"{info.label} ({info.key})"
+
+
+def _collision_note(
+    infos: Sequence[EntityInfo],
+    table: Sequence[Mapping[str, float]],
+    chosen: Sequence[str],
+    rid: str,
+    who: Sequence[int],
+) -> str:
+    """The ``match_collision`` warning for one record that several entities claim."""
+    names = " and ".join(_name(infos[i]) for i in who)
+    odds = ", ".join(f"{table[i].get(rid, 0.0):.2f}" for i in who)
+    winners = [_name(infos[i]) for i in who if chosen[i] == rid]
+    fell = [
+        f"{_name(infos[i])} fell back to "
+        + ("a new record" if chosen[i] == NEW else f"the record {chosen[i]!r}")
+        for i in who
+        if chosen[i] != rid
+    ]
+    return (
+        f"match_collision: {names} both match the record {rid!r} (p={odds}); "
+        f"one-to-one assignment gave it to {winners[0] if winners else 'neither'}"
+        + (f", and {'; '.join(fell)}" if fell else "")
+    )
+
+
+def _candidates(probs: Mapping[str, float]) -> tuple[tuple[str, float], ...]:
+    shown = sorted(
+        ((option, p) for option, p in probs.items() if p >= _NOTICEABLE),
+        key=lambda item: (-item[1], item[0]),
+    )
+    return tuple(shown[:_SHOWN_CANDIDATES])
+
+
+async def _merge_collisions(
+    run: Run,
+    infos: Sequence[EntityInfo],
+    contested: Mapping[str, list[int]],
+    merge_check: MergeCheck,
+) -> list[EntityInfo] | None:
+    """Merge the entities that claim one record, where they are one entity.
+
+    Every pair of claimants of a record gets a merge check; two sets of claimants
+    are joined, strongest check first, only if every pair across them passed.
+
+    Returns:
+        The entities after the merges, or ``None`` if nothing merged.
+    """
+    pairs = [
+        (a, b) for who in contested.values() for a, b in itertools.combinations(who, 2)
+    ]
+    checked = await gather(*(merge_check(infos[a], infos[b]) for a, b in pairs))
+    threshold = run.coref.merge_threshold
+    checks = dict(zip(pairs, checked, strict=True))
+    passed = sorted(
+        (pair for pair, p in checks.items() if p is not None and p >= threshold),
+        key=lambda pair: (-(checks[pair] or 0.0), pair),
+    )
+    sets: dict[int, list[int]] = {i: [i] for i in range(len(infos))}
+    owner = {i: i for i in range(len(infos))}
+    for a, b in passed:
+        ra, rb = owner[a], owner[b]
+        if ra == rb:
+            continue
+        across = [(min(x, y), max(x, y)) for x in sets[ra] for y in sets[rb]]
+        if all(pair in checks and pair in passed for pair in across):
+            for member in sets[rb]:
+                owner[member] = ra
+            sets[ra] = sorted(sets[ra] + sets.pop(rb))
+    if len(sets) == len(infos):
+        return None
+    return [_merged([infos[i] for i in members]) for members in sets.values()]
+
+
+async def match_entities(
+    run: Run,
+    plan: SchemaPlan,
+    text: str,
+    noun: str,
+    entities: Sequence[EntityInfo],
+    candidates: Sequence[Candidate],
+    identity: Sequence[str],
+    merge_check: MergeCheck,
+) -> MatchOutcome:
+    """Match every entity to an existing record or to ``__new__``.
+
+    Args:
+        run: The invoke's context (``run.match`` configures the step).
+        plan: The schema of the entities and records.
+        text: The user's input.
+        noun: What an entity is called in prompts.
+        entities: The entities that qualify, in order of first mention.
+        candidates: The existing records (normalised keys).
+        identity: Keys of the identity fields, for the prefilter and for compact
+            rendering.
+        merge_check: Asks the coreference merge check for two entities (used with
+            ``match.collision="merge"``).
+
+    Returns:
+        The decisions.
+
+    Raises:
+        AmbiguousMatchError: With ``match.on_ambiguous="raise"``, for the first
+            ambiguous entity.
+    """
+    if not entities:
+        return MatchOutcome()
+    config = run.match
+    matcher = _Matcher(run, plan, text, noun, candidates, identity)
+    ids = [c.record_id for c in candidates]
+    infos = list(entities)
+    answers: dict[str, MatchAnswer] = {}
+    while True:
+        todo = [e for e in infos if e.key not in answers]
+        for info, answer in zip(
+            todo, await gather(*(matcher.ask(e) for e in todo)), strict=True
+        ):
+            answers[info.key] = answer
+        table = [answers[e.key].probs for e in infos]
+        chosen = assign(table, ids, prune=_PRUNE)
+        contested = collisions(table)
+        if contested and config.collision == "merge":
+            merged = await _merge_collisions(run, infos, contested, merge_check)
+            if merged is not None:
+                before = {e.key: e for e in infos}
+                for info in merged:  # a merged entity must be asked again
+                    if before.get(info.key) != info:
+                        answers.pop(info.key, None)
+                        run.warn(
+                            f"match_merged: {info.label} ({info.key}) was found as "
+                            "two entities that both matched one record, and the "
+                            "merge check says they are one; they were merged and "
+                            "matched again"
+                        )
+                infos = merged
+                continue
+        for rid, who in sorted(contested.items()):
+            run.warn(_collision_note(infos, table, chosen, rid, who))
+        break
+    for message in matcher.warnings():
+        run.warn(message)
+
+    out: list[EntityInfo] = []
+    targets: dict[str, str | None] = {}
+    skipped: list[SkippedEntity] = []
+    for info, pick in zip(infos, chosen, strict=True):
+        answer = answers[info.key]
+        info = replace(info, match_probs=dict(answer.probs))
+        out.append(info)
+        p = answer.p(pick)
+        sure = (
+            bool(answer.probs)
+            and p >= config.accept
+            and answer.confidence is not None
+            and answer.confidence >= config.min_confidence
+        )
+        if sure:
+            targets[info.key] = None if pick == NEW else pick
+            continue
+        candidates_ = _candidates(answer.probs)
+        detail = f"{info.label!r} could not be matched with enough certainty: " + (
+            f"the best option {pick!r} has p={p:.2f} (accept at "
+            f"{config.accept:g}) and the answer's confidence is "
+            f"{answer.confidence:.2f} (needs {config.min_confidence:g})"
+            if answer.confidence is not None
+            else "the model gave no answer"
+        )
+        if config.on_ambiguous == "raise":
+            raise AmbiguousMatchError(
+                f"{plan.name} entity {info.label!r}: {detail}",
+                schema_name=plan.name,
+                label=info.label,
+                candidates=candidates_,
+            )
+        if config.on_ambiguous == "insert":
+            targets[info.key] = None
+            continue
+        skipped.append(
+            SkippedEntity(plan.name, info, "ambiguous_match", detail, candidates_)
+        )
+    return MatchOutcome(tuple(out), targets, tuple(skipped))
+
+
+# --------------------------------------------------------------------------- #
+# Deletes
+# --------------------------------------------------------------------------- #
+
+
+async def flag_deletes(
+    run: Run,
+    plan: SchemaPlan,
+    text: str,
+    candidates: Sequence[Candidate],
+    identity: Sequence[str],
+) -> dict[str, float | None]:
+    """Ask, per existing record, whether the input says it should be removed.
+
+    One Clef ``noul`` per record (call kind ``delete``) over the state ``{input,
+    record}``; records with the same state share a request. A record that would
+    make the state too large for Clef is rendered compactly (``match_compacted``).
+    ``CallMeta.entity`` holds the ids of the records of the request, comma-joined, in
+    question order (the questions are ``delete.0``, ``delete.1`` ...).
+
+    Args:
+        run: The invoke's context.
+        plan: The schema of the records.
+        text: The user's input.
+        candidates: The existing records (normalised keys).
+        identity: Keys of the identity fields (kept when compacting).
+
+    Returns:
+        The probability by record id (``None`` for a missing answer).
+    """
+    budget = run.limits.clef_state_token_budget
+    groups: dict[str, tuple[dict[str, Any], list[str]]] = {}
+    compacted = 0
+    for candidate in candidates:
+        record: dict[str, Any] = dict(candidate.data)
+        state = run.clef_state(text, record=record)
+        if estimate_tokens(state) > budget:
+            record = compact_record(candidate.data, identity, run.match.render_fields)
+            state = run.clef_state(text, record=record)
+            compacted += 1
+        key = json.dumps(state, sort_keys=True, default=str)
+        groups.setdefault(key, (state, []))[1].append(candidate.record_id)
+    if compacted:
+        run.warn(
+            f"match_compacted: {compacted} existing {plan.name} record(s) did not "
+            "fit one Clef request in full, so the delete question saw them "
+            "rendered compactly"
+        )
+    question = NoulQuestion(
+        type="noul",
+        instructions=(
+            "Does `input` state that `record` should be removed or no longer applies?"
+        ),
+        criteria=NoulCriteria(
+            true="The input says the record should be removed or no longer applies.",
+            false="The input does not say that about the record.",
+        ),
+    )
+
+    async def ask(state: dict[str, Any], rids: list[str]) -> dict[str, float | None]:
+        answers = await run.call_clef(
+            {f"delete.{k}": question for k in range(len(rids))},
+            state,
+            meta=CallMeta(kind="delete", schema=plan.name, entity=",".join(rids)),
+        )
+        found: dict[str, float | None] = {}
+        for k, rid in enumerate(rids):
+            answer = answers.get(f"delete.{k}")
+            found[rid] = answer.noul if isinstance(answer, NoulAnswer) else None
+        return found
+
+    parts = await gather(*(ask(state, rids) for state, rids in groups.values()))
+    merged: dict[str, float | None] = {}
+    for part in parts:
+        merged.update(part)
+    return {c.record_id: merged.get(c.record_id) for c in candidates}

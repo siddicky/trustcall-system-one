@@ -17,6 +17,11 @@ single-entity insert pipeline (step 6) concurrently:
    cluster-level merge checks, and anything that stays inconsistent is a warning
    (an entity is never invented).
 
+With existing records of the schema ``apply_collection`` goes on (steps 8 and 9,
+``_match``): every entity is matched to a record or to ``__new__`` (one-to-one),
+matched records are updated with the full update path, new entities inserted, and,
+with ``enable_deletes``, records the input says to remove are deleted.
+
 A ``Scope`` says what is collected from where, so the same engine can serve a
 nested list later (``parent``, ``pointer`` and ``existing`` are the parts that
 differ from a top-level ``Many``); at the top level ``parent`` is ``None``.
@@ -39,7 +44,20 @@ from trustcall_system_one._coref import (
     ordered_pair,
     plural,
 )
-from trustcall_system_one._entity import InsertOutcome, insert_one
+from trustcall_system_one._entity import (
+    InsertOutcome,
+    UpdateOutcome,
+    insert_one,
+    update_one,
+)
+from trustcall_system_one._existing import ExistingRecord, normalise_record
+from trustcall_system_one._match import (
+    Candidate,
+    MatchOutcome,
+    flag_deletes,
+    identity_keys,
+    match_entities,
+)
 from trustcall_system_one._render import RenderedState, discovery_focus, entity_focus
 from trustcall_system_one._run import CLEF_BATCH, Run, gather
 from trustcall_system_one._types import (
@@ -62,6 +80,7 @@ __all__ = [
     "CollectionOutcome",
     "CollectionResult",
     "Scope",
+    "apply_collection",
     "clean_mention",
     "collect",
     "identity_fields",
@@ -113,6 +132,11 @@ _CONNECTORS = frozenset(
     | {"vs", "versus", "et", "und", "y"}
 )
 """Words that join two names into a list or a phrase, never part of one name."""
+_PARTICLES = frozenset(
+    {"van", "von", "de", "der", "den", "da", "del", "della", "di", "du"}
+    | {"la", "le", "bin", "ibn", "al", "ter", "ten"}
+)
+"""Lower-case name particles ("Vincent van Gogh") that may lie inside one name."""
 _DETERMINER = re.compile(r"^(?:the|an|a|this|that|these|those)\s+", re.IGNORECASE)
 _POSSESSIVE = re.compile("['\u2019]s$", re.IGNORECASE)
 _EDGE = " \t\r\n\"'\u201c\u201d\u2018\u2019`,;:.!?()[]{}"
@@ -135,9 +159,10 @@ class Scope:
         parent: The entity the collection belongs to; ``None`` at the top level.
         pointer: JSON Pointer of the collection inside its parent's document
             (empty at the top level).
-        existing: Existing items to match the entities against (records at the
-            top level, list elements for a nested list). Matching arrives with
-            M8; this milestone only inserts, so it must be empty.
+        existing: Existing items to match the entities against (the
+            ``ExistingRecord``s of the schema at the top level, list elements for
+            a nested list). ``collect`` does not use them; ``apply_collection``
+            matches the entities it found against them.
     """
 
     plan: SchemaPlan
@@ -178,13 +203,19 @@ class CollectionResult:
     """What ``insert_collection`` produced.
 
     Attributes:
-        records: One insert record per qualifying entity, in order of first
-            mention (an invalid record is among them, with its skip).
+        records: One record per qualifying entity that was inserted or updated,
+            in order of first mention (an invalid record is among them, with its
+            skip), then the deletes in record order.
         skipped: Entities not turned into a valid record, in order of first
             mention.
         extracted: Whether any extraction request was made.
         attempts: Extraction rounds of the entity that needed the most.
         outcome: The discovery outcome.
+        handled: ``(schema name, record id)`` of every existing record that was
+            updated, deleted or skipped for a reason about itself
+            (``updates_disabled``, ``conflict_update_delete``); the rest are
+            untouched. The schema name is ``"__any__"`` for such a record.
+        deleted: Ids of the records that were deleted.
     """
 
     records: tuple[ResultRecord, ...] = ()
@@ -192,6 +223,8 @@ class CollectionResult:
     extracted: bool = False
     attempts: int = 0
     outcome: CollectionOutcome = field(default_factory=CollectionOutcome)
+    handled: tuple[tuple[str, str], ...] = ()
+    deleted: tuple[str, ...] = ()
 
 
 # --------------------------------------------------------------------------- #
@@ -277,13 +310,15 @@ def _overlap(first: Span, second: Span) -> bool:
     return first[0] < second[1] and second[0] < first[1]
 
 
-def _name_gap(gap: str, *, words: bool) -> bool:
+def _name_gap(gap: str, *, words: bool, particles: bool = False) -> bool:
     """Whether the text between two parts of a name is name material.
 
     Spaces, hyphens inside a hyphenated name, initials ("J.") and, when ``words``
-    allows it, capitalised words (a middle name) are. A separator (``, ; : & /``, a
-    line break, the word "and"), a lower-case word and a possessive ("'s brother")
-    are not: they set one mention apart from the next, or make a phrase.
+    allows it, capitalised words (a middle name) are, and so are lower-case name
+    particles (van, von, de, bin ...) when ``particles`` allows them. A separator
+    (``, ; : & /``, a line break, the word "and"), any other lower-case word and a
+    possessive ("'s brother") are not: they set one mention apart from the next, or
+    make a phrase.
     """
     if re.search(r"[,;:&/\n\r]", gap):
         return False
@@ -291,6 +326,8 @@ def _name_gap(gap: str, *, words: bool) -> bool:
         if not token or (len(token) <= 2 and token[0].isupper() and token[1:] in "."):
             continue
         plain = token.replace("'", "").replace("\u2019", "")
+        if particles and token in _PARTICLES:
+            continue
         if not (words and token[0].isupper() and plain.isalnum()):
             return False
         if token.casefold() in _NOT_NAMES or token.casefold() in _CONNECTORS:
@@ -312,12 +349,14 @@ def _one_name(source: str, whole: Span, parts: Sequence[Span]) -> bool:
     if single.count(False) > 1:
         return False
     words = all(single)
+    # a particle ("van") lies inside a name only between capitalised single tokens
+    particles = words and all(source[start : start + 1].isupper() for start, _ in parts)
     cursor = whole[0]
     for start, end in sorted(parts):
-        if not _name_gap(source[cursor:start], words=words):
+        if not _name_gap(source[cursor:start], words=words, particles=particles):
             return False
         cursor = end
-    return _name_gap(source[cursor : whole[1]], words=words)
+    return _name_gap(source[cursor : whole[1]], words=words, particles=particles)
 
 
 def _resolve_overlaps(mentions: Sequence[Mention], source: str) -> list[Mention]:
@@ -906,14 +945,7 @@ async def collect(
 
     Raises:
         ValueError: If ``Many(identity=...)`` names a field the schema lacks.
-        NotImplementedError: If ``scope.existing`` is not empty (matching
-            against existing records arrives with M8).
     """
-    if scope.existing:
-        raise NotImplementedError(
-            f"matching {scope.plan.name} entities against existing records "
-            "arrives in M8"
-        )
     plan, config = scope.plan, run.discovery
     warnings: list[str] = []
 
@@ -1061,6 +1093,53 @@ async def collect(
 # --------------------------------------------------------------------------- #
 
 
+def _focuses(scope: Scope, info: EntityInfo) -> tuple[Any, Any]:
+    """The focus header of an entity's Clairic requests, with and without offsets."""
+    plan = scope.plan
+    focus = entity_focus(
+        plan.name, scope.noun, info.label, [(m.text, m.span) for m in info.mentions]
+    )
+    plain = entity_focus(
+        plan.name, scope.noun, info.label, [(m.text, None) for m in info.mentions]
+    )
+    return focus, plain
+
+
+async def _insert_entity(run: Run, scope: Scope, info: EntityInfo) -> InsertOutcome:
+    focus, plain = _focuses(scope, info)
+    return await insert_one(
+        run,
+        scope.plan,
+        scope.source,
+        label=info.label,
+        entity=info,
+        focus=focus,
+        focus_plain=plain,
+    )
+
+
+async def _update_entity(
+    run: Run,
+    scope: Scope,
+    info: EntityInfo,
+    target: ExistingRecord,
+    *,
+    enable_updates: bool,
+) -> UpdateOutcome:
+    focus, plain = _focuses(scope, info)
+    return await update_one(
+        run,
+        scope.plan,
+        scope.source,
+        target,
+        label=info.label,
+        enable_updates=enable_updates,
+        entity=info,
+        focus=focus,
+        focus_plain=plain,
+    )
+
+
 async def insert_collection(
     run: Run, scope: Scope, *, skip_presence: bool = False
 ) -> CollectionResult:
@@ -1085,29 +1164,7 @@ async def insert_collection(
         TransportError: If a request failed.
     """
     outcome = await collect(scope, run, skip_presence=skip_presence)
-    plan = scope.plan
-
-    async def extract(info: EntityInfo) -> InsertOutcome:
-        focus = entity_focus(
-            plan.name,
-            scope.noun,
-            info.label,
-            [(m.text, m.span) for m in info.mentions],
-        )
-        plain = entity_focus(
-            plan.name, scope.noun, info.label, [(m.text, None) for m in info.mentions]
-        )
-        return await insert_one(
-            run,
-            plan,
-            scope.source,
-            label=info.label,
-            entity=info,
-            focus=focus,
-            focus_plain=plain,
-        )
-
-    done = await gather(*(extract(info) for info in outcome.entities))
+    done = await gather(*(_insert_entity(run, scope, e) for e in outcome.entities))
     records: list[ResultRecord] = []
     skips: list[tuple[str, SkippedEntity]] = [
         (s.entity.key, s) for s in outcome.skipped
@@ -1126,4 +1183,234 @@ async def insert_collection(
         extracted=bool(outcome.entities),
         attempts=attempts,
         outcome=outcome,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Steps 8-9: records the input is about
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class _Work:
+    """What happened to one entity once it was matched."""
+
+    info: EntityInfo
+    record: ResultRecord | None = None
+    skipped: SkippedEntity | None = None
+    attempts: int = 0
+    extracted: bool = False
+    handled: tuple[str, str] | None = None
+
+
+def _delete_record(
+    plan: SchemaPlan, candidate: Candidate, p: float, names: Sequence[str]
+) -> ResultRecord:
+    """The result record of a deletion: the record as it was, and nothing after."""
+    label = next(
+        (str(candidate.data[k]) for k in names if candidate.data.get(k) is not None),
+        candidate.record_id,
+    )
+    return ResultRecord(
+        schema_name=plan.name,
+        json_doc_id=candidate.record_id,
+        kind="delete",
+        value=None,
+        before=dict(candidate.data),
+        after=None,
+        entity=EntityInfo(
+            key=candidate.record_id, label=label, match_probs={candidate.record_id: p}
+        ),
+    )
+
+
+async def apply_collection(
+    run: Run,
+    scope: Scope,
+    *,
+    skip_presence: bool = False,
+    enable_inserts: bool = False,
+    enable_updates: bool = True,
+    enable_deletes: bool = False,
+) -> CollectionResult:
+    """Find the entities of a schema and deal with them against its existing records.
+
+    Without existing records this is ``insert_collection``. With them:
+
+    1. ``collect`` finds the entities (discovery, coreference, qualification);
+    2. each entity is matched to an existing record or to ``__new__``, one-to-one
+       (``_match``); with ``enable_deletes`` a Clef question per record asks
+       whether the input says to remove it, concurrently;
+    3. an entity matched to a record is updated by the full update path of
+       ``update_one`` (presence not asked again, attribution scoped to the entity),
+       unless the record is also flagged for deletion (``conflict_update_delete``:
+       neither happens) or ``enable_updates`` is off (``updates_disabled``); a new
+       entity is inserted if ``enable_inserts`` (else ``inserts_disabled``); an
+       entity that could not be matched is ``ambiguous_match``;
+    4. the records flagged for deletion are deleted (``kind="delete"``, ``after``
+       ``None``), last, in record order; records nothing happened to are untouched.
+
+    Args:
+        run: The invoke's context.
+        scope: What to find and where; ``scope.existing`` holds the schema's
+            ``ExistingRecord``s.
+        skip_presence: Skip the presence question (the schema was forced).
+        enable_inserts: Insert entities that match no record.
+        enable_updates: Update the records entities were matched to.
+        enable_deletes: Delete records the input says to remove.
+
+    Returns:
+        The records (inserts and updates in order of first mention, then the
+        deletes), the skipped entities and which records were dealt with.
+
+    Raises:
+        AmbiguousMatchError: With ``match.on_ambiguous="raise"``.
+        ExtractionValidationError: In strict mode, if a record stays invalid.
+        TransportError: If a request failed.
+    """
+    existing: tuple[ExistingRecord, ...] = tuple(scope.existing)
+    if not existing:
+        return await insert_collection(run, scope, skip_presence=skip_presence)
+    plan = scope.plan
+    outcome = await collect(scope, run, skip_presence=skip_presence)
+    names = identity_fields(plan, scope.cardinality)
+    keys = identity_keys(plan, names)
+    candidates = [
+        Candidate(r.record_id, normalise_record(plan, r.data)) for r in existing
+    ]
+    by_id = {r.record_id: r for r in existing}
+    mentioned = not (
+        not outcome.entities
+        and outcome.presence is not None
+        and outcome.presence < run.discovery.presence_absent
+    )
+
+    async def merge_check(a: EntityInfo, b: EntityInfo) -> float | None:
+        return await _merge_check(
+            run,
+            scope,
+            _Group(a.mentions, a.qualify_p),
+            _Group(b.mentions, b.qualify_p),
+        )
+
+    async def matching() -> MatchOutcome:
+        return await match_entities(
+            run,
+            plan,
+            scope.source,
+            scope.noun,
+            outcome.entities,
+            candidates,
+            keys,
+            merge_check,
+        )
+
+    async def deleting() -> dict[str, float | None]:
+        if not (enable_deletes and mentioned):
+            return {}
+        return await flag_deletes(run, plan, scope.source, candidates, keys)
+
+    jobs: list[Any] = [matching(), deleting()]
+    results = await gather(*jobs)
+    matched: MatchOutcome = results[0]
+    delete_p: dict[str, float | None] = results[1]
+    flagged = {
+        rid
+        for rid, p in delete_p.items()
+        if p is not None and p >= run.match.delete_threshold
+    }
+
+    async def work(info: EntityInfo) -> _Work:
+        target = matched.targets[info.key]
+        if target is not None:
+            record = by_id[target]
+            if target in flagged and enable_updates:
+                p = delete_p[target] or 0.0
+                return _Work(
+                    info,
+                    skipped=SkippedEntity(
+                        plan.name,
+                        info,
+                        "conflict_update_delete",
+                        f"{info.label!r} matches the record {target!r}, and the "
+                        f"input also says that record should be removed "
+                        f"(p={p:.2f}); it was neither updated nor deleted",
+                        ((target, info.match_probs.get(target, 0.0)),),
+                    ),
+                    handled=(record.schema_name, record.record_id),
+                )
+            done = await _update_entity(
+                run, scope, info, record, enable_updates=enable_updates
+            )
+            return _Work(
+                info,
+                done.record,
+                done.skipped,
+                done.attempts,
+                done.extracted,
+                done.handled,
+            )
+        if not (enable_inserts or not existing):
+            return _Work(
+                info,
+                skipped=SkippedEntity(
+                    plan.name,
+                    info,
+                    "inserts_disabled",
+                    f"{info.label!r} is not among the existing "
+                    f"{plan.name} records, but enable_inserts is off",
+                    tuple((rid, p) for rid, p in info.match_probs.items() if p >= 0.01),
+                ),
+            )
+        inserted = await _insert_entity(run, scope, info)
+        return _Work(
+            info,
+            inserted.record,
+            inserted.skipped,
+            inserted.attempts,
+            inserted.extracted,
+        )
+
+    todo = [e for e in matched.entities if e.key in matched.targets]
+    done_all = await gather(*(work(e) for e in todo))
+    records: list[tuple[int, ResultRecord]] = []
+    skips: list[tuple[int, SkippedEntity]] = [
+        (int(s.entity.key[1:]), s) for s in (*outcome.skipped, *matched.skipped)
+    ]
+    handled: list[tuple[str, str]] = []
+    attempts = 0
+    extracted = False
+    for item in done_all:
+        order = int(item.info.key[1:])
+        if item.record is not None:
+            records.append((order, item.record))
+        if item.skipped is not None:
+            skips.append((order, item.skipped))
+        if item.handled is not None:
+            handled.append(item.handled)
+        attempts = max(attempts, item.attempts)
+        extracted = extracted or item.extracted
+    conflicts = {
+        w.handled[1]
+        for w in done_all
+        if w.skipped is not None and w.skipped.reason == "conflict_update_delete"
+        if w.handled is not None
+    }
+    deletes: list[ResultRecord] = []
+    for candidate in candidates:
+        rid = candidate.record_id
+        if rid in flagged and rid not in conflicts:
+            deletes.append(_delete_record(plan, candidate, delete_p[rid] or 0.0, keys))
+            record = by_id[rid]
+            handled.append((record.schema_name, rid))
+    records.sort(key=lambda pair: pair[0])
+    skips.sort(key=lambda pair: pair[0])
+    return CollectionResult(
+        records=(*(r for _, r in records), *deletes),
+        skipped=tuple(s for _, s in skips),
+        extracted=extracted,
+        attempts=attempts,
+        outcome=outcome,
+        handled=tuple(dict.fromkeys(handled)),
+        deleted=tuple(r.json_doc_id for r in deletes if r.json_doc_id is not None),
     )

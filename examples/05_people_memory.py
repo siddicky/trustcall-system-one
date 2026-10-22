@@ -1,8 +1,5 @@
 """A conversation updates three people you know and introduces a fourth.
 
-Needs milestone M8 (record matching): the multi-entity discovery of M7 is built, but
-``Many`` with existing records still raises ``NotImplementedError``
-(``tests/unit/test_examples.py`` expects that and flips when M8 does).
 ``uv run python examples/05_people_memory.py [--offline]``
 
 The scenario is trustcall's "relationships" demo: you keep a list of people, and a
@@ -12,8 +9,10 @@ update the right records, insert the new person and ignore the dog.
 What to look at:
 
 * ``Records``: ids ``0``, ``1``, ``2`` are updates of the existing records you passed
-  in, in order of first mention; Olivia Davis is an insert (``id -``). The unmentioned
-  records would be listed as untouched (there are none here).
+  in, in order of first mention; Olivia Davis is an insert (``id -``). Each person of
+  the conversation is matched to one existing record or to none (one Clef choice per
+  person; the assignment is one-to-one), and a record the conversation does not
+  mention would be listed as untouched (there are none here).
 * ``skipped``: "Sunny" was found as a name but is a dog, so the qualification check
   ("is Sunny a Person?") refuses it: ``not_qualified``.
 * Notes are appended with ``add /notes/-``; the existing notes are never rewritten.
@@ -26,7 +25,10 @@ What to look at:
   climbing sits right before Michael's name, so a reader focused on Michael picks it up;
   the attribution check ("does the input say this about Michael?") drops it
   (``rejected``). Sarah's name comes back as the short form "Sarah", which a naive
-  diff would write over "Sarah Johnson"; the change gate refuses it.
+  diff would write over "Sarah Johnson": the diff itself refuses to replace an identity
+  field with a part of it (``identity_subset``, before any model is asked). The
+  relationship "neighbor" differs from the record's "Neighbor" only in case, so it
+  becomes a ``replace`` that the change gate refuses (the input states nothing new).
 * Each mention is shown with its span in context.
 
 Live mode runs on the real models (about forty requests); offline mode scripts the
@@ -190,7 +192,7 @@ def offline_script() -> OfflineScript:
             "Sunny": None,
         }
     )
-    script.handlers["gate"] = change_gate(0.94, deny={'"Sarah"': 0.06})
+    script.handlers["gate"] = change_gate(0.94, deny={'"neighbor"': 0.06})
     return script
 
 

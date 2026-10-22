@@ -490,14 +490,6 @@ async def test_any_applies_to_the_extractors_schema() -> None:
 # --------------------------------------------------------------------------- #
 
 
-async def test_list_form_records_without_a_wrapper_imply_many() -> None:
-    world = script()
-    extractor = make_extractor([Contact], world)
-    with pytest.raises(NotImplementedError, match="M8"):
-        await extractor.ainvoke(TEXT, existing=[("rec-1", "Contact", RECORD)])
-    assert world.transport.calls == []
-
-
 async def test_dict_form_implies_one() -> None:
     world = script()
     extractor = make_extractor([Contact], world)

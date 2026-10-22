@@ -184,6 +184,10 @@ class Extractor:  # frozen; per-invoke state lives in _Run
   `(id, name, rec)`, `(id, BaseModel)`, bare `list[BaseModel]` with minted ids), `"__any__"`,
   and `existing_schema_policy` True/False/"ignore" — behavioural spec is
   `_validate_existing` in `/home/user/trustcall/trustcall/_base.py:850-990`.
+- **Matching:** `match=MatchConfig(accept, min_confidence, render_fields, collision, on_ambiguous,
+  delete_threshold)` configures how a `Many` schema's entities are matched to its existing records
+  (see "Collection engine", steps 8-9); `on_ambiguous="raise"` raises `AmbiguousMatchError`
+  (`schema_name`, `label`, `candidates`).
 - **`s1_field(...)`** → `Field(json_schema_extra={"trustcall_system_one": {...}})` with
   `instructions, null_threshold, min_confidence, clairic_type, unit, decimals, integer,
   identity, skip, clef, criteria`.
@@ -253,11 +257,12 @@ with `Scope{plan, source, cardinality (the Many), parent, pointer, existing}`; a
 step 6. Top-level and nested differ only in: discovery wording ("…belonging to {parent}"),
 existing items (records with ids vs list elements with indices), output (one `ResultRecord` per
 entity vs ops inside the parent's patch list such as `add /pets/-`), and removal flag
-(`enable_deletes` vs `enable_item_removals`). M7 builds the discovery side and the insert of
-every entity: a `Many(S)` WITH existing records of S raises `NotImplementedError` naming M8
-(before any request; list-form `existing` of a schema without a wrapper implies `Many`, so it
-does too); an `"__any__"` record is never claimed by a `Many` (it stays in `untouched`, with a
-warning). Settings: `DiscoveryConfig(presence_absent=0.2, presence_present=0.5,
+(`enable_deletes` vs `enable_item_removals`). `collect` builds the discovery side (steps 1-5);
+`insert_collection` inserts every entity (step 6) and `apply_collection` is what a `Many(S)` WITH
+existing records of S runs (list-form `existing` of a schema without a wrapper implies `Many`, so
+it does too): `collect`, then steps 8 and 9 (matching, updates, inserts, deletes). An `"__any__"`
+record takes part in the one-to-one claim like for a `One` (see "Update path"): a `Many` that
+claims one has it among its existing records. Settings: `DiscoveryConfig(presence_absent=0.2, presence_present=0.5,
 count_trust_max=10 (1 to 30), broaden_on_count_mismatch=True)` and `CorefConfig(strategy="auto",
 merge_threshold=0.5, max_pairwise_mentions=60, context_chars=120,
 all_pairs_below=24)`, passed to
@@ -388,23 +393,91 @@ schema title: "Person").
    stay isolated (no cross-record echo), and failures stay per-entity.
    **Result:** one `ResultRecord(kind="insert", json_doc_id=None, entity=EntityInfo(key, label,
    mentions, first_mention, qualify_p, parent=None))` per qualifying entity in first-mention
-   order (`match_probs` stays empty until M8), the skipped entities (`not_qualified` and
+   order (`match_probs` stays empty without existing records, see step 8), the skipped entities (`not_qualified` and
    `validation_failed`, in first-mention order) and the warnings; `responses` holds the valid
    models in the same order.
 7. **Attribution (default on):** Clef `noul` per non-null value and per list element: "Does
    `input` state that {desc} of `entity.label` is '{value}'?" ≥ 0.6 keep, < 0.3 drop
    (`attribution`), between → isolated re-ask then one more check. On updates an op must pass
    **both** attribution (right entity) and the change gate (new vs. record).
-8. **Matching (`_match.py`):** Clef `choice` per entity with criteria = each existing record
-   as JSON plus `__new__`. > 254 records → prefilter by identity similarity (warning);
-   over the Clef state budget → compact rendering (warning). One-to-one **Hungarian
-   assignment** over `-log p` with a `__new__` column per entity; collisions where both
-   claims ≥ 0.5 raise warning `match_collision` (opt-in `match.collision="merge"`). Apply
-   only if p ≥ 0.6 and confidence ≥ 0.5, else `SkippedEntity(ambiguous_match)`.
-9. **Flags per entity:** matched → update (if `enable_updates`); `__new__` → insert (if
-   `enable_inserts` or no existing records of S were given); deletes via Clef `noul` per
-   existing record ≥ 0.85; update+delete on one record → `conflict_update_delete`.
-   Unmentioned records → `untouched`, no ops.
+8. **Matching (`_match.py`, `apply_collection`)**, for a `Many(S)` with existing records of S (the
+   `ExistingRecord`s of S, plus a claimed `"__any__"` one). `MatchConfig(accept=0.6,
+   min_confidence=0.5, render_fields=4, collision="warn", on_ambiguous="skip",
+   delete_threshold=0.85)` (frozen, hashable, validated; `create_extractor(match=)`):
+   * **Request.** One Clef `choice` per qualifying entity (call kind `match`, question id `match`,
+     `CallMeta.entity` the entity key): "Which listed record is `entity.label`?" over the
+     entity-anchored state `{input, entity: {label, mentions}}` (`Ctx.fitted`: mentions with spans
+     and context; an over-budget input is narrowed to windows around them), with criteria
+     `{"rec_<i>": <the record, normalised keys, as a JSON object>, …, "__new__": "A <Title> not
+     among the listed records"}` (`i` is the record's place in the list, so ids stay stable when
+     the list is cut). Entities have distinct states, so every entity is its own request, all
+     concurrent. A missing answer gives no probabilities (the entity is ambiguous).
+   * **Prefilter.** More than 254 records (Clef allows 255 options, `__new__` is one): each entity
+     is offered the 254 records most similar to it, by identity: the best difflib token-set ratio
+     between the record's identity value(s) (`Many(identity=)`, else the schema's, else its first
+     text fields) and the entity's label and each of its mention forms, a diminutive
+     (`_coref.nicknames`: Bob/Robert) counting 0.9; ties go to the earlier record. One run warning
+     `match_prefiltered` carries the number of records. Records that were not offered have no
+     probability.
+   * **Budget.** If the state plus the options estimate over `limits.clef_state_token_budget`, the
+     records are rendered compactly (identity fields, up to `render_fields` further non-null
+     scalar fields, the first 3 elements of every list, long texts clipped to 160 characters); if
+     that is still too much only as many of the most similar records as fit are offered (at least
+     one); if even one does not fit beside the whole state the input is narrowed further.
+     One warning `match_compacted` says so (and how few records an entity was offered).
+   * **Assignment.** The probabilities of all entities go into ONE one-to-one assignment: the
+     Hungarian algorithm (pure Python, `hungarian`; O(rows² · columns)) over the cost
+     `-log(max(p, 1e-9))`, with the records as columns (those no entity gives 0.001 are left out)
+     plus one `__new__` column per entity, so any number of entities can be new and the loser of a
+     contested record falls to its best feasible alternative. Exact ties go to the earlier
+     entity and the earlier record (a perturbation of 1e-12 per column index, not dictionary
+     order). **Collisions:** two entities that both claim one record, each with its most likely
+     option being that record at `p >= 0.5`, warn `match_collision` (both entities, the record, the
+     probabilities, who got it and where the other fell back). With `match.collision="merge"` the
+     claimants are first checked pairwise with the coreference cluster-level merge check (Clef
+     `noul`, kind `coref`, id `merge`); two sets of claimants join only if every pair across
+     them passed `coref.merge_threshold`; a merged entity (the earliest key, the union of the
+     mentions, relabelled) is matched again (`match_merged` warning) and a collision that
+     survives warns as above.
+   * **Thresholds.** An assignment stands only if its option (a record or `__new__`) has `p >=
+     accept` AND the answer's confidence is `>= min_confidence`. Else the entity is ambiguous:
+     `SkippedEntity(reason="ambiguous_match", candidates=((option, p), …))` (the options with p ≥
+     0.01, the most likely first; the records it might have been are NOT handled, so they stay
+     untouched), or, with `on_ambiguous="insert"`, it is treated as new (still subject to the
+     insert rule of step 9), or `"raise"` raises `AmbiguousMatchError` (before any extraction).
+     A collision loser whose fallback is below `accept` is ambiguous too.
+   * **Result.** `EntityInfo.match_probs` holds `{record id: p, …, "__new__": p}` for the options
+     it was offered; `ExtractionResult.records` are ordered by first mention (updates and inserts
+     mixed), then the deletes in record order; `skipped` is in entity order; `json_doc_id` is
+     the record id for updates and deletes and `None` for inserts; `response_metadata` and
+     `responses` list the valid inserts and updates (a delete has no model).
+9. **Flags per entity:**
+   * matched to record r → the full update path (`update_one(entity=, focus=)`: presence is NOT
+     asked again, the Clairic focus header and every Clef state name the entity and its mention
+     spans, so attribution and the change gate are about that entity only; per-operation gate; the
+     identity token-subset rule, so "Sarah" never overwrites "Sarah Johnson"; scalar-list appends
+     as `add /notes/-`; `not_mentioned` for fields it did not state), if `enable_updates`, else
+     `SkippedEntity(reason="updates_disabled")` (the record counts as dealt with, not untouched);
+   * `__new__` → insert (`insert_one`) if `enable_inserts`, else
+     `SkippedEntity(reason="inserts_disabled")` (an extractor given existing records of S is the
+     only case here, so "or no existing records of S were given" is the plain insert path of
+     step 6);
+   * **deletes** (`enable_deletes`; skipped when the presence question found no mention of S at
+     all): one Clef `noul` per existing record (call kind `delete`, ids `delete.<k>`), state
+     `{input, record}` (the record compacted as above if over budget; records with identical
+     states share a request), "Does `input` state that `record` should be removed or no longer
+     applies?"; `CallMeta.entity` holds the ids of the request's records, comma-joined, in
+     question order. They run concurrently with matching. At `>= delete_threshold` the record is
+     `ResultRecord(kind="delete", json_doc_id=<id>, before=<record>, after=None, value=None,
+     entity.match_probs={id: p})` and `ExtractionResult.deleted` lists its id;
+   * a record both matched for update and flagged for delete → `SkippedEntity(
+     reason="conflict_update_delete", candidates=((id, match p),))`: neither an update nor a
+     delete (and no extraction request). With `enable_updates=False` nothing is updated, so the
+     delete goes ahead next to the entity's `updates_disabled`;
+   * records nothing happened to (not matched, not flagged, or matched ambiguously) →
+     `ExtractionResult.untouched`, keyed by (schema, id) so that an `"__any__"` record is told
+     apart; no ops. With no entities at all (presence below `discovery.presence_absent`, or
+     nothing found) nothing but the discovery requests is made.
 
 ## Verification ladder (`_verify.py`) and update path (`_diff.py`, `_gates.py`)
 
@@ -438,7 +511,7 @@ Clairic requests always send
 `ainvoke(text, existing=...)`: `_existing.py` coerces `existing` (five shapes, `"__any__"`,
 `existing_schema_policy`), then each `One` schema that has a record runs `update_one`
 (`_entity.py`); a schema without a record is extracted as an insert (`enable_inserts` decides about
-inserts next to existing records of the same schema, which needs `Many` and matching, M8).
+inserts next to existing records of the same schema, which needs `Many` and matching, step 8).
 
 **`existing` (`_existing.py`).** Shapes: `{schema_name: record}` (the id is the schema name);
 `list[SchemaInstance]`; `list[(record_id, schema_name, record)]`; `list[(record_id, BaseModel)]`
@@ -455,15 +528,15 @@ schema "validates" almost any record, and a record meant for a schema whose requ
 held yet must not go to one the input is not about). Of the present candidates the only one whose
 model validates the record claims it, else the most present one, with a warning naming the
 claimant. Once a schema has claimed a record it leaves the candidate set (a `One` takes one
-record), a record nobody is left to claim stays untouched (listed in `untouched`, with a warning;
+record; a `Many` takes one too, which then joins its existing records), a record nobody is left to claim stays untouched (listed in `untouched`, with a warning;
 nothing raises after calls were spent), and a schema that loses a claim takes the insert path as if
 no record existed, so the same text can update one schema's record and insert another schema's
 record. Record keys are normalised to the keys the schema
 validates (alias where there is one) at every level of sub-models and unions, so diffs,
 patches and validation talk about the same keys. Cardinality: dict form → `One(S)`; an explicit
 `One(S)` with exactly one list-form record of S → that record; several → `ValueError`
-("use Many"); list-form records of S with no explicit wrapper imply `Many(S)` →
-`NotImplementedError` naming M8.
+("use Many"); list-form records of S with no explicit wrapper imply `Many(S)`, which matches
+its entities against them (steps 8-9 of "Collection engine").
 
 **Pipeline** (`update_one`):
 1. Presence gate as for inserts (skipped for a forced schema). Absent → no operation, no
@@ -731,8 +804,11 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
   "the only entity of the schema" (the `One` path). The world fails loudly on a label that names
   one entity while the spans belong to another, and (`check_state`, on by default) on a Clef state
   whose input holds none of the entity's mentions.
-  Every request shape it relies on is listed in the `FakeWorld` docstring. `matches=` is stored
-  for M8 and `match` calls are answered `__new__`.
+  Every request shape it relies on is listed in the `FakeWorld` docstring. `matches=` (a
+  model, a dict whose keys must equal the record's, or a string that occurs in the record's JSON)
+  picks the offered record a `match` call answers at 0.92 (the rest share 0.08; no `matches=` is
+  `__new__` at 0.92; one that fits no offered record, or several, is an `AssertionError`);
+  `.delete(record_id, p)` declares the `delete` answer (default 0.05).
 - Unit tests (`pytest --disable-socket --allow-unix-socket`): `test_wire`, `test_compile` (one
   case per type-table row), `test_names` (regex property, pinned hash), `test_flatten`,
   `test_coerce`, `test_diff` (ordering, `/-` repair, list set semantics, echo spans),
@@ -740,9 +816,12 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
   (5 shapes × 3 policies, ported by behaviour from trustcall's `test_strict_existing.py`),
   `test_cardinality`, `test_transport` (`httpx.MockTransport`: retries, `Retry-After`,
   limiter, envelope).
-- `test_collection.py` on `FakeWorld` (M7 covers the insert side: the README people without
+- `test_match.py` (Hungarian vs brute force, `assign`, collisions, similarity, the prefilter,
+  compaction, thresholds, `on_ambiguous`, merge, delete questions) and `test_collection_update.py`
+  (the scenarios below, end to end on `FakeWorld`);
+  `test_collection.py` on `FakeWorld` (M7 covers the insert side: the README people without
   existing records, Sunny `not_qualified`, coreference, count reconciliation, presence,
-  attribution bleed, mixed `[Many, One]`; the numbered scenarios below finish with M8/M9):
+  attribution bleed, mixed `[Many, One]`; scenarios 1, 4, 5, 6, 9 and 10 below are M8, 8 is M9):
   (1) the trustcall README Emma/Michael/Sarah/Olivia
   scenario — three updates with ids 0/1/2 and appended notes, Olivia inserted, existing notes
   untouched, Sunny `not_qualified`, `enable_inserts=False` variant skips Olivia;

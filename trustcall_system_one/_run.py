@@ -11,6 +11,7 @@ from trustcall_system_one._config import (
     DiscoveryConfig,
     GateConfig,
     Limits,
+    MatchConfig,
     PassesConfig,
     PresenceConfig,
     RepairConfig,
@@ -160,6 +161,7 @@ class Run:
         limits: Structural limits (including the Clef state budget).
         discovery: Settings of entity discovery (``Many``).
         coref: Settings of mention clustering (``Many``).
+        match: Settings of matching entities to existing records (``Many``).
         images: Images sent with every request that carries the user's input.
             Each request model validates the documented size limits before it is
             sent.
@@ -182,6 +184,7 @@ class Run:
     limits: Limits = field(default_factory=Limits)
     discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
     coref: CorefConfig = field(default_factory=CorefConfig)
+    match: MatchConfig = field(default_factory=MatchConfig)
     images: Sequence[Any] | None = None
     reference_date: str | None = None
     strict: bool = False
@@ -440,6 +443,7 @@ class Run:
         proposed_change: Any = None,
         spans: Sequence[tuple[int, int]] | None = None,
         extra: Mapping[str, Any] | None = None,
+        budget: int | None = None,
     ) -> dict[str, Any]:
         """Build a Clef state and keep it under ``limits.clef_state_token_budget``.
 
@@ -450,6 +454,8 @@ class Run:
             proposed_change: A change under review (updates).
             spans: Spans in ``text`` to keep if the input has to be narrowed.
             extra: Further keys of the state (see ``_render.clef_state``).
+            budget: A smaller budget than ``limits.clef_state_token_budget`` (the
+                question that goes with the state takes up the rest).
 
         Returns:
             The state; when it was too large the input is narrowed and a warning
@@ -464,7 +470,9 @@ class Run:
         )
         state, warning = fit_clef_state(
             state,
-            self.limits.clef_state_token_budget,
+            self.limits.clef_state_token_budget
+            if budget is None
+            else min(budget, self.limits.clef_state_token_budget),
             spans=spans,
             window_chars=self.verify.window_chars,
         )

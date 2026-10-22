@@ -1066,27 +1066,6 @@ async def test_a_forced_many_schema_leaves_the_others_out() -> None:
     assert "presence" not in kinds(result)
 
 
-async def test_many_with_existing_records_is_not_implemented_before_m8() -> None:
-    world = readme_world()
-    extractor = extractor_for(world, Many(Person, identity="name"))
-    records = [("0", "Person", {"name": "Emma Thompson"})]
-    with pytest.raises(NotImplementedError, match="M8"):
-        await extractor.ainvoke(TEXT, existing=records)
-    with pytest.raises(NotImplementedError, match="M8"):
-        await extractor.ainvoke(TEXT, existing={"Person": {"name": "Emma Thompson"}})
-    assert world.transport().calls == []  # nothing was spent
-
-
-async def test_list_form_existing_records_imply_many_which_needs_m8() -> None:
-    world = readme_world()
-    extractor = extractor_for(world, Person)
-    with pytest.raises(NotImplementedError, match="M8"):
-        await extractor.ainvoke(
-            TEXT, existing=[("0", "Person", {"name": "Emma Thompson"})]
-        )
-    assert world.transport().calls == []
-
-
 async def test_existing_records_of_another_schema_do_not_stop_a_many() -> None:
     text = "Emma Thompson organises the Spring Fair on 2024-04-20. Michael Chen helps."
     world = FakeWorld(text)
@@ -1118,15 +1097,6 @@ async def test_existing_records_of_another_schema_do_not_stop_a_many() -> None:
         ("Event", "update"),
     ]
     assert result.untouched == ()
-
-
-async def test_the_scope_refuses_existing_records_until_m8() -> None:
-    from trustcall_system_one import compile_schema
-
-    scope = Scope(compile_schema(Person), TEXT, Many(Person), existing=({"name": "x"},))
-    run = Run(transport=readme_world().transport())
-    with pytest.raises(NotImplementedError, match="M8"):
-        await collect(scope, run)
 
 
 async def test_collect_returns_the_entities_and_skips_without_extracting() -> None:
@@ -1237,19 +1207,6 @@ async def test_strict_mode_raises_for_an_entity_that_stays_invalid() -> None:
     extractor = extractor_for(world, Many(Strict, identity="name"), strict=True)
     with pytest.raises(ExtractionValidationError, match="Strict failed validation"):
         await extractor.ainvoke(world.text)
-
-
-async def test_an_any_record_is_left_untouched_by_a_many_schema() -> None:
-    world = readme_world()
-    extractor = extractor_for(world, Many(Person, identity="name"))
-    result = await extractor.ainvoke(
-        TEXT, existing=[("keep", "__any__", {"name": "Emma Thompson"})]
-    )
-    assert len(result.records) == 4  # the Many inserted, as it has no records
-    assert result.untouched == ("keep",)
-    assert any(
-        "a Many schema cannot claim a record before M8" in w for w in result.warnings
-    )
 
 
 async def test_the_collection_works_in_a_batch_and_through_the_sync_bridge() -> None:
@@ -2013,6 +1970,62 @@ def test_a_name_with_its_own_parts_is_still_one_name(
 ) -> None:
     answer = ClairicAnswer(type="list", value=items)
     assert [m.text for m in parse_mentions(text, answer, None)] == [whole]
+
+
+@pytest.mark.parametrize(
+    ("text", "items", "whole"),
+    [
+        (
+            "Vincent van Gogh painted.",
+            ["Vincent van Gogh", "Vincent", "Gogh"],
+            "Vincent van Gogh",
+        ),
+        (
+            "Ludwig von Beethoven wrote.",
+            ["Ludwig von Beethoven", "Ludwig", "Beethoven"],
+            "Ludwig von Beethoven",
+        ),
+        (
+            "Leonardo da Vinci drew.",
+            ["Leonardo da Vinci", "Leonardo", "Vinci"],
+            "Leonardo da Vinci",
+        ),
+        (
+            "Osama bin Laden spoke.",
+            ["Osama bin Laden", "Osama", "Laden"],
+            "Osama bin Laden",
+        ),
+    ],
+)
+def test_a_lower_case_name_particle_stays_inside_one_name(
+    text: str, items: list[str], whole: str
+) -> None:
+    answer = ClairicAnswer(type="list", value=items)
+    assert [m.text for m in parse_mentions(text, answer, None)] == [whole]
+
+
+@pytest.mark.parametrize(
+    ("text", "items", "kept"),
+    [
+        # only particles are name material: other lower-case words are not
+        ("Emma met Tom.", ["Emma met Tom", "Emma", "Tom"], ["Emma", "Tom"]),
+        # a particle between a separator and a name does not join anything
+        ("Emma, de Tom came.", ["Emma, de Tom", "Emma", "Tom"], ["Emma", "Tom"]),
+        # the parts must be capitalised single tokens
+        ("emma van tom came.", ["emma van tom", "emma", "tom"], ["emma", "tom"]),
+        # two multi-token names with a particle between them are two people
+        (
+            "Emma Thompson van Michael Chen",
+            ["Emma Thompson van Michael Chen", "Emma Thompson", "Michael Chen"],
+            ["Emma Thompson", "Michael Chen"],
+        ),
+    ],
+)
+def test_a_particle_does_not_make_a_bridge_between_separate_mentions(
+    text: str, items: list[str], kept: list[str]
+) -> None:
+    answer = ClairicAnswer(type="list", value=items)
+    assert [m.text for m in parse_mentions(text, answer, None)] == kept
 
 
 async def test_a_discovery_that_lists_a_name_with_its_parts_gives_one_record() -> None:

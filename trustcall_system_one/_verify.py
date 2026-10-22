@@ -337,6 +337,7 @@ class Ctx:
         record: Any = None,
         proposed_change: Any = None,
         windows: Sequence[Span] | None = None,
+        budget: int | None = None,
     ) -> dict[str, Any]:
         """A Clef state about this entity, kept under the Clef budget.
 
@@ -357,6 +358,7 @@ class Ctx:
             entity: Whether to include ``entity`` at all.
             record: An existing record (updates).
             proposed_change: A change under review (updates).
+            budget: A smaller token budget for the state (see ``Run.clef_state``).
         """
         whole = [*(spans or ()), *self.mention_spans()]
         if windows:
@@ -373,6 +375,7 @@ class Ctx:
             record=record,
             proposed_change=proposed_change,
             spans=list(dict.fromkeys(anchors)) or None,
+            budget=budget,
         )
         if entity and state["input"] != self.text:
             state["entity"] = self.entity_dict(spans=False)

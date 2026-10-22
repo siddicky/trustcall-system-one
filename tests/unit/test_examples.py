@@ -10,6 +10,7 @@ it removes the marker. That is the point: the example is the milestone's demo.
 
 import importlib.util
 import sys
+from collections import Counter
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -306,7 +307,6 @@ def test_04_repair(capsys: pytest.CaptureFixture[str]) -> None:
         assert block in out
 
 
-@pytest.mark.xfail(raises=NotImplementedError, strict=True, reason="needs M8")
 def test_05_people_memory(capsys: pytest.CaptureFixture[str]) -> None:
     module = load("05_people_memory")
     result = run("05_people_memory", capsys)
@@ -345,7 +345,34 @@ def test_05_people_memory(capsys: pytest.CaptureFixture[str]) -> None:
     assert [(s.reason, s.entity.first_mention.text) for s in result.skipped] == [
         ("not_qualified", "Sunny")
     ]
-    assert result.untouched == ()
+    assert result.untouched == () and result.deleted == ()
+    # the patches: notes are appended, nothing else is touched
+    assert [[(p.op, p.path) for p in r.patches] for r in result.records] == [
+        [("add", "/notes/-")] * 3,
+        [("add", "/notes/-")] * 2,
+        [("add", "/notes/-")] * 3,
+        [],
+    ]
+    assert [m["json_doc_id"] for m in result.response_metadata] == [
+        "0",
+        "1",
+        "2",
+        None,
+    ]
+    # Sarah: the short form never overwrites the full name, and the case-only
+    # relationship change is refused by the gate
+    sarah_record = result.records[2]
+    assert {(r.path, r.reason) for r in sarah_record.rejected} >= {
+        ("/name", "identity_subset"),
+        ("/relationship", "gate_noul"),
+    }
+    # the match probabilities are reported per entity: the record, or __new__
+    chosen = []
+    for record in result.records:
+        assert record.entity is not None
+        probs = record.entity.match_probs
+        chosen.append(max(probs, key=lambda k: probs[k]))
+    assert chosen == ["0", "1", "2", "__new__"]
     # every mention carries its span in the conversation
     text = module.CONVERSATION
     for record in result.records:
@@ -353,6 +380,18 @@ def test_05_people_memory(capsys: pytest.CaptureFixture[str]) -> None:
         for mention in record.entity.mentions:
             assert mention.span is not None
             assert text[mention.span[0] : mention.span[1]] == mention.text
+
+
+def test_05_calls_follow_the_matching_pipeline(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = run("05_people_memory", capsys, keep_output=True)
+    counts = Counter(call.kind for call in result.calls)
+    assert counts["match"] == 4  # one choice per person that qualifies; not Sunny
+    assert counts["qualify"] == 1 and counts["gate"] == 9
+    # a request as the library sent it: the options are the records as JSON
+    out = capsys.readouterr().out
+    assert "match 4" in out and "29 requests" in out
 
 
 def test_06_attribution_guard(capsys: pytest.CaptureFixture[str]) -> None:
@@ -388,7 +427,7 @@ def test_06_calls_follow_the_collection_pipeline(
 
 
 async def test_05_offline_script_answers_the_real_discovery_shapes() -> None:
-    """05 needs M8 for its update half; its discovery half already runs."""
+    """The discovery half of 05, on its own: the shapes M7 sends."""
     from trustcall_system_one import Many, compile_schema
     from trustcall_system_one._collection import Scope, collect
     from trustcall_system_one._run import Run
