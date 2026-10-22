@@ -62,9 +62,11 @@ from trustcall_system_one.transport import (
     CloudflareTransport,
     RoutingTransport,
     Transport,
+    TypeSafeTransport,
     clef_fallback_from_env,
     clef_fallback_on_from_env,
     clef_provider_from_env,
+    provider_from_env,
     system_one_transport,
 )
 
@@ -120,13 +122,17 @@ class _Core:
         self, transport: Transport | None, concurrency: ConcurrencyConfig | None
     ) -> None:
         if transport is None:
-            # a bad TRUSTCALL_S1_CLEF_PROVIDER or ..._FALLBACK fails here
+            # a bad TRUSTCALL_S1_PROVIDER, ..._CLEF_PROVIDER or ..._FALLBACK fails
+            # here (a contradiction between them, on first use)
+            provider_from_env()
             clef_provider_from_env()
             clef_fallback_from_env()
             clef_fallback_on_from_env()
         self._given = transport
         self._concurrency = concurrency
-        self._owned: CloudflareTransport | RoutingTransport | None = None
+        self._owned: (
+            CloudflareTransport | RoutingTransport | TypeSafeTransport | None
+        ) = None
         self._lock = threading.RLock()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
@@ -142,13 +148,19 @@ class _Core:
             return self._given
         with self._lock:
             if self._owned is None:
-                cloudflare = CloudflareTransport(concurrency=self._concurrency)
-                self._owned = system_one_transport(
-                    clef_provider_from_env(),
-                    clef_fallback=clef_fallback_from_env(),
-                    cloudflare=cloudflare,
-                    concurrency=self._concurrency,
-                )
+                if provider_from_env() == "typesafe":
+                    self._owned = system_one_transport(
+                        provider="typesafe", concurrency=self._concurrency
+                    )
+                else:
+                    cloudflare = CloudflareTransport(concurrency=self._concurrency)
+                    self._owned = system_one_transport(
+                        clef_provider_from_env(),
+                        provider="cloudflare",
+                        clef_fallback=clef_fallback_from_env(),
+                        cloudflare=cloudflare,
+                        concurrency=self._concurrency,
+                    )
             return self._owned
 
     # -- the bridge loop --------------------------------------------------- #

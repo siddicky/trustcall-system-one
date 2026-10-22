@@ -12,6 +12,7 @@ echoes them).
 cd trustcall-system-one                # your checkout of the repository
 export CLOUDFLARE_ACCOUNT_ID=...      # from the environment only
 export CLOUDFLARE_API_TOKEN=...       # (CLOUDFLARE_AUTH_TOKEN also works)
+# TypeSafe-only run instead: see section 4e (TYPESAFE_API_KEY and TRUSTCALL_S1_PROVIDER=typesafe)
 git rev-parse --short HEAD            # the commit under test: put it in the report
 git status --short                    # must be clean; if not, say what is not
 uv sync --all-extras --group dev
@@ -292,6 +293,66 @@ How to read it:
 - `images` cannot be sent to the Decisions API: such a request fails with the primary's error.
 - Never re-run only the failed cases quietly: each request that reached either provider may have
   been charged.
+
+## 4d. The Decisions API as the primary for Clef
+
+```bash
+export EXPERIENTIAL_API_KEY=...                  # from the environment only
+export TRUSTCALL_S1_CLEF_PROVIDER=decisions      # required: a key alone enables nothing
+uv run python -m evals run --live --clef-provider decisions --config default \
+    --out evals/results/decisions-primary
+```
+
+The Decisions API (`gpt-6-luna-decisions`, served by OpenAI through Experiential Labs) answers
+every Clef request; Clairic stays on Cloudflare. It takes 32 questions per request and its bare
+picks are capped at 0.8 (`decisions_hard_cap`), so compare it with the default run before
+trusting it. It is a different model from Clef: a case that only passes with it is a finding.
+`summary.md` prints "Extraction: cloudflare clairic; decisions: experiential decisions
+(gpt-6-luna-decisions, hard cap 0.8)", and `results.json` has the same as `extraction` and
+`decisions`.
+
+## 4e. TypeSafe-only: Jev for Clairic and Clef
+
+```bash
+export TYPESAFE_API_KEY=...                      # from the environment only; do not echo it
+test -n "$TYPESAFE_API_KEY" && echo set          # enough to check it
+export TRUSTCALL_S1_PROVIDER=typesafe            # required: the key alone never switches
+# no Cloudflare variable is needed
+
+# live smoke: the four scenarios of section 1 on Jev
+TRUSTCALL_S1_LIVE=1 TRUSTCALL_S1_PROVIDER=typesafe uv run pytest -m live -s tests/live
+# the evals on Jev (start with --concurrency 2; raise it while there is no 429)
+uv run python -m evals run --live --provider typesafe --config default --concurrency 2 \
+    --out evals/results/typesafe-default
+# the examples
+uv run python examples/01_invoice.py
+```
+
+In the report, for each case or for the totals: the requests (a Clairic call is a stitch request, a
+selection request and a verification request, so expect about twice the requests of the Cloudflare
+run), the input tokens (the state is repeated in each; Jev's input is $0.042 per Mtok and its output is
+free), the wall seconds, and which warnings fired. Per call the log has `provider` `typesafe` and
+`model` `jev-<version>` (the model that answered; `jev-latest` moves). Read these first:
+
+- `escalated` in a field's `raw` answers (the verification doubted a selection) and `needs_review` on a
+  date. Report how many selections were doubted and whether the ladder rejected them rightly.
+- A case whose expected value is not among the candidates can never pass (Jev only selects): report the
+  value and the sentence, that is a finding for the candidate generators, not for Jev.
+- Calibration: the library's thresholds were tuned on Cloudflare. Report the attribution
+  probabilities (`probabilities` in `results.json`) next to the Cloudflare run before changing any.
+- An `UncertainOutcomeError` (a timeout, a 408 or any 5xx including 529 Overloaded, never resent: the
+  call may have been charged; a Clairic call that fails after an earlier request answered keeps those
+  tokens in the call log and counts as uncertain), a `RateLimitError` after the retries (only 429 is
+  retried, with backoff), and a 422 (the message names the field; the body and the user's text are not
+  echoed).
+- `needs_review` on a date whose year or week was inferred (confidence capped at 0.8: those are re-asked),
+  and `escalated: hook_error` / `hook_invalid` if you passed an escalation hook.
+- Before committing anything run `grep -rnE "apikey_[0-9a-f]{20,}" . --exclude-dir=.git
+  --exclude-dir=.venv`: it must find nothing.
+
+To tabulate the three combinations (Cloudflare, Cloudflare Clairic + Decisions Clef, Jev for both) run
+sections 3, 4d and 4e into separate `--out` directories and compare `aggregate` (`passed`, `requests`,
+`input_tokens`, `wall_s`) and the `extraction` / `decisions` labels of each `results.json`.
 
 ## 5. What to hand back
 

@@ -40,8 +40,9 @@ Planned modules, from the "Package layout" table in `docs/DESIGN.md`:
 - `trustcall_system_one/_types.py`: result types, `SchemaInstance`, `Mention` and `Entity`.
 - `trustcall_system_one/_config.py`: all config dataclasses.
 - `trustcall_system_one/_cardinality.py`: `Many` and `One` wrappers, `Annotated` markers, default resolution.
-- `trustcall_system_one/transport.py` (public): `Transport` protocol, `CloudflareTransport`, `ExperientialTransport` (Clef on Experiential Labs, never retries an uncertain outcome), `DecisionsTransport`, `FallbackTransport`, `RoutingTransport`, `system_one_transport`, adaptive per-model limiter.
+- `trustcall_system_one/transport.py` (public): `Transport` protocol, `CloudflareTransport`, `ExperientialTransport` (Clef on Experiential Labs, never retries an uncertain outcome), `DecisionsTransport`, `TypeSafeTransport` (Jev for both models), `FallbackTransport`, `RoutingTransport`, `system_one_transport`, adaptive per-model limiter.
 - `trustcall_system_one/_decisions.py`: translation between Clef bodies and the Decisions API (the fallback for Clef).
+- `trustcall_system_one/_typesafe.py`: Clef to Jev translation and the Clairic stand-in (selection, verification, escalation); `_candidates.py` (pattern candidates), `_structure.py` (lines, stitching, blocks), `_dateparts.py` (date, time and duration parts).
 - `trustcall_system_one/_wire.py`: exact Clairic and Clef request and response pydantic models.
 - `trustcall_system_one/_schemas.py`: coerces BaseModel, TypedDict, JSON Schema or callable into a BaseModel.
 - `trustcall_system_one/_names.py`: path to wire-name map, with deterministic blake2s shortening.

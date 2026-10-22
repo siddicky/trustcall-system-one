@@ -1,0 +1,35 @@
+{
+    "model": "jev-1.14.0",
+    "answers": {
+        "phone::pick": {
+            "type": "choice",
+            "choice": "(415) 555-0177",
+            "confidence": 0.6,
+            "probabilities": {
+                "Dana Whit <dana.whit@acme-corp.com>": 0.0,
+                "Call": 0.0,
+                "(415) 555-0177": 0.65,
+                "+1 415 555 0142": 0.04,
+                "S001": 0.02,
+                "$1,315.50": 0.0,
+                "Total due: $1,315.50 incl 15% tax, due next Thursday at 2:30 pm.": 0.0,
+                "none": 0.28
+            }
+        },
+        "email::pick": {
+            "type": "choice",
+            "choice": "none",
+            "confidence": 1.0,
+            "probabilities": {
+                "Dana Whit <dana.whit@acme-corp.com>": 0.0,
+                "(415) 555-0177": 0.0,
+                "+1 415 555 0142": 0.0,
+                "none": 1.0
+            }
+        }
+    },
+    "usage": {
+        "input_tokens": 820,
+        "output_tokens": 252
+    }
+}

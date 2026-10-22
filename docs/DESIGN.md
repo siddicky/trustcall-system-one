@@ -139,7 +139,8 @@ own), `field` = one per field.
 | `__init__.py` | public exports only |
 | `_errors.py`, `_types.py`, `_config.py` | exceptions; result types, `SchemaInstance`, `Mention`/`Entity`; all config dataclasses |
 | `_cardinality.py` | `Many`/`One` wrappers + `Annotated` markers; default resolution |
-| `transport.py` (public) | `Transport` protocol, `CloudflareTransport`, `ExperientialTransport`, `RoutingTransport`, `system_one_transport`, adaptive per-model limiter |
+| `transport.py` (public) | `Transport` protocol, `CloudflareTransport`, `ExperientialTransport`, `DecisionsTransport`, `TypeSafeTransport`, `FallbackTransport`, `RoutingTransport`, `system_one_transport`, adaptive per-model limiter |
+| `_typesafe.py`, `_candidates.py`, `_structure.py`, `_dateparts.py` | Jev as a stand-in for Clef (translation) and Clairic (selection): orchestration and verification; pattern candidates; lines, stitching, blocks and sentences; date, time and duration parts |
 | `_decisions.py` | Clef body <-> Decisions API request/response translation (the Clef fallback) |
 | `_wire.py` | exact Clairic/Clef request+response pydantic models |
 | `_schemas.py` | coerce BaseModel / TypedDict / JSON Schema / callable → BaseModel |
@@ -1290,7 +1291,7 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
   experiential=, concurrency=)` builds the usual setup: `"cloudflare"` is a plain
   `CloudflareTransport`, `"experiential"` is `RoutingTransport({"clef": ExperientialTransport()},
   default=CloudflareTransport())`. `None` reads the environment through `clef_provider_from_env()`:
-  `TRUSTCALL_S1_CLEF_PROVIDER=cloudflare|experiential`, else `cloudflare` (an unknown value is a
+  `TRUSTCALL_S1_CLEF_PROVIDER=cloudflare|experiential|decisions`, else `cloudflare` (an unknown value is a
   `ValueError`, raised when the extractor is created). **Opt-in only:** an `EXPERIENTIAL_API_KEY`
   in the environment does not move Clef, because that would send a user's text to another company
   because of a variable they set for something else; choose it with the provider variable, with
@@ -1502,6 +1503,427 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
   the match.
 - Experimental, off: Workers AI queue mode (`queueRequest` + `request_id`) behind a live
   probe — the Clairic schema has no batch properties, so it may be unsupported.
+
+## TypeSafe-only provider (`TypeSafeTransport`, `_typesafe.py`)
+
+TypeSafe's **Jev** (`POST https://api.typesafe.ai/v1/systemone`, `Authorization: Bearer <key>`)
+can replace BOTH Cloudflare models: Clef (decisions) and Clairic (extraction). It is an explicit
+opt-in like every other provider (a `TYPESAFE_API_KEY` alone changes nothing): `TRUSTCALL_S1_PROVIDER=typesafe`
+or `system_one_transport(provider="typesafe")`. No Cloudflare credential is needed, and nothing is
+sent to any other company (a Clef provider other than Cloudflare's, or a Clef fallback, together
+with the TypeSafe provider is a `ValueError`).
+
+### What the live probes showed (scrubbed bodies in `docs/schemas/typesafe-*.example.json`)
+
+* `GET /v1/models`: 200 `{models: [{name, description, release_date}]}` with `jev-latest` and
+  `jev-preview` (the `release_date` is a full ISO timestamp, the docs say `YYYY-MM-DD`).
+* One request with a `noul`, a `choice` and a `score` (`typesafe-systemone-response.example.json`):
+  200, `{model, answers, usage: {input_tokens, output_tokens}}`. `model` answered `jev-1.14.0` for
+  `jev-latest` (the models page says `jev-1.13.0`: the alias moves, log the answered model). Shapes
+  are Clef's exactly: `{type: "noul", noul}`, `{type: "choice", choice, confidence, probabilities}`,
+  `{type: "score", score, confidence, legend: {"0": ..}, probabilities: {"0": ..}}`. A score level is
+  its position in `criteria`, `score` is the probability-weighted level. Response headers: only
+  `x-typesafe-request-id` is TypeSafe's (no rate-limit headers, no `Retry-After` seen); about 0.2 to
+  0.4 s per request.
+* **The shipped selection scheme, probed last** (`typesafe-span-ids-request.example.json` and
+  `typesafe-span-ids-response.example.json`, one request, 820 input and 252 output tokens, about
+  0.4 s): a choice whose option ids are the spans themselves, `"(415) 555-0177"`,
+  `"+1 415 555 0142"`, `"Dana Whit <dana.whit@acme-corp.com>"` (spaces, brackets, a plus sign and
+  punctuation), one sentence id with a description (`"S001"`), an amount with a reading, and `none` last.
+  For "the Person's mobile phone number to call first" Jev answered with the span, verbatim:
+  `(415) 555-0177` **0.65**, `none` **0.28**, the other phone number 0.04, `S001` 0.02, every other
+  option 0.00, `confidence` 0.60. For a field the input does not state (the fax number, in the same
+  request) `none` was **1.0**, `confidence` 1.0. So a span with spaces and punctuation works as an option
+  id, an answer comes back as the id itself (no escaping, no `candidate_N` indirection), and a missing
+  value is found by selecting `none`. The word "Call" was among the options and got 0.00 (it is an
+  instruction, not a name; the generators now drop such words). An earlier probe of a draft scheme
+  (`candidate_N` ids and a `__none__` escape; yes/no questions per candidate answered 0.95 and 0.04)
+  led to this one; its bodies are not kept because that scheme is not shipped.
+* A malformed question is `422 {"detail": [{type, loc, msg, input, ctx}]}`
+  (`typesafe-error-422.example.json`); `input` echoes the offending value, which may be the user's
+  text, so the library's error message shows `loc` and `msg` only.
+* Not probed: a question-count limit. The docs say there is none ("any number of questions is allowed as
+  long as the request fits both limits": 64k tokens per request and 32k per question; 262k with
+  `TypeSafe-Danger-Zone-Long-Context: true`). `TypeSafeTransport.max_questions` is 64, the bound of the
+  Clef request schema the library builds (it chunks the Clef requests the engine makes); the transport
+  itself splits by tokens alone (see below), since TypeSafe states no count.
+* The OpenAPI document is saved as `docs/schemas/typesafe-openapi.json`; the tests validate every
+  request and response of the scripted Jev against it.
+
+### Clef: almost the identity
+
+Jev's `noul`, `choice` and `score` are Clef's, so `to_jev_clef` keeps the state, the question ids
+and their order and the questions as they are, and changes only `model` (`jev-latest`; `model=` or
+`TYPESAFE_DEFAULT_MODEL` pins one, which matters because the thresholds depend on calibration).
+`images` are refused (Jev reads text), and so a Clef request with images is not Jev's to answer
+(`serves()` says so; see the Decisions routing below). The response is validated against the Clef
+response schema (`parse_clef`) and against the questions: an unanswered question, an answer of another
+type, an option or a level that was not offered is a `ModelResponseError` (the message names the
+question, never the option: it can be the user's text).
+
+*Jev's context is 64k tokens for the state and all the questions of a request and 32k for the state and
+one question* (262k with `long_context=True`). Clef cut a long state silently; Jev answers `400
+max_tokens_exceeded`. So the transport meets the limits itself, with conservative token estimates
+(one token per three characters, so the limits are 60,000 and 30,000):
+
+* it **advertises the state it takes**: `TypeSafeTransport.state_token_budget` (24,000; a
+  `long_context` transport takes more; `None` for every other transport, which says nothing).
+  `transport.state_token_budget(transport, model)` reads it (an int attribute or a method, like
+  `max_questions`); `RoutingTransport` answers for the transport that serves the model,
+  `FallbackTransport` with the smaller of its two, and `RecordingTransport` and `CassetteTransport` forward
+  it like `max_questions` (a cassette is replayed with the budget it was recorded with, so the
+  request keys still match). The engine narrows every Clef state it builds to
+  `min(Limits.clef_state_token_budget, transport budget)` in one place (`Run.clef_state`), so a state is
+  not narrowed for Cloudflare's larger window and then refused by Jev;
+* **`to_jev_clef` splits and narrows as the last line of defence**: questions go into as few requests
+  as hold them (each with the whole state; the answers are merged in the request's order, the usage
+  summed), and a state still too large for even one question is narrowed, in as many rounds as it takes
+  (the longest string first, never below 200 characters), so no request exceeds 32k per question or 64k
+  per request. The narrowing keeps windows around the passages the questions quote (a quoted value
+  in a question is found in the state and kept with its surroundings, a `…` marking what was left
+  out) and cuts text nobody quotes from its end. A request that cannot be made to fit is refused
+  locally with a `BadRequestError` and nothing is sent (the engine treats a local refusal as a rejected
+  request and goes on): a question that alone is as large as the context (30k estimated tokens), or a
+  state that has nothing left to cut. A request that fits is one request with the questions as they are.
+  If some parts of a split request answered and another failed, the error carries what the answered
+  parts cost (`partial_usage`) and `maybe_sent`, so it is `uncertain` and a `FallbackTransport` does
+  not re-ask the questions that were already charged.
+
+### Clairic: selection, following TypeSafe's extraction cookbooks
+
+Jev answers closed questions and generates nothing ("select instead of generate"). So Clairic's
+`fields` are served by code that finds candidates and Jev that picks, in four ways. All questions over
+the same state go out in **one request** (the fan-out pattern), split **by a token budget only**
+(`TypeSafeConfig.request_token_budget`, 40k estimated tokens): TypeSafe states no limit on the number of
+questions, so the internal stitch, selection and verification requests carry as many as fit (hundreds of
+list candidates, a stitch question per line) and are not capped at the 64 of a Clef request.
+
+| Clairic field | cookbook | what happens |
+| --- | --- | --- |
+| `text`, `number`, `estimate` | Pre-parsed value extraction | code finds candidate spans (`_candidates.py`); one `choice` per field whose options are the spans themselves (`criteria = {span: None} + {"none": "None of these is the requested value."}`) |
+| free `text`, notes (`list` of text) | Structure recovery | lines with ids, one request stitches hard-wrapped lines, options are block, sentence and clause ids of tagged blocks in the state (`_structure.py`) |
+| `date`, `time`, `datetime`, `duration` | Date extraction | Jev picks the PARTS the text names; code resolves them against `reference_date` (`_dateparts.py`) |
+| `list` | both | one `noul` per candidate: "is the `candidate` one of the items described by `field`?"; elements at or above 0.5 |
+| every selected scalar | SDE cascade | verified by two `noul`s; a doubted field escalates |
+
+**Pre-parsed value extraction** (cookbook: `find` + `pick`, "a regex finds the candidate values,
+TypeSafe picks the one the question asks for, and code copies it verbatim"). Candidates, by field
+type, always deduplicated by text (a repeated text is one option with up to three places) and in
+document order (Jev leans toward the first option, `none` is last):
+
+* `text`: email, URL, telephone (7 to 15 digits, not a date; no pattern runs across a line break, so
+  a telephone number, a date or a time never joins two lines), `Label: value` values, quoted strings,
+  identifiers with a letter (`INV-2291`), capitalised name sequences (with the parts of a name:
+  "Emma Thompson", "Emma", "Thompson"; `of` and particles inside a name; sentence starters, the
+  verbs that open an instruction ("Call", "Please", "Contact", "Send", ...) and weekday and month names
+  dropped), amounts and numbers written as they are, and dates and times
+  written as they are (not resolved);
+* `number`/`estimate` (`integer`, `decimals` and, for an estimate, `min`/`max` constrain the values):
+  numeric literals (grouping, `.5`, European `1.315,50`, signs), currency (`$`, `€`, `£`, `¥`, `₹`
+  or a code, the reading shows `1315.5 USD`), percentages (`15%`, value 15), `5k`, `2.5 million`, number
+  words (`twenty-one`, `two hundred and five`, `a dozen`, `half a dozen`); digits inside emails, URLs,
+  telephone numbers, dates, times and identifiers are not quantities. **Sums**: only for a field
+  whose instructions ask for a total ("total", "amount due", "including", ...), the sum of the
+  products (`4 x 250`, `4 pallets at $250.00`) and amounts of one sentence or chained by `+`,
+  offered as one option whose span runs from the first term to the last and whose description reads
+  `1080 (the sum of 1000 + 80)`. That is the only arithmetic, and it is the one the Clairic
+  examples in this repo need (the invoice total); the library does no other arithmetic, and a value
+  that needs one (a difference, a percentage of a figure) is not offered. The cookbook's other
+  advice, that Jev is bad at arithmetic, is why the sum is computed in code and offered.
+* A span longer than 100 characters is not an option id by itself (a sentence is offered by its id).
+* More than 254 candidates (a choice takes 255 options, one is `none`): chunks of 254 are asked in the same
+  request (`<field>::pick0`, `<field>::pick1`, ...), the best candidate of each chunk goes to a final
+  choice (`<field>::final`, a second request), which is the cookbook's "two stages: pick the section
+  first, then the span inside it". Beyond 254 x 254 candidates the lowest-probability chunk winners are dropped.
+
+The answer maps back as `value` (the span's text, or the number), `span` (the candidate's exact
+offsets in the state that was sent: `state_text[s:e] == text` for a pattern candidate), `p_null` =
+P(`none`), `confidence` = Jev's and `guess` = the best non-`none` candidate. **When Jev's choice is
+`none` the value is null, whatever the other probabilities are** (`none` 0.45 over a phone number at
+0.40 is "not stated", and `p_null` is 0.45, so the ladder sees a doubt, not a decision), and the
+best candidate is only the `guess` (so a null `value` whose `p_null` is *below* the
+field's threshold means Jev chose `none` narrowly; `p_null` stays P(`none`) and is not raised to hide it).
+When a candidate was chosen, `value` is null if `p_null` is above
+the field's `null_threshold` (default 0.5), as Clairic's. No candidate at all is a confident null without
+a request. The option ids are the spans (probe 6 above); the ids of structure (`B003`, `S007`) and the
+description of an amount or a sum are the only non-span options.
+
+**Structure recovery** (cookbook: two passes, "the model never generates text: it answers narrow
+questions about the document, and code does the rendering"). Free text is read as blocks, not
+as the lines it happened to be wrapped at:
+
+1. *Lines* (code): non-blank lines with ids `L000`, exact offsets and a flag for a blank line before.
+2. *Stitch* (one request, thresholds from the cookbook): one `noul` per adjacent pair without a blank
+   line between, "Does line L015 pick up mid-sentence, continuing a sentence left unfinished at the end of
+   line L014?", with the cookbook's criteria. The cookbook found that asking "same paragraph" merges
+   every unmarked list (17 blocks against 12), so the question names the narrowest fact. A join
+   probability of **0.2 or more merges after a dangling line** (no `.` `!` `?` `:` `;` at its end) and
+   **0.5 or more after terminal punctuation** (the cookbook: true continuations score as low as 0.39,
+   a list after a colon scores 0.22, so no single cutoff works). Both are `TypeSafeConfig` defaults to
+   evaluate (they were tuned on one memo). The answers are remembered by the hash of the input, so the
+   engine's many calls over one input stitch once, **also when they are concurrent** (the first call over an
+   input asks and the others await the same future: single flight; a failure clears the entry so the next
+   call asks again, and the calls that were waiting on it fail with it instead of sending the request
+   again); a single-line input needs no request.
+3. *Blocks and sentences* (code): merged lines are blocks `B003`; a block is split into sentences
+   `S007` by the library's own splitter (`split_sentences`, pure code, now applied to a stitched
+   block, where a hard wrap no longer splits a sentence), and a sentence into clauses `S007.1` and noun
+   phrases `S007.p1` (determiner phrases, and phrases after a linking word: "as finance lead").
+   Every id maps to an exact span of the original input (through the lines, so a sentence across a hard
+   wrap still has the original start and end).
+4. The state is `{focus, input}` with `input` the tagged blocks, one copy of the text:
+   `B003| [S007] The old make targets keep working. [S008] The new entrypoint ...`. The options of
+   a text field are the pattern candidates (their text is their id) and the block, sentence and
+   clause ids with **short descriptions** (60 characters), never the long text again; a
+   yes/no about a sentence names it by id (`{"id": "S007"}`), a clause or a name by its words and a snippet.
+   A value that is a block or a sentence is the joined text (`value` has no line breaks, the span
+   is the original text with them).
+
+The cookbook's type-confidence review flag (underline a block whose type confidence is under 0.55)
+has no counterpart: the library's own thresholds (`min_confidence`, the low-confidence re-ask)
+play that part. This stitching replaces the line-based reading of the input in the TypeSafe path.
+The library's own `sentences` list strategy (a Clef `noul` per sentence of its splitter) is not
+triggered, because Jev's list answers are confident (>= 0.5 by construction) and so the
+`auto` fallback does not fire; the sentence boundaries inside a block still come from the
+splitter, since the cookbook recovers blocks only, not sentence ends.
+
+**Date extraction** (cookbook: "TypeSafe answers `Choice` questions about the date in one call,
+code turns those answers into a `date`. The model reads what the text says and never does the
+calendar math"). For each date field, seven choices go in the same request: `mode` (`absolute`,
+`relative`, `none`), `month`, `day`, `year` (1900 to 2050 plus `none` and `out_of_range`),
+`day_anchor`, `weekday`, `week_offset`, in the cookbook's wording. Code reads only the parts `mode`
+calls for: a year-less date takes the reference year, or the next one when it is more than 31 days
+past; "next Thursday" is the following calendar week, "this Thursday" this week, **"last Thursday" the
+previous one (`week_offset` has `previous`), "yesterday" the day before (`day_anchor` has
+`yesterday`)**, a bare weekday the next on or after the reference date; February 30 or a missing month is
+"no date" (flagged, never guessed). A year or a week that the text did **not** state is inferred by
+that code, and the answer says so: `needs_review` is true, `note` says "inferred year, not stated" (or
+week) and the confidence is capped at 0.8 (`INFERRED_CONFIDENCE`), which is under the library's
+low-confidence bar (0.85), so the ladder re-asks and cross-checks it instead of accepting it. A
+count of days ago ("3 days ago") is not a part, so such a date is not resolved (flagged). **The confidence of the answer is the weakest confidence among the parts used**, `p_null`
+is P(`mode` = `none`) when a date was resolved (for a `datetime` the larger of the date's and the
+time's, since it is not stated if either part is not) and `max(P(none), 1 - confidence)` when it was not,
+and the cookbook's review flag (no date, or confidence under **0.60**) is returned as `needs_review`
+(and `note`) next to the answer. The same scheme reads `time` (`mode`, `hour` on the 24-hour clock,
+`minute`), `datetime` (date parts and time parts; a date without a time is no datetime) and
+`duration` (`mode` and a count per unit from years to seconds; the counts are every whole number from 1
+to 120 and then 150, 180, 240, 300, 360, 480 and 600, `0.5` and `out_of_range`, so 61 to 89 are
+there (an uncommon count above 120 is `out_of_range`: flagged, not guessed); the answer is the sum in the
+field's `unit`, `integer` and `decimals` honoured). The reference date is the request's
+`reference_date`, else the current UTC date. Dates carry no span, as Clairic's.
+A `list` of dates finds the mentions by pattern, asks a yes/no for each, and asks the date
+parts of every accepted mention in a second request.
+
+**SDE cascade** (cookbook: extract with a cheap model, verify with narrow Jev `noul`s, escalate to a
+reasoning model if a signal fires). The stages map onto the library's ladder like this:
+
+* Stage 1, the cheap extractor, is the selection above.
+* Stage 2, the verifier: for each selected scalar, two `noul`s in the cookbook's shape
+  (`instructions = {field_spec, extracted_field, main_question}`, `criteria = {true, false}`, "bad =
+  true"): `hallucinated` ("is the extracted_field unsupported by, or absent from, the source
+  text?") and `off_target` ("does the source text fail to genuinely report the thing the field_spec
+  describes, so the value was pulled from incidental text?"), two of the cookbook's seven heads, the
+  two it gates on,
+  in one request over `{source_text, extraction}`. P(wrong) is the max of the two (the cookbook's
+  `any_flag` gate: one confident red flag is enough) and is returned as `p_wrong`. This is the
+  adapter's own cheap check; the library's attribution (Clef `noul` per value), null check, cross-check
+  and re-ask still run on top of it as for any provider, and nothing here replaces them. The cookbook's
+  `absence_wrong` head for an empty field is the library's `stated`/null check, so it is not duplicated.
+  The other heads are not asked: each is one more `noul` per field on every selection, and the
+  library's own checks cover what they would. They could be added to the same request as further
+  `noul`s under the same `any_flag` rule if the evals show they pay.
+* Stage 3, escalation: P(wrong) above **0.7** (`TypeSafeConfig.fire_threshold`, the cookbook's
+  `FIRE_T`) escalates the field. There is no reasoning model in TypeSafe-only mode, so by default
+  the answer comes back as the library's ladder understands doubt: `p_null = max(p_null, P(wrong))`,
+  `confidence = min(confidence, 1 - P(wrong))`, `value` null if `p_null` passes the null threshold, the
+  selection kept as `guess`, and `escalated: "unavailable"`: the ladder then rejects it, or re-asks it
+  in an isolated request on mention windows (low-confidence re-ask) and cross-checks. A user-supplied
+  hook is optional: `TypeSafeTransport(escalate=callable)` gets an `EscalationRequest` (field, spec, input,
+  focus, selected value, `p_wrong`, signals), may be sync or async, and returns `{"value": ..., "span":
+  [start, end] (offsets in the input), "confidence", "p_null"}` or `None` (decline: the default above
+  applies). Its answer is marked `escalated: "hook"` and is **validated**: a value of the wrong type for the field,
+  a span that is not two integers inside the input (`0 <= start <= end <= len(input)`) or a
+  confidence or `p_null` outside 0..1 is not used (`escalated: "hook_invalid"`), and a hook that raises
+  is tagged `escalated: "hook_error"` and does not fail the call (the doubted field is returned as a
+  null for the ladder, as when there is no hook). The hook is the place to call a reasoning
+  model; it is called once per doubted field and its cost is the caller's. `verify_selection=False`
+  turns stage 2 off.
+
+### Known limits of selection
+
+* **Jev can only select a value that is among the candidates.** A value that is not a span code
+  finds is never returned: a bare noun ("engineer") that no phrase rule produces, a value that needs
+  rewriting (a phone number to E.164, "Dana" expanded to a full name, a total that is not a sum of what
+  the sentence states), a part of a word. The recall of the generators is the ceiling of the
+  extraction, and they are English-oriented (number words, months, weekdays, stop words). Dates are
+  the exception: Jev reads their parts, so a date written in another way or language can still be
+  read.
+* **Dates**: the parts are read in English and resolved in code, with limits worth knowing. A two-digit
+  year is not resolved (the year choices are 1900 to 2050; "14/8/26" asks Jev to name a year and
+  it may name one wrongly, the confidence is then the weakest part's). Day-first against month-first
+  (`3/4/2026`) is Jev's reading of the text: nothing in code decides it, so a numeric date with both
+  numbers up to 12 is the least reliable. Time zones are not read: a time is the clock time written,
+  with no offset. The year-less date is biased to the future (the reference year, or the next if the
+  date is more than 31 days past); that and a bare weekday are flagged as inferred
+  (`needs_review`, confidence at most 0.8), but "August 14" in a document about last year still resolves
+  to the coming one. "Last Thursday" and "yesterday" are read; "3 days ago" is not.
+* Two entities whose names are the same text share candidates (dedup by text; the span is the first
+  occurrence), and the focus can quote the entity's mentions but cannot tell which occurrence it means.
+* `count` fields ("how many Persons does the input mention?") find a numeral only if one is written:
+  a count nobody states is a null (the count reconciliation of `Many` is then simply off). Lists of
+  more than `max_list_candidates` (400) candidates drop the structural candidates first.
+* Cost: every Clairic call is the stitch request (once per input), the selection request(s) and the
+  verification request, each carrying the state again, plus the options; Clef calls are one request
+  each. Output tokens are free and input is $0.042 per Mtok, so tokens are cheap and round trips (about
+  0.2 to 0.4 s each) are the latency. `usage.passes` of a Clairic response is its number of Jev requests
+  and `jev.stages` the count by stage (`stitch`, `select`, `refine`, `verify`).
+* Calibration: the library's thresholds (attribution 0.75/0.4, the gates, `min_confidence` 0.5, presence,
+  qualify, match) were tuned on Cloudflare's Clairic and Clef. Jev calibrates differently; a choice's
+  `confidence` over 255 options is not Clairic's, and the cookbooks' numbers (0.2/0.5, 0.60, 0.7) were
+  tuned on TypeSafe's own documents. Nothing is retuned: treat them as defaults to evaluate
+  (`TypeSafeConfig`, and the sweeps in the runbook).
+* Not served: `images` (BadRequestError), `forecast` fields (BadRequestError; `serves()` is false), an
+  input of more than `max_input_chars` (60,000) is cut at a word, the response says `truncated: true`
+  and `state_text` is the prefix that was read, so the library re-asks on windows as it does for
+  Clairic; `long_context=True` raises the limits.
+* **Accounting.** A call is accounted under the model that answered
+  (`TransportResponse.served_model`, as for a fallback), here `jev-1.14.0`, so `Usage.by_model` shows
+  Jev and its tokens are not priced as Clairic's. An error is logged under the served model when the
+  failing request got one (an earlier request of the call did) and else under the alias (`jev-latest`):
+  that is the model that was asked. A Clairic call that sent no Jev request (no candidate in the input)
+  is recorded under the TypeSafe model (`jev-latest`) with 0 tokens and 0 passes. `Prices` has no
+  default for Jev ($0.042 per Mtok input, output free): give `Prices({"jev-latest": 0.042})`, which
+  prices every `jev-*` version that has no price of its own (the alias is the fallback for any
+  `jev-1.x.y`), or a price per version; until then `cost.complete` is false. TypeSafe reports no cost
+  field.
+* **A call of several requests that fails part-way still cost something.** The error carries the tokens
+  of the requests that had answered (`partial_usage`, a `ClairicUsage`) and the engine records them in
+  the call log and the totals; requests that were cancelled while in flight may have been sent and are
+  counted (`cancelled_siblings`, named in the message); and once any request went out the failure is
+  classified `uncertain` whatever its last error was (a rate limit on the third request is not "nothing
+  ran"). Each request is counted the moment it answers, not when its siblings are all done, so when one of
+  26 parallel requests fails the 25 that answered are on the error. The module-level `classify_failure`
+  honours `maybe_sent` / `partial_usage` on any error, so `RecordingTransport` or `RoutingTransport` around
+  the TypeSafe transport do not hide it from a `FallbackTransport`, and the engine keeps a failed
+  primary's `partial_usage` in the call log. `call_deadline` (300 s) bounds the whole Clairic call, not
+  each request: a call that runs out of time is an `UncertainOutcomeError` (something may have gone out),
+  with the tokens of the requests that had answered. Calls that share one stitch request each get their
+  own copy of its failure, without the leader's charge or cancelled-sibling note.
+
+### Transport, errors and retries
+
+`TypeSafeTransport` is an `ExperientialTransport` with TypeSafe's endpoint, key (`TYPESAFE_API_KEY`;
+`TYPESAFE_BASE_URL` and `TYPESAFE_DEFAULT_MODEL` are the SDK's variables and are read too) and
+errors: one HTTP client per loop, the adaptive limiter (one limit for both models, key `typesafe`), a
+300 s call deadline. **A request that may have reached the server is never resent**: a timeout, a read
+or write error, a dropped connection, a 408 or **any 5xx, 529 Overloaded included**, raises
+`UncertainOutcomeError` (classified `uncertain` for `FallbackTransport`). A 529 means the server
+was overloaded, not that the request was not processed: it may have run the model and may have charged, so
+it is exactly as uncertain as a 503, never resent, and `max_retries` does not apply to it; it does
+tell the adaptive limiter to slow down, as a 429 does. **Retried**: a
+connect error (nothing was sent) with jittered backoff, and **`429 Too Many Requests` only**, which the
+API documents as "retry after a short delay" and which means the request was refused before any
+work: it honours `Retry-After` and `retry-after-ms`, otherwise backs off exponentially up to
+`max_retries` (6), within the deadline; a wait longer than `max_retry_after` (60 s) fails at once; it
+halves the limiter. Unlike the Experiential transport a 429 **without** `Retry-After` is retried too,
+since TypeSafe says to back off and retry (`_retry_needs_hint = False`). After the retries a 429 is a
+`RateLimitError` (`unavailable`: nothing ran).
+401 and 403 are `AuthError`, 400, 413, 415, 422 and other 4xx `BadRequestError` (a 422 shows each
+`detail` as `loc: msg`; **no user text is in an error message or in the body kept on the error**: `input` and
+`ctx` are dropped, a `loc` is cut after `criteria` (the next key is an option id, which can be the
+user's text), and `cf_errors` is the same cleaned list), a 2xx that is not a valid answer to its questions a
+`ModelResponseError`. A Clairic call is several requests; the error is the failing request's, the
+others are cancelled, and what the requests that had answered cost is on the error (see Accounting
+above). The messages of `from_jev`, of an invalid request and of a response that does not parse
+(`parse_clef`, `parse_clairic`: pydantic's text with its `input_value` is replaced by `loc: message`, the
+location cut after `criteria` and `probabilities`, whose next keys are options) name the question and the
+field, never an option or a value. `x-typesafe-request-id` is the request id.
+
+### Selection
+
+`system_one_transport(clef=None, *, provider=None, typesafe=None, ...)`: `provider="typesafe"` returns a
+`TypeSafeTransport`; `provider_from_env()` reads `TRUSTCALL_S1_PROVIDER` (`cloudflare` default,
+`typesafe`; anything else is a `ValueError` when the extractor is created); the extractor's default
+transport, `examples/_common.py`, `tests/live/conftest.py` and the evals (`--provider typesafe`) use it. A
+key in the environment alone never selects it. Cassettes are keyed by the engine's Clairic or Clef
+request, so a recording made on TypeSafe replays under any provider and the other way round (the
+Clairic answers are the adapter's).
+
+**Repair and existing records.** A repair request (the library's `<previous_attempt>` and
+`<validation_errors>` blocks after the input; the errors are the engine's `{field, message, type, input}`
+objects) is served as one: the errors, shortened (`field: message`, at most three; the `input` an error may
+show is never read, it can be the user's text), go into the pick instructions ("An earlier answer was
+rejected (email: not allowed on this domain): it is not an option."), and the rejected answer is removed
+from the options when an error names **this field** (a nested path such as `contacts.0.email` names
+`email`), since offering it again would repeat the answer that failed. A **record-level** error (the
+field is `(record)`: a model validator such as "discount must be below price") does not say which field
+was wrong, so every candidate stays, including the previous answer, and the instructions only say that a
+check on the whole record failed and the earlier answer may still be right. If nothing else is left (the only candidate was the rejected
+one) the field is a null with no request, rather than an identical paid call. The `<existing>` record is
+**not sent to Jev**: selection reads the input only (an echo of the stored value is caught by the
+input-only cross-check, as for Clairic), so Jev cannot "confirm" a value from the record.
+
+**The Decisions API as the primary for Clef.** `system_one_transport("decisions")` (or
+`TRUSTCALL_S1_CLEF_PROVIDER=decisions`, or `--clef-provider decisions` in the evals) is
+`RoutingTransport({"clef": DecisionsTransport()}, default=CloudflareTransport())`: the Decisions
+API (`gpt-6-luna-decisions` via Experiential Labs, served by OpenAI) answers every Clef request, not
+only after a failure. The same opt-in rule applies (an `EXPERIENTIAL_API_KEY` alone changes nothing), the
+hard-pick cap of 0.8 applies (a bare yes cannot authorise a removal), the question limit is
+`DecisionsTransport`'s 32, and it is a `ValueError` to also ask for the Decisions fallback. The Decisions API takes text only, so
+**a Clef request with images goes to the default (Cloudflare)**: `RoutingTransport` asks the routed
+transport's `serves(model, payload)` and hands such a request, and only a request with images, to the
+default when it is another transport that can serve it (the Decisions API never sees the image). The
+response says so (`TransportResponse.rerouted_from`) and the engine records a `request_rerouted` warning.
+Any other request the routed transport cannot serve (a `forecast` field on Jev, an invalid
+Decisions payload) is not moved: the routed transport refuses it locally, so the text never goes to
+another company unasked.
+So three combinations can be benchmarked: Cloudflare Clairic + Clef (default), Cloudflare Clairic + the
+Decisions API for Clef, and TypeSafe Jev for both.
+
+**Evals record the combination.** `SuiteResult` and `results.json` / `summary.md` carry `provider`,
+`clef_provider`, `clef_fallback` and two labels for tabulating: `extraction` (`cloudflare clairic`,
+`typesafe jev`, `scripted world`) and `decisions` (`cloudflare clef`, `experiential clef`,
+`experiential decisions (gpt-6-luna-decisions, hard cap 0.8)`, `typesafe jev`, plus ` + fallback
+decisions`). **A pure replay says what was recorded, not what would answer**: when nothing is sent the
+labels are `replay (recorded on <label>)`, from the `provider` each recording carries (`unknown` for
+a cassette from before the field existed). `--provider typesafe` together with `--clef-provider` or
+`--clef-fallback` (or the `TRUSTCALL_S1_CLEF_PROVIDER` / `TRUSTCALL_S1_CLEF_FALLBACK` variables) is
+refused, since Jev answers Clef itself; the same goes for `system_one_transport(provider="typesafe")` with an
+explicit `cloudflare=`, `experiential=` or `decisions=` object.
+
+**A TypeSafe object needs the provider.** `system_one_transport(typesafe=TypeSafeTransport(...))`
+with the provider resolving to anything but `typesafe` is a `ValueError` (it would have returned a
+`CloudflareTransport` and sent the text to Cloudflare while the caller thought it was on Jev): say
+`provider="typesafe"` or `TRUSTCALL_S1_PROVIDER=typesafe`. The provider is never switched for you.
+
+**Cassettes keep provenance.** A recording carries `provider` and `served_model` (and, for Clef, the
+`state_token_budget` its states were narrowed to, as it carries `max_questions`) when the transport knows
+them, and a replay returns them, so a replayed call is accounted under the model that answered. A
+cassette recorded before these fields replays exactly as it did. Cassettes are still keyed by the
+engine's request, so one recorded on any provider replays under any other.
+
+### Scrubbing
+
+`testing.scrub` replaces the exact value of `TYPESAFE_API_KEY` (like the other credentials), any
+`apikey_` + 16 or more characters of `[A-Za-z0-9_-]`, and a Bearer header; `RecordingTransport` writes
+no call whose request or response holds the key (an explicit `api_key=` too, through
+`sensitive_values()`), so a cassette cannot hold it. Like the Experiential key it is inside the httpx
+exception chained to an `UncertainOutcomeError`: scrub `Authorization` headers and `apikey_` keys in an
+error tracker's `before_send`.
+
+### Tests
+
+`test_typesafe_candidates.py` (candidates per type with tables, exact spans, the structure and its
+thresholds, the date parts), `test_typesafe_transport.py` (Clef both ways against `clef-*.json`, Clairic
+answers against `clairic-output.json` and `parse_clairic`, errors, retries, the limits, verification and
+the escalation hook), `test_typesafe_select.py` (selection by argument and environment, the contradictions,
+the Decisions provider, scrubbing, the evals and their labels) and `test_typesafe_review.py` (the corrections of the review: 529, none-means-null, the state budget and a
+Clef request split to Jev's limits, no user text in errors, cassette provenance, single-flight stitching,
+repair, Decisions with images, partial usage and the deadline, the hook, the evals' refusals) and
+`test_typesafe_world.py` (every eval
+case end to end: `tests/unit/jev_mock.py` plays Jev from the case's `FakeWorld`, validating each request
+against the OpenAPI schema, with the real transport and engine in between: `One` inserts, updates and
+`Many` scenarios). All offline (`httpx.MockTransport`).
 
 ## Testing
 

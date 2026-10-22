@@ -49,6 +49,7 @@ from trustcall_system_one.transport import (
     Transport,
     TransportResponse,
     max_questions,
+    state_token_budget,
 )
 
 __all__ = [
@@ -374,6 +375,8 @@ class Run:
             request_id=getattr(primary, "request_id", None),
             provider=getattr(primary, "provider", None),
             cost=spent,
+            # a primary whose call of several requests failed part-way still used tokens
+            usage=getattr(primary, "partial_usage", None),
         )
         if spent is not None:
             self.usage.add_spend(charged_model, meta.kind, spent)
@@ -404,6 +407,7 @@ class Run:
                 duration_ms=(time.perf_counter() - started) * 1000,
                 error=CANCELLED_AFTER_SEND,
                 provider=getattr(cancelled, "provider", None),
+                usage=getattr(cancelled, "partial_usage", None),
             )
             raise
         except Exception as exc:
@@ -421,12 +425,19 @@ class Run:
                 request_id=getattr(exc, "request_id", None),
                 provider=getattr(exc, "provider", None),
                 cost=spent,
+                # a call of several requests that failed part-way still used tokens
+                usage=getattr(exc, "partial_usage", None),
             )
             if spent is not None:  # charged for a response that could not be used
                 self.usage.add_spend(charged_model, meta.kind, spent)
             raise
         if response.fallback_from is not None:
             self._note_fallback(model, meta, n_items, response, started)
+        if response.rerouted_from is not None:
+            self.warn(
+                f"request_rerouted: {response.rerouted_from} cannot serve a request "
+                f"with images, so it went to {response.provider or 'the default'}"
+            )
         return _Sent(
             body=response.body,
             retries=response.retries,
@@ -555,8 +566,9 @@ class Run:
         except Exception as exc:
             self._unparsable(self.clairic_model, meta, len(fields), sent, exc)
             raise
+        # a stand-in provider's calls are filed under the model that answered
         self._record(
-            self.clairic_model,
+            sent.served_model or self.clairic_model,
             meta,
             len(fields),
             usage=response.usage,
@@ -746,7 +758,9 @@ class Run:
             spans: Spans in ``text`` to keep if the input has to be narrowed.
             extra: Further keys of the state (see ``_render.clef_state``).
             budget: A smaller budget than ``limits.clef_state_token_budget`` (the
-                question that goes with the state takes up the rest).
+                question that goes with the state takes up the rest). That limit is
+                itself capped by what the transport says it takes
+                (``transport.state_token_budget``: Jev reads 32k tokens).
 
         Returns:
             The state; when it was too large the input is narrowed and a warning
@@ -759,11 +773,13 @@ class Run:
             proposed_change=proposed_change,
             extra=extra,
         )
+        cap = self.limits.clef_state_token_budget
+        advertised = state_token_budget(self.transport, self.clef_model)
+        if advertised is not None:  # the transport's model reads less than that
+            cap = min(cap, advertised)
         state, warning = fit_clef_state(
             state,
-            self.limits.clef_state_token_budget
-            if budget is None
-            else min(budget, self.limits.clef_state_token_budget),
+            cap if budget is None else min(budget, cap),
             spans=spans,
             window_chars=self.verify.window_chars,
         )

@@ -1,4 +1,7 @@
-"""Transport protocol, adaptive concurrency limiter and the Cloudflare client."""
+"""Transport protocol, adaptive limiter and the clients of the providers.
+
+Cloudflare, Experiential Labs, the Decisions API and TypeSafe.
+"""
 
 import asyncio
 import contextlib
@@ -37,8 +40,26 @@ from trustcall_system_one._errors import (
     UncertainOutcomeError,
 )
 from trustcall_system_one._types import CallKind
+from trustcall_system_one._typesafe import (
+    EscalationHook,
+    EscalationRequest,
+    RunStats,
+    TypeSafeConfig,
+    estimate_tokens,
+    from_jev,
+    gather_all,
+    run_clairic,
+    to_jev_clef,
+)
 from trustcall_system_one._version import __version__
-from trustcall_system_one._wire import body_model, normalize_model_id, parse_clef
+from trustcall_system_one._wire import (
+    ClairicUsage,
+    ClefUsage,
+    body_model,
+    normalize_model_id,
+    parse_clef,
+    safe_loc_parts,
+)
 
 __all__ = [
     "DEFAULT_FALLBACK_ON",
@@ -48,15 +69,21 @@ __all__ = [
     "CallMeta",
     "CloudflareTransport",
     "DecisionsTransport",
+    "EscalationHook",
+    "EscalationRequest",
     "ExperientialTransport",
     "FallbackTransport",
     "RoutingTransport",
     "Transport",
     "TransportResponse",
+    "TypeSafeConfig",
+    "TypeSafeTransport",
     "clef_fallback_from_env",
     "clef_fallback_on_from_env",
     "clef_provider_from_env",
     "max_questions",
+    "provider_from_env",
+    "state_token_budget",
     "system_one_transport",
 ]
 
@@ -88,6 +115,32 @@ def max_questions(transport: object, model: str) -> int:
     if isinstance(said, int) and not isinstance(said, bool) and said >= 1:
         return said
     return DEFAULT_MAX_QUESTIONS
+
+
+def state_token_budget(transport: object, model: str) -> int | None:
+    """The most tokens of Clef state ``transport`` takes for ``model``, or ``None``.
+
+    A transport says it with a ``state_token_budget`` attribute (an int) or method
+    (``state_token_budget(model)``), as it says its ``max_questions``. Jev reads 32k
+    tokens for the state and one question, so ``TypeSafeTransport`` has one;
+    Cloudflare, Experiential Labs and the Decisions API say nothing (``None``: the
+    library's ``Limits.clef_state_token_budget`` alone applies). A
+    ``RoutingTransport`` answers for the transport serving the model and a
+    ``FallbackTransport`` with the smaller of its two.
+
+    Args:
+        transport: The transport the requests go to.
+        model: The Clef model (full id or bare name).
+
+    Returns:
+        A budget of at least 1, or ``None``.
+    """
+    said = getattr(transport, "state_token_budget", None)
+    if callable(said):
+        said = said(model)
+    if isinstance(said, int) and not isinstance(said, bool) and said >= 1:
+        return said
+    return None
 
 
 @dataclass(frozen=True)
@@ -126,6 +179,9 @@ class TransportResponse:
         served_model: The model that answered when it is not the one the request
             named (the Decisions model of a fallback), so that calls are
             accounted under the model that was used.
+        rerouted_from: When a ``RoutingTransport`` handed a request it could not
+            send to the routed transport (images) to its default, the provider
+            it was routed to; the engine records a warning.
     """
 
     body: dict[str, Any]
@@ -138,6 +194,7 @@ class TransportResponse:
     fallback_error: str | None = None
     served_model: str | None = None
     primary_error: BaseException | None = None
+    rerouted_from: str | None = None
 
 
 @runtime_checkable
@@ -1022,7 +1079,7 @@ class CloudflareTransport(_HttpTransport):
 
 EXPERIENTIAL_URL = "https://api.experientiallabs.ai/v1/systemone"
 _EXPERIENTIAL_MODELS = frozenset({"clef", "clef-flash"})
-_CORRELATION_HEADERS = ("x-correlation-id", "x-request-id")
+_CORRELATION_HEADERS = ("x-correlation-id", "x-request-id", "x-typesafe-request-id")
 # Failures that happen before a single byte of the request is sent: the server
 # cannot have seen the request, so trying again cannot be charged twice.
 _PRE_SEND_RETRYABLE = (httpx.ConnectError, httpx.ConnectTimeout)
@@ -1137,6 +1194,19 @@ class ExperientialTransport(_HttpTransport):
     max_questions = 32
     """Questions one Clef request may carry: the API answers a 400 ("questions must
     map 1 through 32 ids to typed questions") above 32."""
+
+    _unprocessed_statuses: frozenset[int] = frozenset({429})
+    _overload_statuses: frozenset[int] = frozenset()
+    """Statuses that tell the limiter to slow down although the request may have
+    been run (so it is not retried): TypeSafe's 529."""
+    """Statuses that mean the request was refused unprocessed (so, can be resent)."""
+    _retry_needs_hint = True
+    """Whether such a refusal is retried only when it carries a ``Retry-After``."""
+
+    @staticmethod
+    def _retry_after(response: httpx.Response) -> float | None:
+        """Seconds the server asked to wait, from the response headers."""
+        return _parse_retry_after(response.headers.get("Retry-After"))
 
     def __init__(
         self,
@@ -1329,6 +1399,21 @@ class ExperientialTransport(_HttpTransport):
         del meta  # nothing about the call leaves the process
         self._check_model(model)
         outgoing, context = self._prepare(payload)
+        return await self._post(model, outgoing, context, timeout=timeout)
+
+    async def _post(
+        self,
+        model: str,
+        outgoing: Mapping[str, Any],
+        context: Any,
+        *,
+        timeout: float | None,
+    ) -> TransportResponse:
+        """Send one request body with the retry policy of the class.
+
+        ``model`` is the key of the adaptive limiter; ``context`` is handed to
+        ``_read_success`` to read the answer.
+        """
         token = self._token()
         url = self._base_url
         headers = self._headers(token)
@@ -1403,15 +1488,18 @@ class ExperientialTransport(_HttpTransport):
                                 provider=self.provider,
                                 served_model=self._served_model(body),
                             )
-                        retry_after = _parse_retry_after(
-                            response.headers.get("Retry-After")
-                        )
-                        if status == 429:
+                        retry_after = self._retry_after(response)
+                        if (
+                            status in self._unprocessed_statuses
+                            or status in self._overload_statuses
+                        ):
                             self.limiter.on_rate_limited(model, generation)
                         failure = self._error_for_status(
                             response, retry_after=retry_after
                         )
-                        if status != 429 or retry_after is None:
+                        if status not in self._unprocessed_statuses or (
+                            retry_after is None and self._retry_needs_hint
+                        ):
                             failure.retries = retries
                             raise failure
             except _SlotTimeout:
@@ -1648,6 +1736,506 @@ class DecisionsTransport(ExperientialTransport):
 
 
 # --------------------------------------------------------------------------- #
+# TypeSafe (Jev)
+# --------------------------------------------------------------------------- #
+
+TYPESAFE_URL = "https://api.typesafe.ai"
+TYPESAFE_MODEL = "jev-latest"
+_TYPESAFE_LIMITER_KEY = "typesafe"
+_JEV_STATE_TOKENS = 24_000
+"""Estimated tokens of a Clef state Jev takes with room for the questions: it takes
+32k for the state and one question, 64k for the state and all of them."""
+_JEV_QUESTION_TOKENS = 30_000
+_JEV_REQUEST_TOKENS = 60_000
+_JEV_LONG_TOKENS = 250_000  # 262k with the long-context header
+
+
+def _clean_detail(body: Any) -> Any:
+    """A 422 body without the values that failed.
+
+    ``input`` and ``ctx`` echo the offending value, which can be the user's text, and
+    a ``loc`` past ``criteria`` is an option id, which can be too: the body that is
+    kept on the error has ``type``, ``loc`` (cut at ``criteria``) and ``msg`` only.
+    """
+    if not (isinstance(body, dict) and isinstance(body.get("detail"), list)):
+        return body
+    cleaned: list[Any] = []
+    for entry in body["detail"]:
+        if isinstance(entry, dict):
+            cleaned.append(
+                {
+                    "type": entry.get("type"),
+                    "loc": safe_loc_parts(entry.get("loc", ())),
+                    "msg": str(entry.get("msg"))[:200] if entry.get("msg") else None,
+                }
+            )
+        else:
+            cleaned.append(str(entry)[:100])
+    return {"detail": cleaned}
+
+
+def _typesafe_detail(body: Any) -> str:
+    """The reason in a TypeSafe error body, without echoing the request."""
+    cleaned = _clean_detail(body)
+    if isinstance(cleaned, dict) and isinstance(cleaned.get("detail"), list):
+        parts = []
+        for entry in cleaned["detail"][:5]:
+            if isinstance(entry, dict):
+                parts.append(
+                    f"{'.'.join(entry['loc'])}: "
+                    f"{entry.get('msg') or entry.get('type') or ''}"
+                )
+            else:
+                parts.append(str(entry))
+        return "; ".join(parts)[:400]
+    return _error_detail(body)
+
+
+class TypeSafeTransport(ExperientialTransport):
+    """Serves BOTH System One models with TypeSafe's Jev (``POST /v1/systemone``).
+
+    Clef requests go through almost unchanged (Jev's ``noul``, ``choice`` and
+    ``score`` are Clef's). Clairic requests are served by *selection* (code finds
+    candidates, Jev picks), and dates, times and durations by Jev reading their
+    parts: see ``docs/DESIGN.md`` ("TypeSafe-only provider") and
+    ``trustcall_system_one._typesafe``. No Cloudflare credential is needed.
+
+    The retry policy is that of ``ExperientialTransport`` (a request that may have
+    reached the server is never resent: a timeout, a dropped connection, a 408 or a
+    5xx, **529 Overloaded included**, raises ``UncertainOutcomeError``; a connect
+    error is retried), with TypeSafe's rule for ``429 Too Many Requests``, which the
+    API says to back off and retry: it is retried (honouring ``Retry-After`` and
+    ``retry-after-ms``) up to ``max_retries``, within ``call_deadline``, with or
+    without a hint. A 529 may have been processed (overload can strike after the
+    work), so it is not resent. A Clairic call is several Jev requests: an error is
+    that of the request that failed, carries the tokens of the requests that had
+    answered (``partial_usage``) and counts as ``uncertain`` once any request went
+    out; ``call_deadline`` bounds the whole call, not each request.
+
+    A call reports the Jev model that answered (``TransportResponse.served_model``);
+    ``usage.passes`` of a Clairic response is its number of requests and ``jev.stages``
+    says which. TypeSafe reports no cost.
+    """
+
+    provider = "typesafe"
+    _api_name = "TypeSafe API"
+    max_questions = 64
+    """Questions of a Clef request the engine may put in one request. The docs state
+    no limit on the number of questions (only the context: 64k tokens per request,
+    32k per question); 64 is the bound of the Clef request schema the library builds.
+    The transport itself splits a request by tokens only."""
+    _retry_needs_hint = False
+    _overload_statuses = frozenset({529})  # slows the limiter; never retried
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        model: str | None = None,
+        config: TypeSafeConfig | None = None,
+        escalate: EscalationHook | None = None,
+        long_context: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        """Create a transport.
+
+        The key is resolved on each ``run``, so a missing one raises ``AuthError``
+        there and not here.
+
+        Args:
+            api_key: TypeSafe API key; else ``TYPESAFE_API_KEY``.
+            base_url: The API root; else ``TYPESAFE_BASE_URL``, else
+                ``https://api.typesafe.ai`` (requests go to ``/v1/systemone``).
+            model: The Jev model or alias; else ``TYPESAFE_DEFAULT_MODEL``, else
+                ``jev-latest``. A versioned id (``jev-1.14.0``) pins the model, which
+                matters because the library's thresholds depend on its calibration.
+            config: Thresholds and limits of the Clairic stand-in (the cookbooks'
+                numbers by default).
+            escalate: A callable that answers a field the verification doubts with a
+                stronger model (see ``EscalationHook``); ``None`` (the default)
+                returns such a field as a low-confidence or null answer.
+            long_context: Send ``TypeSafe-Danger-Zone-Long-Context: true`` (262k
+                tokens per request and question instead of 64k and 32k; slower and
+                less accurate) and let a request hold more.
+            **kwargs: The other settings of ``ExperientialTransport`` (``client``,
+                ``timeout``, ``max_retries``, ``call_deadline``, ``concurrency``...).
+
+        Raises:
+            ValueError: If a setting is out of range.
+        """
+        root = (base_url or os.environ.get("TYPESAFE_BASE_URL") or TYPESAFE_URL).strip()
+        super().__init__(
+            api_key=api_key, base_url=f"{root.rstrip('/')}/v1/systemone", **kwargs
+        )
+        self._model = (
+            model or os.environ.get("TYPESAFE_DEFAULT_MODEL") or TYPESAFE_MODEL
+        ).strip()
+        if not self._model:
+            raise ValueError("model must not be empty")
+        base = config or TypeSafeConfig()
+        if long_context:
+            base = dataclasses.replace(
+                base,
+                request_token_budget=max(base.request_token_budget, 200_000),
+                max_input_chars=max(base.max_input_chars, 300_000),
+            )
+        self._config = base
+        self._escalate = escalate
+        self._long_context = long_context
+        self._question_tokens = (
+            _JEV_LONG_TOKENS if long_context else _JEV_QUESTION_TOKENS
+        )
+        self._request_tokens = _JEV_LONG_TOKENS if long_context else _JEV_REQUEST_TOKENS
+        self.state_token_budget: int = (
+            _JEV_LONG_TOKENS - 30_000 if long_context else _JEV_STATE_TOKENS
+        )
+        """Estimated tokens of a Clef state this transport takes (the engine narrows a
+        state to ``min(limits.clef_state_token_budget, this)``): Jev reads 32k tokens
+        for the state and one question, so the state keeps room for the question."""
+        self._stitch_memo: dict[str, asyncio.Future[dict[str, float]]] = {}
+
+    def serves(self, model: str, payload: Mapping[str, Any] | None = None) -> bool:
+        """Whether Jev can answer the request: Clairic or Clef, text only."""
+        try:
+            name = body_model(model)
+        except ValueError:
+            return False
+        if payload is None:
+            return True
+        if payload.get("images"):
+            return False
+        fields = payload.get("fields") if name == "clairic" else None
+        if isinstance(fields, Mapping):
+            return all(
+                isinstance(f, Mapping) and f.get("type") != "forecast"
+                for f in fields.values()
+            )
+        return True
+
+    def classify_failure(self, exc: Exception) -> str | None:
+        """Say whether a failure of ``run`` means that nothing was run.
+
+        A Clairic call that failed after an earlier request of it had answered (or
+        went out) is ``"uncertain"``: it was charged, whatever the last error was.
+        """
+        if isinstance(exc, _NEVER_FALL_BACK):
+            return None
+        if getattr(exc, "maybe_sent", False) or getattr(exc, "partial_usage", None):
+            return "uncertain"
+        return classify_failure(exc)
+
+    def _token(self) -> str:
+        token = (self._api_key or os.environ.get("TYPESAFE_API_KEY") or "").strip()
+        if not token:
+            raise AuthError("No TypeSafe API key: pass api_key or set TYPESAFE_API_KEY")
+        return token
+
+    def _headers(self, token: str) -> dict[str, str]:
+        headers = super()._headers(token)
+        if self._long_context:
+            headers["TypeSafe-Danger-Zone-Long-Context"] = "true"
+        return headers
+
+    @staticmethod
+    def _retry_after(response: httpx.Response) -> float | None:
+        millis = response.headers.get("retry-after-ms")
+        if millis:
+            try:
+                value = float(millis) / 1000.0
+            except ValueError:
+                value = None
+            if value is not None and math.isfinite(value):
+                return max(0.0, value)
+        return _parse_retry_after(response.headers.get("Retry-After"))
+
+    def _served_model(self, body: Mapping[str, Any]) -> str | None:
+        return str(body.get("model") or self._model)
+
+    def _error_model(self) -> str | None:
+        return self._model
+
+    def _read_success(self, response: httpx.Response, context: Any) -> dict[str, Any]:
+        body = self._unwrap(response)
+        if context is not None:  # the questions: check the answers against them
+            from_jev(body, context)
+        return body
+
+    @staticmethod
+    def _unwrap(response: httpx.Response) -> dict[str, Any]:
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise ModelResponseError(
+                "TypeSafe API returned a non-JSON success response",
+                raw=response.text,
+            ) from exc
+        if not isinstance(body, dict):
+            raise ModelResponseError(
+                "TypeSafe API response is not a JSON object", raw=body
+            )
+        parse_clef(body)  # ModelResponseError if it is not a valid response
+        return body
+
+    @classmethod
+    def _error_for_status(
+        cls, response: httpx.Response, *, retry_after: float | None
+    ) -> TransportError:
+        """Map a non-2xx response: 429 is retried, 408, 529 and 5xx are uncertain."""
+        status = response.status_code
+        body = _clean_detail(_json_or_text(response))
+        message = f"{cls._api_name} returned HTTP {status}: {_typesafe_detail(body)}"
+        request_id = _correlation_id(response)
+        if request_id:
+            message += f" (request id {request_id})"
+        error: TransportError
+        if status in (401, 403):
+            error = AuthError(message, status_code=status, body=body)
+        elif status == 429:
+            error = RateLimitError(
+                message, status_code=status, body=body, retry_after=retry_after
+            )
+        elif status == 408 or status >= 500:  # 529 Overloaded too: it may have run
+            error = UncertainOutcomeError(
+                f"{message}. {_UNCERTAIN_NOTE}", status_code=status, body=body
+            )
+        elif 300 <= status < 500:
+            entries = (
+                [e for e in body["detail"] if isinstance(e, dict)]
+                if isinstance(body, dict) and isinstance(body.get("detail"), list)
+                else []
+            )
+            error = BadRequestError(
+                message, status_code=status, body=body, cf_errors=entries
+            )
+        else:
+            error = TransportError(message, status_code=status, body=body)
+        error.retry_after = retry_after
+        error.request_id = request_id
+        return error
+
+    @_tagged
+    async def run(
+        self,
+        model: str,
+        payload: Mapping[str, Any],
+        *,
+        meta: CallMeta,
+        timeout: float | None = None,
+    ) -> TransportResponse:
+        """Run one Clairic or Clef call on Jev.
+
+        Args:
+            model: The Clairic or Clef model (full id or bare name).
+            payload: The Clairic or Clef request body.
+            meta: Routing context (not sent).
+            timeout: Per-request timeout in seconds; ``None`` uses the client's.
+
+        Returns:
+            A bare Clef response, or a Clairic response assembled from the Jev
+            requests (``usage.passes`` counts them), with the retry count, the total
+            duration and the Jev model that answered as ``served_model``.
+
+        Raises:
+            AuthError: No key, or HTTP 401/403.
+            BadRequestError: A model that is not Clairic or Clef, a request Jev
+                cannot serve (images, ``forecast``), or HTTP 3xx/4xx (a 422's
+                ``detail`` is in the message, without the user's text).
+            RateLimitError: HTTP 429 that outlasted the retries.
+            UncertainOutcomeError: A timeout, a failure after the request was sent,
+                HTTP 408, 529 or 5xx. Never retried; the call may have been charged.
+            TransportError: A failure before the request was sent.
+            ModelResponseError: A 2xx that is not a valid answer to the questions.
+        """
+        del meta  # nothing about the call leaves the process
+        try:
+            name = body_model(model)
+        except ValueError:
+            raise BadRequestError(
+                f"TypeSafeTransport serves Clairic and Clef, not {model!r}"
+            ) from None
+        if name != "clairic":
+            return await self._clef(payload, timeout)
+        return await self._clairic(payload, timeout)
+
+    async def _clef(
+        self, payload: Mapping[str, Any], timeout: float | None
+    ) -> TransportResponse:
+        """A Clef request: one Jev request, or several when Jev's context needs it."""
+        requests = to_jev_clef(
+            payload,
+            self._model,
+            question_budget=self._question_tokens,
+            request_budget=self._request_tokens,
+        )
+        if len(requests) == 1:
+            (request,) = requests
+            return await self._post(
+                _TYPESAFE_LIMITER_KEY, request, request["questions"], timeout=timeout
+            )
+        started = time.perf_counter()
+        answered: list[TransportResponse] = []
+
+        async def one(r: Mapping[str, Any]) -> TransportResponse:
+            done = await self._post(
+                _TYPESAFE_LIMITER_KEY, r, r["questions"], timeout=timeout
+            )
+            answered.append(done)  # counted as it completes, whatever its siblings do
+            return done
+
+        try:
+            sent = await gather_all(*(one(r) for r in requests))
+        except BaseException as exc:
+            siblings = int(getattr(exc, "cancelled_siblings", 0))
+            if answered or siblings:
+                exc.maybe_sent = True  # type: ignore[attr-defined]
+            if answered:  # those parts were run, and charged
+                exc.partial_usage = ClefUsage(  # type: ignore[attr-defined]
+                    input_tokens=sum(
+                        int(p.body["usage"]["input_tokens"]) for p in answered
+                    ),
+                    output_tokens=sum(
+                        int(p.body["usage"]["output_tokens"]) for p in answered
+                    ),
+                )
+                exc.served_model = answered[-1].served_model  # type: ignore[attr-defined]
+            _note_siblings(exc, siblings)
+            raise
+        answers: dict[str, Any] = {}
+        usage = {"input_tokens": 0, "output_tokens": 0}
+        for part in sent:
+            answers.update(part.body["answers"])
+            for key in usage:
+                usage[key] += int(part.body["usage"][key])
+        order = list(payload["questions"])
+        body = {
+            "model": sent[-1].body["model"],
+            "answers": {q: answers[q] for q in order if q in answers},
+            "usage": usage,
+        }
+        merged_response: TransportResponse = dataclasses.replace(
+            sent[0],
+            body=body,
+            retries=sum(p.retries for p in sent),
+            duration_ms=(time.perf_counter() - started) * 1000,
+        )
+        return merged_response
+
+    def _batches(
+        self, state: Any, questions: Mapping[str, Mapping[str, Any]]
+    ) -> list[dict[str, Mapping[str, Any]]]:
+        """Split questions into requests by the context budget alone.
+
+        There is no question-count cap here: TypeSafe states none, so the stitch,
+        selection and verification requests hold as many questions as fit.
+        """
+        budget = self._config.request_token_budget
+        base = estimate_tokens(state)
+        batches: list[dict[str, Mapping[str, Any]]] = [{}]
+        used = base
+        for qid, question in questions.items():
+            cost = estimate_tokens(question)
+            current = batches[-1]
+            if current and used + cost > budget:
+                batches.append({})
+                current = batches[-1]
+                used = base
+            current[qid] = question
+            used += cost
+        return [b for b in batches if b]
+
+    def _annotate(self, exc: BaseException, stats: RunStats) -> None:
+        """Put what the earlier requests of a failed Clairic call cost on its error."""
+        exc.served_model = stats.model or self._model  # type: ignore[attr-defined]
+        siblings = int(getattr(exc, "cancelled_siblings", 0))
+        if stats.requests or siblings:
+            exc.maybe_sent = True  # type: ignore[attr-defined]
+        if stats.requests:
+            exc.partial_usage = ClairicUsage(  # type: ignore[attr-defined]
+                input_tokens=stats.input_tokens,
+                output_tokens=stats.output_tokens,
+                passes=stats.requests,
+            )
+        _note_siblings(exc, siblings)
+
+    async def _clairic(
+        self, payload: Mapping[str, Any], timeout: float | None
+    ) -> TransportResponse:
+        started = time.perf_counter()
+        stats = RunStats()
+
+        async def send(
+            state: Any, questions: Mapping[str, Mapping[str, Any]], stage: str
+        ) -> Mapping[str, Any]:
+            request = {
+                "model": self._model,
+                "state": state,
+                "questions": dict(questions),
+            }
+            sent = await self._post(
+                _TYPESAFE_LIMITER_KEY, request, dict(questions), timeout=timeout
+            )
+            response = parse_clef(sent.body)
+            # Counted the moment this request has answered: when a sibling fails
+            # later, what this one cost is already in the stats (and on the error).
+            stats.requests += 1
+            stats.stages[stage] += 1
+            stats.input_tokens += response.usage.input_tokens
+            stats.output_tokens += response.usage.output_tokens
+            stats.retries += sent.retries
+            stats.model = response.model
+            if sent.request_id:
+                stats.request_ids.append(sent.request_id)
+            return response.answers
+
+        async def ask(
+            state: Any, questions: Mapping[str, Mapping[str, Any]], stage: str
+        ) -> Mapping[str, Any]:
+            merged: dict[str, Any] = {}
+            batches = self._batches(state, questions)
+            for answers in await gather_all(*(send(state, b, stage) for b in batches)):
+                merged.update(answers)
+            return merged
+
+        try:
+            body = await asyncio.wait_for(
+                run_clairic(
+                    payload,
+                    ask=ask,
+                    stats=stats,
+                    config=self._config,
+                    memo=self._stitch_memo,
+                    escalate=self._escalate,
+                    model_name=self._model,
+                ),
+                self._call_deadline,
+            )
+        except asyncio.TimeoutError:
+            note = (
+                f"the Clairic call used up its {self._call_deadline}s deadline after "
+                f"{stats.requests} answered request(s)"
+            )
+            # something may have been sent (and charged) when time ran out, so it
+            # is never "nothing ran", whether or not a request had answered
+            error = UncertainOutcomeError(f"{note}. {_UNCERTAIN_NOTE}")
+            error.maybe_sent = True
+            self._annotate(error, stats)
+            raise error from None
+        except BaseException as exc:
+            self._annotate(exc, stats)
+            raise
+        return TransportResponse(
+            body=body,
+            retries=stats.retries,
+            duration_ms=(time.perf_counter() - started) * 1000,
+            status_code=200,
+            request_id=stats.request_ids[0] if stats.request_ids else None,
+            provider=self.provider,
+            served_model=stats.model or self._model,
+        )
+
+
+# --------------------------------------------------------------------------- #
 # Fallback
 # --------------------------------------------------------------------------- #
 
@@ -1662,6 +2250,24 @@ FallbackTrigger = Union[str, "type[Exception]"]
 _NEVER_FALL_BACK = (AuthError, BadRequestError)
 
 
+def _note_siblings(exc: BaseException, siblings: int) -> None:
+    """Say once, on a failed call's error, that other requests were cancelled.
+
+    The text is built from the message the error had before any note, so an error
+    that reaches this twice (it is annotated by every call that shares it) is not
+    annotated twice.
+    """
+    if not siblings or not isinstance(exc, TrustcallSystemOneError) or not exc.args:
+        return
+    base: tuple[Any, ...] = getattr(exc, "_args_before_note", exc.args)
+    exc._args_before_note = base  # type: ignore[attr-defined]
+    exc.args = (
+        f"{base[0]} ({siblings} other request(s) of this call were cancelled after "
+        "they may have been sent; their outcome is unknown)",
+        *base[1:],
+    )
+
+
 def classify_failure(exc: Exception) -> str | None:
     """The category of a transport failure, as far as the type says.
 
@@ -1672,16 +2278,23 @@ def classify_failure(exc: Exception) -> str | None:
       request that was refused, never sent or never connected.
     * ``None``: anything else (``AuthError``, ``BadRequestError``, a bug).
 
+    An error that says a request may have gone out and been charged
+    (``maybe_sent``, or ``partial_usage``: a call of several requests that failed
+    part-way) is ``"uncertain"`` whatever its type, so wrappers that do not know the
+    transport (``RecordingTransport``, ``RoutingTransport``) do not fall back on it.
+
     A transport that knows more says so with its own ``classify_failure(exc)``
     (``CloudflareTransport`` does: its failures after retries include timeouts and
     dropped connections that are not "nothing ran").
     """
+    if isinstance(exc, _NEVER_FALL_BACK):
+        return None
+    if getattr(exc, "maybe_sent", False) or getattr(exc, "partial_usage", None):
+        return "uncertain"  # a call of several requests: some went out and were charged
     if isinstance(exc, (UncertainOutcomeError, ServerError)):
         return "uncertain"
     if isinstance(exc, ModelResponseError):
         return "bad_response"
-    if isinstance(exc, _NEVER_FALL_BACK):
-        return None
     if isinstance(exc, TransportError):  # RateLimitError, or nothing was sent
         return "unavailable"
     return None
@@ -1794,6 +2407,18 @@ class FallbackTransport:
         if callable(serves) and not serves(model):
             return limit
         return min(limit, max_questions(self._fallback, model))
+
+    def state_token_budget(self, model: str) -> int | None:
+        """The smaller state budget of the two transports (``None``: none says one)."""
+        found = [
+            b
+            for b in (
+                state_token_budget(self._primary, model),
+                state_token_budget(self._fallback, model),
+            )
+            if b is not None
+        ]
+        return min(found) if found else None
 
     def _falls_back_on(self, exc: Exception) -> bool:
         if isinstance(exc, _NEVER_FALL_BACK):
@@ -1952,6 +2577,10 @@ class RoutingTransport:
         """Questions one request may carry: the limit of the transport serving it."""
         return max_questions(self.transport_for(model), model)
 
+    def state_token_budget(self, model: str) -> int | None:
+        """The state budget of the transport serving the model (``None``: none)."""
+        return state_token_budget(self.transport_for(model), model)
+
     async def run(
         self,
         model: str,
@@ -1960,10 +2589,33 @@ class RoutingTransport:
         meta: CallMeta,
         timeout: float | None = None,
     ) -> TransportResponse:
-        """Run the call on the transport chosen for ``model``."""
-        return await self.transport_for(model).run(
-            model, payload, meta=meta, timeout=timeout
-        )
+        """Run the call on the transport chosen for ``model``.
+
+        A routed transport that says it cannot serve this request because it
+        carries images (the Decisions API takes text only) hands it to the default
+        transport, when the default is another one that can; the response says so
+        (``rerouted_from``) and the engine records a warning. Any other request the
+        routed transport cannot serve (a ``forecast`` field on Jev, an invalid
+        Decisions payload) is not moved: the routed transport refuses it locally,
+        rather than the text going to another company without being asked.
+        """
+        route = self.transport_for(model)
+        serves = getattr(route, "serves", None)
+        rerouted: str | None = None
+        if (
+            route is not self._default
+            and payload.get("images")
+            and callable(serves)
+            and not serves(model, payload)
+        ):
+            other = getattr(self._default, "serves", None)
+            if not callable(other) or other(model, payload):
+                rerouted = _provider_name(route)
+                route = self._default
+        reply = await route.run(model, payload, meta=meta, timeout=timeout)
+        if rerouted is not None:
+            reply = dataclasses.replace(reply, rerouted_from=rerouted)
+        return reply
 
     def _members(self) -> list[Transport]:
         members: list[Transport] = []
@@ -2015,15 +2667,17 @@ class RoutingTransport:
                     closer()
 
 
-ClefProvider = Literal["cloudflare", "experiential"]
+ClefProvider = Literal["cloudflare", "experiential", "decisions"]
+Provider = Literal["cloudflare", "typesafe"]
 
 
-def clef_provider_from_env(environ: Mapping[str, str] | None = None) -> ClefProvider:
-    """Which provider serves Clef, from the environment.
+def provider_from_env(environ: Mapping[str, str] | None = None) -> Provider:
+    """Which provider serves BOTH models (Clairic and Clef), from the environment.
 
-    ``TRUSTCALL_S1_CLEF_PROVIDER`` (``cloudflare`` or ``experiential``, any case)
-    decides. With it unset or empty, Clef stays on Cloudflare: having an
-    ``EXPERIENTIAL_API_KEY`` in the environment does not move it. Sending your
+    ``TRUSTCALL_S1_PROVIDER`` is ``cloudflare`` (the default: Clairic and Clef on
+    Cloudflare, Clef optionally elsewhere, see ``clef_provider_from_env``) or
+    ``typesafe`` (TypeSafe's Jev replaces both, see ``TypeSafeTransport``). Having a
+    ``TYPESAFE_API_KEY`` in the environment does not switch anything: sending your
     text to another company is an explicit choice, made with this variable or by
     passing a transport.
 
@@ -2031,7 +2685,38 @@ def clef_provider_from_env(environ: Mapping[str, str] | None = None) -> ClefProv
         environ: The environment to read; defaults to ``os.environ``.
 
     Returns:
-        ``"cloudflare"`` or ``"experiential"``.
+        ``"cloudflare"`` or ``"typesafe"``.
+
+    Raises:
+        ValueError: If the variable holds anything else.
+    """
+    env = os.environ if environ is None else environ
+    value = (env.get("TRUSTCALL_S1_PROVIDER") or "").strip().lower()
+    if not value or value == "cloudflare":
+        return "cloudflare"
+    if value == "typesafe":
+        return "typesafe"
+    raise ValueError(
+        f"TRUSTCALL_S1_PROVIDER must be 'cloudflare' or 'typesafe', not {value!r}"
+    )
+
+
+def clef_provider_from_env(environ: Mapping[str, str] | None = None) -> ClefProvider:
+    """Which provider serves Clef, from the environment.
+
+    ``TRUSTCALL_S1_CLEF_PROVIDER`` (``cloudflare``, ``experiential`` or ``decisions``,
+    any case) decides. With it unset or empty, Clef stays on Cloudflare: having an
+    ``EXPERIENTIAL_API_KEY`` in the environment does not move it. Sending your
+    text to another company is an explicit choice, made with this variable or by
+    passing a transport. ``decisions`` makes the Decisions API (``DecisionsTransport``,
+    a GPT model behind Experiential Labs) answer every Clef request as the primary,
+    not as a fallback.
+
+    Args:
+        environ: The environment to read; defaults to ``os.environ``.
+
+    Returns:
+        ``"cloudflare"``, ``"experiential"`` or ``"decisions"``.
 
     Raises:
         ValueError: If the variable holds anything else.
@@ -2040,11 +2725,11 @@ def clef_provider_from_env(environ: Mapping[str, str] | None = None) -> ClefProv
     value = (env.get("TRUSTCALL_S1_CLEF_PROVIDER") or "").strip().lower()
     if not value or value == "cloudflare":
         return "cloudflare"
-    if value == "experiential":
-        return "experiential"
+    if value in ("experiential", "decisions"):
+        return value  # type: ignore[return-value]
     raise ValueError(
-        "TRUSTCALL_S1_CLEF_PROVIDER must be 'cloudflare' or 'experiential', "
-        f"not {value!r}"
+        "TRUSTCALL_S1_CLEF_PROVIDER must be 'cloudflare', 'experiential' or "
+        f"'decisions', not {value!r}"
     )
 
 
@@ -2117,19 +2802,36 @@ def clef_fallback_on_from_env(
 def system_one_transport(
     clef: ClefProvider | None = None,
     *,
+    provider: Provider | None = None,
     clef_fallback: ClefFallback | None = None,
     clef_fallback_on: Iterable[FallbackTrigger] | str | None = None,
     cloudflare: CloudflareTransport | None = None,
     experiential: ExperientialTransport | None = None,
     decisions: DecisionsTransport | None = None,
+    typesafe: TypeSafeTransport | None = None,
     concurrency: ConcurrencyConfig | None = None,
-) -> CloudflareTransport | RoutingTransport:
+) -> CloudflareTransport | RoutingTransport | TypeSafeTransport:
     """Build the usual transport: Clairic on Cloudflare, Clef where you choose.
+
+    Three combinations are selectable (each is an explicit opt-in):
+
+    * Cloudflare for both: the default;
+    * Cloudflare Clairic with the Decisions API answering every Clef request:
+      ``clef="decisions"``;
+    * TypeSafe's Jev for both Clairic and Clef: ``provider="typesafe"``.
 
     Args:
         clef: ``"cloudflare"`` serves Clef from Cloudflare; ``"experiential"`` from
-            ``ExperientialTransport``. ``None`` decides from the environment (see
+            ``ExperientialTransport``; ``"decisions"`` from ``DecisionsTransport``
+            (the Decisions API with its 0.8 hard-pick cap and 32-question limit, as
+            the primary). ``None`` decides from the environment (see
             ``clef_provider_from_env``).
+        provider: ``"cloudflare"`` (the default) or ``"typesafe"``, which serves
+            Clairic AND Clef with Jev and needs no Cloudflare credential. ``None``
+            decides from the environment (see ``provider_from_env``). With
+            ``"typesafe"`` a ``clef`` other than Cloudflare's and a Clef fallback are
+            contradictions (Jev already answers Clef; a fallback would send the text
+            elsewhere) and raise ``ValueError``.
         clef_fallback: ``"decisions"`` wraps Clef in a ``FallbackTransport`` whose
             fallback is ``DecisionsTransport`` (the Decisions API, same key); this
             sends text to Experiential Labs when the primary fails, also if Clef
@@ -2142,33 +2844,82 @@ def system_one_transport(
         cloudflare: The Cloudflare transport to use; by default a new one.
         experiential: The Experiential transport to use; by default a new one.
         decisions: The Decisions transport to use; by default a new one.
+        typesafe: The TypeSafe transport to use; by default a new one.
         concurrency: Concurrency limits for the transports created here.
 
     Returns:
         A plain ``CloudflareTransport`` when Clef is on Cloudflare without a
-        fallback; otherwise a ``RoutingTransport`` that sends Clef to the chosen
-        transport (wrapped in the fallback, if any) and everything else to
-        Cloudflare. For ``create_extractor(..., transport=...)``; close it with
-        ``aclose`` or ``close`` when you are done.
+        fallback; a ``TypeSafeTransport`` for ``provider="typesafe"``; otherwise a
+        ``RoutingTransport`` that sends Clef to the chosen transport (wrapped in the
+        fallback, if any) and everything else to Cloudflare. For
+        ``create_extractor(..., transport=...)``; close it with ``aclose`` or
+        ``close`` when you are done.
 
     Raises:
         ValueError: If an argument or the environment names an unknown provider or
-            fallback.
+            fallback, or contradicts the TypeSafe-only provider or itself.
     """
-    provider = clef_provider_from_env() if clef is None else clef
-    if provider not in ("cloudflare", "experiential"):
-        raise ValueError(f"unknown Clef provider {provider!r}")
+    chosen = provider_from_env() if provider is None else provider
+    if chosen not in ("cloudflare", "typesafe"):
+        raise ValueError(f"unknown provider {chosen!r}")
+    if typesafe is not None and chosen != "typesafe":
+        raise ValueError(
+            "a TypeSafe transport was passed but the provider is "
+            f"{chosen!r}: the text would go to Cloudflare. Say it: "
+            "provider='typesafe' (or TRUSTCALL_S1_PROVIDER=typesafe); the provider "
+            "is never switched for you"
+        )
+    if chosen == "typesafe":
+        others = [
+            name
+            for name, given in (
+                ("cloudflare", cloudflare),
+                ("experiential", experiential),
+                ("decisions", decisions),
+            )
+            if given is not None
+        ]
+        if others:
+            raise ValueError(
+                f"the TypeSafe provider uses none of the {others} transports "
+                "you passed: TypeSafe answers both models (pass typesafe=)"
+            )
+        explicit_clef = clef_provider_from_env() if clef is None else clef
+        if explicit_clef != "cloudflare":
+            raise ValueError(
+                "the TypeSafe provider answers Clef with Jev itself: do not also "
+                f"choose Clef provider {explicit_clef!r} (unset "
+                "TRUSTCALL_S1_CLEF_PROVIDER)"
+            )
+        if (
+            clef_fallback_from_env() if clef_fallback is None else clef_fallback
+        ) != "none":
+            raise ValueError(
+                "the TypeSafe provider is TypeSafe only: a Clef fallback would send "
+                "the text to another company (unset TRUSTCALL_S1_CLEF_FALLBACK)"
+            )
+        return typesafe or TypeSafeTransport(concurrency=concurrency)
+    clef_choice = clef_provider_from_env() if clef is None else clef
+    if clef_choice not in ("cloudflare", "experiential", "decisions"):
+        raise ValueError(f"unknown Clef provider {clef_choice!r}")
     fallback = clef_fallback_from_env() if clef_fallback is None else clef_fallback
     if fallback not in ("decisions", "none"):
         raise ValueError(f"unknown Clef fallback {fallback!r}")
+    if clef_choice == "decisions" and fallback == "decisions":
+        raise ValueError(
+            "Clef already is the Decisions API: a Decisions fallback would send the "
+            "same request to it again (unset TRUSTCALL_S1_CLEF_FALLBACK)"
+        )
     base = cloudflare or CloudflareTransport(concurrency=concurrency)
-    if provider == "cloudflare" and fallback == "none":
+    if clef_choice == "cloudflare" and fallback == "none":
         return base
-    clef_transport: Transport = (
-        base
-        if provider == "cloudflare"
-        else experiential or ExperientialTransport(concurrency=concurrency)
-    )
+    clef_transport: Transport
+    if clef_choice == "cloudflare":
+        clef_transport = base
+    elif clef_choice == "decisions":
+        clef_transport = decisions or DecisionsTransport(concurrency=concurrency)
+    else:
+        clef_transport = experiential or ExperientialTransport(concurrency=concurrency)
     if fallback == "decisions":
         triggers = (
             clef_fallback_on_from_env()

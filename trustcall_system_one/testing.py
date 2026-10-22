@@ -50,6 +50,7 @@ from trustcall_system_one.transport import (
     Transport,
     TransportResponse,
     max_questions,
+    state_token_budget,
 )
 
 __all__ = [
@@ -2116,6 +2117,7 @@ _SECRET_ENV = (
     "CLOUDFLARE_API_TOKEN",
     "CLOUDFLARE_AUTH_TOKEN",
     "EXPERIENTIAL_API_KEY",
+    "TYPESAFE_API_KEY",
 )
 _REDACTED = "<redacted>"
 _MIN_SECRET = 16
@@ -2163,6 +2165,7 @@ _GATEWAY_PATH = re.compile(
     r"(?<=gateway\.ai\.cloudflare\.com/v1/)[^/\s\"'?#]+", re.IGNORECASE
 )
 _EXPERIENTIAL_KEY = re.compile(r"\bxpl_[A-Za-z0-9_-]{16,}")
+_TYPESAFE_KEY = re.compile(r"\bapikey_[A-Za-z0-9_-]{16,}")
 _ACCOUNT_ID = re.compile(r"(?<=accounts/)[0-9a-fA-F]{32}(?![0-9A-Za-z])")
 _BEARER_HEADER = re.compile(
     r"(?i)(authorization[\"']?\s*[:=]\s*[\"']?)bearer\s+[^\s\"',}]+"
@@ -2177,10 +2180,10 @@ def scrub(text: str, extra: Iterable[str] = ()) -> str:
 
     For error messages, reports and other text that is not replayed as data: the
     exact values of the Cloudflare environment variables, of
-    ``EXPERIENTIAL_API_KEY`` and of ``extra`` (for example
+    ``EXPERIENTIAL_API_KEY``, ``TYPESAFE_API_KEY`` and of ``extra`` (for example
     ``CloudflareTransport.sensitive_values()`` or
-    ``ExperientialTransport.sensitive_values()``), any ``xpl_`` Experiential
-    Labs key, the account id in a
+    ``ExperientialTransport.sensitive_values()`` or ``TypeSafeTransport``), any
+    ``xpl_`` Experiential Labs key, any ``apikey_`` TypeSafe key, the account id in a
     Cloudflare API URL (``api.cloudflare.com/client/v4/accounts/<id>``), an AI
     Gateway URL (``gateway.ai.cloudflare.com/v1/<id>/``) or an ``accounts/<32 hex
     characters>`` path, and the bearer token of an ``Authorization`` header (or a
@@ -2206,6 +2209,7 @@ def scrub(text: str, extra: Iterable[str] = ()) -> str:
     text = _GATEWAY_PATH.sub(_REDACTED, text)
     text = _ACCOUNT_ID.sub(_REDACTED, text)
     text = _EXPERIENTIAL_KEY.sub(_REDACTED, text)
+    text = _TYPESAFE_KEY.sub(_REDACTED, text)
     text = _BEARER_HEADER.sub(rf"\1Bearer {_REDACTED}", text)
     return _BEARER_TOKEN.sub(f"Bearer {_REDACTED}", text)
 
@@ -2265,7 +2269,14 @@ class RecordingTransport:
             "response",
             "status",
             "duration_ms",
+            "provider",
+            "served_model",
         }
+
+    ``provider`` and ``served_model`` say who answered (``typesafe`` and the Jev
+    version, say) when the transport knows, so a replay accounts the call under the
+    model that answered and a report says what a cassette was recorded on; a
+    cassette without them replays as it always did.
 
     ``key`` is ``request_key(model, request)``. ``request`` is the payload that was
     sent and ``response`` the bare response body. A Clef line also carries
@@ -2279,8 +2290,8 @@ class RecordingTransport:
     Only payloads and bodies are written: never headers, tokens or account ids
     (the wrapped transport owns those). As a second line of defence a call whose
     request or response holds the exact value of ``CLOUDFLARE_ACCOUNT_ID``,
-    ``CLOUDFLARE_API_TOKEN``, ``CLOUDFLARE_AUTH_TOKEN``, ``EXPERIENTIAL_API_KEY``
-    or of the credentials of the wrapped ``CloudflareTransport``,
+    ``CLOUDFLARE_API_TOKEN``, ``CLOUDFLARE_AUTH_TOKEN``, ``EXPERIENTIAL_API_KEY``,
+    ``TYPESAFE_API_KEY`` or of the credentials of the wrapped ``CloudflareTransport``,
     ``ExperientialTransport`` or ``RoutingTransport`` (``sensitive_values()``; 16
     characters or more) is NOT written, with a ``RuntimeWarning``: a cassette
     replays exactly what was asked and answered, so it is never edited. The message
@@ -2326,6 +2337,10 @@ class RecordingTransport:
         64 that a transport without a limit gets.
         """
         return max_questions(self._inner, model)
+
+    def state_token_budget(self, model: str) -> int | None:
+        """The state budget of the wrapped transport (``None``: it says none)."""
+        return state_token_budget(self._inner, model)
 
     def _write(self, line: Mapping[str, Any]) -> None:
         sensitive = getattr(self._inner, "sensitive_values", None)
@@ -2388,6 +2403,9 @@ class RecordingTransport:
         }
         if "questions" in request:  # a Clef request: the limit it was chunked by
             head["max_questions"] = self.max_questions(model)
+            budget = self.state_token_budget(model)
+            if budget is not None:  # and the size its state was narrowed to
+                head["state_token_budget"] = budget
         started = time.perf_counter()
         try:
             result = await self._inner.run(model, payload, meta=meta, timeout=timeout)
@@ -2403,15 +2421,17 @@ class RecordingTransport:
                     }
                 )
             raise
-        self._write(
-            {
-                **head,
-                "response": result.body,
-                "status": result.status_code,
-                "duration_ms": result.duration_ms
-                or (time.perf_counter() - started) * 1000,
-            }
-        )
+        line = {
+            **head,
+            "response": result.body,
+            "status": result.status_code,
+            "duration_ms": result.duration_ms or (time.perf_counter() - started) * 1000,
+        }
+        if result.provider:
+            line["provider"] = result.provider
+        if result.served_model:
+            line["served_model"] = result.served_model
+        self._write(line)
         return result
 
 
@@ -2476,6 +2496,7 @@ class CassetteTransport:
         self._cursor: dict[str, int] = {}
         self._lock = threading.Lock()
         self._recorded_limit: int | None = None
+        self._recorded_budget: int | None = None
         self.hits = 0
         self.forwarded = 0
         self.misses: list[tuple[str, dict[str, Any], CallMeta]] = []
@@ -2506,6 +2527,16 @@ class CassetteTransport:
                         self._recorded_limit is None or limit < self._recorded_limit
                     )
                     self._recorded_limit = limit if smaller else self._recorded_limit
+                budget = entry.get("state_token_budget")
+                if (
+                    isinstance(budget, int)
+                    and not isinstance(budget, bool)
+                    and budget > 0
+                    and (
+                        self._recorded_budget is None or budget < self._recorded_budget
+                    )
+                ):
+                    self._recorded_budget = budget
 
     def max_questions(self, model: str) -> int:
         """Questions one Clef request may carry when it is replayed.
@@ -2521,6 +2552,40 @@ class CassetteTransport:
         if self._inner is not None:
             limits.append(max_questions(self._inner, model))
         return min(limits) if limits else DEFAULT_MAX_QUESTIONS
+
+    def state_token_budget(self, model: str) -> int | None:
+        """The state budget the Clef requests were recorded with (the smallest).
+
+        So the states are narrowed as they were and the request keys match; and, when
+        a miss can go to an ``inner`` transport, no larger than that one takes.
+        ``None`` if neither says one.
+        """
+        found = [b for b in (self._recorded_budget,) if b is not None]
+        if self._inner is not None:
+            inner = state_token_budget(self._inner, model)
+            if inner is not None:
+                found.append(inner)
+        return min(found) if found else None
+
+    def providers(self) -> dict[str, tuple[str, ...]]:
+        """Who answered the recorded calls: ``{"clairic": (...), "clef": (...)}``.
+
+        The ``provider`` of each recording by the model it was for; a recording
+        made before the field existed has none and is not listed.
+        """
+        found: dict[str, dict[str, None]] = {"clairic": {}, "clef": {}}
+        for entries in self._entries.values():
+            for entry in entries:
+                provider = entry.get("provider")
+                try:
+                    family = (
+                        "clairic" if body_model(entry["model"]) == "clairic" else "clef"
+                    )
+                except ValueError:
+                    continue
+                if isinstance(provider, str) and provider:
+                    found[family][provider] = None
+        return {k: tuple(sorted(v)) for k, v in found.items()}
 
     def fork(
         self, *, strict: bool | None = None, inner: Transport | None = None
@@ -2539,6 +2604,7 @@ class CassetteTransport:
         other._inner = self._inner if inner is None else inner
         other._entries = self._entries
         other._recorded_limit = self._recorded_limit
+        other._recorded_budget = self._recorded_budget
         other._cursor = {}
         other._lock = threading.Lock()
         other.hits = other.forwarded = 0
@@ -2629,6 +2695,8 @@ class CassetteTransport:
             retries=0,
             duration_ms=float(entry.get("duration_ms") or 0.0),
             status_code=entry.get("status"),
+            provider=entry.get("provider"),
+            served_model=entry.get("served_model"),
         )
 
     @staticmethod
