@@ -411,11 +411,12 @@ _CURRENCY = r"(?:[$€£¥₹]|(?:USD|EUR|GBP|CAD|AUD|CHF|JPY|INR)(?![A-Za-z]))"
 _DIGITS = r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
 _EU_DIGITS = r"\d{1,3}(?:\.\d{3})+,\d{1,2}"
 _NUMBER = re.compile(
-    r"(?<![\w.,/])(?<!\w-)(?P<sign>[-\u2212])?(?P<cur>" + _CURRENCY + r"\s?)?"
+    r"(?<![\w.,/])(?<!\w-)(?P<sign>[-\u2212])?(?P<cur>" + _CURRENCY + r"[ \t]?)?"
     r"(?P<num>" + _EU_DIGITS + "|" + _DIGITS + r"|\.\d+)"
-    r"(?P<suf>\s?(?:%|percent\b|per\s?cent\b|thousand\b|million\b|billion\b|k\b|K\b|bn\b)"
-    r"|(?<=[$€£¥₹\d])\s?[mM]\b(?<![\d\s][mM]))?"
-    r"(?P<cur2>\s(?:USD|EUR|GBP|CAD|AUD|CHF|JPY|INR)(?![A-Za-z]))?"
+    r"(?P<suf>[ \t]?(?:%|percent\b|per[ \t]?cent\b|thousand\b|million\b|billion\b"
+    r"|k\b|K\b|bn\b)"
+    r"|(?<=[$€£¥₹\d])[ \t]?[mM]\b(?<![\d \t][mM]))?"
+    r"(?P<cur2>[ \t](?:USD|EUR|GBP|CAD|AUD|CHF|JPY|INR)(?![A-Za-z]))?"
     r"(?![\w@]|\.\d|,\d)"
 )
 _SYMBOL_CODE = {
@@ -487,8 +488,9 @@ _TOTAL = re.compile(
     re.IGNORECASE,
 )
 _PRODUCT = re.compile(
-    r"(?<![\w.,])(?P<q>\d+(?:\.\d+)?)\s*(?:(?:[A-Za-z]+\s+){0,3}(?:at|@)|x|\u00d7|\*)\s*"
-    r"(?P<p>" + _CURRENCY + r"?\s?(?:" + _DIGITS + r"))(?![\w@]|\.\d)",
+    r"(?<![\w.,])(?P<q>\d+(?:\.\d+)?)[ \t]*"
+    r"(?:(?:[A-Za-z]+[ \t]+){0,3}(?:at|@)|x|\u00d7|\*)[ \t]*"
+    r"(?P<p>" + _CURRENCY + r"?[ \t]?(?:" + _DIGITS + r"))(?![\w@]|\.\d)",
     re.IGNORECASE,
 )
 

@@ -375,6 +375,8 @@ class Run:
             request_id=getattr(primary, "request_id", None),
             provider=getattr(primary, "provider", None),
             cost=spent,
+            # a primary whose call of several requests failed part-way still used tokens
+            usage=getattr(primary, "partial_usage", None),
         )
         if spent is not None:
             self.usage.add_spend(charged_model, meta.kind, spent)
@@ -431,6 +433,11 @@ class Run:
             raise
         if response.fallback_from is not None:
             self._note_fallback(model, meta, n_items, response, started)
+        if response.rerouted_from is not None:
+            self.warn(
+                f"request_rerouted: {response.rerouted_from} cannot serve a request "
+                f"with images, so it went to {response.provider or 'the default'}"
+            )
         return _Sent(
             body=response.body,
             retries=response.retries,

@@ -33,6 +33,7 @@ pattern); the transport splits a request only for the question limit or the cont
 """
 
 import asyncio
+import copy
 import inspect
 import json
 import re
@@ -85,6 +86,7 @@ from trustcall_system_one._wire import (
     NoulAnswer,
     ScoreAnswer,
     parse_clef,
+    validation_summary,
 )
 
 __all__ = [
@@ -225,56 +227,152 @@ class RunStats:
 # --------------------------------------------------------------------------- #
 
 
-def safe_loc_parts(loc: Any) -> list[str]:
-    """The parts of a pydantic error location, cut after ``criteria``.
-
-    Past ``criteria`` the next keys are option ids, which can be the user's text.
-    """
-    parts: list[str] = []
-    for part in loc if isinstance(loc, (list, tuple)) else (loc,):
-        parts.append(str(part))
-        if part == "criteria":
-            break
-    return parts
-
-
-def safe_loc(loc: Any) -> str:
-    """A pydantic error location without the keys that hold the user's data."""
-    return ".".join(safe_loc_parts(loc))
-
-
-def validation_summary(exc: ValidationError) -> str:
-    """``loc: message`` of the first errors, never the values that failed."""
-    notes = []
-    for e in exc.errors(include_input=False)[:5]:
-        # a tag error's message quotes the tag it was given
-        msg = "unknown tag" if e["type"] == "union_tag_invalid" else e["msg"]
-        notes.append(f"{safe_loc(e['loc'])}: {msg}")
-    return "; ".join(notes)[:400]
-
-
 def estimate_tokens(value: Any) -> float:
     """A conservative token estimate of a JSON value: one token per three characters."""
     return len(json.dumps(value, ensure_ascii=False, default=str)) / 3.0
 
 
-def _shrink(value: Any, excess: int) -> Any:
-    """``value`` with about ``excess`` characters fewer (its largest string's)."""
+_FLOOR = 200
+"""No string is cut to fewer characters than this."""
+_QUOTED = re.compile(
+    r"[\"'`\u201c\u2018]([^\"'`\u201c\u201d\u2018\u2019\n]{4,120})[\"'`\u201d\u2019]"
+)
+
+
+def _anchors(questions: Mapping[str, Any]) -> list[str]:
+    """The quoted passages of the questions: what they refer to in the state."""
+    found: dict[str, None] = {}
+
+    def walk(value: Any) -> None:
+        if isinstance(value, str):
+            for m in _QUOTED.finditer(value):
+                text = m.group(1).strip()
+                if len(text) >= 4 and any(c.isalnum() for c in text):
+                    found.setdefault(text)
+        elif isinstance(value, Mapping):
+            for k, v in value.items():
+                walk(k)
+                walk(v)
+        elif isinstance(value, (list, tuple)):
+            for v in value:
+                walk(v)
+
+    walk(questions)
+    return list(found)[:20]
+
+
+def _windows(text: str, spans: list[tuple[int, int]], keep: int) -> str | None:
+    """``text`` cut to about ``keep`` characters in windows around ``spans``."""
+    spans = sorted(spans)
+    reach = keep // (2 * len(spans))
+    while True:
+        merged: list[tuple[int, int]] = []
+        for a, b in spans:
+            lo, hi = max(0, a - reach), min(len(text), b + reach)
+            while 0 < lo < a and not text[lo - 1].isspace():  # start at a word
+                lo += 1
+            while b < hi < len(text) and not text[hi].isspace():  # end at a word
+                hi -= 1
+            if merged and lo <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+            else:
+                merged.append((lo, hi))
+        if sum(hi - lo + 3 for lo, hi in merged) <= keep:
+            break
+        if reach == 0:  # the spans alone are too long: keep as many as fit
+            kept: list[tuple[int, int]] = []
+            total = 0
+            for lo, hi in merged:
+                if total + hi - lo + 3 > keep:
+                    break
+                kept.append((lo, hi))
+                total += hi - lo + 3
+            if not kept:
+                return None
+            merged = kept
+            break
+        reach //= 2
+    body = "\n\u2026\n".join(text[lo:hi] for lo, hi in merged)
+    head = "\u2026\n" if merged[0][0] > 0 else ""
+    tail = "\n\u2026" if merged[-1][1] < len(text) else ""
+    return head + body + tail
+
+
+def _cut(text: str, keep: int, anchors: Sequence[str]) -> str:
+    """``text`` cut to about ``keep`` characters.
+
+    The windows around the passages the questions quote are kept, with a mark
+    (``…``) where text was left out; with none of those in the text, its start.
+    """
+    if keep >= len(text):
+        return text
+    spans: list[tuple[int, int]] = []
+    for anchor in anchors:
+        at = text.find(anchor)
+        found = 0
+        while at >= 0 and found < 5:
+            spans.append((at, at + len(anchor)))
+            found += 1
+            at = text.find(anchor, at + len(anchor))
+    if spans:
+        windowed = _windows(text, spans, keep)
+        if windowed is not None:
+            return windowed
+    cut = text.rfind(" ", 0, keep)
+    return text[: cut if cut > 0 else keep].rstrip() + "\n\u2026"
+
+
+def _strings(value: Any, path: tuple[Any, ...] = ()) -> Any:
+    """Every string in a JSON value with its path."""
     if isinstance(value, str):
-        keep = max(200, len(value) - excess)
-        if keep >= len(value):
-            return value
-        cut = value.rfind(" ", 0, keep)
-        return value[: cut if cut > 0 else keep].rstrip() + "\n…"
-    if isinstance(value, dict) and value:
-        big = max(value, key=lambda k: len(json.dumps(value[k], default=str)))
-        return {**value, big: _shrink(value[big], excess)}
-    if isinstance(value, list) and value:
-        at = max(
-            range(len(value)), key=lambda i: len(json.dumps(value[i], default=str))
-        )
-        return [*value[:at], _shrink(value[at], excess), *value[at + 1 :]]
-    return value
+        yield path, value
+    elif isinstance(value, dict):
+        for k, v in value.items():
+            yield from _strings(v, (*path, k))
+    elif isinstance(value, list):
+        for i, v in enumerate(value):
+            yield from _strings(v, (*path, i))
+
+
+def _replace(value: Any, path: tuple[Any, ...], new: str) -> Any:
+    if not path:
+        return new
+    head, rest = path[0], path[1:]
+    if isinstance(value, dict):
+        return {**value, head: _replace(value[head], rest, new)}
+    return [*value[:head], _replace(value[head], rest, new), *value[head + 1 :]]
+
+
+def _shrink(value: Any, excess: int, anchors: Sequence[str] = ()) -> Any:
+    """``value`` with about ``excess`` characters fewer, from its longest string.
+
+    A string is never cut below ``_FLOOR`` characters; when the longest cannot give
+    any more the next longest is cut, so repeated calls reach every string.
+    """
+    longest = max(
+        ((p, t) for p, t in _strings(value) if len(t) > _FLOOR),
+        key=lambda pt: len(pt[1]),
+        default=None,
+    )
+    if longest is None:
+        return value
+    path, text = longest
+    return _replace(value, path, _cut(text, max(_FLOOR, len(text) - excess), anchors))
+
+
+def _fit(state: Any, room: float, anchors: Sequence[str]) -> Any:
+    """Narrow ``state`` until its estimate is at most ``room`` tokens, or refuse."""
+    cost = estimate_tokens(state)
+    while cost > room:
+        state = _shrink(state, int((cost - room) * 3.0) + 3, anchors)
+        narrowed = estimate_tokens(state)
+        if narrowed >= cost:  # nothing is left to cut
+            raise BadRequestError(
+                f"the state cannot be narrowed to the {int(room)} tokens that Jev "
+                "takes together with this request's largest question"
+            )
+        cost = narrowed
+    return state
 
 
 def to_jev_clef(
@@ -305,9 +403,15 @@ def to_jev_clef(
         One or more ``{model, state, questions}``; in order, their questions are the
         request's questions in order.
 
+    The narrowing keeps windows around the passages the questions quote and cuts
+    other text from its end, in as many rounds as it takes. A request that cannot be
+    made to fit (a question that alone is as large as the context, a state that
+    cannot be cut small enough) is refused here, locally, with nothing sent.
+
     Raises:
-        BadRequestError: If the payload is not a Clef request or holds images
-            (Jev reads text).
+        BadRequestError: If the payload is not a Clef request, holds images (Jev
+            reads text), has a question too large for Jev's context or a state that
+            cannot be narrowed to fit it.
     """
     try:
         request = ClefRequest.model_validate(payload)
@@ -325,12 +429,15 @@ def to_jev_clef(
     if question_budget is None and request_budget is None:
         return [{"model": jev_model, "state": state, "questions": questions}]
     costs = {qid: estimate_tokens(q) for qid, q in questions.items()}
+    cap = min(b for b in (question_budget, request_budget) if b is not None)
+    widest = max(costs, key=lambda qid: costs[qid])
+    if costs[widest] >= cap:  # no state at all would make it fit
+        raise BadRequestError(
+            f"question {widest!r} alone is about {int(costs[widest])} tokens: more "
+            f"than the {cap} that Jev takes for a question and its state"
+        )
+    state = _fit(state, cap - costs[widest], _anchors(questions))
     state_cost = estimate_tokens(state)
-    if question_budget is not None:
-        room = question_budget - max(costs.values())
-        if state_cost > room:
-            state = _shrink(state, int((state_cost - max(room, 1000)) * 3.0) + 3)
-            state_cost = estimate_tokens(state)
     limit = request_budget if request_budget is not None else float("inf")
     batches: list[dict[str, Any]] = [{}]
     used = state_cost
@@ -494,10 +601,45 @@ def _focus(head: str, content: str) -> str:
 
 @dataclass(frozen=True)
 class _Repair:
-    """The rejected answer of a repair request (``<previous_attempt>`` and errors)."""
+    """The rejected answer of a repair request and why (what the engine wrote).
+
+    Attributes:
+        previous: ``<previous_attempt>``: the answer that was rejected.
+        errors: ``(field, message)`` of the ``<validation_errors>`` the engine
+            wrote (``field`` is a dotted path, or ``(record)`` for an error of the
+            whole record). The ``input`` it may show is never read: it can be the
+            user's text and nothing here has a use for it.
+    """
 
     previous: Any
-    errors: str
+    errors: tuple[tuple[str, str], ...] = ()
+
+    def names(self, name: str) -> bool:
+        """Whether an error names the field ``name`` itself, not only the record."""
+        return any(
+            where == name or where.endswith("." + name) or where.startswith(name + ".")
+            for where, _ in self.errors
+        )
+
+    def note(self, name: str) -> str:
+        """What goes into the instructions of the pick for ``name``."""
+        if self.names(name):
+            shown = "; ".join(
+                f"{where}: {message}" if where != "(record)" else message
+                for where, message in self.errors[:3]
+            )
+            return (
+                f" An earlier answer was rejected ({shown[:240]}): it is not an option."
+                if shown
+                else " An earlier answer was rejected: it is not an option."
+            )
+        shown = "; ".join(message for _, message in self.errors[:3])[:240]
+        return (
+            f" A check on the whole record failed ({shown}); the earlier answer may "
+            "still be right."
+            if shown
+            else ""
+        )
 
 
 def _repair_of(tail: str) -> _Repair | None:
@@ -511,7 +653,7 @@ def _repair_of(tail: str) -> _Repair | None:
         previous: Any = json.loads(found.group(1))
     except ValueError:
         previous = found.group(1)
-    errors = ""
+    errors: list[tuple[str, str]] = []
     block = re.search(
         r"<validation_errors>\n(.*?)\n</validation_errors>", tail, re.DOTALL
     )
@@ -520,13 +662,11 @@ def _repair_of(tail: str) -> _Repair | None:
             listed = json.loads(block.group(1))
         except ValueError:
             listed = []
-        notes = []
         for item in listed if isinstance(listed, list) else []:
-            if isinstance(item, dict) and item.get("msg"):
-                where = ".".join(str(p) for p in item.get("loc", ()))
-                notes.append(f"{where}: {item['msg']}" if where else str(item["msg"]))
-        errors = "; ".join(notes[:3])[:240]
-    return _Repair(previous, errors)
+            if isinstance(item, dict) and item.get("message"):
+                where = str(item.get("field") or "(record)")
+                errors.append((where, str(item["message"])[:160]))
+    return _Repair(previous, tuple(errors))
 
 
 def _is_previous(candidate: Candidate, previous: Any) -> bool:
@@ -544,7 +684,7 @@ def _desc(spec: ClairicField, name: str) -> str:
 
 
 def _pick_instructions(
-    desc: str, structured: bool, repair: _Repair | None = None
+    desc: str, structured: bool, repair: _Repair | None = None, name: str = ""
 ) -> str:
     options = (
         "Each option is an exact quoted span of `input`, or the id of a block (B..), "
@@ -553,13 +693,7 @@ def _pick_instructions(
         else "Each option is an exact quoted span of `input`."
     )
     desc = desc if desc.rstrip().endswith((".", "?", "!", ":")) else desc.rstrip() + "."
-    again = (
-        f" An earlier answer was rejected ({repair.errors}): it is not an option."
-        if repair is not None and repair.errors
-        else " An earlier answer was rejected: it is not an option."
-        if repair is not None
-        else ""
-    )
+    again = repair.note(name) if repair is not None else ""
     return (
         f"For the entity named in `focus`, from what `input` states: {desc} "
         f"Which option is it? {options} Choose {NONE} if `input` does not state it."
@@ -839,6 +973,24 @@ async def _structure(
     )
 
 
+def _own_copy(error: Exception) -> Exception:
+    """A failure of the stitch another call made, as this call's own error.
+
+    Without the leader's notes: this call sent nothing, so what the leader's other
+    requests cost and which of them were cancelled is not this call's.
+    """
+    try:
+        mine = copy.copy(error)
+    except Exception:
+        return error
+    for name in ("cancelled_siblings", "maybe_sent", "partial_usage", "served_model"):
+        mine.__dict__.pop(name, None)
+    before = mine.__dict__.pop("_args_before_note", None)
+    if before is not None:
+        mine.args = before
+    return mine
+
+
 async def _stitch(
     content: str,
     lines: Sequence[Any],
@@ -864,9 +1016,10 @@ async def _stitch(
         except asyncio.CancelledError:
             if not shared.cancelled():
                 raise  # this task was cancelled, not the one that was asking
-        except Exception:
-            memo.pop(key, None)  # it failed for the others too; ask again
-            raise
+        except Exception as failure:
+            if memo.get(key) is shared:  # never a newer owner's entry
+                del memo[key]
+            raise _own_copy(failure) from None
     mine: asyncio.Future[dict[str, float]] = loop.create_future()
     if len(memo) >= 256:
         memo.pop(next(iter(memo)))
@@ -909,7 +1062,10 @@ def _plan(
         else:
             job = _Job(name, spec, "pick", repair=repair)
             job.options = _candidates(spec, content, structure, config)
-            if repair is not None:  # a repair never offers the rejected answer again
+            # A repair does not offer the rejected answer again, when an error names
+            # this field. A record-level error ("discount must be below price") does
+            # not say which field was wrong, so the answer stays an option.
+            if repair is not None and repair.names(name):
                 job.options = [
                     c for c in job.options if not _is_previous(c, repair.previous)
                 ]
@@ -957,7 +1113,9 @@ def _stage_one(job: _Job) -> dict[str, Any]:
             qid = f"{name}::pick" if len(job.chunks) == 1 else f"{name}::pick{k}"
             out[qid] = {
                 "type": "choice",
-                "instructions": _pick_instructions(desc, _structured(spec), job.repair),
+                "instructions": _pick_instructions(
+                    desc, _structured(spec), job.repair, name
+                ),
                 "criteria": _criteria(chunk),
             }
     elif job.kind == "list":
@@ -1006,7 +1164,7 @@ def _absorb(job: _Job, answers: Mapping[str, Any]) -> dict[str, Any]:
             f"{name}::final": {
                 "type": "choice",
                 "instructions": _pick_instructions(
-                    _desc(spec, name), _structured(spec), job.repair
+                    _desc(spec, name), _structured(spec), job.repair, name
                 ),
                 "criteria": _criteria(job.finalists),
             }
@@ -1085,7 +1243,11 @@ def _finish(
         if top is not None:
             out["guess"] = top.value
         # Jev's own choice of `none` is "not stated", whatever the threshold; the
-        # null threshold decides only when a candidate was chosen
+        # null threshold decides only when a candidate was chosen. So a null value
+        # whose p_null is BELOW the field's threshold means Jev chose `none` (its
+        # probability for it was the largest, though under the threshold): p_null
+        # stays P(none) and is never raised to hide that, and `guess` is the best
+        # candidate.
         chose_none = answer.choice == NONE
         if top is not None and not chose_none and p_null <= _null_threshold(spec):
             out["value"] = top.value
@@ -1225,16 +1387,22 @@ async def _verify(
 
 
 def _value_fits(spec: ClairicField, value: Any) -> bool:
-    """Whether a hook's value is of the field's type."""
-    kind = spec.type
+    """Whether a hook's value is of the field's type (a list's elements too)."""
     if value is None:
         return True
+    if spec.type == "list":
+        return isinstance(value, list) and all(
+            v is not None and _kind_fits(spec.items or "text", v) for v in value
+        )
+    return _kind_fits(spec.type, value)
+
+
+def _kind_fits(kind: str, value: Any) -> bool:
+    """Whether a non-null value is of a field type (or a list's item type)."""
     if kind == "text":
         return isinstance(value, str)
     if kind in ("number", "estimate", "duration"):
         return isinstance(value, (int, float)) and not isinstance(value, bool)
-    if kind == "list":
-        return isinstance(value, list)
     if not isinstance(value, str):
         return False
     try:

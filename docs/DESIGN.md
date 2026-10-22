@@ -1577,10 +1577,17 @@ max_tokens_exceeded`. So the transport meets the limits itself, with conservativ
   not narrowed for Cloudflare's larger window and then refused by Jev;
 * **`to_jev_clef` splits and narrows as the last line of defence**: questions go into as few requests
   as hold them (each with the whole state; the answers are merged in the request's order, the usage
-  summed), and a state still too large for even one question is narrowed (its largest string cut at a
-  word and marked `…`), so no request exceeds 32k per question or 64k per request. A request that fits
-  is one request with the questions as they are. A failure in one request of several cancels the
-  others (which may have been sent) and counts as `uncertain`.
+  summed), and a state still too large for even one question is narrowed, in as many rounds as it takes
+  (the longest string first, never below 200 characters), so no request exceeds 32k per question or 64k
+  per request. The narrowing keeps windows around the passages the questions quote (a quoted value
+  in a question is found in the state and kept with its surroundings, a `…` marking what was left
+  out) and cuts text nobody quotes from its end. A request that cannot be made to fit is refused
+  locally with a `BadRequestError` and nothing is sent (the engine treats a local refusal as a rejected
+  request and goes on): a question that alone is as large as the context (30k estimated tokens), or a
+  state that has nothing left to cut. A request that fits is one request with the questions as they are.
+  If some parts of a split request answered and another failed, the error carries what the answered
+  parts cost (`partial_usage`) and `maybe_sent`, so it is `uncertain` and a `FallbackTransport` does
+  not re-ask the questions that were already charged.
 
 ### Clairic: selection, following TypeSafe's extraction cookbooks
 
@@ -1634,7 +1641,9 @@ offsets in the state that was sent: `state_text[s:e] == text` for a pattern cand
 P(`none`), `confidence` = Jev's and `guess` = the best non-`none` candidate. **When Jev's choice is
 `none` the value is null, whatever the other probabilities are** (`none` 0.45 over a phone number at
 0.40 is "not stated", and `p_null` is 0.45, so the ladder sees a doubt, not a decision), and the
-best candidate is only the `guess`. When a candidate was chosen, `value` is null if `p_null` is above
+best candidate is only the `guess` (so a null `value` whose `p_null` is *below* the
+field's threshold means Jev chose `none` narrowly; `p_null` stays P(`none`) and is not raised to hide it).
+When a candidate was chosen, `value` is null if `p_null` is above
 the field's `null_threshold` (default 0.5), as Clairic's. No candidate at all is a confident null without
 a request. The option ids are the spans (probe 6 above); the ids of structure (`B003`, `S007`) and the
 description of an amount or a sum are the only non-span options.
@@ -1792,8 +1801,14 @@ reasoning model if a signal fires). The stages map onto the library's ladder lik
   the call log and the totals; requests that were cancelled while in flight may have been sent and are
   counted (`cancelled_siblings`, named in the message); and once any request went out the failure is
   classified `uncertain` whatever its last error was (a rate limit on the third request is not "nothing
-  ran"). `call_deadline` (300 s) bounds the whole Clairic call, not each request: a call that runs out of
-  time is an `UncertainOutcomeError` when a request had answered.
+  ran"). Each request is counted the moment it answers, not when its siblings are all done, so when one of
+  26 parallel requests fails the 25 that answered are on the error. The module-level `classify_failure`
+  honours `maybe_sent` / `partial_usage` on any error, so `RecordingTransport` or `RoutingTransport` around
+  the TypeSafe transport do not hide it from a `FallbackTransport`, and the engine keeps a failed
+  primary's `partial_usage` in the call log. `call_deadline` (300 s) bounds the whole Clairic call, not
+  each request: a call that runs out of time is an `UncertainOutcomeError` (something may have gone out),
+  with the tokens of the requests that had answered. Calls that share one stitch request each get their
+  own copy of its failure, without the leader's charge or cancelled-sibling note.
 
 ### Transport, errors and retries
 
@@ -1804,7 +1819,8 @@ errors: one HTTP client per loop, the adaptive limiter (one limit for both model
 or write error, a dropped connection, a 408 or **any 5xx, 529 Overloaded included**, raises
 `UncertainOutcomeError` (classified `uncertain` for `FallbackTransport`). A 529 means the server
 was overloaded, not that the request was not processed: it may have run the model and may have charged, so
-it is exactly as uncertain as a 503, never resent, and `max_retries` does not apply to it. **Retried**: a
+it is exactly as uncertain as a 503, never resent, and `max_retries` does not apply to it; it does
+tell the adaptive limiter to slow down, as a 429 does. **Retried**: a
 connect error (nothing was sent) with jittered backoff, and **`429 Too Many Requests` only**, which the
 API documents as "retry after a short delay" and which means the request was refused before any
 work: it honours `Retry-After` and `retry-after-ms`, otherwise backs off exponentially up to
@@ -1818,8 +1834,10 @@ since TypeSafe says to back off and retry (`_retry_needs_hint = False`). After t
 user's text), and `cf_errors` is the same cleaned list), a 2xx that is not a valid answer to its questions a
 `ModelResponseError`. A Clairic call is several requests; the error is the failing request's, the
 others are cancelled, and what the requests that had answered cost is on the error (see Accounting
-above). The messages of `from_jev` and of an invalid request name the question and the field, never an
-option or a value. `x-typesafe-request-id` is the request id.
+above). The messages of `from_jev`, of an invalid request and of a response that does not parse
+(`parse_clef`, `parse_clairic`: pydantic's text with its `input_value` is replaced by `loc: message`, the
+location cut after `criteria` and `probabilities`, whose next keys are options) name the question and the
+field, never an option or a value. `x-typesafe-request-id` is the request id.
 
 ### Selection
 
@@ -1832,10 +1850,15 @@ request, so a recording made on TypeSafe replays under any provider and the othe
 Clairic answers are the adapter's).
 
 **Repair and existing records.** A repair request (the library's `<previous_attempt>` and
-`<validation_errors>` blocks after the input) is served as one: the errors, shortened (`loc: msg`, at most
-three), go into the pick instructions ("An earlier answer was rejected (email: not allowed on this
-domain): it is not an option."), and the rejected answer is removed from the options, since offering it
-again would repeat the answer that failed. If nothing else is left (the only candidate was the rejected
+`<validation_errors>` blocks after the input; the errors are the engine's `{field, message, type, input}`
+objects) is served as one: the errors, shortened (`field: message`, at most three; the `input` an error may
+show is never read, it can be the user's text), go into the pick instructions ("An earlier answer was
+rejected (email: not allowed on this domain): it is not an option."), and the rejected answer is removed
+from the options when an error names **this field** (a nested path such as `contacts.0.email` names
+`email`), since offering it again would repeat the answer that failed. A **record-level** error (the
+field is `(record)`: a model validator such as "discount must be below price") does not say which field
+was wrong, so every candidate stays, including the previous answer, and the instructions only say that a
+check on the whole record failed and the earlier answer may still be right. If nothing else is left (the only candidate was the rejected
 one) the field is a null with no request, rather than an identical paid call. The `<existing>` record is
 **not sent to Jev**: selection reads the input only (an echo of the stored value is caught by the
 input-only cross-check, as for Clairic), so Jev cannot "confirm" a value from the record.
@@ -1848,8 +1871,12 @@ only after a failure. The same opt-in rule applies (an `EXPERIENTIAL_API_KEY` al
 hard-pick cap of 0.8 applies (a bare yes cannot authorise a removal), the question limit is
 `DecisionsTransport`'s 32, and it is a `ValueError` to also ask for the Decisions fallback. The Decisions API takes text only, so
 **a Clef request with images goes to the default (Cloudflare)**: `RoutingTransport` asks the routed
-transport's `serves(model, payload)` and hands such a request to the default when it is another
-transport that can serve it (the Decisions API never sees the image).
+transport's `serves(model, payload)` and hands such a request, and only a request with images, to the
+default when it is another transport that can serve it (the Decisions API never sees the image). The
+response says so (`TransportResponse.rerouted_from`) and the engine records a `request_rerouted` warning.
+Any other request the routed transport cannot serve (a `forecast` field on Jev, an invalid
+Decisions payload) is not moved: the routed transport refuses it locally, so the text never goes to
+another company unasked.
 So three combinations can be benchmarked: Cloudflare Clairic + Clef (default), Cloudflare Clairic + the
 Decisions API for Clef, and TypeSafe Jev for both.
 
@@ -1863,6 +1890,11 @@ a cassette from before the field existed). `--provider typesafe` together with `
 `--clef-fallback` (or the `TRUSTCALL_S1_CLEF_PROVIDER` / `TRUSTCALL_S1_CLEF_FALLBACK` variables) is
 refused, since Jev answers Clef itself; the same goes for `system_one_transport(provider="typesafe")` with an
 explicit `cloudflare=`, `experiential=` or `decisions=` object.
+
+**A TypeSafe object needs the provider.** `system_one_transport(typesafe=TypeSafeTransport(...))`
+with the provider resolving to anything but `typesafe` is a `ValueError` (it would have returned a
+`CloudflareTransport` and sent the text to Cloudflare while the caller thought it was on Jev): say
+`provider="typesafe"` or `TRUSTCALL_S1_PROVIDER=typesafe`. The provider is never switched for you.
 
 **Cassettes keep provenance.** A recording carries `provider` and `served_model` (and, for Clef, the
 `state_token_budget` its states were narrowed to, as it carries `max_questions`) when the transport knows

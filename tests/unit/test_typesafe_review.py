@@ -49,22 +49,45 @@ from trustcall_system_one import (
     Prices,
     RateLimitError,
     RoutingTransport,
+    TransportError,
     TransportResponse,
     TypeSafeConfig,
     UncertainOutcomeError,
     Usage,
     system_one_transport,
 )
+from trustcall_system_one._candidates import pattern_candidates
 from trustcall_system_one._render import estimate_tokens
+from trustcall_system_one._repair import _Blocks
 from trustcall_system_one._run import Run
-from trustcall_system_one._typesafe import _focus, from_jev, to_jev_clef
-from trustcall_system_one._wire import ClairicUsage
+from trustcall_system_one._structure import join_questions, structure_key, to_lines
+from trustcall_system_one._typesafe import (
+    _focus,
+    _own_copy,
+    _Repair,
+    _repair_of,
+    _stitch,
+    _value_fits,
+    from_jev,
+    to_jev_clef,
+)
+from trustcall_system_one._wire import (
+    ClairicField,
+    ClairicUsage,
+    parse_clairic,
+    parse_clef,
+)
 from trustcall_system_one.testing import (
     CassetteTransport,
     FakeTransport,
     RecordingTransport,
 )
-from trustcall_system_one.transport import max_questions, state_token_budget
+from trustcall_system_one.transport import (
+    _note_siblings,
+    classify_failure,
+    max_questions,
+    state_token_budget,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -429,13 +452,14 @@ def test_waiters_of_a_failed_stitch_fail_with_it_and_do_not_resend() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _trailer(previous: Any, message: str, loc: str = "email") -> str:
-    errors = [{"type": "value_error", "loc": [loc], "msg": message}]
-    return (
-        f"<previous_attempt>\n{json.dumps(previous)}\n</previous_attempt>\n"
-        f"<validation_errors>\n{json.dumps(errors)}\n</validation_errors>\n"
-        "<expected_schema>\n{}\n</expected_schema>"
-    )
+def _trailer(
+    previous: Any, message: str, field: str = "email", shown: str | None = None
+) -> str:
+    """The trailer the repair loop really writes (``_Blocks.trailer``)."""
+    error: dict[str, Any] = {"field": field, "message": message, "type": "value_error"}
+    if shown is not None:
+        error["input"] = shown  # the engine shows a leaf's own value
+    return _Blocks(previous, [error], "{}").trailer()
 
 
 def test_a_repair_says_what_was_wrong_and_does_not_offer_the_answer_again() -> None:
@@ -629,7 +653,7 @@ def test_the_deadline_bounds_the_whole_clairic_call_not_each_request() -> None:
     assert transport.classify_failure(caught.value) == "uncertain"
     # a deadline hit before anything answered is still not "nothing was sent"
     stalled = make(slow, call_deadline=0.05)
-    with pytest.raises(Exception) as first:
+    with pytest.raises(UncertainOutcomeError) as first:  # never a plain TransportError
         clairic(stalled, clairic_payload(EMAIL_FIELD))
     assert "deadline" in str(first.value)
     assert stalled.classify_failure(first.value) == "uncertain"
@@ -838,3 +862,515 @@ def test_choice_helper_is_the_probed_shape() -> None:
     answer = choice({"criteria": {"a": None, "b": None, "none": None}}, "a", 0.8)
     assert answer["probabilities"]["a"] == 0.8
     assert sum(answer["probabilities"].values()) == pytest.approx(1.0)
+
+
+# --------------------------------------------------------------------------- #
+# Second review. 11: what a failed sibling leaves behind, seen through wrappers
+# --------------------------------------------------------------------------- #
+
+LIST_FIELD = {"people": {"type": "list", "items": "text", "instructions": "People"}}
+LIST_TEXT = "\n".join(f"Person{i} Name{i} met Person{i + 1}." for i in range(40))
+SPLIT = TypeSafeConfig(
+    verify_selection=False,
+    stitch=False,
+    max_list_candidates=1000,
+    request_token_budget=1500,  # several requests in the selection round
+)
+
+
+def _parallel_failure() -> tuple[Any, Jev, dict[str, int]]:
+    jev = Jev(picks())
+    seen = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen["n"] += 1
+        if seen["n"] == 2:
+            await asyncio.sleep(0.3)  # the others have answered by then
+            return httpx.Response(429, json={})
+        return jev(request)
+
+    return make(handler, config=SPLIT, max_retries=0), jev, seen
+
+
+def test_the_siblings_that_answered_are_counted_when_one_fails() -> None:
+    transport, _jev, seen = _parallel_failure()
+    with pytest.raises(RateLimitError) as caught:
+        clairic(transport, clairic_payload(LIST_FIELD, LIST_TEXT))
+    error: Any = caught.value
+    assert seen["n"] >= 3  # a call of many requests, one of which is refused
+    assert error.maybe_sent is True
+    assert error.partial_usage.passes == seen["n"] - 1  # every other one answered
+    assert error.partial_usage.input_tokens == 100 * (seen["n"] - 1)
+    assert transport.classify_failure(error) == "uncertain"
+
+
+def test_a_fallback_does_not_re_ask_what_a_failed_call_was_charged_for() -> None:
+    transport, _jev, _seen = _parallel_failure()
+    spare = Spy()
+    both = FallbackTransport(transport, spare)
+    with pytest.raises(RateLimitError):
+        run(both.run(CLAIRIC, clairic_payload(LIST_FIELD, LIST_TEXT), meta=META))
+    assert not spare.calls
+
+
+def test_a_wrapped_transport_keeps_the_uncertainty(tmp_path: Path) -> None:
+    jev = Jev(picks(email="dana.personal@gmail.com"))
+    seen = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["n"] += 1
+        if seen["n"] == 2:  # the stitch answered, the selection is refused
+            return httpx.Response(429, json={})
+        return jev(request)
+
+    spare = Spy()
+    wrapped = RecordingTransport(make(handler, max_retries=0), tmp_path / "c.jsonl")
+    both = FallbackTransport(wrapped, spare)
+    with pytest.raises(RateLimitError) as caught:
+        run(both.run(CLAIRIC, clairic_payload(EMAIL_FIELD), meta=META))
+    assert not spare.calls  # the module-level classification sees maybe_sent
+    assert classify_failure(caught.value) == "uncertain"
+    assert seen["n"] == 2
+
+
+def test_classification_honours_a_charge_whatever_the_error_type() -> None:
+    plain = RateLimitError("slow down")
+    assert classify_failure(plain) == "unavailable"
+    charged = RateLimitError("slow down")
+    charged.maybe_sent = True
+    assert classify_failure(charged) == "uncertain"
+    paid = TransportError("x")
+    paid.partial_usage = ClairicUsage(  # type: ignore[attr-defined]
+        input_tokens=1, output_tokens=1, passes=1
+    )
+    assert classify_failure(paid) == "uncertain"
+    refused = BadRequestError("no")
+    refused.maybe_sent = True
+    assert classify_failure(refused) is None  # a bad request is never retried
+
+
+def _clef_split_failure() -> tuple[Any, Any, dict[str, int]]:
+    payload = {
+        **CLEF_PAYLOAD,
+        "state": {"input": "word " * 2000},
+        "questions": {
+            f"q{i}": {
+                "type": "noul",
+                "instructions": f"Is it {i}?",
+                "criteria": {"true": "y", "false": "n"},
+            }
+            for i in range(6)
+        },
+    }
+    seen = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen["n"] += 1
+        body = json.loads(request.content)
+        if seen["n"] == 2:
+            await asyncio.sleep(0.2)
+            return httpx.Response(429, json={})
+        answers = {q: {"type": "noul", "noul": 0.1} for q in body["questions"]}
+        usage = {"input_tokens": 1000, "output_tokens": 5}
+        return httpx.Response(
+            200, json={"model": "jev-1.14.0", "answers": answers, "usage": usage}
+        )
+
+    transport = make(handler, max_retries=0)
+    transport._request_tokens = 3420  # a split into several requests
+    return transport, payload, seen
+
+
+def test_a_split_clef_request_that_fails_part_way_keeps_what_answered() -> None:
+    transport, payload, seen = _clef_split_failure()
+    with pytest.raises(RateLimitError) as caught:
+        run(transport.run(CLEF, payload, meta=META))
+    error: Any = caught.value
+    assert seen["n"] > 2
+    assert error.maybe_sent is True
+    assert error.partial_usage.input_tokens == 1000 * (seen["n"] - 1)
+    assert transport.classify_failure(error) == "uncertain"
+
+
+def test_a_fallback_does_not_re_ask_the_clef_parts_that_were_charged() -> None:
+    transport, payload, _seen = _clef_split_failure()
+    spare = Spy()
+    with pytest.raises(RateLimitError):
+        run(FallbackTransport(transport, spare).run(CLEF, payload, meta=META))
+    assert not spare.calls
+
+
+async def test_the_primary_failure_of_a_fallback_keeps_its_tokens() -> None:
+    class Partway:
+        async def run(
+            self, model: str, payload: Any, *, meta: Any, timeout: float | None = None
+        ) -> TransportResponse:
+            error = UncertainOutcomeError("the selection timed out")
+            error.partial_usage = ClairicUsage(  # type: ignore[attr-defined]
+                input_tokens=300, output_tokens=7, passes=2
+            )
+            error.served_model = "jev-1.14.0"
+            raise error
+
+    class Refuses:
+        async def run(
+            self, model: str, payload: Any, *, meta: Any, timeout: float | None = None
+        ) -> TransportResponse:
+            raise TransportError("no")
+
+    engine = Run(transport=FallbackTransport(Partway(), Refuses(), on="uncertain"))
+    with pytest.raises(TransportError):
+        await engine._send(CLAIRIC, {"model": "clairic"}, META, 1)
+    primary, fallback = engine.calls
+    assert primary.usage["input_tokens"] == 300  # the primary's tokens are kept
+    assert primary.model == "jev-1.14.0"
+    assert fallback.error is not None
+    assert engine.usage.input_tokens == 300
+
+
+def test_note_of_cancelled_siblings_is_added_once() -> None:
+    error = UncertainOutcomeError("the selection timed out")
+    _note_siblings(error, 2)
+    _note_siblings(error, 2)  # a second call that shares the error
+    assert str(error).count("cancelled after they may have been sent") == 1
+    mine = _own_copy(error)
+    assert "cancelled" not in str(mine)  # the sibling note is the leader's
+    assert str(mine) == "the selection timed out"
+
+
+def test_a_waiter_gets_its_own_error_without_the_leaders_charge() -> None:
+    error = UncertainOutcomeError("slow")
+    error.partial_usage = ClairicUsage(  # type: ignore[attr-defined]
+        input_tokens=5, output_tokens=1, passes=1
+    )
+    error.maybe_sent = True
+    error.cancelled_siblings = 3  # type: ignore[attr-defined]
+    mine = _own_copy(error)
+    assert mine is not error
+    assert getattr(mine, "partial_usage", None) is None
+    assert not getattr(mine, "maybe_sent", False)
+    assert not getattr(mine, "cancelled_siblings", 0)
+    leader: Any = error
+    assert leader.partial_usage.passes == 1  # the leader's is untouched
+
+
+async def test_a_waiter_never_removes_a_newer_owners_entry() -> None:
+    content = "line one and\ncontinues here."
+    lines = to_lines(content)
+    questions = join_questions(lines)
+    key = structure_key(content)
+    loop = asyncio.get_running_loop()
+    old: asyncio.Future[dict[str, float]] = loop.create_future()
+    newer: asyncio.Future[dict[str, float]] = loop.create_future()
+    memo = {key: old}
+
+    async def ask(*_: Any) -> Any:
+        raise AssertionError("a waiter does not ask")
+
+    waiter = asyncio.create_task(_stitch(content, lines, questions, ask, memo))
+    await asyncio.sleep(0)  # it is waiting on `old`
+    memo[key] = newer  # another call took over the entry
+    old.set_exception(RuntimeError("the first stitch failed"))
+    with pytest.raises(RuntimeError):
+        await waiter
+    assert memo[key] is newer
+    newer.cancel()
+
+
+def test_529_slows_the_limiter_and_is_still_not_retried() -> None:
+    recorder = Recorder(httpx.Response(529, json={}), ok())
+    transport = make(recorder)
+    before = transport.limiter.limit("typesafe")
+    with pytest.raises(UncertainOutcomeError):
+        run(transport.run(CLEF, CLEF_PAYLOAD, meta=META))
+    assert transport.limiter.limit("typesafe") == max(1, before // 2)
+    assert len(recorder.requests) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Second review. 4: a Clef request is narrowed until it fits, or refused locally
+# --------------------------------------------------------------------------- #
+
+
+def _delete_question(i: int) -> dict[str, Any]:
+    return {
+        "type": "noul",
+        "instructions": f"Does `input` state that `records.r{i}` should be deleted?",
+        "criteria": {"true": "yes", "false": "no"},
+    }
+
+
+def _fits(parts: list[dict[str, Any]]) -> None:
+    for part in parts:
+        state = estimate_tokens(part["state"])
+        costs = [estimate_tokens(q) for q in part["questions"].values()]
+        assert state + max(costs) <= 30_000
+        assert state + sum(costs) <= 60_000
+
+
+def test_a_state_of_many_records_is_narrowed_until_the_request_fits() -> None:
+    records = {
+        f"r{i}": {"name": f"Person {i}", "notes": "lorem ipsum dolor sit amet " * 30}
+        for i in range(300)
+    }
+    state = {"input": "Alice left the company. " * 50, "records": records}
+    questions = {f"delete.r{i}": _delete_question(i) for i in range(60)}
+    assert estimate_tokens(state) > 50_000
+    parts = to_jev_clef(
+        {"model": "clef", "state": state, "questions": questions},
+        "jev-latest",
+        question_budget=30_000,
+        request_budget=60_000,
+    )
+    _fits(parts)
+    assert [q for p in parts for q in p["questions"]] == list(questions)
+    assert parts[0]["state"]["input"].startswith("Alice left")  # the input is kept
+
+
+def test_what_the_questions_quote_is_kept_when_the_state_is_narrowed() -> None:
+    filler = "filler words go here " * 3000
+    needle = "Lisbon and pays by card"
+    text = f"{filler}The customer lives in {needle}, every month. {filler}"
+    question = {
+        "type": "noul",
+        "instructions": f"Does `input` say the city is Lisbon? It reads '{needle}'.",
+        "criteria": {"true": "yes", "false": "no"},
+    }
+    (part,) = to_jev_clef(
+        {"model": "clef", "state": {"input": text}, "questions": {"q": question}},
+        "jev-latest",
+        question_budget=30_000,
+        request_budget=60_000,
+    )
+    kept = part["state"]["input"]
+    assert needle in kept  # not just the start of the text
+    assert "\u2026" in kept  # with a mark where text was left out
+    assert len(kept) < len(text)
+    _fits([part])
+    # text the questions do not quote is cut from its end
+    (plain,) = to_jev_clef(
+        {
+            "model": "clef",
+            "state": {"input": text},
+            "questions": {"q": _delete_question(1)},
+        },
+        "jev-latest",
+        question_budget=30_000,
+        request_budget=60_000,
+    )
+    assert plain["state"]["input"].startswith("filler words")
+    assert plain["state"]["input"].endswith("\u2026")
+
+
+def test_a_question_that_alone_fills_jevs_context_is_refused_locally() -> None:
+    huge = {
+        "type": "choice",
+        "instructions": "Which?",
+        "criteria": {f"o{i}": "x" * 400 for i in range(254)},
+    }
+    payload = {
+        "model": "clef",
+        "state": {"input": "hello " * 20000},
+        "questions": {"m": huge},
+    }
+    with pytest.raises(BadRequestError, match="'m' alone"):
+        to_jev_clef(
+            payload, "jev-latest", question_budget=30_000, request_budget=60_000
+        )
+    recorder = Recorder(ok())
+    with pytest.raises(BadRequestError):  # through the transport: nothing is sent
+        run(make(recorder).run(CLEF, payload, meta=META))
+    assert not recorder.requests
+
+
+def test_a_state_that_cannot_be_cut_small_enough_is_refused_locally() -> None:
+    state = {
+        "records": {f"r{i}": "x" * 150 for i in range(1000)}
+    }  # all under the floor
+    payload = {"model": "clef", "state": state, "questions": {"q": _delete_question(1)}}
+    recorder = Recorder(ok())
+    with pytest.raises(BadRequestError, match="cannot be narrowed"):
+        run(make(recorder).run(CLEF, payload, meta=META))
+    assert not recorder.requests
+
+
+# --------------------------------------------------------------------------- #
+# Second review. 9: the repair trailer the engine really writes
+# --------------------------------------------------------------------------- #
+
+
+def test_the_real_trailer_is_read_and_the_input_it_shows_is_not_copied() -> None:
+    private = "dana-private@secret.example"
+    trailer = _trailer(
+        "dana.personal@gmail.com", "not allowed here", "email", shown=private
+    )
+    repair = _repair_of(trailer)
+    assert repair is not None
+    assert repair.previous == "dana.personal@gmail.com"
+    assert repair.errors == (("email", "not allowed here"),)
+    jev = Jev(picks(email="dana.whit@acme-corp.com"))
+    payload = clairic_payload(EMAIL_FIELD, MAIL, trailer=trailer)
+    clairic(make(jev, config=TypeSafeConfig(verify_selection=False)), payload)
+    assert private not in json.dumps(jev.requests)  # never in an instruction
+
+
+def test_a_record_level_error_keeps_the_answer_as_an_option() -> None:
+    field = {"price": {"type": "number", "instructions": "The price in dollars."}}
+    text = "It costs 42 dollars, with a 50 dollar discount."
+    trailer = _trailer(42, "Value error, discount must be below price", "(record)")
+    jev = Jev(picks(price="42"))
+    sent = clairic(
+        make(jev, config=TypeSafeConfig(verify_selection=False)),
+        clairic_payload(field, text, trailer=trailer),
+    )
+    (select,) = [r for r in jev.requests if "price::pick" in r["questions"]]
+    question = select["questions"]["price::pick"]
+    assert "42" in question["criteria"]  # not removed: the price may be right
+    assert "discount must be below price" in question["instructions"]
+    assert "it is not an option" not in question["instructions"]
+    assert sent.body["answers"]["price"]["value"] == 42
+    # an error that names this very field does remove it
+    own = _trailer(42, "too high", "price")
+    jev2 = Jev(picks(price="50"))
+    clairic(
+        make(jev2, config=TypeSafeConfig(verify_selection=False)),
+        clairic_payload(field, text, trailer=own),
+    )
+    (second,) = [r for r in jev2.requests if "price::pick" in r["questions"]]
+    assert "42" not in second["questions"]["price::pick"]["criteria"]
+    assert "price: too high" in second["questions"]["price::pick"]["instructions"]
+
+
+def test_a_nested_path_names_its_leaf_field() -> None:
+    repair = _Repair("x", (("contacts.0.email", "bad"),))
+    assert repair.names("email")
+    assert not repair.names("phone")
+    assert not _Repair("x", (("(record)", "bad"),)).names("email")
+
+
+# --------------------------------------------------------------------------- #
+# Second review. 12, 6, 10 and the nits
+# --------------------------------------------------------------------------- #
+
+
+def test_a_typesafe_transport_without_the_provider_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    own = make(Recorder(ok()))
+    with pytest.raises(ValueError, match="the text would go to Cloudflare"):
+        system_one_transport(typesafe=own)
+    with pytest.raises(ValueError, match="the text would go to Cloudflare"):
+        system_one_transport(provider="cloudflare", typesafe=own)
+    assert system_one_transport(provider="typesafe", typesafe=own) is own
+    monkeypatch.setenv("TRUSTCALL_S1_PROVIDER", "typesafe")  # opt-in by the variable
+    assert system_one_transport(typesafe=own) is own
+
+
+def test_a_response_that_does_not_parse_names_no_option_or_value() -> None:
+    body = {
+        "model": "jev-1.14.0",
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+        "answers": {
+            "email::pick": {
+                "type": "choice",
+                "choice": "dana.secret@private.example",
+                "confidence": 0.9,
+                "probabilities": {"dana.secret@private.example": "not a number"},
+            }
+        },
+    }
+    with pytest.raises(ModelResponseError) as caught:
+        parse_clef(body)
+    assert "private" not in str(caught.value)
+    assert "dana.secret" not in str(caught.value)
+    assert "answers.email::pick.choice.probabilities" in str(caught.value)
+    with pytest.raises(ModelResponseError) as clairic_error:
+        parse_clairic({"answers": {"x": "dana.secret"}})
+    assert "dana.secret" not in str(clairic_error.value)
+
+
+def test_only_a_request_with_images_is_rerouted_and_the_engine_says_so() -> None:
+    ts = make(Recorder(ok()))
+    default = Spy()
+    routing = RoutingTransport({"clairic": ts}, default=default)
+    forecast = {
+        "f": {
+            "type": "forecast",
+            "min": 0,
+            "max": 10,
+            "horizon": 3,
+            "instructions": "x",
+        }
+    }
+    with pytest.raises(BadRequestError, match="forecast"):  # refused, not moved
+        run(routing.run(CLAIRIC, clairic_payload(forecast), meta=META))
+    assert not default.calls
+
+    decisions = DecisionsTransport(
+        api_key="xpl_" + "ab12cd34" * 5,
+        client=httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda r: httpx.Response(500, json={}))
+        ),
+    )
+    router = RoutingTransport({"clef": decisions}, default=default)
+    with_image = {**CLEF_PAYLOAD, "images": ["data:image/png;base64,iVBORw0KGgo="]}
+    reply = run(router.run(CLEF, with_image, meta=META))
+    assert reply.rerouted_from == "decisions"
+    assert len(default.calls) == 1
+
+    async def through_the_engine() -> list[str]:
+        engine = Run(transport=router)
+        await engine._send(CLEF, with_image, META, 1)
+        return engine.warnings
+
+    warnings = asyncio.run(through_the_engine())
+    assert any(w.startswith("request_rerouted") for w in warnings)
+    # an invalid Decisions payload (no images) is not moved either
+    bad = {**CLEF_PAYLOAD, "questions": {}}
+    with pytest.raises(Exception) as refused:
+        run(router.run(CLEF, bad, meta=META))
+    assert len(default.calls) == 2 or "request_rerouted" not in str(refused.value)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Pay 250\nUSD now",
+        "Pay 5\nk now",
+        "Pay 5\nmillion now",
+        "Pay $\n250 now",
+        "7\n%",
+    ],
+)
+def test_a_number_does_not_run_across_a_line_break(text: str) -> None:
+    for c in pattern_candidates(ClairicField(type="number", instructions="x"), text):
+        assert "\n" not in c.text
+    # the number on its own line is still found
+    texts = {
+        c.text
+        for c in pattern_candidates(ClairicField(type="number", instructions="x"), text)
+    }
+    assert any(t in texts for t in ("250", "5", "7"))
+
+
+def test_a_product_does_not_run_across_a_line_break() -> None:
+    field = ClairicField(type="number", instructions="The total amount due.")
+    for c in pattern_candidates(field, "4\nx 250 and a total\n4 x\n250"):
+        assert "\n" not in c.text
+
+
+def test_the_hook_value_of_a_list_is_checked_element_by_element() -> None:
+    numbers = ClairicField(type="list", items="number", instructions="x")
+    assert _value_fits(numbers, [1, 2.5])
+    assert not _value_fits(numbers, [1, "2"])
+    assert not _value_fits(numbers, [True])
+    assert not _value_fits(numbers, [None])
+    words = ClairicField(type="list", items="text", instructions="x")
+    assert _value_fits(words, ["a", "b"])
+    assert not _value_fits(words, ["a", 3])
+    assert not _value_fits(words, "a")
+    dates = ClairicField(type="list", items="date", instructions="x")
+    assert _value_fits(dates, ["2026-08-14"])
+    assert not _value_fits(dates, ["next Thursday"])
+    assert _value_fits(words, None)
+    assert _value_fits(words, [])

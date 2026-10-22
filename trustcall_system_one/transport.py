@@ -49,15 +49,16 @@ from trustcall_system_one._typesafe import (
     from_jev,
     gather_all,
     run_clairic,
-    safe_loc_parts,
     to_jev_clef,
 )
 from trustcall_system_one._version import __version__
 from trustcall_system_one._wire import (
     ClairicUsage,
+    ClefUsage,
     body_model,
     normalize_model_id,
     parse_clef,
+    safe_loc_parts,
 )
 
 __all__ = [
@@ -178,6 +179,9 @@ class TransportResponse:
         served_model: The model that answered when it is not the one the request
             named (the Decisions model of a fallback), so that calls are
             accounted under the model that was used.
+        rerouted_from: When a ``RoutingTransport`` handed a request it could not
+            send to the routed transport (images) to its default, the provider
+            it was routed to; the engine records a warning.
     """
 
     body: dict[str, Any]
@@ -190,6 +194,7 @@ class TransportResponse:
     fallback_error: str | None = None
     served_model: str | None = None
     primary_error: BaseException | None = None
+    rerouted_from: str | None = None
 
 
 @runtime_checkable
@@ -1191,6 +1196,9 @@ class ExperientialTransport(_HttpTransport):
     map 1 through 32 ids to typed questions") above 32."""
 
     _unprocessed_statuses: frozenset[int] = frozenset({429})
+    _overload_statuses: frozenset[int] = frozenset()
+    """Statuses that tell the limiter to slow down although the request may have
+    been run (so it is not retried): TypeSafe's 529."""
     """Statuses that mean the request was refused unprocessed (so, can be resent)."""
     _retry_needs_hint = True
     """Whether such a refusal is retried only when it carries a ``Retry-After``."""
@@ -1481,7 +1489,10 @@ class ExperientialTransport(_HttpTransport):
                                 served_model=self._served_model(body),
                             )
                         retry_after = self._retry_after(response)
-                        if status in self._unprocessed_statuses:
+                        if (
+                            status in self._unprocessed_statuses
+                            or status in self._overload_statuses
+                        ):
                             self.limiter.on_rate_limited(model, generation)
                         failure = self._error_for_status(
                             response, retry_after=retry_after
@@ -1814,6 +1825,7 @@ class TypeSafeTransport(ExperientialTransport):
     32k per question); 64 is the bound of the Clef request schema the library builds.
     The transport itself splits a request by tokens only."""
     _retry_needs_hint = False
+    _overload_statuses = frozenset({529})  # slows the limiter; never retried
 
     def __init__(
         self,
@@ -2062,18 +2074,32 @@ class TypeSafeTransport(ExperientialTransport):
                 _TYPESAFE_LIMITER_KEY, request, request["questions"], timeout=timeout
             )
         started = time.perf_counter()
-        try:
-            sent = await gather_all(
-                *(
-                    self._post(
-                        _TYPESAFE_LIMITER_KEY, r, r["questions"], timeout=timeout
-                    )
-                    for r in requests
-                )
+        answered: list[TransportResponse] = []
+
+        async def one(r: Mapping[str, Any]) -> TransportResponse:
+            done = await self._post(
+                _TYPESAFE_LIMITER_KEY, r, r["questions"], timeout=timeout
             )
+            answered.append(done)  # counted as it completes, whatever its siblings do
+            return done
+
+        try:
+            sent = await gather_all(*(one(r) for r in requests))
         except BaseException as exc:
-            if getattr(exc, "cancelled_siblings", 0):
+            siblings = int(getattr(exc, "cancelled_siblings", 0))
+            if answered or siblings:
                 exc.maybe_sent = True  # type: ignore[attr-defined]
+            if answered:  # those parts were run, and charged
+                exc.partial_usage = ClefUsage(  # type: ignore[attr-defined]
+                    input_tokens=sum(
+                        int(p.body["usage"]["input_tokens"]) for p in answered
+                    ),
+                    output_tokens=sum(
+                        int(p.body["usage"]["output_tokens"]) for p in answered
+                    ),
+                )
+                exc.served_model = answered[-1].served_model  # type: ignore[attr-defined]
+            _note_siblings(exc, siblings)
             raise
         answers: dict[str, Any] = {}
         usage = {"input_tokens": 0, "output_tokens": 0}
@@ -2130,12 +2156,7 @@ class TypeSafeTransport(ExperientialTransport):
                 output_tokens=stats.output_tokens,
                 passes=stats.requests,
             )
-        if siblings and isinstance(exc, TrustcallSystemOneError) and exc.args:
-            exc.args = (
-                f"{exc.args[0]} ({siblings} other request(s) of this call were "
-                "cancelled after they may have been sent; their outcome is unknown)",
-                *exc.args[1:],
-            )
+        _note_siblings(exc, siblings)
 
     async def _clairic(
         self, payload: Mapping[str, Any], timeout: float | None
@@ -2144,8 +2165,8 @@ class TypeSafeTransport(ExperientialTransport):
         stats = RunStats()
 
         async def send(
-            state: Any, questions: Mapping[str, Mapping[str, Any]]
-        ) -> tuple[Any, TransportResponse]:
+            state: Any, questions: Mapping[str, Mapping[str, Any]], stage: str
+        ) -> Mapping[str, Any]:
             request = {
                 "model": self._model,
                 "state": state,
@@ -2154,24 +2175,26 @@ class TypeSafeTransport(ExperientialTransport):
             sent = await self._post(
                 _TYPESAFE_LIMITER_KEY, request, dict(questions), timeout=timeout
             )
-            return parse_clef(sent.body), sent
+            response = parse_clef(sent.body)
+            # Counted the moment this request has answered: when a sibling fails
+            # later, what this one cost is already in the stats (and on the error).
+            stats.requests += 1
+            stats.stages[stage] += 1
+            stats.input_tokens += response.usage.input_tokens
+            stats.output_tokens += response.usage.output_tokens
+            stats.retries += sent.retries
+            stats.model = response.model
+            if sent.request_id:
+                stats.request_ids.append(sent.request_id)
+            return response.answers
 
         async def ask(
             state: Any, questions: Mapping[str, Mapping[str, Any]], stage: str
         ) -> Mapping[str, Any]:
             merged: dict[str, Any] = {}
             batches = self._batches(state, questions)
-            results = await gather_all(*(send(state, b) for b in batches))
-            for response, sent in results:
-                stats.requests += 1
-                stats.stages[stage] += 1
-                stats.input_tokens += response.usage.input_tokens
-                stats.output_tokens += response.usage.output_tokens
-                stats.retries += sent.retries
-                stats.model = response.model
-                if sent.request_id:
-                    stats.request_ids.append(sent.request_id)
-                merged.update(response.answers)
+            for answers in await gather_all(*(send(state, b, stage) for b in batches)):
+                merged.update(answers)
             return merged
 
         try:
@@ -2192,11 +2215,9 @@ class TypeSafeTransport(ExperientialTransport):
                 f"the Clairic call used up its {self._call_deadline}s deadline after "
                 f"{stats.requests} answered request(s)"
             )
-            error: TransportError = (
-                UncertainOutcomeError(f"{note}. {_UNCERTAIN_NOTE}")
-                if stats.requests
-                else TransportError(note)
-            )
+            # something may have been sent (and charged) when time ran out, so it
+            # is never "nothing ran", whether or not a request had answered
+            error = UncertainOutcomeError(f"{note}. {_UNCERTAIN_NOTE}")
             error.maybe_sent = True
             self._annotate(error, stats)
             raise error from None
@@ -2229,6 +2250,24 @@ FallbackTrigger = Union[str, "type[Exception]"]
 _NEVER_FALL_BACK = (AuthError, BadRequestError)
 
 
+def _note_siblings(exc: BaseException, siblings: int) -> None:
+    """Say once, on a failed call's error, that other requests were cancelled.
+
+    The text is built from the message the error had before any note, so an error
+    that reaches this twice (it is annotated by every call that shares it) is not
+    annotated twice.
+    """
+    if not siblings or not isinstance(exc, TrustcallSystemOneError) or not exc.args:
+        return
+    base: tuple[Any, ...] = getattr(exc, "_args_before_note", exc.args)
+    exc._args_before_note = base  # type: ignore[attr-defined]
+    exc.args = (
+        f"{base[0]} ({siblings} other request(s) of this call were cancelled after "
+        "they may have been sent; their outcome is unknown)",
+        *base[1:],
+    )
+
+
 def classify_failure(exc: Exception) -> str | None:
     """The category of a transport failure, as far as the type says.
 
@@ -2239,16 +2278,23 @@ def classify_failure(exc: Exception) -> str | None:
       request that was refused, never sent or never connected.
     * ``None``: anything else (``AuthError``, ``BadRequestError``, a bug).
 
+    An error that says a request may have gone out and been charged
+    (``maybe_sent``, or ``partial_usage``: a call of several requests that failed
+    part-way) is ``"uncertain"`` whatever its type, so wrappers that do not know the
+    transport (``RecordingTransport``, ``RoutingTransport``) do not fall back on it.
+
     A transport that knows more says so with its own ``classify_failure(exc)``
     (``CloudflareTransport`` does: its failures after retries include timeouts and
     dropped connections that are not "nothing ran").
     """
+    if isinstance(exc, _NEVER_FALL_BACK):
+        return None
+    if getattr(exc, "maybe_sent", False) or getattr(exc, "partial_usage", None):
+        return "uncertain"  # a call of several requests: some went out and were charged
     if isinstance(exc, (UncertainOutcomeError, ServerError)):
         return "uncertain"
     if isinstance(exc, ModelResponseError):
         return "bad_response"
-    if isinstance(exc, _NEVER_FALL_BACK):
-        return None
     if isinstance(exc, TransportError):  # RateLimitError, or nothing was sent
         return "unavailable"
     return None
@@ -2545,21 +2591,31 @@ class RoutingTransport:
     ) -> TransportResponse:
         """Run the call on the transport chosen for ``model``.
 
-        A routed transport that says it cannot serve this request (``serves``: the
-        Decisions API takes no images) hands it to the default transport, when the
-        default is another one.
+        A routed transport that says it cannot serve this request because it
+        carries images (the Decisions API takes text only) hands it to the default
+        transport, when the default is another one that can; the response says so
+        (``rerouted_from``) and the engine records a warning. Any other request the
+        routed transport cannot serve (a ``forecast`` field on Jev, an invalid
+        Decisions payload) is not moved: the routed transport refuses it locally,
+        rather than the text going to another company without being asked.
         """
         route = self.transport_for(model)
         serves = getattr(route, "serves", None)
+        rerouted: str | None = None
         if (
             route is not self._default
+            and payload.get("images")
             and callable(serves)
             and not serves(model, payload)
         ):
             other = getattr(self._default, "serves", None)
             if not callable(other) or other(model, payload):
+                rerouted = _provider_name(route)
                 route = self._default
-        return await route.run(model, payload, meta=meta, timeout=timeout)
+        reply = await route.run(model, payload, meta=meta, timeout=timeout)
+        if rerouted is not None:
+            reply = dataclasses.replace(reply, rerouted_from=rerouted)
+        return reply
 
     def _members(self) -> list[Transport]:
         members: list[Transport] = []
@@ -2806,6 +2862,13 @@ def system_one_transport(
     chosen = provider_from_env() if provider is None else provider
     if chosen not in ("cloudflare", "typesafe"):
         raise ValueError(f"unknown provider {chosen!r}")
+    if typesafe is not None and chosen != "typesafe":
+        raise ValueError(
+            "a TypeSafe transport was passed but the provider is "
+            f"{chosen!r}: the text would go to Cloudflare. Say it: "
+            "provider='typesafe' (or TRUSTCALL_S1_PROVIDER=typesafe); the provider "
+            "is never switched for you"
+        )
     if chosen == "typesafe":
         others = [
             name
