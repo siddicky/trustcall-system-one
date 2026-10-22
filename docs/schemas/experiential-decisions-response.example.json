@@ -1,0 +1,36 @@
+{
+    "model": "gpt-6-luna-decisions",
+    "answers": [
+        {
+            "type": "choice",
+            "name": "review",
+            "choice": "review",
+            "probabilities": [
+                {
+                    "value": "accept",
+                    "probability": 0.0
+                },
+                {
+                    "value": "review",
+                    "probability": 1.0
+                }
+            ],
+            "confidence": 1.0
+        }
+    ],
+    "usage": {
+        "input_tokens": 201,
+        "input_tokens_details": {
+            "cached_tokens": 0,
+            "cache_write_tokens": 0
+        },
+        "output_tokens": 0,
+        "output_tokens_details": {
+            "reasoning_tokens": 0
+        },
+        "total_tokens": 201,
+        "cost": 0.0,
+        "is_byok": false
+    },
+    "provider": "openai"
+}

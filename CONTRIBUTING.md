@@ -1,0 +1,41 @@
+# Contributing
+
+Read [AGENTS.md](AGENTS.md) first: it has the rules and the module layout. The short version:
+install with `make install`, and run `make lint` and `make test` before every commit. `make help`
+lists every target.
+
+## Releasing
+
+Releases go to PyPI from a git tag, through PyPI trusted publishing, so no API token is stored in
+the repository or in GitHub. (Version 0.1.0a1 was the exception: it was uploaded by hand with an
+API token. Every release from 0.1.0a2 on goes through the workflow.)
+
+1. Set the new version in `pyproject.toml` (`version`) and in `trustcall_system_one/_version.py`
+   (`__version__`). Both must match, and the tag must match both.
+2. Merge the change to `main` with CI green.
+3. Tag that commit and push the tag, for example:
+
+   ```bash
+   git tag v0.1.0a2
+   git push origin v0.1.0a2
+   ```
+
+4. The `Release` workflow (`.github/workflows/release.yml`) checks that the tag matches both
+   version strings, runs the tests, builds the sdist and wheel, and publishes them with
+   `uv publish --trusted-publishing always` in the `pypi` environment.
+
+One-time setup: on pypi.org, open the project's Manage > Publishing page and add a GitHub trusted
+publisher for `trustcall-system-one` with owner `siddicky`, repository `trustcall-system-one`,
+workflow `release.yml` and environment `pypi`. The GitHub repository needs an environment named
+`pypi` (Settings > Environments).
+
+## Live smoke test in CI
+
+The `live` job in `.github/workflows/ci.yml` runs `make smoke` against the real Cloudflare API. It
+runs only from a manual dispatch, and it fails if the credentials are missing.
+
+1. Create the `cloudflare-live` environment under Settings > Environments.
+2. Add `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` as secrets of that environment.
+   Repository secrets with the same names also work.
+3. Optionally add required reviewers to the environment, so that each live run waits for approval.
+4. Run it from Actions > CI > Run workflow.
