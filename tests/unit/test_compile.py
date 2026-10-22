@@ -1958,7 +1958,10 @@ def test_a_nested_models_docstring_reaches_the_instructions_of_its_leaves() -> N
 def test_a_field_without_a_description_is_described_by_its_models_docstring() -> None:
     plan = compile_schema(Plane)
     group = plan.spec(("airframe", "total_airframe_hours"))
-    assert group.description.startswith("a duration as printed on a sheet")
+    # the field keeps its own name; the docstring only says what it holds
+    assert (
+        group.description == "total airframe hours (a duration as printed on a sheet)"
+    )
     assert "hours times 60" not in group.description  # the leaves carry the rest
     assert plan.spec(("airframe", "cycles")).description == "landing cycles"
 
@@ -2015,7 +2018,7 @@ def test_the_items_of_a_list_of_models_describe_the_field() -> None:
         gear: list[Gear] = Field(default_factory=list)
 
     plan = compile_schema(Plane2)
-    assert plan.spec(("gear",)).description.startswith("one landing gear leg")
+    assert plan.spec(("gear",)).description.startswith("gear (one landing gear leg")
 
 
 def test_a_long_docstring_is_cut_in_the_context_and_the_text_stays_in_the_limit() -> (
@@ -2036,3 +2039,73 @@ def test_a_long_docstring_is_cut_in_the_context_and_the_text_stays_in_the_limit(
     assert spec.instructions.endswith(": leaf")
     assert "Sentence one explains" in spec.context
     assert len(spec.context) < 260
+
+
+def test_two_fields_of_one_model_never_get_the_same_description() -> None:
+    class Address(BaseModel):
+        """A postal address."""
+
+        street: Optional[str] = None
+        city: Optional[str] = None
+
+    class Order(BaseModel):
+        """A customer order."""
+
+        order_id: str
+        billing_address: Optional[Address] = None
+        shipping_address: Optional[Address] = None
+
+    plan = compile_schema(Order)
+    billing = plan.spec(("billing_address",))
+    shipping = plan.spec(("shipping_address",))
+    assert billing.description != shipping.description
+    assert billing.clef is not None and shipping.clef is not None
+    assert billing.clef.instructions != shipping.clef.instructions
+    assert "billing address" in billing.clef.instructions
+    assert "shipping address" in shipping.clef.instructions
+    assert billing.description == "billing address (a postal address)"
+    # the leaves keep apart too
+    assert (
+        plan.spec(("billing_address", "city")).instructions
+        != plan.spec(("shipping_address", "city")).instructions
+    )
+
+
+def test_a_docstring_is_added_to_the_field_name_never_put_in_its_place() -> None:
+    class Weight(BaseModel):
+        """Numeric with explicit unit (if detected), plus raw string."""
+
+        value: Optional[float] = None
+        raw: Optional[str] = None
+
+    class Weights(BaseModel):
+        mtow: Optional[Weight] = None
+        mlw: Optional[Weight] = None
+        mzfw: Optional[Weight] = None
+
+    plan = compile_schema(Weights)
+    texts = [plan.spec((name,)).description for name in ("mtow", "mlw", "mzfw")]
+    assert len(set(texts)) == 3
+    assert (
+        texts[0] == "mtow (Numeric with explicit unit (if detected), plus raw string)"
+    )
+    questions = [plan.spec((n,)).clef for n in ("mtow", "mlw", "mzfw")]
+    assert len({q.instructions for q in questions if q is not None}) == 3
+
+
+def test_a_parametrised_generics_docstring_is_the_generics() -> None:
+    from typing import Generic, TypeVar
+
+    T = TypeVar("T")
+
+    class Reading(BaseModel, Generic[T]):
+        """A sensor reading whose total is in tenths of a degree."""
+
+        value: Optional[T] = None
+        raw: Optional[str] = None
+
+    class Rig(BaseModel):
+        probe: Optional[Reading[int]] = None
+
+    spec = compile_schema(Rig).spec(("probe", "value"))
+    assert "tenths of a degree" in spec.context

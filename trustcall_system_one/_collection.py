@@ -721,6 +721,28 @@ def identity_fields(plan: SchemaPlan, many: Many) -> tuple[str, ...]:
     return names
 
 
+def _scalar_hint(plan: SchemaPlan, name: str) -> str:
+    """A dotted path to a text field below an identity that is not a plain value.
+
+    ``""`` when ``name`` is a plain field, or has no text field below it.
+    """
+    spec = identity_spec(plan, name)
+    if spec is None or spec.engine in ("clairic", "clef"):
+        return ""
+    below = [
+        s
+        for s in plan.specs
+        if s.path[: len(spec.path)] == spec.path
+        and len(s.path) > len(spec.path)
+        and s.engine == "clairic"
+        and s.clairic is not None
+        and s.clairic.type == "text"
+        and all(isinstance(p, str) for p in s.path)
+    ]
+    pick = next((s for s in below if s.identity), None) or next(iter(below), None)
+    return IDENTITY_SEP.join(str(p) for p in pick.path) if pick else ""
+
+
 def _identity_phrase(plan: SchemaPlan, names: Sequence[str]) -> str:
     """How the identity reads in a question: ``name (full name)``."""
     parts: list[str] = []
@@ -1063,7 +1085,8 @@ async def _discover(
         what = f"Every mention of a {noun}{of} by their {phrase}"
     else:
         described = _described(scope.plan)
-        what = f"Every mention of a {noun}{of}" + (
+        a_noun = f"{article(noun)} {noun}" if rows else f"a {noun}"
+        what = f"Every mention of {a_noun}{of}" + (
             f" ({described})" if described else ""
         )
     if rows:
@@ -1073,10 +1096,11 @@ async def _discover(
             f"{what}, in the order they appear in the input. Give one entry per "
             f"{noun}: the exact words of the input that label it or tell it apart "
             "from the others, such as its position, number or model"
-            + (f" (a {noun} has {labels})" if labels else "")
-            + f". Do not list headings, units, bare numbers or the values of "
-            f"those fields on their own, and list a {noun} once for each row or "
-            "place that describes it."
+            + (f" ({article(noun)} {noun} has {labels})" if labels else "")
+            + ". Do not list headings or units, or the values of those fields on "
+            f"their own. A number or a code is an entry only when it is what "
+            f"labels the row (a position, a number, a serial number). List "
+            f"{article(noun)} {noun} once for each row or place that describes it."
         )
     else:
         instructions = (
@@ -1092,7 +1116,7 @@ async def _discover(
     asked = await ask_clairic(ctx, fields, meta=scope.meta("discover"))
     answer, anchored = asked["mentions"]
     found = parse_mentions(scope.source, answer, anchored, run, scope)
-    return _prefilter(run, scope, found) if rows else found
+    return found
 
 
 async def _count(run: Run, scope: Scope) -> int | None:
@@ -1170,24 +1194,46 @@ def _bare(text: str) -> str:
     return " ".join(cleaned.replace("\\", " ").split()).strip(" .,:;-\u2013").casefold()
 
 
-def _screens(scope: "Scope") -> tuple[frozenset[str], bool]:
-    """The words no item is called, and whether a bare number may be an item.
+@dataclass(frozen=True)
+class _Screen:
+    """What the code screen of an identity-less list knows about its item model.
+
+    Attributes:
+        generic: Words no item is called (see ``_screens``).
+        numbers: Whether a bare number may be an item (a required numeric field).
+        options: The options of the item's own choice fields (``Literal`` values,
+            enum names and values), bare: a mention that IS one (the position
+            ``1``, ``L``) names a row.
+    """
+
+    generic: frozenset[str]
+    numbers: bool
+    options: frozenset[str]
+
+
+def _screens(scope: "Scope") -> _Screen:
+    """The words no item is called, and what may name a row on its own.
 
     The words are the stoplist, what the collection and its item are called, and the
     names of the item's own fields (a mention that is only the label of a field is
     a column heading). A number may be an item when the item model has a required
-    numeric field (``Reading.value``).
+    numeric field (``Reading.value``), and a short code or a number is one when it
+    is an option of one of the item's choice fields.
     """
     plan = scope.plan
     names: set[str] = set(_GENERIC)
     for word in (plan.name, plan.title, scope.noun, scope.kind, scope.name):
         names.add(_bare(word))
         names.add(_bare(plural(word)))
+    options: set[str] = set()
     for spec in plan.specs:
         label = _bare(_humane(str(spec.path[-1])))
         names.add(label)
         names.update(label.split())  # "tsn" heads the column of "tsn hours"
         names.add(_bare(spec.description))
+        for key, value in (spec.key_map or {}).items():
+            options.add(_bare(str(key)))
+            options.add(_bare(str(getattr(value, "value", value))))
     numbers = any(
         spec.required
         and spec.clairic is not None
@@ -1195,33 +1241,83 @@ def _screens(scope: "Scope") -> tuple[frozenset[str], bool]:
         for spec in plan.specs
     )
     names.discard("")
-    return frozenset(names), numbers
+    options.discard("")
+    return _Screen(frozenset(names), numbers, frozenset(options - names))
 
 
-def _plausible_item(text: str, generic: frozenset[str], numbers: bool) -> bool:
-    """Whether a mention could be one item of a list of rows (see ``_prefilter``)."""
+_CONFIDENT_ITEM = 0.8
+"""Qualification at or above which an item is kept whatever the count says."""
+_SERIAL = re.compile(r"\d{4,}")
+
+
+def _rank(text: str, screen: _Screen) -> int:
+    """How plausible a mention is as one item: 3 or more passes the code screen.
+
+    * 4: an option of one of the item's choice fields (``1``, ``L``);
+    * 3: a serial or part number (four digits or more, or letters with a figure), a
+      required-number item's figure, or any word that is not a heading;
+    * 2: a short capitalised code of one to three letters (``L``, ``LH``, ``NLG``);
+    * 1: a bare figure;
+    * 0: markup, a heading or a field label, which are never an item.
+    """
     bare = _bare(text)
     if not any(ch.isalnum() for ch in bare):
-        return False
+        return 0
+    if bare in screen.options:
+        return 4
     if not any(ch.isalpha() for ch in bare):  # figures, dates, money amounts
-        return numbers and bool(_NUMERIC.fullmatch(text.strip()))
-    if bare in generic:
-        return False
-    # a letter or two (and no figure) is a fragment, a unit or a bullet
-    return len(bare.split()) > 1 or len(bare) > 2 or any(ch.isdigit() for ch in bare)
+        if screen.numbers and _NUMERIC.fullmatch(text.strip()):
+            return 3
+        return 3 if _SERIAL.fullmatch(bare.replace(" ", "")) else 1
+    if bare in screen.generic:
+        return 0
+    if len(bare.split()) > 1 or len(bare) > 2 or any(ch.isdigit() for ch in bare):
+        return 3
+    return 2 if text.strip(" *_|`.:").isupper() else 1
 
 
-def _prefilter(run: Run, scope: "Scope", mentions: Sequence[Mention]) -> list[Mention]:
-    """Drop what cannot be one item of an identity-less list; say how many."""
-    generic, numbers = _screens(scope)
-    kept = [m for m in mentions if _plausible_item(m.text, generic, numbers)]
-    if len(kept) < len(mentions):
+def _plausible_item(text: str, screen: _Screen) -> bool:
+    """Whether a mention could be one item of a list of rows (see ``_prefilter``)."""
+    return _rank(text, screen) >= 3
+
+
+def _prefilter(
+    run: Run, scope: "Scope", mentions: Sequence[Mention], count: int | None
+) -> list[Mention]:
+    """Drop what cannot be one item of an identity-less list; say how many.
+
+    The screen never takes the candidates below the count Clairic gave: when fewer
+    mentions survive than the input holds items, the best of the dropped (a short
+    code like ``L`` or ``LH``, a bare figure; never a heading or markup) come back,
+    in rank order, up to ten per item, and go on to the one-by-one qualification,
+    which is what decides about them.
+    """
+    screen = _screens(scope)
+    ranked = [(_rank(m.text, screen), m) for m in mentions]
+    kept = [m for rank, m in ranked if rank >= 3]
+    dropped = len(mentions) - len(kept)
+    back: list[Mention] = []
+    if count is not None and len(kept) < count:
+        pool = sorted(
+            ((rank, m) for rank, m in ranked if 1 <= rank < 3),
+            key=lambda item: (-item[0], item[1].span or (0, 0)),
+        )
+        back = [m for _, m in pool[: max(count * 10, 10)]]
+        kept = sorted([*kept, *back], key=lambda m: (m.span or (0, 0), m.text))
+    if dropped:
         run.warn(
             scope.scoped(
-                f"junk_mentions_dropped: {len(mentions) - len(kept)} of "
-                f"{len(mentions)} mention(s) of a {scope.noun} were dropped before "
-                "clustering (bare numbers, one or two letters, markup, headings "
-                f"and the names of the {scope.noun}'s own fields)"
+                f"junk_mentions_dropped: {dropped - len(back)} of {len(mentions)} "
+                f"mention(s) of {article(scope.kind)} {scope.kind} were dropped before "
+                "clustering "
+                "(bare figures, one or two letters, markup, headings and the names "
+                f"of the {scope.kind}'s own fields)"
+                + (
+                    f"; {len(back)} of them came back because Clairic counted "
+                    f"{count} and fewer survived"
+                    if back
+                    else ""
+                )
             )
         )
     return kept
@@ -1257,8 +1353,8 @@ class _Group:
     """Brought back by an existing record (``discovery.record_presence``), with
     ``qualify_p`` left as qualification said it."""
     capped: bool = False
-    """Left out because the input holds fewer items than were found (identity-less
-    items are cut to the count, the best qualified first)."""
+    """Left out because the input holds fewer items than were found and it qualified
+    only weakly (``capped_to_count``; identity-less items only)."""
 
     @property
     def label(self) -> str:
@@ -1407,8 +1503,8 @@ async def _group(
             run.warn(
                 scope.scoped(
                     f"mentions_screened_out: {len(refused)} of {len(mentions)} "
-                    f"mention(s) of a {scope.noun} were refused one by one before "
-                    f"clustering (for example {shown})"
+                    f"mention(s) of {article(scope.kind)} {scope.kind} were refused "
+                    f"one by one before clustering (for example {shown})"
                 )
             )
         mentions = keep
@@ -2041,6 +2137,15 @@ async def collect(
             "entity, so discovery relies on the schema's description; name one "
             "with Many(..., identity=...) or s1_field(identity=True)"
         )
+    for name in names:
+        hint = _scalar_hint(plan, name)
+        if hint:
+            warn(
+                f"identity_not_scalar: Many({plan.name}, identity={name!r}) names a "
+                "field that holds more than a value, so it tells no two entities "
+                f"apart by value; name a field inside it, for example "
+                f"identity={hint!r}"
+            )
     phrase = _identity_phrase(plan, names)
     rows = _nested_without_identity(scope, phrase)
     if scope.kind_fell_back:
@@ -2056,6 +2161,8 @@ async def collect(
     results = await gather(*jobs)
     mentions: list[Mention] = results[0]
     count: int | None = results[1]
+    if rows:
+        mentions = _prefilter(run, scope, mentions, count)
     presence: float | None = None
     cut = False
     if not skip_presence:
@@ -2135,6 +2242,8 @@ async def collect(
         )
         if act and count > len(live) and not explained:
             wider = await _discover(run, scope, phrase, broaden=True)
+            if rows:
+                wider = _prefilter(run, scope, wider, count)
             merged = _union(mentions, wider, scope.source)
             if merged != mentions:
                 mentions = merged
@@ -2145,21 +2254,31 @@ async def collect(
                 groups = await _adopt_records(run, scope, names, groups, live, warn)
                 live = _qualified(groups, config.qualify_min)
         checked = 0
-        if act and count < len(live) and rows:
-            # no name tells these items apart, so merge checks have nothing to join:
-            # the input holds `count` of them, and the best qualified are those
-            best = sorted(live, key=lambda g: (-(g.qualify_p or 1.0), g.first))[:count]
-            for g in live:
-                g.capped = g not in best
-            live = _qualified(groups, config.qualify_min)
-            qualified = sum(1 for g in groups if g.capped) + len(best)
-            warn(
-                f"items_capped_to_count: {qualified} candidate {scope.noun}(s) "
-                f"qualified but the input holds {count}; the best qualified were kept"
-            )
-        elif act and count < len(live):
+        if act and count < len(live):
             groups, checked = await _merge(run, scope, groups, count, pair_cache)
             live = _qualified(groups, config.qualify_min)
+        if act and rows and count < len(live):
+            # items nothing names: those the qualification was only lukewarm about
+            # go first (a confidently qualified item is kept even when Clairic
+            # undercounts, and the warning below says so)
+            weak = sorted(
+                (
+                    g
+                    for g in live
+                    if g.qualify_p is not None and g.qualify_p < _CONFIDENT_ITEM
+                ),
+                key=lambda g: (g.qualify_p or 0.0, g.first),
+            )
+            left_out = weak[: len(live) - count]
+            for g in left_out:
+                g.capped = True
+            if left_out:
+                live = _qualified(groups, config.qualify_min)
+                warn(
+                    f"items_capped_to_count: {len(left_out)} weakly qualified "
+                    f"{scope.kind}(s) were left out because the input holds "
+                    f"{count}"
+                )
         why = (
             ""
             if act
@@ -2221,13 +2340,14 @@ async def collect(
                 if p is not None
                 else f"{group.label!r} is not a {scope.noun}"
             )
+            reason = "not_qualified"
             if group.capped:
+                reason = "capped_to_count"
                 detail = (
-                    f"{group.label!r} qualifies (p={p}) but the input holds fewer "
-                    f"{plural(scope.noun)} than were found, and better qualified "
-                    "ones were kept"
+                    f"{group.label!r} qualified only weakly (p={p:.2f}) and the "
+                    f"input holds fewer {plural(scope.noun)} than were found"
                 )
-            skipped.append(SkippedEntity(plan.name, info, "not_qualified", detail))
+            skipped.append(SkippedEntity(plan.name, info, reason, detail))
     return CollectionOutcome(
         tuple(entities), tuple(skipped), tuple(warnings), presence, count
     )

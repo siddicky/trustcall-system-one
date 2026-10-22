@@ -676,8 +676,25 @@ def _decide(
     return None
 
 
-def _lookup_in(pairs: Mapping[tuple[int, int], float]) -> Callable[[int, int], float]:
-    return lambda i, j: pairs.get((i, j), 0.0)
+def _lookup_in(
+    pairs: Mapping[tuple[int, int], float], mentions: Sequence[Mention]
+) -> Callable[[int, int], float]:
+    """Pair probabilities for clustering; an unanswered pair of identical words is 1.
+
+    A pair that is not in ``pairs`` was not asked (it is implausible) or its
+    question got no answer (the request was refused). Two mentions with the same
+    words are always asked, so for them a missing pair is an unanswered one, and the
+    same words are the same entity rather than two duplicates.
+    """
+
+    def lookup(i: int, j: int) -> float:
+        known = pairs.get((i, j))
+        if known is not None:
+            return known
+        same = normalise(mentions[i].text) == normalise(mentions[j].text)
+        return 1.0 if same else 0.0
+
+    return lookup
 
 
 def _options_within_budget(
@@ -803,10 +820,28 @@ async def _incremental(
         )
         fresh: list[int] = []
         joins: dict[int, list[int]] = {}
+        twins: dict[int, list[int]] = {}  # unanswered repeats of a fresh mention
+        first_of: dict[str, int] = {}
         for k in batch:
-            target = _decide(
-                answers.get(f"assign.m{k}"), criteria, run.coref.merge_threshold
-            )
+            answer = answers.get(f"assign.m{k}")
+            target = _decide(answer, criteria, run.coref.merge_threshold)
+            if target is None and answer is None:
+                # no answer (the request was refused, or nothing fitted the budget):
+                # the same words are the same entity rather than a duplicate
+                text = normalise(mentions[k].text)
+                target = next(
+                    (
+                        c
+                        for c, members in enumerate(clusters)
+                        if any(normalise(mentions[i].text) == text for i in members)
+                    ),
+                    None,
+                )
+                if target is None and text in first_of:
+                    twins.setdefault(first_of[text], []).append(k)
+                    continue
+                if target is None:
+                    first_of[text] = k
             if target is None:
                 fresh.append(k)
             else:
@@ -827,8 +862,12 @@ async def _incremental(
                 cache=cache,
                 scope=scope,
             )
-            groups = agglomerate(len(sub), _lookup_in(pairs), run.coref.merge_threshold)
+            groups = agglomerate(
+                len(sub), _lookup_in(pairs, sub), run.coref.merge_threshold
+            )
             clusters.extend([fresh[i] for i in group] for group in groups)
+        for first, repeats in twins.items():
+            next(c for c in clusters if first in c).extend(repeats)
     if capped_by_budget:
         run.warn(
             f"coref_options_capped: so many entities of {schema} were found that a "
@@ -903,5 +942,5 @@ async def cluster_mentions(
         cache=shared,
         scope=scope,
     )
-    groups = agglomerate(n, lambda i, j: pairs.get((i, j), 0.0), config.merge_threshold)
+    groups = agglomerate(n, _lookup_in(pairs, mentions), config.merge_threshold)
     return Clustering(tuple(tuple(g) for g in groups), pairs, "pairwise")

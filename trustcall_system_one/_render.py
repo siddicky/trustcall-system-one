@@ -609,22 +609,16 @@ def estimate_request_tokens(
     return total * _SAFETY
 
 
-def rebase_spans(value: Any, length: int, windows: Sequence[Span]) -> Any:
-    """Re-base the ``"span"`` entries of a state into a narrowed input.
+OFFSET_KEYS = frozenset(
+    {"mentions", "entity", "entities", "parent", "clusters", "a", "b", "candidates"}
+)
+"""The keys of a Clef state that cite where the INPUT mentions something (a mention's
+``span``). Anything else (``record``, ``records``, ``proposed_change``, ``existing``,
+values the user stored) may contain a key called ``span`` that means something
+else, and is never read as an offset or rewritten."""
 
-    A narrowed input (``narrow_text``) is a different string, so the offsets a state
-    carries for mentions would point at the wrong text. A span inside one window is
-    mapped into the narrowed text; one that is not is removed (its entry keeps its
-    text and context). The ``input`` key itself is left alone.
 
-    Args:
-        value: A state (or part of one): dicts and lists are copied.
-        length: Length of the whole input.
-        windows: The windows the input was narrowed to.
-
-    Returns:
-        The state with its spans re-based.
-    """
+def _rebase(value: Any, length: int, windows: Sequence[Span]) -> Any:
     if isinstance(value, Mapping):
         result: dict[str, Any] = {}
         for key, item in value.items():
@@ -633,17 +627,38 @@ def rebase_spans(value: Any, length: int, windows: Sequence[Span]) -> Any:
                 if moved:
                     result[key] = list(moved[0])
                 continue
-            result[key] = (
-                item if key == "input" else rebase_spans(item, length, windows)
-            )
+            result[key] = _rebase(item, length, windows)
         return result
     if isinstance(value, list):
-        return [rebase_spans(item, length, windows) for item in value]
+        return [_rebase(item, length, windows) for item in value]
     return value
 
 
+def rebase_spans(state: Mapping[str, Any], length: int, windows: Sequence[Span]) -> Any:
+    """Re-base the input offsets of a state into a narrowed input.
+
+    A narrowed input (``narrow_text``) is a different string, so the offsets a state
+    carries for mentions would point at the wrong text. Under the keys of
+    ``OFFSET_KEYS`` a span inside one window is mapped into the narrowed text and one
+    that is not is removed (its entry keeps its text and context). Everything else,
+    ``input`` and the user's records included, is left exactly as it is.
+
+    Args:
+        state: A Clef state (dicts and lists are copied).
+        length: Length of the whole input.
+        windows: The windows the input was narrowed to.
+
+    Returns:
+        The state with its spans re-based.
+    """
+    return {
+        key: _rebase(item, length, windows) if key in OFFSET_KEYS else item
+        for key, item in state.items()
+    }
+
+
 def state_spans(state: Mapping[str, Any]) -> list[Span]:
-    """Every span a state cites outside its input (mentions, clusters, parents)."""
+    """Every input offset a state cites (under ``OFFSET_KEYS``), for anchoring."""
     found: list[Span] = []
 
     def walk(value: Any) -> None:
@@ -651,13 +666,15 @@ def state_spans(state: Mapping[str, Any]) -> list[Span]:
             for key, item in value.items():
                 if key == "span" and isinstance(item, (list, tuple)) and len(item) == 2:
                     found.append((int(item[0]), int(item[1])))
-                elif key != "input":
+                else:
                     walk(item)
         elif isinstance(value, list):
             for item in value:
                 walk(item)
 
-    walk(state)
+    for key, item in state.items():
+        if key in OFFSET_KEYS:
+            walk(item)
     return found
 
 

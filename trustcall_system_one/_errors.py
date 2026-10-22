@@ -16,8 +16,10 @@ __all__ = [
     "TransportError",
     "TrustcallSystemOneError",
     "UncertainOutcomeError",
+    "exception_chain",
     "is_request_rejection",
     "is_size_rejection",
+    "may_have_run",
 ]
 
 
@@ -224,41 +226,76 @@ class AmbiguousMatchError(TrustcallSystemOneError):
         self.candidates = candidates
 
 
-_SIZE_WORDS = re.compile(
-    r"too (?:large|long|big)|requires \d+ tokens|maximum (?:is|context|number)|"
-    r"max(?:imum)? (?:input|context|token)|exceeds?|context (?:length|window)|"
-    r"payload too|token limit|too many tokens",
+_SIZE_MESSAGE = re.compile(
+    r"requires\s+\d[\d,]*\s+tokens|max_tokens_exceeded|maximum context length",
     re.IGNORECASE,
 )
+"""The size refusals that are recognised by their text: Cloudflare's ``Request
+requires 69639 tokens; the maximum is 65529``, the Decisions API's
+``max_tokens_exceeded`` and the common "maximum context length"."""
+
+
+def exception_chain(exc: BaseException) -> list[BaseException]:
+    """An error and its chain: ``primary_error``, ``__cause__``, ``__context__``."""
+    seen: list[BaseException] = []
+    pending: list[BaseException | None] = [exc]
+    while pending:
+        link = pending.pop()
+        if link is None or any(link is other for other in seen):
+            continue
+        seen.append(link)
+        pending.extend(
+            (getattr(link, "primary_error", None), link.__cause__, link.__context__)
+        )
+    return seen
+
+
+def may_have_run(exc: BaseException) -> bool:
+    """Whether the request behind an error may have been run, and charged.
+
+    True when the error, or anything in its chain (a fallback's error carries the
+    primary's as ``primary_error``), is an ``UncertainOutcomeError`` or a
+    ``ServerError``, says ``maybe_sent``, or reports a ``partial_usage``. Such a
+    request is never contained, resent or split: the caller decides.
+    """
+    for link in exception_chain(exc):
+        if isinstance(link, (UncertainOutcomeError, ServerError)):
+            return True
+        if getattr(link, "maybe_sent", False):
+            return True
+        if getattr(link, "partial_usage", None) is not None:
+            return True
+    return False
 
 
 def is_size_rejection(exc: BaseException) -> bool:
     """Whether a provider refused one request because of its size.
 
-    HTTP 413, a local ``RequestTooLargeError``, or a 400/422 whose message talks
-    about tokens, size or a maximum (Cloudflare: ``Request requires 69639 tokens;
-    the maximum is 65529``).
+    HTTP 413, the engine's own ``RequestTooLargeError``, or a 400/422 whose message
+    or body is one of the recognised size refusals (``_SIZE_MESSAGE``). Nothing
+    else counts: a field error is not a size error however it is worded.
     """
     if isinstance(exc, RequestTooLargeError):
         return True
-    if not isinstance(exc, BadRequestError):
+    if not isinstance(exc, BadRequestError) or may_have_run(exc):
         return False
     if exc.status_code == 413:
         return True
-    return exc.status_code in (400, 422) and bool(_SIZE_WORDS.search(str(exc)))
+    if exc.status_code not in (400, 422):
+        return False
+    return bool(_SIZE_MESSAGE.search(f"{exc} {exc.body!s}"))
 
 
 def is_request_rejection(exc: BaseException) -> bool:
-    """Whether an error says that THIS request was refused, not that the service is.
+    """Whether an error is a refusal of THIS request that the engine contains.
 
-    A 400, 413 or 422 ``BadRequestError`` (or the engine's own
-    ``RequestTooLargeError``) is about one request's content or size: the same
-    request would be refused again, but every other request is unaffected, so the
-    engine drops that request and goes on. Everything else keeps raising: a rejected
-    key (``AuthError``), a rate limit, a server failure, a wrong URL or model (404),
-    and above all ``UncertainOutcomeError`` (the request may have run and been
-    charged; retrying or guessing is the caller's decision).
+    Contained by default are only the size refusals (``is_size_rejection``): the
+    same request would be refused again, every other request is unaffected, and
+    the engine drops that request and goes on. Everything else keeps raising: any
+    other 400 or 422 (a malformed field is a bug that every request shares, not a
+    one-off), a rejected key (``AuthError``), a rate limit, a server failure, a wrong
+    URL or model (404), and above all anything that may have been run and charged
+    (``UncertainOutcomeError``, ``ServerError``, ``maybe_sent``, ``partial_usage``,
+    also behind a fallback's ``primary_error``): that is the caller's decision.
     """
-    if isinstance(exc, RequestTooLargeError):
-        return True
-    return isinstance(exc, BadRequestError) and exc.status_code in (400, 413, 422)
+    return is_size_rejection(exc)

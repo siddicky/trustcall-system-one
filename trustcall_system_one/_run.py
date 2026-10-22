@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import json
+import re
 import time
 from collections.abc import Awaitable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -22,6 +23,7 @@ from trustcall_system_one._config import (
 from trustcall_system_one._errors import (
     BadRequestError,
     RequestTooLargeError,
+    exception_chain,
     is_request_rejection,
     is_size_rejection,
 )
@@ -83,6 +85,10 @@ _STATE_SHARE = 0.5
 _MAX_SPLIT = 3
 """Most requests a Clef request is split into before its state is narrowed instead."""
 _REJECTION_SHOWN = 160
+_MAX_SAME_REFUSAL = 8
+"""How often one contained refusal may repeat in a run before it is raised: a refusal
+that every request meets is not a one-off, and the run would only be a string of
+warnings."""
 
 Answer = Union[NoulAnswer, ChoiceAnswer, ScoreAnswer]  # noqa: UP007
 """Any Clef answer."""
@@ -289,8 +295,10 @@ class Run:
         rejected: The hashes of the requests (Clef and Clairic) a provider refused
             as a request (HTTP 400, 413 or 422): the same request is not sent again,
             it is treated as refused again.
-        sent_sizes: ``(call kind, estimated tokens)`` of every Clef request put on
-            the wire (``estimate_request_tokens``), for tests and diagnostics.
+        refusals: How often each contained refusal happened (by its message with the
+            figures taken out); past ``_MAX_SAME_REFUSAL`` the next one is raised.
+        largest_sent: The largest estimated size (``estimate_request_tokens``) of a
+            Clef request put on the wire, for tests and diagnostics.
         fallback_used: How many requests a fallback transport answered after
             its primary failed (also reported as the ``clef_fallback_used`` warning).
         fallback_hard: How many of those answers had no probabilities.
@@ -326,7 +334,8 @@ class Run:
     )
     clef_memo: "dict[str, dict[str, Answer]]" = field(default_factory=dict)
     rejected: set[str] = field(default_factory=set)
-    sent_sizes: list[tuple[str, float]] = field(default_factory=list)
+    refusals: dict[str, int] = field(default_factory=dict)
+    largest_sent: float = 0.0
     fallback_used: int = 0
     fallback_hard: int = 0
     fallback_fields: dict[str, None] = field(default_factory=dict)
@@ -611,9 +620,9 @@ class Run:
         try:
             sent = await self._send(self.clairic_model, payload, meta, len(fields))
         except BadRequestError as exc:
-            if self.strict or not is_request_rejection(exc):
+            if not self._contains(exc):
                 raise
-            # this request is refused (too large, malformed): its fields come back
+            # this request is refused (too large): its fields come back
             # without an answer (`missing_answer`) and the rest of the run goes on;
             # the same request is never sent a second time
             self.rejected.add(key)
@@ -880,11 +889,13 @@ class Run:
             return dict(known)
         if key in self.rejected:  # refused once: it would be refused again
             return {}
-        self.sent_sizes.append((meta.kind, estimate_request_tokens(state, dict(chunk))))
+        self.largest_sent = max(
+            self.largest_sent, estimate_request_tokens(state, dict(chunk))
+        )
         try:
             answers = await self._clef_send(model, chunk, payload, meta)
         except BadRequestError as exc:
-            if self.strict or not is_request_rejection(exc):
+            if not self._contains(exc, count=resplit):
                 raise
             self.rejected.add(key)
             if resplit and len(chunk) > 1 and is_size_rejection(exc):
@@ -904,6 +915,28 @@ class Run:
             return {}
         self.clef_memo[key] = answers
         return dict(answers)
+
+    def _contains(self, exc: BadRequestError, *, count: bool = True) -> bool:
+        """Whether a refused request is contained (the call goes on without answers).
+
+        Only a recognised size refusal is, never in ``strict`` mode, never when the
+        request may have been run and charged (the error, its ``primary_error`` or
+        its causes say uncertain, ``maybe_sent`` or ``partial_usage``; the
+        transport's own ``classify_failure`` is asked too), and not when the same
+        refusal has come ``_MAX_SAME_REFUSAL`` times already: that one is raised.
+        """
+        if self.strict or not is_request_rejection(exc):
+            return False
+        classify = getattr(self.transport, "classify_failure", None)
+        if callable(classify):
+            for link in exception_chain(exc):
+                if isinstance(link, Exception) and classify(link) == "uncertain":
+                    return False
+        if not count:  # the halves of a request that was counted already
+            return True
+        signature = re.sub(r"\d+", "N", f"{exc.status_code} {exc}")
+        self.refusals[signature] = self.refusals.get(signature, 0) + 1
+        return self.refusals[signature] <= _MAX_SAME_REFUSAL
 
     def _warn_rejected(self, meta: CallMeta, n_items: int, exc: BaseException) -> None:
         """Warn that a request was refused and its questions or fields go unanswered."""

@@ -102,7 +102,6 @@ def test_a_dotted_identity_resolves_to_the_leaf_below_the_sub_model() -> None:
         ("identification.serial", "Ident has no field of"),
         ("identity.msn", "Aircraft has no field of"),
         ("remarks.msn", "'remarks' is not a sub-model"),
-        ("identification", "sub-model or a list of models"),
         ("identification.msn.x", "'msn' is not a sub-model"),
     ],
 )
@@ -249,3 +248,29 @@ async def test_a_nested_identity_is_never_replaced_by_a_short_form_of_itself() -
         r.reason == "identity_subset" and r.path == "/identification/msn"
         for r in record.rejected
     )
+
+
+async def test_a_sub_model_as_the_identity_still_works_and_suggests_the_leaf() -> None:
+    """The live workaround of the aircraft run: `identity="identification"`."""
+    plan = compile_schema(Aircraft)
+    assert identity_fields(plan, Many(Aircraft, identity="identification")) == (
+        "identification",
+    )
+    sheet = world()
+    result = await create_extractor(
+        [Many(Aircraft, identity="identification")], transport=sheet.transport()
+    ).ainvoke(SHEET)
+    got = {
+        r.value.identification.msn
+        for r in result.records
+        if isinstance(r.value, Aircraft)
+    }
+    assert got == {"8547", "12345"}
+    (warning,) = [w for w in result.warnings if w.startswith("identity_not_scalar")]
+    assert "identity='identification.msn'" in warning
+    # and a plain field raises nothing
+    ok = create_extractor(
+        [Many(Aircraft, identity="identification.msn")], transport=sheet.transport()
+    )
+    again = await ok.ainvoke(SHEET)
+    assert not any(w.startswith("identity_not_scalar") for w in again.warnings)

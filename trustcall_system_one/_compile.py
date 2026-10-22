@@ -1829,8 +1829,11 @@ def identity_problem(model: type[BaseModel], name: str) -> str:
     """Why ``name`` cannot identify a record of ``model``, or ``""`` when it can.
 
     ``name`` is a field name, or a dotted path through sub-models to a scalar leaf
-    (``"identification.msn"``). The leaf must be a plain value (text, a number, an
-    enum, a list of plain values), not a sub-model, a list of models or a mapping.
+    (``"identification.msn"``). The leaf of a dotted path must be a plain value
+    (text, a number, an enum, a list of plain values), not a sub-model, a list of
+    models or a mapping. A plain top-level name is accepted whatever it holds, as it
+    always was (a sub-model used as the identity is a workaround that works, if
+    poorly: ``collect`` warns and suggests the dotted path).
     """
     current = model
     parts = name.split(IDENTITY_SEP)
@@ -1846,6 +1849,8 @@ def identity_problem(model: type[BaseModel], name: str) -> str:
         base = _strip(annotation).base
         is_model = isinstance(base, type) and issubclass(base, BaseModel)
         last = index == len(parts) - 1
+        if last and len(parts) == 1:
+            return ""
         if last:
             if is_model or _model_of(annotation) is not None:
                 return (
@@ -1899,8 +1904,16 @@ _CONTEXT_DOC_CHARS = 160
 
 def _own_doc(model: Any) -> str:
     """A model's OWN docstring on one line (pydantic's default one is not it)."""
-    doc = vars(model).get("__doc__") if isinstance(model, type) else None
-    return _clean(inspect.cleandoc(doc)) if isinstance(doc, str) and doc.strip() else ""
+    if not isinstance(model, type):
+        return ""
+    doc = vars(model).get("__doc__")
+    if not (isinstance(doc, str) and doc.strip()):
+        # a parametrised generic (``Box[int]``) is a subclass that has no docstring
+        # of its own: the docstring is the generic's
+        meta = getattr(model, "__pydantic_generic_metadata__", None) or {}
+        origin = meta.get("origin")
+        return _own_doc(origin) if origin is not None else ""
+    return _clean(inspect.cleandoc(doc))
 
 
 def _model_of(annotation: Any) -> type[BaseModel] | None:
@@ -1956,9 +1969,10 @@ def _as_description(doc: str) -> str:
 def _description(info: FieldInfo, shape: _Shape, name: str, metadata: list[Any]) -> str:
     """Pick the field description.
 
-    The order is the ``Field`` description, ``Doc``, the title, then the class
-    docstring of the model the field holds (a sub-model, or the items of a list of
-    models) and last the humanised name.
+    The order is the ``Field`` description, ``Doc``, the title, then the humanised
+    name, which carries the class docstring of the model the field holds (a
+    sub-model, or the items of a list of models) in parentheses: ``billing address
+    (a postal address)``. The docstring never replaces the name.
     """
     extra = info.json_schema_extra
     schema_description = extra.get("description") if isinstance(extra, dict) else None
@@ -1977,7 +1991,9 @@ def _description(info: FieldInfo, shape: _Shape, name: str, metadata: list[Any])
         and (doc := _own_doc(held))
         and not _says_nothing_new(doc, held.__name__, name)
     ):
-        return _as_description(doc)
+        # the field's own name stays: two fields of one model (a billing and a
+        # shipping address) must not become the same question
+        return f"{_humanise(name)} ({_as_description(doc)})"
     return _humanise(name)
 
 

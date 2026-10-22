@@ -932,8 +932,11 @@ want a normalised vocabulary, make the field a `Literal` (a Clef choice), not fr
   found by what an item is, the mentions are screened in code and one by one before clustering
   (warnings `junk_mentions_dropped`, `mentions_screened_out`) and the result is cut to the count.
   Name the items with `Many(identity=...)` whenever they have something to be named by.
-- A sub-model's class docstring is sent: it describes a field that has no description, and it
-  follows the instructions of the sub-model's fields ("hours times 60 plus the minutes").
+- A sub-model's class docstring is sent as context: it follows the name of a field that holds the
+  model (`billing address (a postal address)`; the name is never replaced) and the instructions of
+  the sub-model's own fields ("hours times 60 plus the minutes").
+- `Many(identity="identification")` (a sub-model as the identity) is still accepted, with an
+  `identity_not_scalar` warning that names the dotted path to use instead.
 - Without a wrapper: list-form `existing` with records of a schema implies `Many(Schema)`;
   dict-form `{"Schema": record}` implies `One(Schema)`; otherwise `One(Schema)`. An explicit
   wrapper always wins. `One` given several list-form records raises `ValueError` ("use Many").
@@ -1007,10 +1010,12 @@ examples print costs in fractions of a cent. Clef's price is not published, so
 (`result.cost.complete` is `False` until `prices=Prices(per_million_input={...})` covers every model).
 Every Clef request is estimated before it is sent (state and questions, calibrated on real
 table-heavy text) and kept under `Limits(clef_state_token_budget=56_000)`: split by questions, or its
-input narrowed to windows around the mentions. A request the provider still refuses as such (HTTP
-400, 413, 422: too large, malformed) does not abort the invoke: that request's answers are missing
-and `request_rejected` says which; auth errors, rate limits and uncertain outcomes still raise, and
-`strict=True` raises on a refusal too.
+input narrowed to windows around the mentions. A request the provider still refuses for its size
+(HTTP 413, or Cloudflare's "Request requires N tokens") does not abort the invoke: that request's
+answers are missing and `request_rejected` says which. Any other 4xx (a malformed field), auth
+errors, rate limits, anything that may have been charged (an uncertain outcome, also behind a
+fallback) and a refusal that repeats more than 8 times still raise, and `strict=True` raises on a
+size refusal too.
 `result.usage`, `result.calls` (one entry per request, with kind, status and duration)
 and `result.warnings` tell you what happened; `passes=PassesConfig(split="entity" |
 "submodel" | "field")` trades request count for narrower questions.

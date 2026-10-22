@@ -18,6 +18,7 @@ from trustcall_system_one import (
     CorefConfig,
     Limits,
     Many,
+    ServerError,
     UncertainOutcomeError,
     create_extractor,
 )
@@ -31,12 +32,18 @@ from trustcall_system_one._render import (
     estimate_text_tokens,
     estimate_tokens,
     rebase_spans,
+    state_spans,
 )
 from trustcall_system_one._run import Run
-from trustcall_system_one._wire import ChoiceQuestion, NoulCriteria, NoulQuestion
+from trustcall_system_one._wire import (
+    ChoiceQuestion,
+    ClairicField,
+    NoulCriteria,
+    NoulQuestion,
+)
 from trustcall_system_one.testing import FakeTransport, FakeWorld, noul
 from trustcall_system_one.testing import clef_response as clef_reply
-from trustcall_system_one.transport import CallMeta
+from trustcall_system_one.transport import CallMeta, FallbackTransport
 
 BUDGET = 56_000
 
@@ -107,7 +114,7 @@ async def test_a_422_on_one_call_leaves_the_other_entities_intact() -> None:
     handler = world.transport()._handler  # the world's own answers
 
     def refuse_one(model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
-        if meta.kind == "extract" and victim in payload["state"]:
+        if meta.kind == "extract" and meta.entity == "e3":
             raise BadRequestError(
                 "Cloudflare API returned HTTP 422: AiError: Request requires "
                 "69639 tokens; the maximum is 65529",
@@ -125,7 +132,7 @@ async def test_a_422_on_one_call_leaves_the_other_entities_intact() -> None:
     asked = [
         json.dumps(body, sort_keys=True)
         for _, body, meta in transport.calls
-        if meta.kind == "extract" and victim in body["state"]
+        if meta.kind == "extract" and meta.entity == "e3"
     ]
     assert asked and len(asked) == len(set(asked))
 
@@ -239,19 +246,139 @@ async def test_a_not_found_is_not_a_request_rejection() -> None:
 
 
 def test_which_errors_count_as_a_refused_request() -> None:
-    assert is_request_rejection(BadRequestError("x", status_code=422))
-    assert is_request_rejection(BadRequestError("x", status_code=413))
+    size = "Request requires 69639 tokens; the maximum is 65529"
+    assert is_request_rejection(BadRequestError(size, status_code=422))
+    assert is_request_rejection(BadRequestError(size, status_code=400))
+    assert is_request_rejection(BadRequestError("payload too large", status_code=413))
+    assert is_request_rejection(
+        BadRequestError("error: max_tokens_exceeded", status_code=422)
+    )
     assert is_request_rejection(RequestTooLargeError("x"))
-    assert not is_request_rejection(BadRequestError("x", status_code=404))
-    assert not is_request_rejection(BadRequestError("x"))
+    # any other client error is a bug that every request shares: it raises
+    assert not is_request_rejection(BadRequestError("x", status_code=422))
+    assert not is_request_rejection(
+        BadRequestError("list fields don't take 'null_threshold'", status_code=422)
+    )
+    assert not is_request_rejection(BadRequestError(size, status_code=404))
+    assert not is_request_rejection(BadRequestError(size))
     assert not is_request_rejection(AuthError("x", status_code=401))
     assert not is_request_rejection(UncertainOutcomeError("x"))
-    assert is_size_rejection(
-        BadRequestError(
-            "Request requires 69639 tokens; the maximum is 65529", status_code=422
+    assert is_size_rejection(BadRequestError(size, status_code=422))
+    assert not is_size_rejection(BadRequestError("bad field", status_code=422))
+
+
+@pytest.mark.parametrize(
+    "mark",
+    [
+        {"maybe_sent": True},
+        {"partial_usage": {"input_tokens": 5}},
+    ],
+)
+def test_an_error_that_may_have_been_charged_is_never_a_rejection(
+    mark: dict[str, Any],
+) -> None:
+    err = BadRequestError("HTTP 413: payload too large", status_code=413)
+    for name, value in mark.items():
+        setattr(err, name, value)
+    assert not is_request_rejection(err) and not is_size_rejection(err)
+
+
+def test_a_primary_that_may_have_run_makes_the_fallbacks_refusal_uncontainable() -> (
+    None
+):
+    fallback_error = BadRequestError("HTTP 413: payload too large", status_code=413)
+    fallback_error.primary_error = UncertainOutcomeError("timeout after send")
+    assert not is_request_rejection(fallback_error)
+    chained = BadRequestError("HTTP 413: payload too large", status_code=413)
+    chained.__cause__ = ServerError("HTTP 503", status_code=503)
+    assert not is_request_rejection(chained)
+
+
+async def test_an_uncertain_primary_behind_a_fallback_is_raised() -> None:
+    """probe_more `fallback`: the primary's request may have run; nothing is resent."""
+    primary_calls: list[int] = []
+    fallback_calls: list[int] = []
+
+    class Primary(FakeTransport):
+        def classify_failure(self, exc: Exception) -> str | None:
+            return "uncertain" if isinstance(exc, UncertainOutcomeError) else None
+
+    def primary(model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
+        primary_calls.append(len(payload["questions"]))
+        if len(payload["questions"]) > 4:
+            raise UncertainOutcomeError(
+                "read timeout after send; may have been charged"
+            )
+        return clef_reply(
+            {q: noul(0.9) for q in payload["questions"]}, model=payload["model"]
+        )
+
+    def fallback(model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
+        fallback_calls.append(len(payload["questions"]))
+        raise BadRequestError(
+            "Decisions API returned HTTP 413: payload too large", status_code=413
+        )
+
+    run = Run(
+        transport=FallbackTransport(
+            Primary(primary), FakeTransport(fallback), on=("unavailable", "uncertain")
         )
     )
-    assert not is_size_rejection(BadRequestError("bad field", status_code=422))
+    questions = {
+        f"q{i}": NoulQuestion(
+            type="noul",
+            instructions=f"Is {i} even?",
+            criteria=NoulCriteria(true="y", false="n"),
+        )
+        for i in range(8)
+    }
+    with pytest.raises(BadRequestError):
+        await run.call_clef(questions, {"input": "x"}, meta=CallMeta(kind="gate"))
+    assert primary_calls == [8] and fallback_calls == [8]  # no half was sent again
+    assert not any("request_rejected" in w for w in run.warnings)
+
+
+async def test_a_field_error_422_is_raised_not_contained() -> None:
+    """A 422 about the request's FIELDS (code 3030) is a bug every request shares."""
+
+    def handler(model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
+        raise BadRequestError(
+            "Cloudflare API returned HTTP 422: list fields don't take "
+            "'null_threshold' (3030)",
+            status_code=422,
+        )
+
+    run = Run(transport=FakeTransport(handler))
+    question = NoulQuestion(
+        type="noul", instructions="?", criteria=NoulCriteria(true="y", false="n")
+    )
+    with pytest.raises(BadRequestError, match="3030"):
+        await run.call_clef({"q": question}, {"input": "x"}, meta=CallMeta(kind="gate"))
+    with pytest.raises(BadRequestError, match="3030"):
+        await run.call_clairic(
+            {"f": ClairicField(type="text", instructions="x")},
+            "text",
+            meta=CallMeta(kind="extract"),
+        )
+
+
+async def test_the_same_refusal_over_and_over_trips_the_circuit_breaker() -> None:
+    def handler(model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
+        raise BadRequestError(
+            "HTTP 413: payload too large", status_code=413
+        )  # every request is "too large"
+
+    run = Run(transport=FakeTransport(handler))
+    question = NoulQuestion(
+        type="noul", instructions="?", criteria=NoulCriteria(true="y", false="n")
+    )
+    contained = 0
+    with pytest.raises(BadRequestError):
+        for n in range(30):
+            state = {"input": f"text {n}"}  # a different request each time
+            await run.call_clef({"q": question}, state, meta=CallMeta(kind="gate"))
+            contained += 1
+    assert contained == 8  # the ninth is raised
 
 
 # --------------------------------------------------------------------------- #
@@ -360,3 +487,54 @@ async def test_the_transport_may_advertise_a_smaller_budget() -> None:
     run = Run(transport=Small(lambda m, p, c: None))
     assert run.clef_budget() == 1_500
     assert Run(transport=FakeTransport(lambda m, p, c: None)).clef_budget() == BUDGET
+
+
+async def test_a_refused_coref_does_not_split_a_repeated_name_in_two() -> None:
+    """probe_more `coref`: PN-0003 appears twice; a refused coref inserted it twice."""
+    names = [f"PN-{i:04d}" for i in range(20)]
+    rows = [f"| {i + 1} | {n} |" for i, n in enumerate(names)]
+    rows.append("| 21 | PN-0003 (repeat of row 4) |")
+    text = "\n".join(["| No | Part |", "|---|---|", *rows])
+    world = FakeWorld(text)
+    for n in names:
+        world.entity(
+            n,
+            schema=Part,
+            mentions=[(n, 0), (n, 1)] if n == "PN-0003" else [n],
+            fields={"name": n},
+        )
+    handler = world.transport()._handler
+
+    def refuse(model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
+        if meta.kind == "coref":
+            raise BadRequestError(
+                "HTTP 422: Request requires 69639 tokens; the maximum is 65529",
+                status_code=422,
+            )
+        return handler(model, payload, meta)
+
+    for strategy in ("incremental", "pairwise"):
+        result = await create_extractor(
+            [Many(Part)],
+            transport=FakeTransport(refuse),
+            coref=CorefConfig(strategy=strategy),
+        ).ainvoke(text)
+        got = [r.value.name for r in result.records if isinstance(r.value, Part)]
+        assert sorted(got) == names, strategy  # PN-0003 once, every other part once
+        assert any(w.startswith("request_rejected") for w in result.warnings)
+
+
+def test_a_records_own_span_key_is_never_read_or_rewritten() -> None:
+    record = {"span": [2010, 2015], "note": "the span of years"}
+    state = {
+        "input": "x" * 100,
+        "record": record,
+        "records": {"r0": {"span": [1, 2]}},
+        "proposed_change": {"to": {"span": [3, 4]}},
+        "mentions": {"m0": {"text": "a", "span": [10, 12]}},
+    }
+    assert state_spans(state) == [(10, 12)]
+    moved = rebase_spans(state, 100, [(5, 20)])
+    assert moved["record"] == record and moved["records"] == state["records"]
+    assert moved["proposed_change"] == state["proposed_change"]
+    assert moved["mentions"]["m0"]["span"] == [7, 9]

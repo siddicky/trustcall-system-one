@@ -251,7 +251,7 @@ up, and a bare `spec(path)` that several members share raises instead of guessin
 
 `ge/le/gt/lt` go into prose (Clairic `min`/`max` are estimate/forecast-only); opt-in
 `limits.estimate_for_bounded_numbers`. Instructions = parent context (" → "-joined model title and ancestor field names, with the member after a union field: `Book → author → address`, `Owner → pet (Dog)`; always present for a nested field, and mandatory when a name was shortened) + description, templated through the owner chain (`the Book's author's address's city`; a leading article of the description is dropped so the template does not double it) (`Field.description` →
-`typing_extensions.Doc` → title → the class docstring of the model the field holds (its first sentence, for a sub-model or the items of a `list[Model]`; pydantic's own default docstring is never used, nor one that only repeats the names) → humanised name) + type/constraint hints, templated per entity
+`typing_extensions.Doc` → title → humanised name, which carries the class docstring of the model the field holds in parentheses (its first sentence, for a sub-model or the items of a `list[Model]`: `billing address (a postal address)`; pydantic's own default docstring is never used, nor one that only repeats the names, and a parametrised generic uses its generic's docstring). The docstring is added to the field's own name, never put in its place, so two fields of one model (a billing and a shipping address, six weights) keep distinct descriptions and presence questions) + type/constraint hints, templated per entity
 ("{label}'s {desc}").
 **Class docstrings reach the leaves.** The parent context of a field of a nested model also carries the first sentences (at most 160 characters) of the docstring of the model that declares it, after the last ancestor: `Aircraft → airframe → total airframe hours (A duration as printed on a sheet. The total in minutes is hours times 60 plus the minutes): total minutes`. So what `HhMm` says about converting hours:minutes to `total_minutes` is part of the Clairic instruction and of every Clef question about that leaf (`FieldSpec.context` / `clef_context`, which the engine reuses when it rebuilds a question). Not added below a union member (the member's tag already carries its docstring), nor when the docstring only repeats the model or field name ("An address."), nor beyond `limits.max_instruction_chars` (the description is never the part that is cut). A lint warns on aggregation-style descriptions ("total of…").
 
@@ -283,9 +283,12 @@ schema title: "Person").
 1. **Identity field:** `Many(identity=...)` (compound allowed; a name the schema lacks is a
    `ValueError` at `create_extractor`; a name may be a **dotted path through sub-models to a scalar
    leaf**, `Many(AircraftSpec, identity="identification.msn")`, also in a compound identity and in a
-   nested-list marker `Annotated[list[AircraftSpec], Many(identity="identification.msn")]`. A path
+   nested-list marker `Annotated[list[AircraftSpec], Many(identity="identification.msn")]`. A dotted path
    that does not exist, passes through something that is not a sub-model, or ends at a sub-model, a
-   list of models or a mapping is a `ValueError` naming the step that fails. The same resolved
+   list of models or a mapping is a `ValueError` naming the step that fails. A plain top-level name is
+   accepted whatever it holds, as before (`Many(identity="identification")`, a sub-model, was the
+   live workaround and still works, if poorly: matching ignores a dict value), with an
+   `identity_not_scalar` warning that suggests the dotted path to its first text field. The same resolved
    path is used everywhere an identity is: the discovery question (`by their msn (manufacturer
    serial number)`: the last segment and the leaf's description), the existing records' identity
    values for matching and the prefilter (`record_value` reads the aliased keys level by level:
@@ -700,25 +703,35 @@ is legitimate) the engine now:
    not list headings, units, bare numbers or the values of those fields on their own, and list a
    {kind} once for each row or place that describes it." {kind} is the title-derived kind
    (`EngineInfo` is "engine") unless `Many(label=)` says otherwise;
-2. **screens the mentions in code** (`_prefilter`, warning `junk_mentions_dropped`): markup
-   (`**`, `|`, `<br>`) is stripped, then a mention is dropped when nothing is left, when it is a bare
-   figure (unless the item model has a *required* numeric field: `Reading.value` keeps `21.5`),
-   when it is one or two letters without a digit (`A`, `MA`), or when it is only a heading: the
-   stoplist (`model`, `type`, `total`, `cycles`, `status`, ...), what the collection and its item are
-   called, or the label of one of the item's own fields or a word of it (`tsn` for `tsn_hours`);
+2. **screens the mentions in code** (`_prefilter`, warning `junk_mentions_dropped`), ranking each
+   mention: markup (`**`, `|`, `<br>`) is stripped, and a mention is dropped when nothing is left or
+   when it is only a heading (rank 0: the stoplist `model`, `type`, `total`, `cycles`, `status`, ..., what the
+   collection and its item are called, or the label of one of the item's own fields or a word of
+   it, `tsn` for `tsn_hours`). It is kept (rank 3 or more) when it is a word or phrase, a serial or
+   part number (four digits or more, or letters with a figure), a figure when the item model has
+   a *required* numeric field (`Reading.value` keeps `21.5`), or an **option of one of the item's
+   own choice fields** (`1` for `position: Literal["1", "2"]`, `Nose` for an enum). Bare figures and
+   one or two letters (`A`, `MA`, `L`, `LH`) rank 1 or 2 and are dropped, **but the screen never
+   takes the candidates below the count Clairic gave**: when fewer survive than the input holds
+   items (a landing gear table whose rows are `L`, `R`, `LH`), the best of the dropped (a capitalised
+   code before a bare figure, never a heading) come back, up to ten per item, and go on to step 3,
+   which is what decides about them (the warning says how many came back);
 3. **qualifies each remaining mention on its own before coreference** (`_group(screen=True)`): one
    `noul` per mention, 64 to a request, so a table of 100 cells costs two requests, and only the
    mentions that are not refused are clustered. The refused ones are not entities; one warning
    (`mentions_screened_out`) counts them and quotes the first five, instead of 100 `SkippedEntity`
    rows that would bury the real skips. Qualification answers are cached by mention, so a
    cluster that is a single mention is not asked again;
-4. cuts the result to the **count** Clairic gave when more candidates qualify than the input holds
-   (`items_capped_to_count`, the best qualified first; the others are `not_qualified` skips), because
-   merge checks cannot join items that no name connects.
+4. on a **count below the candidates** runs the merge checks as for any `Many`, then cuts only what
+   qualified *weakly* (below 0.8; `qualify_p=None` is never cut) down to the count, worst first:
+   those are skipped as `capped_to_count` with `items_capped_to_count` warning. A confidently
+   qualified item is never dropped because Clairic undercounted; the run says
+   `count_below_discovered` and keeps it.
 
 On a synthetic engine, gear and component table (two engines, three gear legs, 120 table cells that a
-model might list) this takes 33 requests where the old path took 61 (coreference 29 → 2), and no cell
-is reported as a skipped entity. Left out: a plural phrase that covers several items ("2 x V2527-A5",
+model might list) this takes 34 requests where the old path took 61 (coreference 29 → 2), and no cell
+is reported as a skipped entity (the one-by-one qualification asks about 141 mentions in 4
+requests; serial numbers and option values are kept for it, which is the price of not losing rows). Left out: a plural phrase that covers several items ("2 x V2527-A5",
 "CFM56-7B26 engines") is still one mention, and so one item; splitting it by the count is a
 positional extraction that needs the model, not a rule, and is a known limit (see Risks).
 
@@ -1537,7 +1550,10 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
     3 requests, the state shared) when its questions are what is large, else the `input` is
     narrowed to windows around the spans the state cites (mentions, clusters, parent), with those
     spans re-based into the narrowed text (`rebase_spans`; spans outside every window are
-    dropped, text and context stay) and the questions split to fit what is left; if even that does
+    dropped, text and context stay). Only the keys that cite offsets into the input are read or
+    rewritten (`OFFSET_KEYS`: `mentions`, `entity`, `entities`, `parent`, `clusters`, `a`, `b`,
+    `candidates`); a `record`, `records` or `proposed_change` that happens to contain a key called
+    `span` is never touched and the questions split to fit what is left; if even that does
     not fit, the request is dropped without being sent (`RequestTooLargeError`, treated like a
     refusal below). `Run.clef_state` (what the callers use to build a state) narrows with the same
     estimate, and `Run.clef_budget()` is the effective budget: the knob, lowered to a
@@ -1548,18 +1564,33 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
     the Clef request budget"), the batch is halved while fewer than 24 entities would fit, and
     with no room at all the batch's mentions simply start entities of their own. The pairwise
     questions keep a quarter of the budget for themselves.
-  * **A refused request does not abort the invoke.** HTTP 400, 413 or 422 (`BadRequestError`, or the
-    engine's own `RequestTooLargeError`) are about one request: it is logged, a
-    `request_rejected` warning names the call (kind, scope, schema, entity, field) and the provider's
-    message, and the call returns no answers, which every caller already handles as an unanswered
-    question: a Clairic field resolves as `missing_answer`, a presence or qualify question as
-    "unknown", a coreference pair or assignment as "not the same entity", a gate as "not a pass".
-    The identical request is never sent again in the run (`Run.rejected`), a refused request of
-    several questions that looks size-related (413, or a message about tokens or a maximum) is
-    sent once more as two *smaller* requests (`clef_request_resplit`), and with `strict=True` the
-    error is raised instead. What still raises: `AuthError` (401/403), rate limits, server errors,
-    a 404/405 (a wrong URL or model, nothing request-specific), and `UncertainOutcomeError`, which
-    is never swallowed and never retried (the request may have run and been charged).
+  * **A request refused for its SIZE does not abort the invoke.** Contained are: HTTP 413, the
+    engine's own `RequestTooLargeError`, and a 400/422 whose message is a recognised size refusal
+    (Cloudflare's `Request requires N tokens; the maximum is M`, the Decisions API's
+    `max_tokens_exceeded`, "maximum context length"). Every OTHER 400 or 422 raises: a malformed
+    field (a 422 code 3030) is a bug that every request shares, and swallowing it would turn a
+    run into a string of warnings. (There is no switch to contain all 4xx errors; if one is
+    wanted it is a one-line change of `_errors.is_request_rejection`.) A contained request is
+    logged, a `request_rejected` warning names the call (kind, scope, schema, entity, field) and
+    the provider's message, and the call returns no answers, which every caller already handles
+    as an unanswered question: a Clairic field resolves as `missing_answer`, a presence or
+    qualify question as "unknown", a coreference pair or assignment as "not the same entity"
+    unless the two mentions are the same words (they are then one entity, so a refused
+    coreference does not insert `PN-0003` twice), a gate as "not a pass". The identical request is never
+    sent again in the run (`Run.rejected`); a refused request of several questions is sent once
+    more as two *smaller* requests (`clef_request_resplit`; only for these recognised size
+    refusals); with `strict=True` the error is raised; and a **circuit breaker** raises the
+    refusal once the same one (its message with the figures taken out) has been contained more
+    than 8 times in a run (the halves of a resplit do not count), because a refusal that every
+    request meets is not a one-off.
+  * **What is never contained or resent**: anything that may have been run and charged. An
+    `UncertainOutcomeError`, a `ServerError`, an error with `maybe_sent`, or one with a
+    `partial_usage` raises, and so does an error that merely *carries* one: a
+    `FallbackTransport` whose primary failed uncertain and whose fallback then answered 413 raises
+    that 413 with the primary's error as `primary_error` (`_errors.may_have_run` looks through
+    `primary_error`, `__cause__` and `__context__`, and the transport's own `classify_failure`
+    is asked too), so neither half of a split is sent to the primary again. Also raised:
+    `AuthError` (401/403), rate limits, other server errors, a 404/405.
   * The post-hoc check stays: a warning when `usage.input_tokens ≥ 0.97 × 65,536`.
 - Usage per call into `CallRecord`s and a `Usage` total by model and by kind. `Prices`
   defaults to Clairic $0.10/M only; Clef's price isn't published, so `Prices.cost(usage)`
@@ -1850,8 +1881,10 @@ green. The examples were the acceptance tests for M5 to M9.
    live run of one kind of document (aircraft spec tables on Cloudflare); another tokenizer, a
    dense non-Latin text or images (not counted) can still exceed it, in which case the provider's
    422 is contained (that request's answers are missing, with a `request_rejected` warning) rather
-   than fatal. Containment means an invoke can now *finish* with some fields `missing_answer` or
-   some mentions unclustered where it used to raise: read `warnings`, or use `strict=True`.
+   than fatal. Containment (size refusals only) means an invoke can now *finish* with some fields
+   `missing_answer` or some mentions unclustered where it used to raise: read `warnings`, or use
+   `strict=True`. Non-size 4xx errors, anything uncertain and a refusal that repeats more than 8
+   times still raise.
 3. Clairic/Clef rate limits are unpublished; ~40 requests per invoke × `batch` may hit 429s —
    adaptive limiter.
 4. Span offsets could drift if Clairic normalises state — always request `state_text`.
