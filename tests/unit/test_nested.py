@@ -205,9 +205,9 @@ async def test_nested_instructions_carry_the_parent_context() -> None:
     (attribution,) = script.calls("attribution")
     question = attribution[1]["questions"]["attr.author.address.city"]
     assert question["instructions"] == (
-        "Does `input` state or directly imply (including simple arithmetic from "
-        "stated figures, or date math) that city (author → address) of "
-        '`entity.label` is "Portland"?'
+        "Does `input` state that city (author → address) of `entity.label` is "
+        '"Portland", or does it follow by simple arithmetic or date math from '
+        "figures the input states about `entity.label`?"
     )
     # the presence question is asked with the sub-model's own context
     (_, payload, meta) = script.calls("presence")[1]
@@ -1523,22 +1523,6 @@ async def test_member_leaves_name_the_member_in_their_instructions() -> None:
     assert fields["pet.Dog.nickname"]["instructions"] == (
         "Owner → pet (Dog): the Owner's pet's nickname"
     )
-
-
-async def test_a_recursive_models_deferred_field_is_warned_about_once() -> None:
-    class Tree(BaseModel):
-        label: str
-        parent: Optional["Tree"] = None
-        children: list[Address] = []
-
-    Tree.model_rebuild()
-    script = Script()
-    script.clairic = {"label": ca("text", "oak", find="oak")}
-    script.group_presence = {"parent": 0.0}
-    result = await run([Tree], script, "oak")
-    mentions = [w for w in result.warnings if "collection fields" in w]
-    assert len(mentions) == 1 and "Tree.children" in mentions[0]
-    assert sum("max_recursion" in w for w in result.warnings) == 1
 
 
 # --------------------------------------------------------------------------- #

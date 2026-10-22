@@ -167,6 +167,11 @@ class Run:
             sent.
         reference_date: ISO date Clairic resolves relative dates against.
         strict: Raise instead of returning an invalid record or a truncated state.
+        enable_inserts: Whether an item the input mentions that matches none of the
+            existing items of a nested list is added to it (a nested list the
+            record holds no items of takes them regardless).
+        enable_item_removals: Whether the items of a nested list that the input
+            says to remove are removed.
         usage: Token and request totals so far.
         calls: One record per transport call, failed calls included.
         warnings: Notes about anything that was degraded, without duplicates.
@@ -188,6 +193,8 @@ class Run:
     images: Sequence[Any] | None = None
     reference_date: str | None = None
     strict: bool = False
+    enable_inserts: bool = False
+    enable_item_removals: bool = False
     usage: Usage = field(default_factory=Usage)
     calls: list[CallRecord] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)

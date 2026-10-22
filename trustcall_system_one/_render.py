@@ -23,6 +23,7 @@ from typing import Any
 __all__ = [
     "ELLIPSIS",
     "Focus",
+    "Parent",
     "RenderedState",
     "clef_state",
     "discovery_focus",
@@ -175,11 +176,20 @@ def narrowed_spans(
     return found
 
 
+Parent = tuple[str, Sequence[Span | None]]
+"""The parent of a nested entity for a focus header: its label and mention spans."""
+
+
+def _cited(spans: Sequence[Span | None]) -> str:
+    return ", ".join(f"{span[0]}-{span[1]}" for span in spans if span)
+
+
 def entity_focus(
     schema: str,
     kind: str,
     label: str,
     mentions: Sequence[tuple[str, Span | None]],
+    parent: Parent | None = None,
 ) -> Focus:
     """The focus header of one entity of a collection.
 
@@ -188,35 +198,67 @@ def entity_focus(
         kind: What the entity is, for "any other ...": the schema title.
         label: The entity's label (``"Emma Thompson"``).
         mentions: Its mentions as ``(text, span)``, spans in the original input.
+        parent: For an item of a nested list, the label of the entity it belongs to
+            and where the input mentions that entity.
 
     Returns:
         The opening tag (``<focus schema="Person" entity="Emma Thompson">``, the
-        one place the label is written) and the lines that say whom to answer
-        for and, when the offsets are known, where the input mentions the entity
-        (never the mention texts themselves).
+        one place the label is written; ``parent="..."`` names the owner of a
+        nested item the same way) and the lines that say whom to answer for and,
+        when the offsets are known, where the input mentions the entity (never
+        the mention texts themselves).
     """
-    header = f'<focus schema="{_attribute(schema)}" entity="{_attribute(label)}">'
+    header = f'<focus schema="{_attribute(schema)}" entity="{_attribute(label)}"'
+    if parent is not None:
+        header += f' parent="{_attribute(parent[0])}"'
+    header += ">"
     lines = [
         "Answer each field for the entity named above only. "
         f"Ignore facts about any other {kind.lower()}."
     ]
+    if parent is not None:
+        lines.append(
+            f"The entity is a {kind.lower()} of the parent named above: ignore any "
+            f"{kind.lower()} that belongs to someone else."
+        )
     # Offsets only: the header must not quote the mention texts. Clairic answers
     # with a span, and a quoted name in the header is a place a span can start at
     # (a live answer began in the quote and ended in the input, so its value held
     # the header's tail and the input tag).
-    cited = ", ".join(f"{span[0]}-{span[1]}" for _, span in mentions if span)
+    cited = _cited([span for _, span in mentions])
     if cited:
         lines.append(f"The entity is mentioned in the input at characters {cited}.")
+    if parent is not None and (where := _cited(parent[1])):
+        lines.append(f"The parent is mentioned in the input at characters {where}.")
     return header, tuple(lines)
 
 
-def discovery_focus(schema: str, kind: str) -> Focus:
-    """The focus header of the discovery and count requests of a collection."""
-    header = f'<focus schema="{_attribute(schema)}" task="discover">'
-    return header, (
-        f"Look for every {kind.lower()} the input mentions, whoever they are. "
-        "Answer from the input text only.",
-    )
+def discovery_focus(schema: str, kind: str, parent: Parent | None = None) -> Focus:
+    """The focus header of the discovery and count requests of a collection.
+
+    Args:
+        schema: Name of the schema.
+        kind: What an entity is called.
+        parent: For a nested list, the label of the entity the items belong to and
+            where the input mentions it.
+    """
+    header = f'<focus schema="{_attribute(schema)}" task="discover"'
+    if parent is not None:
+        header += f' parent="{_attribute(parent[0])}"'
+    header += ">"
+    if parent is None:
+        return header, (
+            f"Look for every {kind.lower()} the input mentions, whoever they are. "
+            "Answer from the input text only.",
+        )
+    lines = [
+        f"Look for every {kind.lower()} of the parent named above that the input "
+        f"mentions, and ignore any {kind.lower()} that belongs to someone else. "
+        "Answer from the input text only."
+    ]
+    if where := _cited(parent[1]):
+        lines.append(f"The parent is mentioned in the input at characters {where}.")
+    return header, tuple(lines)
 
 
 def render_clairic(

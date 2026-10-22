@@ -17,6 +17,7 @@ from pydantic import (
     BeforeValidator,
     ConfigDict,
     Field,
+    PrivateAttr,
     StringConstraints,
     ValidationError,
     field_validator,
@@ -448,6 +449,14 @@ class ClairicAnswer(_Response):
     p_above: float | None = None
     quantiles: list[Any] | None = None
     steps: list[Any] | None = None
+    _raw_spans: list[list[int]] | None = PrivateAttr(default=None)
+    """The spans as the model returned them, when ``spans`` was re-paired.
+
+    Clairic's list ``value`` and ``spans`` are not index-aligned (a span can be
+    there for a mention the values leave out), so ``align_list_spans`` pairs each
+    value with a span by text and keeps what the model said here, for the callers
+    that want every span (discovery).
+    """
 
     @field_validator("span", mode="before")
     @classmethod

@@ -27,7 +27,13 @@ from typing import Any, Literal
 from pydantic import BaseModel, ValidationError
 from pydantic_core import PydanticSerializationError, to_jsonable_python
 
-from trustcall_system_one._compile import FieldGroup, SchemaPlan, UnionGroup
+from trustcall_system_one._compile import (
+    VALUE_FIELD,
+    FieldGroup,
+    FieldSpec,
+    SchemaPlan,
+    UnionGroup,
+)
 from trustcall_system_one._types import SchemaInstance
 
 __all__ = [
@@ -366,13 +372,47 @@ def _names(owner: Iterable[Any]) -> dict[str, str]:
     return mapping
 
 
-def _normalise_group(group: FieldGroup, data: Mapping[str, Any]) -> dict[str, Any]:
+def _normalise_items(plan: SchemaPlan, spec: FieldSpec, value: Any) -> Any:
+    """Normalise the items of a collection or mapping value (else leave it alone)."""
+    item = plan.collection(spec)
+    if spec.engine == "collection":
+        if not isinstance(value, list):
+            return value
+        return [
+            normalise_record(item.item, element)
+            if isinstance(element, Mapping)
+            else element
+            for element in value
+        ]
+    if not isinstance(value, Mapping):
+        return value
+    holder = next(
+        (c for c in item.item.root.children if str(c.path[-1]) == VALUE_FIELD), None
+    )
+    if holder is None:
+        return dict(value)
+    return {
+        key: _normalise_group(item.item, holder, entry)
+        if isinstance(entry, Mapping)
+        else entry
+        for key, entry in value.items()
+    }
+
+
+def _normalise_group(
+    plan: SchemaPlan, group: FieldGroup, data: Mapping[str, Any]
+) -> dict[str, Any]:
     names = _names(group.specs)
     children = {
         (c.alias if c.alias is not None else str(c.path[-1])): c for c in group.children
     }
     unions = {
         (u.alias if u.alias is not None else str(u.path[-1])): u for u in group.unions
+    }
+    collections = {
+        (s.alias if s.alias is not None else str(s.path[-1])): s
+        for s in group.specs
+        if s.engine in ("collection", "mapping")
     }
     for child in group.children:
         names.update(_names([child]))
@@ -387,20 +427,25 @@ def _normalise_group(group: FieldGroup, data: Mapping[str, Any]) -> dict[str, An
                 continue
             sub_group = children.get(target)
             sub_union = unions.get(target)
+            sub_collection = collections.get(target)
             if sub_group is not None and isinstance(value, Mapping):
-                value = _normalise_group(sub_group, value)
+                value = _normalise_group(plan, sub_group, value)
             elif sub_union is not None and isinstance(value, Mapping):
-                value = _normalise_union(sub_union, value)
+                value = _normalise_union(plan, sub_union, value)
+            elif sub_collection is not None:
+                value = _normalise_items(plan, sub_collection, value)
             out[target] = value
     return out
 
 
-def _normalise_union(union: UnionGroup, data: Mapping[str, Any]) -> dict[str, Any]:
+def _normalise_union(
+    plan: SchemaPlan, union: UnionGroup, data: Mapping[str, Any]
+) -> dict[str, Any]:
     """Normalise a union value as the member it validates as (else the best fit)."""
     best: dict[str, Any] | None = None
     best_hits = -1
     for member in union.members:
-        candidate = _normalise_group(member.group, data)
+        candidate = _normalise_group(plan, member.group, data)
         try:
             member.model.model_validate(candidate)
         except ValidationError:
@@ -421,8 +466,8 @@ def normalise_record(plan: SchemaPlan, data: Mapping[str, Any]) -> dict[str, Any
 
     A field is accepted under its name or its alias and written under the key
     ``model_validate`` expects (the alias, when it has one), at every level of
-    sub-models and unions of models. Keys the schema does not know are kept
-    as they are, and collections (``list[Model]``) are left alone until M9.
+    sub-models, unions of models and collection items. Keys the schema does not
+    know are kept as they are.
 
     Args:
         plan: The compiled schema.
@@ -431,4 +476,4 @@ def normalise_record(plan: SchemaPlan, data: Mapping[str, Any]) -> dict[str, Any
     Returns:
         A new dict.
     """
-    return _normalise_group(plan.root, data)
+    return _normalise_group(plan, plan.root, data)

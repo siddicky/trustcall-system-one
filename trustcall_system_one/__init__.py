@@ -2,6 +2,7 @@
 
 from trustcall_system_one._cardinality import Many, One
 from trustcall_system_one._compile import (
+    CollectionPlan,
     FieldGroup,
     FieldSpec,
     SchemaPlan,
@@ -75,6 +76,7 @@ __all__ = [
     "CallMeta",
     "CallRecord",
     "CloudflareTransport",
+    "CollectionPlan",
     "ConcurrencyConfig",
     "CorefConfig",
     "CostReport",

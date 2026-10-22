@@ -25,6 +25,8 @@ from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Any
 
+from pydantic import BaseModel
+
 from trustcall_system_one._chunk import (
     Merged,
     agree,
@@ -69,14 +71,18 @@ from trustcall_system_one._wire import (
 from trustcall_system_one.transport import CallMeta
 
 __all__ = [
+    "LINEAGE_SEP",
     "Asked",
     "Ctx",
     "ExistingBlock",
     "FieldState",
+    "Nest",
+    "Placement",
     "Resolved",
     "accept",
     "adopt_cross",
     "agree",
+    "align_list_spans",
     "ask_clairic",
     "compact_block",
     "contest_cross",
@@ -90,6 +96,8 @@ __all__ = [
 
 Span = tuple[int, int]
 
+LINEAGE_SEP = " \u203a "
+"""Joins the names of an item and its ancestors in a warning."""
 REASK_SUFFIX = " Answer only from the text near these mentions."
 _SHORT_CODES = frozenset({"abstain", "unstated", "type_uncertain", "missing_answer"})
 _NONE_OF_THESE = "none_of_these"
@@ -119,6 +127,43 @@ class ExistingBlock:
     text: str
     data: Mapping[str, Any] | None = None
     compacted: bool = False
+
+
+@dataclass(frozen=True)
+class Nest:
+    """Where a plan sits inside the document it is part of.
+
+    A collection's item plan is a plan of its own, so how deep it is nested and
+    which item models are on the way down is not in the plan; the engine carries
+    it to keep ``limits.max_depth`` and ``limits.max_recursion`` honest for
+    collections of collections.
+
+    Attributes:
+        depth: How many path segments lie between the document root and this
+            plan's root.
+        chain: The item models from the root down to this plan, the root model
+            first.
+    """
+
+    depth: int = 0
+    chain: tuple[type[BaseModel], ...] = ()
+
+
+@dataclass(frozen=True)
+class Placement:
+    """Where a nested item sits: its parent, ancestors, nesting and call scope.
+
+    Attributes:
+        parent: The entity the item belongs to.
+        lineage: The names of its ancestors including the parent, outermost first.
+        nest: How deep the item's plan is nested (see ``Nest``).
+        scope: ``CallMeta.scope`` of its calls.
+    """
+
+    parent: EntityInfo | None = None
+    lineage: tuple[str, ...] = ()
+    nest: Nest = field(default_factory=Nest)
+    scope: str = ""
 
 
 @dataclass
@@ -157,6 +202,14 @@ class Ctx:
         vetoed: Why every operation of an update is refused without being judged
             (an identity conflict between the entity and the record it was matched
             to); empty when nothing is.
+        parent: For an item of a nested list, the entity it belongs to: the Clef
+            states name it (``entity.parent``) so the items of two parents stay
+            apart.
+        lineage: The names of the ancestors of a nested item, outermost first
+            (``"Emma Thompson (e0)"``); run warnings start with them.
+        nest: Where the plan sits in the document (see ``Nest``).
+        scope: ``CallMeta.scope`` of this context's calls: the parent key and the
+            pointer of the collection (``"e0/pets"``), empty at the top level.
     """
 
     run: Run
@@ -177,6 +230,10 @@ class Ctx:
     focus: Focus | None = None
     focus_plain: Focus | None = None
     vetoed: str = ""
+    parent: EntityInfo | None = None
+    lineage: tuple[str, ...] = ()
+    nest: Nest = field(default_factory=Nest)
+    scope: str = ""
 
     def input_only(self) -> "Ctx":
         """The same context without the record: every request is about the input.
@@ -189,7 +246,13 @@ class Ctx:
 
     def meta(self, kind: CallKind, *, field: str | None = None) -> CallMeta:
         """Routing context for a call. The entity is its key, not its label."""
-        return CallMeta(kind=kind, schema=self.plan.name, entity=self.key, field=field)
+        return CallMeta(
+            kind=kind,
+            schema=self.plan.name,
+            entity=self.key,
+            field=field,
+            scope=self.scope,
+        )
 
     def desc(self, spec: FieldSpec) -> str:
         """The field's description, put through ``verify.instruction_template``.
@@ -292,9 +355,16 @@ class Ctx:
         )
 
     def warn(self, message: str) -> None:
-        """Record a run warning; one about a collection entity names the entity."""
+        """Record a run warning; one about a collection entity names the entity.
+
+        An item of a nested list is named through its ancestors:
+        ``Emma Thompson (e0) \u203a Rex (e1): ...``.
+        """
+        names = list(self.lineage)
         if self.info is not None:
-            message = f"{self.info.label} ({self.info.key}): {message}"
+            names.append(f"{self.info.label} ({self.info.key})")
+        if names:
+            message = f"{LINEAGE_SEP.join(names)}: {message}"
         self.run.warn(message)
 
     def mention_spans(self) -> list[Span]:
@@ -303,13 +373,47 @@ class Ctx:
             return []
         return [m.span for m in self.info.mentions if m.span is not None]
 
+    def parent_spans(self) -> list[Span]:
+        """Where the input mentions the parent of a nested item."""
+        if self.parent is None:
+            return []
+        return [m.span for m in self.parent.mentions if m.span is not None]
+
+    def _mention_entries(self, info: EntityInfo, *, spans: bool) -> list[Any]:
+        """The ``mentions`` of an entity in a Clef state: text, span, context."""
+        context = self.run.coref.context_chars
+        entries: list[Any] = []
+        total = len(info.mentions)
+        for index, m in enumerate(info.mentions):
+            entry: dict[str, Any] = {"text": m.text}
+            if m.span is not None:
+                if spans:
+                    entry["span"] = list(m.span)
+                if has_context(index, total):  # the first 8 and the last 2
+                    start, end = m.span
+                    entry["context"] = self.text[
+                        max(0, start - context) : end + context
+                    ]
+            entries.append(entry)
+        return entries
+
+    def parent_dict(self, *, spans: bool = True) -> dict[str, Any] | None:
+        """The parent of a nested item for a Clef state: ``{"label", "mentions"}``."""
+        if self.parent is None:
+            return None
+        return {
+            "label": self.parent.label,
+            "mentions": self._mention_entries(self.parent, spans=spans),
+        }
+
     def entity_dict(self, *, spans: bool = True) -> dict[str, Any]:
         """The ``entity`` of a Clef state: ``{"label", "mentions"}``.
 
         The mentions are the texts the input uses; for a collection entity each
         is an object with its text, its span in the input and a short context
         around it (as coreference states have), so two entities that share a label
-        (two people called Emma) can still be told apart.
+        (two people called Emma) can still be told apart. An item of a nested list
+        also carries its ``parent`` (the same, for the entity it belongs to).
 
         Args:
             spans: Include the spans. They are offsets in the whole input, so a
@@ -318,21 +422,12 @@ class Ctx:
         """
         mentions: list[Any] = list(self.mentions)
         if self.info is not None and self.info.mentions:
-            context = self.run.coref.context_chars
-            mentions = []
-            total = len(self.info.mentions)
-            for index, m in enumerate(self.info.mentions):
-                entry: dict[str, Any] = {"text": m.text}
-                if m.span is not None:
-                    if spans:
-                        entry["span"] = list(m.span)
-                    if has_context(index, total):  # the first 8 and the last 2
-                        start, end = m.span
-                        entry["context"] = self.text[
-                            max(0, start - context) : end + context
-                        ]
-                mentions.append(entry)
-        return {"label": self.label, "mentions": mentions}
+            mentions = self._mention_entries(self.info, spans=spans)
+        entity: dict[str, Any] = {"label": self.label, "mentions": mentions}
+        parent = self.parent_dict(spans=spans)
+        if parent is not None:
+            entity["parent"] = parent
+        return entity
 
     def fitted(
         self,
@@ -366,7 +461,7 @@ class Ctx:
             proposed_change: A change under review (updates).
             budget: A smaller token budget for the state (see ``Run.clef_state``).
         """
-        whole = [*(spans or ()), *self.mention_spans()]
+        whole = [*(spans or ()), *self.mention_spans(), *self.parent_spans()]
         if windows:
             shown = narrow_text(self.text, windows)
             anchors = narrowed_spans(len(self.text), windows, whole)
@@ -546,6 +641,7 @@ async def ask_clairic(
     rendered = ctx.rendered(windows=windows)
     response = await run.call_clairic(fields, rendered, meta=meta)
     anchored = run.anchor(rendered, response)
+    response = align_list_spans(response, anchored)
     if not response.truncated:
         return {name: (response.answers.get(name), anchored) for name in fields}
 
@@ -786,6 +882,96 @@ def _room(read: int | None, reserved: int) -> int | None:
     return None if read is None else max(0, read - reserved)
 
 
+def _fold(text: Any) -> str:
+    """Case- and whitespace-insensitive form of a piece of text."""
+    return " ".join(str(text).split()).casefold()
+
+
+def _aligned(answer: ClairicAnswer, anchored: RenderedState) -> ClairicAnswer:
+    """Pair every element of a text list answer with a span that covers it.
+
+    Clairic's ``value`` and ``spans`` need not be index-aligned: the first live
+    run gave a span for a second "Sarah" that the values left out, so the spans
+    after it belonged to the wrong elements. Each element gets the first unused
+    span whose covered text equals it (case and whitespace aside), else the first
+    free occurrence of its text in the input block of the returned state; if an
+    element has none, the answer keeps no spans. An answer whose spans already
+    line up is returned as it is.
+    """
+    value, spans = answer.value, answer.spans
+    if not isinstance(value, list) or not value or not spans:
+        return answer
+    if not all(isinstance(item, str) for item in value):
+        return answer
+    if any(len(pair) != 2 for pair in spans):
+        return answer
+    text = anchored.text
+
+    def covered(pair: Sequence[int]) -> str:
+        return text[pair[0] : pair[1]]
+
+    if len(spans) == len(value) and all(
+        _fold(item) in _fold(covered(pair)) or _fold(covered(pair)) in _fold(item)
+        for item, pair in zip(value, spans, strict=True)
+    ):
+        return answer
+    used: set[int] = set()
+    taken: set[tuple[int, int]] = {(pair[0], pair[1]) for pair in spans}
+    chosen: list[list[int]] = []
+    low, high = anchored.input_span
+    for item in value:
+        key = _fold(item)
+        pick = next(
+            (
+                i
+                for i, pair in enumerate(spans)
+                if i not in used and _fold(covered(pair)) == key
+            ),
+            None,
+        )
+        if pick is not None:
+            used.add(pick)
+            chosen.append(list(spans[pick]))
+            continue
+        at = text.find(item, low, high) if item.strip() else -1
+        while at >= 0 and (at, at + len(item)) in taken:
+            at = text.find(item, at + 1, high)
+        if at < 0:
+            fixed = answer.model_copy(update={"spans": None})
+            fixed._raw_spans = [list(pair) for pair in spans]
+            return fixed
+        taken.add((at, at + len(item)))
+        chosen.append([at, at + len(item)])
+    fixed = answer.model_copy(update={"spans": chosen})
+    fixed._raw_spans = [list(pair) for pair in spans]
+    return fixed
+
+
+def align_list_spans(
+    response: ClairicResponse, anchored: RenderedState | None
+) -> ClairicResponse:
+    """Re-pair the spans of the response's text-list answers with their elements.
+
+    See ``_aligned``. The spans the model returned stay available as the
+    answer's private ``_raw_spans`` for callers that want all of them.
+
+    Args:
+        response: Clairic's response.
+        anchored: The state its spans are offsets into (``None``: nothing to do).
+
+    Returns:
+        The response (a copy when an answer changed).
+    """
+    if anchored is None:
+        return response
+    answers = {
+        name: _aligned(answer, anchored) for name, answer in response.answers.items()
+    }
+    if all(answers[name] is response.answers[name] for name in answers):
+        return response
+    return response.model_copy(update={"answers": answers})
+
+
 def _without_echoes(
     ctx: Ctx, response: ClairicResponse, anchored: RenderedState | None
 ) -> ClairicResponse:
@@ -855,7 +1041,8 @@ async def _ask_chunks(
     ) -> tuple[Span, ClairicResponse, RenderedState | None]:
         rendered = ctx.rendered(windows=[chunk])
         response = await ctx.run.call_clairic(fields, rendered, meta=meta)
-        return chunk, response, ctx.run.anchor(rendered, response)
+        anchored = ctx.run.anchor(rendered, response)
+        return chunk, align_list_spans(response, anchored), anchored
 
     return await gather(*(one(chunk) for chunk in chunks))
 
@@ -1047,8 +1234,11 @@ async def resolve(
                 guess=coerced.guess,
                 lost=tuple(echo_lost),
             )
+    relocated: dict[int, Span] = {}
     if coerced.ok and rendered is not None:
-        coerced, outside, everything = _drop_outside(rendered, coerced)
+        coerced, outside, everything, relocated = _drop_outside(
+            rendered, coerced, ctx.text, notes
+        )
         echo_lost.extend(outside)
         if everything:
             return Resolved(
@@ -1062,10 +1252,17 @@ async def resolve(
                 guess=coerced.guess,
                 lost=tuple(echo_lost),
             )
-    span = _map_span(rendered, coerced.span, notes)
+    span: Span | None = (
+        relocated.get(0) if not isinstance(coerced.value, list) else None
+    )
+    if span is None:
+        span = _map_span(rendered, coerced.span, notes)
     spans: tuple[Span, ...] | None = None
     if coerced.spans is not None:
-        mapped = [_map_span(rendered, pair, notes) for pair in coerced.spans]
+        mapped = [
+            relocated.get(i) or _map_span(rendered, pair, notes)
+            for i, pair in enumerate(coerced.spans)
+        ]
         if all(pair is not None for pair in mapped):
             spans = tuple(pair for pair in mapped if pair is not None)
     if not coerced.ok:
@@ -1107,29 +1304,119 @@ async def resolve(
     )
 
 
+def _frame(rendered: RenderedState, pair: Span) -> bool:
+    """Whether a span touches the header or the trailing blocks of the state.
+
+    ``rendered.text`` is the state Clairic says it read. Everything before the
+    input block's content (the ``<focus>`` header and the sentinel) and
+    everything after it (the closing sentinel, the ``<existing>`` block) is the
+    frame; a span that touches it is not a quote of the input, whatever else it
+    covers.
+    """
+    text = rendered.text
+    start = rendered.input_span[0]
+    close = text.find("\n</input>", rendered.input_span[1])
+    end = len(text) if close < 0 else close
+    return pair[0] < start or pair[1] > end
+
+
+def _occurrences(source: str, value: str) -> list[int]:
+    """Where ``value`` occurs in ``source``: exactly, else with other whitespace."""
+    found = [m.start() for m in re.finditer(re.escape(value), source)]
+    if found or not value.split():
+        return found
+    flexible = r"\s+".join(re.escape(word) for word in value.split())
+    return [m.start() for m in re.finditer(flexible, source)]
+
+
+def _relocate(
+    rendered: RenderedState, source: str, value: Any, pair: Span
+) -> Span | None:
+    """Find a text answer in the original input when its span cannot be mapped.
+
+    ``state_text`` may differ from the state that was sent (line endings
+    normalised, a part cut) so that spans after the first difference map to
+    nothing. The value is searched in the original input instead: the occurrence
+    nearest to where the span would be (counted from the end of the last piece
+    that did map), else the first.
+
+    Returns:
+        The span in the original input, or ``None`` when the value is not text
+        or the input does not contain it.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    starts = _occurrences(source, value)
+    if not starts:
+        return None
+    guess: int | None = None
+    if rendered.segments:
+        seg_start, seg_end, original = rendered.segments[-1]
+        if pair[0] >= seg_end:
+            guess = original + (seg_end - seg_start) + (pair[0] - seg_end)
+    at = min(starts, key=lambda s: abs(s - guess)) if guess is not None else starts[0]
+    length = len(value)
+    if source[at : at + length] != value:  # whitespace differed: take the match
+        flexible = r"\s+".join(re.escape(word) for word in value.split())
+        match = re.compile(flexible).match(source, at)
+        length = match.end() - at if match else length
+    return (at, at + length)
+
+
 def _drop_outside(
-    rendered: RenderedState, coerced: Coerced
-) -> tuple[Coerced, list[tuple[int, str, str]], bool]:
+    rendered: RenderedState, coerced: Coerced, source: str, notes: list[str]
+) -> tuple[Coerced, list[tuple[int, str, str]], bool, dict[int, Span]]:
     """Throw away what is not read from the input block.
 
-    A text answer's span must lie ENTIRELY inside the verbatim input: one that starts
-    in the ``<focus>`` header (which names the entity) and ends in the input is not
-    a quote of the input and would put header text in the value. A list is judged
-    element by element, like ``_drop_echoes``.
+    A text answer's span must not touch the frame of the state Clairic read (see
+    ``_frame``): one that starts in the ``<focus>`` header (which names the entity)
+    and ends in the input is not a quote of the input and would put header text in
+    the value. A span that merely cannot be mapped (``state_text`` differs from
+    what was sent from some point on: CRLF turned into LF) says nothing against the
+    value: if the value is found in the original input it stays and its span is
+    relocated there. A list is judged element by element, like ``_drop_echoes``.
+
+    Args:
+        rendered: The state the answer was asked on, as Clairic returned it.
+        coerced: The answer.
+        source: The original input.
+        notes: Notes of the field (a ``span_relocated`` note is added).
 
     Returns:
         The answer without such elements, the dropped elements as ``(position in the
-        model's answer list, "span_outside_input", detail)`` and whether nothing is
-        left of the answer.
+        model's answer list, "span_outside_input", detail)``, whether nothing is
+        left of the answer and the relocated spans by position in the answer that
+        is returned (``0`` for a scalar).
     """
     value = coerced.value
+
+    def judge(item: Any, pair: Span) -> tuple[bool, Span | None]:
+        """Whether the element stays, and where it was relocated to, if it was."""
+        if rendered.to_original(pair) is not None:
+            return True, None
+        if _frame(rendered, pair):
+            return False, None
+        moved = _relocate(rendered, source, item, pair)
+        if moved is None:
+            return not isinstance(item, str), None  # a number has nothing to find
+        return True, moved
+
     if isinstance(value, list):
         spans = coerced.spans
         if spans is None or len(spans) != len(value):
-            return coerced, [], False
-        keep = [i for i, pair in enumerate(spans) if rendered.to_original(pair)]
+            return coerced, [], False, {}
+        moves: dict[int, Span] = {}
+        keep: list[int] = []
+        for i, pair in enumerate(spans):
+            stays, moved = judge(value[i], pair)
+            if stays:
+                keep.append(i)
+                if moved is not None:
+                    moves[i] = moved
         if len(keep) == len(value):
-            return coerced, [], False
+            if moves:
+                notes.append("span_relocated")
+            return coerced, [], False, moves
         before = coerced.kept if coerced.kept is not None else tuple(range(len(value)))
         lost = [
             (
@@ -1141,17 +1428,29 @@ def _drop_outside(
             if i not in keep
         ]
         if not keep:
-            return coerced, lost, True
+            return coerced, lost, True, {}
         kept = replace(
             coerced,
             value=[value[i] for i in keep],
             spans=tuple(spans[i] for i in keep),
             kept=tuple(before[i] for i in keep),
         )
-        return kept, lost, False
-    if coerced.span is not None and rendered.to_original(coerced.span) is None:
-        return coerced, [], True
-    return coerced, [], False
+        if moves:
+            notes.append("span_relocated")
+        return (
+            kept,
+            lost,
+            False,
+            {k: moves[i] for k, i in enumerate(keep) if i in moves},
+        )
+    if coerced.span is not None:
+        stays, moved = judge(value, coerced.span)
+        if not stays:
+            return coerced, [], True, {}
+        if moved is not None:
+            notes.append("span_relocated")
+            return coerced, [], False, {0: moved}
+    return coerced, [], False, {}
 
 
 def _drop_echoes(
@@ -1558,12 +1857,12 @@ async def _borderline_one(ctx: Ctx, st: FieldState, answers: dict[str, Answer]) 
 # --------------------------------------------------------------------------- #
 
 _ATTR_TRUE = (
-    "The input states this about the entity `entity.label`, or directly implies "
-    "it (simple arithmetic on stated figures, or date math)."
+    "The input states this about the entity `entity.label`, or it follows by "
+    "simple arithmetic or date math from figures the input states about "
+    "`entity.label`."
 )
 _ATTR_FALSE = (
-    "The input does not state or directly imply this about `entity.label`: it "
-    "says something else, concerns another entity, or does not say it."
+    "The input does not state it about `entity.label`, or it concerns another entity."
 )
 
 
@@ -1573,14 +1872,15 @@ def _attribution_question(
     text = display(value)
     if element:
         instructions = (
-            "Does `input` state or directly imply (including simple arithmetic "
-            f'from stated figures) this about `entity.label`: "{text}"?'
+            "Does `input` state this about `entity.label`, or does it follow by "
+            "simple arithmetic from figures the input states about "
+            f'`entity.label`: "{text}"?'
         )
     else:
         instructions = (
-            "Does `input` state or directly imply (including simple arithmetic "
-            f"from stated figures, or date math) that {description} of "
-            f'`entity.label` is "{text}"?'
+            f'Does `input` state that {description} of `entity.label` is "{text}", '
+            "or does it follow by simple arithmetic or date math from figures the "
+            "input states about `entity.label`?"
         )
     return NoulQuestion(
         type="noul",

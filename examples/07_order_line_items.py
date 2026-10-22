@@ -1,15 +1,12 @@
 """Edit one line of an order and add another, leaving every other line alone.
 
-Needs milestone M9 (nested collections through the collection engine); until it lands
-the ``items`` list is left to its default and the call fails or returns no patch
-(``tests/unit/test_examples.py`` expects that and flips when M9 does).
 ``uv run python examples/07_order_line_items.py [--offline]``
 
 ``Order.items`` is a ``list[LineItem]`` marked ``Many(identity="name")``. The same
-collection engine that finds people in a conversation runs *inside* the order: it
-discovers which line items the email talks about, matches each one to an existing
-line (or decides it is new), extracts only that line's fields and turns the difference
-into patch operations whose paths point inside the order.
+collection engine that finds people in a conversation runs *inside* the order,
+scoped to it: it discovers which line items the email talks about, matches each
+one to an existing line (or decides it is new), extracts only that line's fields
+and turns the difference into patch operations whose paths point inside the order.
 
 The email: "please add two more of the blue mugs and drop the quantity of the tea
 towels to 1".
@@ -17,16 +14,22 @@ towels to 1".
 What to look at:
 
 * The patch has exactly two operations: ``replace /items/1/quantity`` (the tea towels,
-  4 -> 1) and ``add /items/-`` (the blue mugs, a line the order did not have).
+  4 -> 1) and ``add /items/-`` (the blue mugs, a line the order did not have). Both
+  were gated by Clef; the first against the tea towels' own record.
 * The steel kettle and the wooden spoon set are not mentioned, so they are not
   asked about and appear unchanged in the "Before -> after" view: no operation
   touches them.
 * "Not applied": the tea towels' name came back as "tea towels" (the email's wording)
   for a line called "Tea towels", so no rename is made (``unchanged``); fields the
   email is silent about are null (``p_null``) and never delete anything.
-* Quantity changes are stated absolutely ("to 1") because Clairic is not good at
-  arithmetic. A relative edit like "two more" of an *existing* line would need the
-  sum in code, which is why it is extracted as a new line of 2 here.
+* Relative edits are not supported (a settled decision: ``docs/DESIGN.md``, "Design
+  decisions settled from the examples review"). The library reads what the text
+  *states* and never computes from the old value. "Two more of the blue mugs" is
+  the new line with the quantity the text states, 2, here only because the order
+  has no blue mugs line. Had it one with 3, the extraction would still read 2 (the
+  text's number, not 3 + 2), so the change gate would be judging "quantity 2" against
+  a record that says 3: say "make it five" when you mean five. That is why the
+  tea towels edit is absolute ("to 1").
 
 Live mode runs on the real models; offline mode scripts the answers.
 """

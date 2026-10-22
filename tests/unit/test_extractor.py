@@ -1185,48 +1185,6 @@ async def test_many_with_an_unknown_identity_field_fails_at_creation() -> None:
         make_extractor([Many(Person, identity="nickname")], person_script())
 
 
-class Pet(BaseModel):
-    name: str
-
-
-class WithDeferred(BaseModel):
-    name: str
-    pets: list[Pet] = []
-    scores: dict[str, int] = {}
-
-
-async def test_collections_and_mappings_are_left_to_their_defaults_with_a_warning() -> (
-    None
-):
-    script = Script()
-    script.clairic = {"name": ca("text", "Ada", find="Ada")}
-    result = await make_extractor([WithDeferred], script).ainvoke("Ada has a dog.")
-    (record,) = result.records
-    assert record.valid
-    assert record.value == WithDeferred(name="Ada")
-    assert set(record.fields) == {"name"}
-    joined = "\n".join(result.warnings)
-    for field_name in ("pets", "scores"):
-        assert f"WithDeferred.{field_name}:" in joined
-    assert "M9" in joined
-    assert sorted(script.calls("extract")[0][1]["fields"]) == ["name"]
-
-
-class NeedsDeferred(BaseModel):
-    name: str
-    pets: list[Pet]
-
-
-async def test_a_required_collection_makes_the_record_invalid() -> None:
-    script = Script()
-    script.clairic = {"name": ca("text", "Ada", find="Ada")}
-    result = await make_extractor([NeedsDeferred], script).ainvoke("Ada has a dog.")
-    (record,) = result.records
-    assert record.valid is False
-    assert record.errors[0].startswith("pets:")
-    assert any("NeedsDeferred.pets" in w and "M9" in w for w in result.warnings)
-
-
 # --------------------------------------------------------------------------- #
 # create_extractor
 # --------------------------------------------------------------------------- #

@@ -415,3 +415,28 @@ def test_fits_normalises_the_record_before_validating() -> None:
     es = coerced([("a", ANY, {"full_name": "Ada"}), ("b", ANY, {"nope": 1})])
     first, second = es.records
     assert fits(plan, first) and not fits(plan, second)
+
+
+def test_the_items_of_collections_and_mappings_are_normalised_too() -> None:
+    class Part(BaseModel):
+        part_no: str = Field(alias="partNo")
+        count: int = 1
+
+    class Kit(BaseModel):
+        parts: list[Part] = []
+        spares: dict[str, Part] = {}
+        stock: dict[str, int] = {}
+
+    record = normalise_record(
+        compile_schema(Kit),
+        {
+            "parts": [{"part_no": "A", "count": 2}, "junk"],
+            "spares": {"x": {"part_no": "B"}},
+            "stock": {"a": 1},
+        },
+    )
+    assert record == {
+        "parts": [{"partNo": "A", "count": 2}, "junk"],
+        "spares": {"x": {"partNo": "B"}},
+        "stock": {"a": 1},
+    }

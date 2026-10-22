@@ -58,15 +58,27 @@ from trustcall_system_one._match import (
     identity_keys,
     match_entities,
 )
-from trustcall_system_one._render import RenderedState, discovery_focus, entity_focus
+from trustcall_system_one._render import (
+    Parent,
+    RenderedState,
+    discovery_focus,
+    entity_focus,
+)
 from trustcall_system_one._run import CLEF_BATCH, Run, gather
 from trustcall_system_one._types import (
+    CallKind,
     EntityInfo,
     Mention,
     ResultRecord,
     SkippedEntity,
 )
-from trustcall_system_one._verify import Ctx, ask_clairic
+from trustcall_system_one._verify import (
+    LINEAGE_SEP,
+    Ctx,
+    Nest,
+    Placement,
+    ask_clairic,
+)
 from trustcall_system_one._wire import (
     ClairicAnswer,
     ClairicField,
@@ -157,12 +169,19 @@ class Scope:
         cardinality: The ``Many`` that asked for them (its ``identity`` and
             ``label``).
         parent: The entity the collection belongs to; ``None`` at the top level.
+            Discovery, qualification, matching and the removal question then all
+            ask about the items *of this parent*.
         pointer: JSON Pointer of the collection inside its parent's document
             (empty at the top level).
         existing: Existing items to match the entities against (the
-            ``ExistingRecord``s of the schema at the top level, list elements for
-            a nested list). ``collect`` does not use them; ``apply_collection``
+            ``ExistingRecord``s of the schema at the top level; for a nested list
+            one per element, its id the element's index, or the key of a
+            mapping entry). ``collect`` does not use them; ``apply_collection``
             matches the entities it found against them.
+        lineage: The names of the ancestors of a nested collection including its
+            parent, outermost first (``("Emma Thompson (e0)",)``); warnings start
+            with them.
+        nest: How deep the item plan is nested in the whole document.
     """
 
     plan: SchemaPlan
@@ -171,11 +190,80 @@ class Scope:
     parent: EntityInfo | None = None
     pointer: str = ""
     existing: tuple[Any, ...] = ()
+    lineage: tuple[str, ...] = ()
+    nest: Nest = field(default_factory=Nest)
 
     @property
     def noun(self) -> str:
         """What one entity is called in prompts."""
         return self.cardinality.label or self.plan.title
+
+    @property
+    def name(self) -> str:
+        """The collection's field name (``"pets"``), empty at the top level."""
+        return self.pointer.rsplit("/", 1)[-1]
+
+    @property
+    def call_scope(self) -> str:
+        """``CallMeta.scope`` of the collection's calls (``"e0/pets"``)."""
+        return f"{self.parent.key}{self.pointer}" if self.parent is not None else ""
+
+    def meta(
+        self, kind: CallKind, *, entity: str | None = None, field: str | None = None
+    ) -> CallMeta:
+        """Routing context of a call of this collection."""
+        return CallMeta(
+            kind=kind,
+            schema=self.plan.name,
+            entity=entity,
+            field=field,
+            scope=self.call_scope,
+        )
+
+    def placement(self) -> Placement:
+        """Where an item of this collection sits, for its own pipeline."""
+        return Placement(self.parent, self.lineage, self.nest, self.call_scope)
+
+    def scoped(self, message: str) -> str:
+        """A warning, started with the ancestors and the field of a nested list."""
+        if self.parent is None:
+            return message
+        return f"{LINEAGE_SEP.join([*self.lineage, self.name])}: {message}"
+
+    def parent_entry(self, context_chars: int, *, spans: bool = True) -> dict[str, Any]:
+        """The parent as a Clef state shows it: ``{"label", "mentions"}``.
+
+        A mention carries its text, its span (unless the input was narrowed and
+        the offsets would point at nothing) and, for the first 8 and the last 2,
+        a short context around it.
+        """
+        assert self.parent is not None
+        total = len(self.parent.mentions)
+        mentions: list[dict[str, Any]] = []
+        for index, m in enumerate(self.parent.mentions):
+            entry: dict[str, Any] = {"text": m.text}
+            if m.span is not None:
+                if spans:
+                    entry["span"] = list(m.span)
+                if has_context(index, total):
+                    start, end = m.span
+                    entry["context"] = self.source[
+                        max(0, start - context_chars) : end + context_chars
+                    ]
+            mentions.append(entry)
+        return {"label": self.parent.label, "mentions": mentions}
+
+    def parent_spans(self) -> list[Span]:
+        """Where the input mentions the parent."""
+        if self.parent is None:
+            return []
+        return [m.span for m in self.parent.mentions if m.span is not None]
+
+    def parent_focus(self) -> Parent | None:
+        """The parent for a focus header: its label and mention spans."""
+        if self.parent is None:
+            return None
+        return self.parent.label, [m.span for m in self.parent.mentions]
 
 
 @dataclass(frozen=True)
@@ -391,26 +479,55 @@ def _resolve_overlaps(mentions: Sequence[Mention], source: str) -> list[Mention]
     return sorted(kept, key=lambda m: m.span or (0, 0))
 
 
-def _span_of(
-    answer: ClairicAnswer, index: int, anchored: RenderedState | None
-) -> Span | None:
-    spans = answer.spans
-    if spans is None or index >= len(spans) or len(spans[index]) != 2:
-        return None
-    if anchored is None:
-        return None
-    return anchored.to_original((spans[index][0], spans[index][1]))
+def _fold(text: str) -> str:
+    """Case- and whitespace-insensitive form of a piece of text."""
+    return " ".join(text.split()).casefold()
 
 
-def _find_unused(source: str, text: str, cursor: int, used: set[Span]) -> int:
-    """The first occurrence of ``text`` after ``cursor`` that no item has, else any."""
-    for start in (cursor, 0):
-        at = source.find(text, start)
-        while at >= 0:
-            if (at, at + len(text)) not in used:
-                return at
-            at = source.find(text, at + 1)
-    return -1
+def _occurrences(source: str, text: str) -> list[Span]:
+    """Every whole-word occurrence of ``text`` in ``source``.
+
+    Exact first; if there is none, with any whitespace between the words and
+    case ignored (Clairic read a state whose line endings may have changed).
+    """
+    words = text.split()
+    if not words:
+        return []
+    lead = r"(?<!\w)" if words[0][0].isalnum() else ""
+    tail = r"(?!\w)" if words[-1][-1].isalnum() else ""
+    for flags, glue in ((0, re.escape(text.strip())), (re.IGNORECASE, None)):
+        body = glue or r"\s+".join(re.escape(w) for w in words)
+        found = [
+            (m.start(), m.end())
+            for m in re.finditer(f"{lead}{body}{tail}", source, flags)
+        ]
+        if found:
+            return found
+    return []
+
+
+def _answered_spans(
+    answer: ClairicAnswer, anchored: RenderedState | None
+) -> list[Span]:
+    """The spans the model gave for a list answer, in original-input offsets.
+
+    The values and the spans of a list answer are not index-aligned (a second
+    mention can be among the spans while the values leave it out), so the spans
+    are never paired with the values by position: each value finds its own by the
+    text it covers. The spans as the model returned them are used when
+    ``align_list_spans`` kept them aside.
+    """
+    raw = answer._raw_spans if answer._raw_spans is not None else answer.spans
+    if anchored is None or raw is None:
+        return []
+    found: list[Span] = []
+    for pair in raw:
+        if len(pair) != 2:
+            continue
+        mapped = anchored.to_original((pair[0], pair[1]))
+        if mapped is not None:
+            found.append(mapped)
+    return found
 
 
 def parse_mentions(
@@ -418,23 +535,28 @@ def parse_mentions(
     answer: ClairicAnswer | None,
     anchored: RenderedState | None,
     run: Run | None = None,
+    scope: Scope | None = None,
 ) -> list[Mention]:
     """The mentions in a discovery answer, as clean mentions in input order.
 
-    Each item is located in the ORIGINAL input: by the span Clairic gave, mapped
-    out of the rendered state, or, failing that, by searching for its text after
-    the previous mention. An item that is not in the input is dropped (Clairic is
-    extractive, so it can only be a slip). Pronoun-only mentions are dropped and
-    determiners and possessives stripped (``clean_mention``). Of two overlapping
-    mentions the longer is kept only if it contains exactly one of them (a span
-    that bridges two mentions replaces neither), and two mentions never share a
-    span.
+    Each distinct value is located in the ORIGINAL input by its text, never by its
+    index in the answer (``value`` and ``spans`` are not aligned): every span the
+    model returned whose covered text equals the value (case and whitespace
+    aside) is a mention of it, so a repeated mention that the values list once is
+    kept; a value no span covers (or listed more often than spans cover it) takes
+    every whole-word occurrence in the input. A value that is not in the input is
+    dropped (Clairic is extractive, so it can only be a slip). Pronoun-only
+    mentions are dropped and determiners and possessives stripped
+    (``clean_mention``). Of two overlapping mentions the longer is kept only if it
+    contains exactly one of them (a span that bridges two mentions replaces
+    neither), and two mentions never share a span.
 
     Args:
         source: The original input.
         answer: Clairic's ``list`` answer.
         anchored: The state to map the answer's spans with.
         run: The invoke's context, to warn about items that could not be placed.
+        scope: The collection, to name it in such a warning (nested lists only).
 
     Returns:
         The mentions, ordered by position.
@@ -442,37 +564,37 @@ def parse_mentions(
     if answer is None or not isinstance(answer.value, list):
         return []
     found: list[Mention] = []
-    used: set[Span] = {
-        (pair[0], pair[1])
-        for index in range(len(answer.value))
-        if (pair := _span_of(answer, index, anchored)) is not None
-    }
-    cursor = 0
-    for index, item in enumerate(answer.value):
+    spans = _answered_spans(answer, anchored)
+    listed: dict[str, int] = {}
+    for item in answer.value:
+        if str(item).strip():
+            listed[_fold(str(item))] = listed.get(_fold(str(item)), 0) + 1
+    used: set[Span] = set()
+    done: set[str] = set()
+    for item in answer.value:
         text = str(item)
-        if not text.strip():
+        key = _fold(text)
+        if not key or key in done:
             continue
-        span = _span_of(answer, index, anchored)
-        if span is not None and source[span[0] : span[1]].strip() != text.strip():
-            lo, hi = max(0, span[0] - 24), min(len(source), span[1] + 24)
-            near = source.find(text, lo, hi)
-            span = None if near < 0 else (near, near + len(text))
-        if span is None:
-            at = _find_unused(source, text, cursor, used)
-            if at < 0:
-                if run is not None:
-                    run.warn(
-                        f"mention_not_in_input: discovery returned {text!r}, which "
-                        "the input does not contain; it was ignored"
-                    )
+        done.add(key)
+        covering = [s for s in spans if _fold(source[s[0] : s[1]]) == key]
+        if len(covering) < listed[key]:
+            covering = _occurrences(source, text) or covering
+        if not covering:
+            if run is not None:
+                message = (
+                    f"mention_not_in_input: discovery returned {text!r}, which "
+                    "the input does not contain; it was ignored"
+                )
+                run.warn(scope.scoped(message) if scope is not None else message)
+            continue
+        for span in covering:
+            if span in used:
                 continue
-            span = (at, at + len(text))
-        used.add(span)
-        cleaned = clean_mention(source[span[0] : span[1]], span)
-        if cleaned is None or cleaned.span is None:
-            continue
-        found.append(cleaned)
-        cursor = span[1]
+            used.add(span)
+            cleaned = clean_mention(source[span[0] : span[1]], span)
+            if cleaned is not None and cleaned.span is not None:
+                found.append(cleaned)
     return _resolve_overlaps(found, source)
 
 
@@ -552,26 +674,35 @@ async def _presence(run: Run, scope: Scope) -> tuple[float | None, bool]:
     """
     plan = scope.plan
     described = _described(plan)
+    nested = scope.parent is not None
+    context = run.coref.context_chars
     question = NoulQuestion(
         type="noul",
         instructions=(
             f"Does `input` mention any {scope.noun}"
             + (f" ({described})" if described else "")
+            + (" belonging to `parent.label`" if nested else "")
             + "?"
         ),
         criteria=NoulCriteria(
-            true=f"The input mentions at least one {scope.noun}.",
-            false=f"The input mentions no {scope.noun}.",
+            true=f"The input mentions at least one {scope.noun}"
+            + (" belonging to the parent." if nested else "."),
+            false=f"The input mentions no {scope.noun}"
+            + (" belonging to the parent." if nested else "."),
         ),
     )
-    state = run.clef_state(scope.source)
+    state = run.clef_state(
+        scope.source,
+        spans=scope.parent_spans() or None,
+        extra={"parent": scope.parent_entry(context)} if nested else None,
+    )
+    cut = state["input"] != scope.source
+    if nested and cut:  # the offsets point into the whole input, not this one
+        state["parent"] = scope.parent_entry(context, spans=False)
     answers = await run.call_clef(
-        {"presence": question},
-        state,
-        meta=CallMeta(kind="presence", schema=plan.name),
+        {"presence": question}, state, meta=scope.meta("presence")
     )
     answer = answers.get("presence")
-    cut = state["input"] != scope.source
     return (answer.noul if isinstance(answer, NoulAnswer) else None), cut
 
 
@@ -582,7 +713,11 @@ def _discovery_ctx(run: Run, scope: Scope) -> Ctx:
         text=scope.source,
         label=scope.noun,
         key="",
-        focus=discovery_focus(scope.plan.name, scope.noun),
+        focus=discovery_focus(scope.plan.name, scope.noun, scope.parent_focus()),
+        parent=scope.parent,
+        lineage=scope.lineage,
+        nest=scope.nest,
+        scope=scope.call_scope,
     )
 
 
@@ -591,11 +726,14 @@ async def _discover(
 ) -> list[Mention]:
     """Ask Clairic for every mention of an entity, and clean what comes back."""
     noun = scope.noun
+    of = f" belonging to {scope.parent.label}" if scope.parent is not None else ""
     if phrase:
-        what = f"Every mention of a {noun} by their {phrase}"
+        what = f"Every mention of a {noun}{of} by their {phrase}"
     else:
         described = _described(scope.plan)
-        what = f"Every mention of a {noun}" + (f" ({described})" if described else "")
+        what = f"Every mention of a {noun}{of}" + (
+            f" ({described})" if described else ""
+        )
     instructions = (
         f"{what}, in the order they appear in the input. Include repeated "
         "mentions and shortened ones (a first name alone). Do not list pronouns. "
@@ -605,37 +743,34 @@ async def _discover(
         "mentions": ClairicField(type="list", items="text", instructions=instructions)
     }
     ctx = _discovery_ctx(run, scope)
-    asked = await ask_clairic(
-        ctx,
-        fields,
-        meta=CallMeta(kind="discover", schema=scope.plan.name),
-    )
+    asked = await ask_clairic(ctx, fields, meta=scope.meta("discover"))
     answer, anchored = asked["mentions"]
-    return parse_mentions(scope.source, answer, anchored, run)
+    return parse_mentions(scope.source, answer, anchored, run, scope)
 
 
 async def _count(run: Run, scope: Scope) -> int | None:
     """Ask Clairic how many distinct entities the input mentions."""
     noun = scope.noun
+    of = f" belonging to {scope.parent.label}" if scope.parent is not None else ""
     field_ = ClairicField(
         type="number",
         integer=True,
         instructions=(
-            f"How many distinct {plural(noun)} does the input mention? Count each "
-            f"individual {noun} once, however many times they are mentioned."
+            f"How many distinct {plural(noun)}{of} does the input mention? Count "
+            f"each individual {noun} once, however many times they are mentioned."
         ),
     )
     ctx = _discovery_ctx(run, scope)
     response = await run.call_clairic(
-        {"count": field_},
-        ctx.rendered(),
-        meta=CallMeta(kind="count", schema=scope.plan.name),
+        {"count": field_}, ctx.rendered(), meta=scope.meta("count")
     )
     answer = response.answers.get("count")
     if response.truncated:
         run.warn(
-            f"count_unreliable: the input of {scope.plan.name} did not fit one "
-            "Clairic request, so the count of entities was ignored"
+            scope.scoped(
+                f"count_unreliable: the input of {scope.plan.name} did not fit one "
+                "Clairic request, so the count of entities was ignored"
+            )
         )
         return None
     if answer is None or answer.value is None or isinstance(answer.value, bool):
@@ -710,37 +845,47 @@ async def _qualify(
             mentions.append(entry)
         return {"label": group.label, "mentions": mentions}
 
+    nested = scope.parent is not None
+
     async def ask(chunk: Sequence[tuple[int, _Group]]) -> dict[str, float | None]:
         anchors = [m.span for _, g in chunk for m in g.mentions if m.span is not None]
+        extra: dict[str, Any] = {
+            "entities": {_provisional(n): entity(g, spans=True) for n, g in chunk}
+        }
+        if nested:
+            extra["parent"] = scope.parent_entry(context)
         state = run.clef_state(
             scope.source,
-            spans=anchors,
-            extra={
-                "entities": {_provisional(n): entity(g, spans=True) for n, g in chunk}
-            },
+            spans=[*anchors, *scope.parent_spans()],
+            extra=extra,
         )
         if state["input"] != scope.source:  # offsets no longer point into the input
             state["entities"] = {
                 _provisional(n): entity(g, spans=False) for n, g in chunk
             }
+            if nested:
+                state["parent"] = scope.parent_entry(context, spans=False)
+        belonging = " belonging to `parent.label`" if nested else ""
         questions = {
             f"qualify.{_provisional(n)}": NoulQuestion(
                 type="noul",
                 instructions=(
                     f"Is `entities.{_provisional(n)}.label` a {scope.noun}"
                     + (f" ({described})" if described else "")
+                    + belonging
                     + "?"
                 ),
                 criteria=NoulCriteria(
-                    true=f"The entity is a {scope.noun}.",
-                    false=f"The entity is something else, not a {scope.noun}.",
+                    true=f"The entity is a {scope.noun}"
+                    + (" belonging to the parent." if nested else "."),
+                    false="The entity is something else, not a "
+                    + f"{scope.noun}"
+                    + (" of the parent." if nested else "."),
                 ),
             )
             for n, _ in chunk
         }
-        answers = await run.call_clef(
-            questions, state, meta=CallMeta(kind="qualify", schema=plan.name)
-        )
+        answers = await run.call_clef(questions, state, meta=scope.meta("qualify"))
         found: dict[str, float | None] = {}
         for n, _ in chunk:
             answer = answers.get(f"qualify.{_provisional(n)}")
@@ -770,6 +915,7 @@ async def _group(
         noun=scope.noun,
         schema=scope.plan.name,
         cache=pair_cache,
+        scope=scope.call_scope,
     )
     groups = [
         _Group(tuple(mentions[i] for i in cluster)) for cluster in clustering.clusters
@@ -824,9 +970,7 @@ async def _merge_check(run: Run, scope: Scope, a: _Group, b: _Group) -> float | 
         spans=[m.span for g in (a, b) for m in g.mentions if m.span],
         extra={"a": side(a), "b": side(b)},
     )
-    answers = await run.call_clef(
-        {"merge": question}, state, meta=CallMeta(kind="coref", schema=scope.plan.name)
-    )
+    answers = await run.call_clef({"merge": question}, state, meta=scope.meta("coref"))
     answer = answers.get("merge")
     return answer.noul if isinstance(answer, NoulAnswer) else None
 
@@ -950,6 +1094,7 @@ async def collect(
     warnings: list[str] = []
 
     def warn(message: str) -> None:
+        message = scope.scoped(message)
         warnings.append(message)
         run.warn(message)
 
@@ -1096,11 +1241,20 @@ async def collect(
 def _focuses(scope: Scope, info: EntityInfo) -> tuple[Any, Any]:
     """The focus header of an entity's Clairic requests, with and without offsets."""
     plan = scope.plan
+    parent = scope.parent_focus()
     focus = entity_focus(
-        plan.name, scope.noun, info.label, [(m.text, m.span) for m in info.mentions]
+        plan.name,
+        scope.noun,
+        info.label,
+        [(m.text, m.span) for m in info.mentions],
+        parent,
     )
     plain = entity_focus(
-        plan.name, scope.noun, info.label, [(m.text, None) for m in info.mentions]
+        plan.name,
+        scope.noun,
+        info.label,
+        [(m.text, None) for m in info.mentions],
+        (parent[0], []) if parent is not None else None,
     )
     return focus, plain
 
@@ -1115,6 +1269,7 @@ async def _insert_entity(run: Run, scope: Scope, info: EntityInfo) -> InsertOutc
         entity=info,
         focus=focus,
         focus_plain=plain,
+        placement=scope.placement(),
     )
 
 
@@ -1138,6 +1293,7 @@ async def _update_entity(
         focus=focus,
         focus_plain=plain,
         identity=identity_fields(scope.plan, scope.cardinality),
+        placement=scope.placement(),
     )
 
 
@@ -1176,6 +1332,8 @@ async def insert_collection(
             records.append(item.record)
         if item.skipped is not None:
             skips.append((info.key, item.skipped))
+        # the items of this entity's nested lists follow it
+        skips.extend((info.key, nested) for nested in item.nested_skipped)
         attempts = max(attempts, item.attempts)
     skips.sort(key=lambda pair: int(pair[0][1:]))
     return CollectionResult(
@@ -1206,6 +1364,7 @@ class _Work:
     attempts: int = 0
     extracted: bool = False
     handled: tuple[str, str] | None = None
+    nested_skipped: tuple[SkippedEntity, ...] = ()
 
 
 def _delete_record(plan: SchemaPlan, candidate: Candidate, p: float) -> ResultRecord:
@@ -1300,12 +1459,15 @@ async def apply_collection(
             candidates,
             keys,
             merge_check,
+            scope.placement(),
         )
 
     async def deleting() -> dict[str, float | None]:
         if not (enable_deletes and mentioned):
             return {}
-        return await flag_deletes(run, plan, scope.source, candidates, keys)
+        return await flag_deletes(
+            run, plan, scope.source, candidates, keys, scope.placement()
+        )
 
     jobs: list[Any] = [matching(), deleting()]
     results = await gather(*jobs)
@@ -1346,6 +1508,7 @@ async def apply_collection(
                 done.attempts,
                 done.extracted,
                 done.handled,
+                done.nested_skipped,
             )
         if not (enable_inserts or not existing):
             return _Work(
@@ -1366,6 +1529,7 @@ async def apply_collection(
             inserted.skipped,
             inserted.attempts,
             inserted.extracted,
+            nested_skipped=inserted.nested_skipped,
         )
 
     todo = [e for e in matched.entities if e.key in matched.targets]
@@ -1383,6 +1547,7 @@ async def apply_collection(
             records.append((order, item.record))
         if item.skipped is not None:
             skips.append((order, item.skipped))
+        skips.extend((order, nested) for nested in item.nested_skipped)
         if item.handled is not None:
             handled.append(item.handled)
         attempts = max(attempts, item.attempts)
@@ -1411,9 +1576,11 @@ async def apply_collection(
         rid = candidate.record_id
         if rid in flagged and rid in unsure:
             run.warn(
-                f"match_delete_held: the record {rid!r} is flagged for deletion, but "
-                f"{unsure[rid]!r} could not be matched with certainty and the record "
-                "is its most likely match, so it was not deleted"
+                scope.scoped(
+                    f"match_delete_held: the record {rid!r} is flagged for deletion, "
+                    f"but {unsure[rid]!r} could not be matched with certainty and "
+                    "the record is its most likely match, so it was not deleted"
+                )
             )
             continue
         if rid in flagged and rid not in conflicts:

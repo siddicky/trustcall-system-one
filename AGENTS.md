@@ -53,6 +53,7 @@ Planned modules, from the "Package layout" table in `docs/DESIGN.md`:
 - `trustcall_system_one/_match.py`: record matching and assignment.
 - `trustcall_system_one/_existing.py`: `existing` coercion, key normalisation, target selection.
 - `trustcall_system_one/_entity.py`: per-entity passes.
+- `trustcall_system_one/_nested.py`: nested collections (items turned into the parent's document, answers and patch operations).
 - `trustcall_system_one/_verify.py`: attribution, cross-check, re-ask and borderline-null handling.
 - `trustcall_system_one/_diff.py`: ops and apply.
 - `trustcall_system_one/_gates.py`: thresholds and the change gate.

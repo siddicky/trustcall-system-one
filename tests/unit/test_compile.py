@@ -667,7 +667,7 @@ def test_deferred_lists_the_deferred_specs() -> None:
 
     plan = compile_schema(Owner)
     # sub-models and unions of models are expanded; collections and mappings wait
-    assert [spec.pretty for spec in plan.deferred()] == ["pets", "scores"]
+    assert [spec.pretty for spec in plan.collection_specs()] == ["pets", "scores"]
     assert list(plan.clairic_fields()) == [
         "name",
         "pet.name",
@@ -812,7 +812,10 @@ def test_recursive_models_expand_down_to_the_depth_limit() -> None:
     assert plan.spec(("parent", "parent", "parent")).warnings == ("max_depth",)
     # depth first in declaration order; the collection of the deepest level is
     # past the limit and skipped
-    assert [spec.pretty for spec in plan.deferred()] == ["parent.children", "children"]
+    assert [spec.pretty for spec in plan.collection_specs()] == [
+        "parent.children",
+        "children",
+    ]
     assert plan.spec(("parent", "parent", "children")).warnings == ("max_depth",)
     shallow = compile_schema(Node, limits=Limits(max_depth=1))
     assert shallow.spec(("parent",)).warnings == ("max_depth",)
@@ -1219,7 +1222,7 @@ def test_every_flat_type_builds_valid_requests() -> None:
     fields = plan.clairic_fields()
     questions = plan.clef_questions()
     assert len(plan.specs) == len(Everything.model_fields)
-    assert plan.deferred() == ()
+    assert plan.collection_specs() == ()
     assert all(spec.engine in ("clairic", "clef") for spec in plan.specs)
     clairic = ClairicRequest(state="Some text.", fields=fields)
     clef = ClefRequest(model="clef", state="Some text.", questions=questions)

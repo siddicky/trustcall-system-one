@@ -44,7 +44,7 @@ from trustcall_system_one._errors import AmbiguousMatchError
 from trustcall_system_one._render import estimate_tokens
 from trustcall_system_one._run import Run, gather
 from trustcall_system_one._types import EntityInfo, Mention, SkippedEntity
-from trustcall_system_one._verify import Ctx
+from trustcall_system_one._verify import Ctx, Placement
 from trustcall_system_one._wire import (
     ChoiceAnswer,
     ChoiceQuestion,
@@ -434,8 +434,10 @@ class _Matcher:
         noun: str,
         candidates: Sequence[Candidate],
         identity: Sequence[str],
+        placement: Placement | None = None,
     ) -> None:
         self.run, self.plan, self.text, self.noun = run, plan, text, noun
+        self.placement = placement or Placement()
         self.candidates = list(candidates)
         self.identity = tuple(identity)
         self.report = _Report()
@@ -456,6 +458,10 @@ class _Matcher:
             key=info.key,
             mentions=tuple(dict.fromkeys(m.text for m in info.mentions)),
             info=info,
+            parent=self.placement.parent,
+            lineage=self.placement.lineage,
+            nest=self.placement.nest,
+            scope=self.placement.scope,
         )
 
     def _ranked(self, info: EntityInfo) -> list[int]:
@@ -514,7 +520,7 @@ class _Matcher:
         answers = await self.run.call_clef(
             {"match": self._question(self._criteria(keep, rows))},
             state,
-            meta=CallMeta(kind="match", schema=self.plan.name, entity=info.key),
+            meta=ctx.meta("match"),
         )
         answer = answers.get("match")
         if not isinstance(answer, ChoiceAnswer):
@@ -665,6 +671,7 @@ async def match_entities(
     candidates: Sequence[Candidate],
     identity: Sequence[str],
     merge_check: MergeCheck,
+    placement: Placement | None = None,
 ) -> MatchOutcome:
     """Match every entity to an existing record or to ``__new__``.
 
@@ -679,6 +686,9 @@ async def match_entities(
             rendering.
         merge_check: Asks the coreference merge check for two entities (used with
             ``match.collision="merge"``).
+        placement: For the items of a nested list, whom they belong to: the
+            match state names the parent, so the candidates are the items of
+            that parent only.
 
     Returns:
         The decisions.
@@ -690,7 +700,7 @@ async def match_entities(
     if not entities:
         return MatchOutcome()
     config = run.match
-    matcher = _Matcher(run, plan, text, noun, candidates, identity)
+    matcher = _Matcher(run, plan, text, noun, candidates, identity, placement)
     ids = [c.record_id for c in candidates]
     infos = list(entities)
     answers: dict[str, MatchAnswer] = {}
@@ -780,6 +790,7 @@ async def flag_deletes(
     text: str,
     candidates: Sequence[Candidate],
     identity: Sequence[str],
+    placement: Placement | None = None,
 ) -> dict[str, float | None]:
     """Ask, per existing record, whether the input says it should be deleted.
 
@@ -798,12 +809,23 @@ async def flag_deletes(
         text: The user's input.
         candidates: The existing records (normalised keys).
         identity: Keys of the identity fields (kept when compacting).
+        placement: For the items of a nested list, whom they belong to: the state
+            carries the ``parent`` and the question asks about removing the item
+            from it.
 
     Returns:
         The probability by record id (``None`` for a missing answer).
     """
     budget = run.limits.clef_state_token_budget
-    base = estimate_tokens(run.clef_state(text, extra={"records": {}}))
+    placed = placement or Placement()
+    parent_ctx = Ctx(
+        run=run, plan=plan, text=text, label="", parent=placed.parent, nest=placed.nest
+    )
+    parent = parent_ctx.parent_dict()
+    shared: dict[str, Any] = {"records": {}}
+    if parent is not None:
+        shared["parent"] = parent
+    base = estimate_tokens(run.clef_state(text, extra=shared))
     batches: list[dict[int, dict[str, Any]]] = []
     used = base
     compacted = 0
@@ -833,8 +855,9 @@ async def flag_deletes(
         index: NoulQuestion(
             type="noul",
             instructions=(
-                f"Does `input` state that `records.r{index}` should be deleted "
-                "\u2014 e.g. the person/item was removed, has died, or should no "
+                f"Does `input` state that `records.r{index}` should be deleted"
+                + (" from `parent.label`" if parent is not None else "")
+                + " \u2014 e.g. the person/item was removed, has died, or should no "
                 "longer be tracked? A change to its details is NOT deletion."
             ),
             criteria=NoulCriteria(
@@ -847,14 +870,22 @@ async def flag_deletes(
     }
 
     async def ask(batch: dict[int, dict[str, Any]]) -> dict[str, float | None]:
-        state = run.clef_state(
-            text, extra={"records": {f"r{i}": r for i, r in batch.items()}}
-        )
+        extra: dict[str, Any] = {"records": {f"r{i}": r for i, r in batch.items()}}
+        if parent is not None:
+            extra["parent"] = parent
+        state = run.clef_state(text, extra=extra, spans=parent_ctx.parent_spans())
+        if parent is not None and state["input"] != text:
+            state["parent"] = parent_ctx.parent_dict(spans=False)
         ids = [candidates[i].record_id for i in batch]
         answers = await run.call_clef(
             {f"delete.r{i}": question_for[i] for i in batch},
             state,
-            meta=CallMeta(kind="delete", schema=plan.name, field=",".join(ids)),
+            meta=CallMeta(
+                kind="delete",
+                schema=plan.name,
+                field=",".join(ids),
+                scope=placed.scope,
+            ),
         )
         found: dict[str, float | None] = {}
         for i in batch:

@@ -24,8 +24,9 @@ uv run python examples/01_invoice.py --offline  # force the scripted transport
   the behaviour, never the models' accuracy.
 
 Every example is a module with `main(offline: bool)` returning its result, so
-`tests/unit/test_examples.py` runs them all offline. Examples that need a milestone that
-is not built yet are `xfail(strict=True)` there, and flip when it lands.
+`tests/unit/test_examples.py` runs them all offline. An example that needs a milestone
+that is not built yet is `xfail(strict=True)` there, and flips when it lands (all eight
+work now).
 
 ## The examples
 
@@ -37,7 +38,7 @@ is not built yet are `xfail(strict=True)` there, and flip when it lands.
 | [`04_repair.py`](04_repair.py) | Validation failures (`"Berlin 10115"` for a five-digit postcode, a dropped birth year for an age) fixed by narrow re-asks that carry the error. Repair fixes extraction mistakes; vocabularies belong in a `Literal`. | offline (live only repairs if the models slip) | M6 |
 | [`05_people_memory.py`](05_people_memory.py) | trustcall's relationships scenario: three records updated, one inserted, a dog skipped, the mention clusters, notes as verbatim quotes. | live or offline | M7-M8 (works now) |
 | [`06_attribution_guard.py`](06_attribution_guard.py) | One person's fact bleeding onto another, caught by the attribution check. | live or offline (bleed injected offline) | M7 (works now) |
-| [`07_order_line_items.py`](07_order_line_items.py) | Edits inside a nested list of an existing order: `replace /items/1/quantity` and `add /items/-`, other lines untouched. | live or offline | M9 |
+| [`07_order_line_items.py`](07_order_line_items.py) | Edits inside a nested list of an existing order: `replace /items/1/quantity` and `add /items/-`, other lines untouched. | live or offline | M9 (works now) |
 | [`08_testing_your_extractor.py`](08_testing_your_extractor.py) | A miniature pytest module: unit-testing your own extractor with `FakeTransport` and `route`, no network. Also runs under `pytest`. | offline only | M1-M3, `FakeWorld` since M7 (works now) |
 
 `_common.py` (mode selection, printing) and `_offline.py` (the scripted models) are

@@ -28,12 +28,13 @@ import dataclasses
 import json
 from collections.abc import Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ValidationError
 from pydantic_core import PydanticUndefined
 
 from trustcall_system_one._compile import (
+    CollectionPlan,
     FieldGroup,
     FieldSpec,
     SchemaPlan,
@@ -66,6 +67,16 @@ from trustcall_system_one._existing import ExistingRecord, normalise_record
 from trustcall_system_one._gates import dedup_elements, gate_changes
 from trustcall_system_one._match import candidate_options, identity_compatible
 from trustcall_system_one._names import Path
+from trustcall_system_one._nested import (
+    COLLECTIONS,
+    NestedInsert,
+    NestedUpdate,
+    doc_key,
+    guard,
+    guard_warning,
+    nest_for,
+    nested_update,
+)
 from trustcall_system_one._render import Focus, RenderedState
 from trustcall_system_one._repair import (
     Hit,
@@ -92,6 +103,8 @@ from trustcall_system_one._verify import (
     Ctx,
     ExistingBlock,
     FieldState,
+    Nest,
+    Placement,
     Resolved,
     accept,
     adopt_cross,
@@ -111,6 +124,9 @@ from trustcall_system_one._wire import (
     NoulQuestion,
 )
 
+if TYPE_CHECKING:
+    from trustcall_system_one._collection import Scope
+
 __all__ = [
     "InsertOutcome",
     "UpdateOutcome",
@@ -121,8 +137,6 @@ __all__ = [
 
 Span = tuple[int, int]
 Extracted = dict[str, tuple[ClairicAnswer | None, RenderedState | None]]
-
-_MILESTONE = {"collection": "M9", "mapping": "M9"}
 
 
 @dataclass(frozen=True)
@@ -136,36 +150,20 @@ class InsertOutcome:
             the repair rounds.
         skipped: The skipped entity (``validation_failed``) when the record is
             invalid.
+        nested_skipped: The items of the record's nested lists that were found
+            and not used (``not_qualified``, ``validation_failed``), each with
+            its ``EntityInfo.parent``.
     """
 
     record: ResultRecord | None
     extracted: bool
     attempts: int = 0
     skipped: SkippedEntity | None = None
+    nested_skipped: tuple[SkippedEntity, ...] = ()
 
 
-def _note_unsupported(run: Run, plan: SchemaPlan, *, updating: bool = False) -> None:
-    """Warn about fields this milestone leaves alone.
-
-    An insert leaves them to their pydantic default, an update leaves them as the
-    record has them. A field a recursive model declares at every level is named
-    once.
-    """
-    outcome = (
-        "left as the record has it"
-        if updating
-        else "left unset so the model default applies"
-    )
-    seen: set[tuple[type[BaseModel], str]] = set()
-    for group in plan.all_groups():
-        for spec in group.specs:
-            key = (group.model, str(spec.path[-1]))
-            if spec.engine in _MILESTONE and key not in seen:
-                seen.add(key)
-                run.warn(
-                    f"{plan.name}.{spec.pretty}: {spec.engine} fields are not "
-                    f"extracted until {_MILESTONE[spec.engine]}; {outcome}"
-                )
+def _note_plan(run: Run, plan: SchemaPlan) -> None:
+    """Record the compile warnings of a plan (a recursive field is named once)."""
     for message in plan.warnings:
         run.warn(f"{plan.name}: {message}")
 
@@ -249,6 +247,7 @@ class _GroupResult:
     leaves: list[_Leaf] = field(default_factory=list)
     children: list["_GroupResult"] = field(default_factory=list)
     unions: list["_UnionResult"] = field(default_factory=list)
+    collections: list[NestedInsert] = field(default_factory=list)
 
 
 @dataclass
@@ -860,8 +859,18 @@ def _emit_leaf(leaf: _Leaf, doc: dict[str, Any], out: _Assembly) -> None:
         answer, rejects = _filled_answer(spec, leaf.value), []
     out.answers[spec.pretty] = answer
     out.rejected.extend(rejects)
-    if answer.value is not None or not spec.has_default:
+    if answer.value is not None:
         doc[_key(spec)] = answer.value
+    elif not spec.has_default:
+        # a required list the input says nothing about is empty, not null (a null
+        # fails validation: "Input should be a valid list"); a nullable one keeps None
+        empty = _is_list_field(spec) and not spec.nullable
+        doc[_key(spec)] = [] if empty else None
+
+
+def _is_list_field(spec: FieldSpec) -> bool:
+    """Whether a field is a Clairic ``list`` (a list, set, tuple or frozenset)."""
+    return spec.clairic is not None and spec.clairic.type == "list"
 
 
 def _validated(
@@ -962,7 +971,29 @@ def _fragment(
             doc[_key(child.group)] = sub
     for union in result.unions:
         _place_union(ctx, union, doc, out, trail)
+    for nested in result.collections:
+        _place_collection(nested, doc, out)
     return doc
+
+
+def _place_collection(
+    nested: NestedInsert, doc: dict[str, Any], out: _Assembly
+) -> None:
+    """Put the items of a collection field into the parent's document.
+
+    The items are in first-mention order (a mapping is keyed by the extracted
+    key). A field with nothing in it takes its default; a required list or mapping
+    that the input says nothing about is empty, not null (a null fails
+    validation); a nullable one keeps ``None``.
+    """
+    spec = nested.spec
+    out.answers.update(nested.answers)
+    out.rejected.extend(nested.rejected)
+    value = nested.document()
+    if value:
+        doc[doc_key(spec)] = value
+    elif not spec.has_default:
+        doc[doc_key(spec)] = None if spec.nullable else value
 
 
 def _unsay(out: _Assembly, pretty_path: str) -> None:
@@ -1047,11 +1078,17 @@ def _place_union(
         out.fatal.add((*trail, _key(union)))
 
 
+_LOOKUP_ERRORS = (AttributeError, IndexError, KeyError, TypeError)
+
+
 def _lookup(model: BaseModel, path: Path) -> Any:
-    """Follow a path of field names through a validated model."""
+    """Follow a path of field names, list positions and mapping keys through a model."""
     value: Any = model
     for part in path:
-        value = getattr(value, str(part))
+        if isinstance(value, Mapping) or isinstance(part, int):
+            value = value[part]
+        else:
+            value = getattr(value, str(part))
     return value
 
 
@@ -1179,13 +1216,13 @@ def _record(ctx: Ctx, built: _Built, qualify_p: float | None) -> ResultRecord:
     final: dict[str, FieldAnswer] = {}
     for key, answer in answers.items():
         if answer.value is not None:
-            with contextlib.suppress(AttributeError):
+            with contextlib.suppress(*_LOOKUP_ERRORS):
                 answer = dataclasses.replace(answer, value=_lookup(model, answer.path))
         final[key] = answer
     for note in out.notes.values():
         value = None
         if note.present:
-            with contextlib.suppress(AttributeError):
+            with contextlib.suppress(*_LOOKUP_ERRORS):
                 value = _lookup(model, note.spec.path)
         final[note.spec.pretty] = _note_answer(note, value)
     return ResultRecord(
@@ -1375,6 +1412,122 @@ async def _finish_insert(
     return record, skipped, state.rounds
 
 
+def _sites(
+    result: _GroupResult, base: tuple[str, ...]
+) -> Iterator[tuple[_GroupResult, tuple[str, ...]]]:
+    """Every group of an entity that stands, with the document keys down to it.
+
+    The groups are the entity's own, its sub-models that were stated and the
+    chosen member of each union: the places where a collection field can hold
+    items.
+    """
+    if not result.present:
+        return
+    yield result, base
+    for child in result.children:
+        yield from _sites(child, (*base, _key(child.group)))
+    for union in result.unions:
+        if union.chosen is not None:
+            yield from _sites(
+                union.members[union.chosen.label], (*base, _key(union.union))
+            )
+
+
+def _lineage_name(ctx: Ctx) -> str:
+    """How the entity of a context is named in the warnings of its items."""
+    return f"{ctx.info.label} ({ctx.info.key})" if ctx.info is not None else ctx.label
+
+
+def _collection_jobs(
+    ctx: Ctx, root: _GroupResult
+) -> list[tuple[_GroupResult, tuple[str, ...], FieldSpec, CollectionPlan]]:
+    """The collection fields to extract: in groups that stand and within limits."""
+    jobs: list[tuple[_GroupResult, tuple[str, ...], FieldSpec, CollectionPlan]] = []
+    seen: set[tuple[Any, str]] = set()
+    for result, base in _sites(root, ()):
+        for spec in result.group.specs:
+            if spec.engine not in COLLECTIONS:
+                continue
+            if spec.engine == "collection" and len(spec.models) != 1:
+                ctx.run.warn(
+                    f"{ctx.plan.name}.{spec.pretty}: unsupported_list_item: a list "
+                    "of a union of models is not extracted"
+                )
+                continue
+            plan = ctx.plan.collection(spec)
+            why = guard(ctx, spec, plan)
+            if why:
+                key = (result.group.model, why + spec.pretty)
+                if key not in seen:
+                    seen.add(key)
+                    ctx.run.warn(guard_warning(ctx, spec, plan, why))
+                continue
+            jobs.append((result, base, spec, plan))
+    return jobs
+
+
+def _collection_scope(
+    ctx: Ctx,
+    parent: EntityInfo,
+    base: tuple[str, ...],
+    spec: FieldSpec,
+    plan: CollectionPlan,
+    existing: tuple[Any, ...] = (),
+) -> "Scope":
+    """The collection scope of a collection field of the entity ``ctx`` is about."""
+    # the collection engine calls this module: import it late
+    from trustcall_system_one._collection import Scope
+
+    return Scope(
+        plan=plan.item,
+        source=ctx.text,
+        cardinality=plan.many,
+        parent=parent,
+        pointer=pointer((*base, doc_key(spec))),
+        existing=existing,
+        lineage=(*ctx.lineage, _lineage_name(ctx)),
+        nest=nest_for(ctx, spec, plan),
+    )
+
+
+async def _insert_nested(ctx: Ctx, root: _GroupResult) -> list[NestedInsert]:
+    """Extract the items of every collection field of an inserted entity.
+
+    For each collection field of a group that stands, the collection engine runs
+    scoped to this entity (discovery, coreference, qualification and counting
+    ask about the items *of this parent*), and every item is inserted by the full
+    single-entity pipeline. The results are attached to their groups, to be put
+    into the parent's document on assembly.
+    """
+    from trustcall_system_one._collection import insert_collection
+
+    jobs = _collection_jobs(ctx, root)
+    if not jobs:
+        return []
+    parent = ctx.info or EntityInfo(key=ctx.key, label=ctx.label)
+
+    async def one(
+        job: tuple[_GroupResult, tuple[str, ...], FieldSpec, CollectionPlan],
+    ) -> NestedInsert:
+        _, base, spec, plan = job
+        scope = _collection_scope(ctx, parent, base, spec, plan)
+        done = await insert_collection(ctx.run, scope)
+        return NestedInsert.build(
+            spec,
+            plan,
+            base,
+            done.records,
+            done.skipped,
+            extracted=done.extracted,
+            attempts=done.attempts,
+        )
+
+    built = await gather(*(one(job) for job in jobs))
+    for job, nested in zip(jobs, built, strict=True):
+        job[0].collections.append(nested)
+    return built
+
+
 async def insert_one(
     run: Run,
     plan: SchemaPlan,
@@ -1386,14 +1539,17 @@ async def insert_one(
     entity: EntityInfo | None = None,
     focus: Focus | None = None,
     focus_plain: Focus | None = None,
+    placement: Placement | None = None,
 ) -> InsertOutcome:
     """Extract one entity of a schema from ``text``.
 
     Nested sub-models and unions of models are expanded into groups (see
     ``compile_schema``): an optional sub-model is gated by its own presence
     question, a union is resolved by one Clef choice and only the chosen
-    member's fields are asked. Collections and mappings are left unset (with a
-    warning); a required field that depends on one makes the record invalid.
+    member's fields are asked. Each collection field (``list[Model]``,
+    ``dict[str, X]``) of a group that stands goes through the collection engine,
+    scoped to this entity (the items *of this parent*), once the entity's own
+    fields are known; the items are put into the document in first-mention order.
 
     Args:
         run: The invoke's context.
@@ -1408,6 +1564,7 @@ async def insert_one(
         focus: The focus header of the Clairic requests (a collection entity's).
         focus_plain: The same without offsets, for requests that carry only
             windows of the input.
+        placement: For an item of a nested list, whom it belongs to.
 
     Returns:
         The outcome: no record when the gate finds no entity, else an insert
@@ -1418,6 +1575,7 @@ async def insert_one(
         StateTruncatedError: In strict mode, if Clairic keeps truncating.
         TransportError: If a request failed (it is in ``run.calls`` first).
     """
+    placed = placement or Placement()
     if entity is None:
         ctx = Ctx(run=run, plan=plan, text=text, label=label)
     else:
@@ -1433,7 +1591,16 @@ async def insert_one(
             focus_plain=focus_plain,
         )
         skip_presence = True
-    _note_unsupported(run, plan)
+    ctx = dataclasses.replace(
+        ctx,
+        parent=placed.parent,
+        lineage=placed.lineage,
+        nest=placed.nest
+        if placed.nest.chain
+        else Nest(placed.nest.depth, (plan.schema,)),
+        scope=placed.scope,
+    )
+    _note_plan(run, plan)
     qualify_p: float | None = presence
     if entity is not None and qualify_p is None:
         qualify_p = entity.qualify_p
@@ -1446,8 +1613,15 @@ async def insert_one(
     root = await _run_unit(ctx, plan.root)
     await run_ladder(ctx, list(_leaf_states(root)))
     _settle(root)
+    nested = await _insert_nested(ctx, root)
     record, skipped, rounds = await _finish_insert(ctx, root, qualify_p)
-    return InsertOutcome(record, True, 1 + rounds, skipped)
+    return InsertOutcome(
+        record,
+        True,
+        max([1 + rounds, *(n.attempts for n in nested)]),
+        skipped,
+        tuple(item for n in nested for item in n.skipped),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1472,6 +1646,8 @@ class UpdateOutcome:
         extracted: Whether any extraction request was made.
         attempts: Extraction rounds: 0 when nothing was extracted, else 1 plus
             the repair rounds.
+        nested_skipped: The items of the record's nested lists that were found
+            and not used, each with its ``EntityInfo.parent``.
     """
 
     record: ResultRecord | None
@@ -1479,6 +1655,7 @@ class UpdateOutcome:
     handled: tuple[str, str] | None
     extracted: bool
     attempts: int = 0
+    nested_skipped: tuple[SkippedEntity, ...] = ()
 
 
 def _json_default(model: type[BaseModel], spec: FieldSpec) -> Any:
@@ -1565,17 +1742,6 @@ def _answers(result: _GroupResult, out: _Assembly, base: tuple[str, ...]) -> Non
             answer, rejects = _filled_answer(spec, leaf.value), []
         out.answers[spec.pretty] = answer
         out.rejected.extend(rejects)
-    for spec in group.specs:
-        if spec.engine in _MILESTONE:
-            out.rejected.append(
-                RejectedOp(
-                    None,
-                    json_pointer((*base, _key(spec))),
-                    "unsupported",
-                    f"{spec.engine} fields are not extracted until "
-                    f"{_MILESTONE[spec.engine]}; the record keeps its value",
-                )
-            )
     for child in result.children:
         _answers(child, out, (*base, _key(child.group)))
     for union in result.unions:
@@ -1809,23 +1975,31 @@ async def _evaluate(
     root: _GroupResult,
     before: dict[str, Any],
     cache: dict[tuple[str, str, str], _Verdict],
+    nested: NestedUpdate,
 ) -> _Eval:
     """Diff the answers against the record, judge, apply and validate.
 
     ``cache`` holds the verdicts of the operations that were judged already, so a
-    repair round only pays for the operations its new answers produced.
+    repair round only pays for the operations its new answers produced. The
+    operations of the nested items join the record's own: a new item (``add``)
+    is judged like any other addition, while an item's field changes were
+    attributed and gated by the item's own update, and a removal was decided by
+    the removal question, so they stand as they are.
     """
     run, plan = ctx.run, ctx.plan
     nodes = _group_node(root, "")
     diff = diff_group(nodes, before, allow_null_removals=run.gates.allow_null_removals)
-    fresh = [c for c in diff.changes if _change_key(c) not in cache]
+    changes = [*diff.changes, *nested.changes]
+    for settled in nested.fixed:
+        cache.setdefault(_change_key(settled), _Verdict(settled))
+    fresh = [c for c in changes if _change_key(c) not in cache]
     if fresh:
         for verdict in await _judge_changes(ctx, before, fresh):
             cache[_change_key(verdict.change)] = verdict
-    verdicts = [cache[_change_key(c)] for c in diff.changes]
+    verdicts = [cache[_change_key(c)] for c in changes]
     passed = [v.change for v in verdicts if v.reason is None]
     ordered = sort_changes(passed)
-    lists = list_paths(nodes)
+    lists = list_paths(nodes) | frozenset(nested.lists)
     applied = apply_ops(before, [change.as_op() for change in ordered], lists=lists)
     reasons: dict[int, str] = {}
     apply_rejected: list[RejectedOp] = []
@@ -1857,6 +2031,7 @@ async def _repair_update(
     before: dict[str, Any],
     cache: dict[tuple[str, str, str], _Verdict],
     ev: _Eval,
+    nested: NestedUpdate,
 ) -> tuple[_Eval, int, list[RejectedOp]]:
     """Re-ask the fields an update's validation errors implicate.
 
@@ -1972,7 +2147,7 @@ async def _repair_update(
 
     async def refresh() -> Pending:
         nonlocal ev
-        ev = await _evaluate(ctx, root, before, cache)
+        ev = await _evaluate(ctx, root, before, cache, nested)
         return pending()
 
     await repair_loop(
@@ -1992,6 +2167,7 @@ async def _finish_update(
     before: dict[str, Any],
     target: ExistingRecord,
     entity: EntityInfo,
+    nested: NestedUpdate,
 ) -> tuple[ResultRecord, int]:
     """Diff, judge, apply and validate an update; repair what fails validation.
 
@@ -2000,13 +2176,15 @@ async def _finish_update(
     """
     run, plan = ctx.run, ctx.plan
     cache: dict[tuple[str, str, str], _Verdict] = {}
-    ev = await _evaluate(ctx, root, before, cache)
+    ev = await _evaluate(ctx, root, before, cache, nested)
     rounds = 0
     refused: list[RejectedOp] = []
     if run.repair.enabled and ev.failure is not None:
-        ev, rounds, refused = await _repair_update(ctx, root, before, cache, ev)
+        ev, rounds, refused = await _repair_update(ctx, root, before, cache, ev, nested)
     out = _Assembly()
     _answers(root, out, ())
+    out.answers.update(nested.answers)
+    out.rejected.extend(nested.rejected)
     judged = sorted(
         (v for v in ev.verdicts if v.rejection is not None), key=lambda v: v.stage
     )
@@ -2093,14 +2271,20 @@ async def _finish_update(
     valid = failure is None and model is not None
     final: dict[str, FieldAnswer] = {}
     for key, answer in answers.items():
-        if valid and model is not None and answer.value is not None:
-            with contextlib.suppress(AttributeError):
+        # an item's answer is not looked up again: removals shift the positions
+        if (
+            model is not None
+            and valid
+            and answer.value is not None
+            and key not in nested.answers
+        ):
+            with contextlib.suppress(*_LOOKUP_ERRORS):
                 answer = dataclasses.replace(answer, value=_lookup(model, answer.path))
         final[key] = answer
     for note in out.notes.values():
         value = None
         if valid and model is not None and note.present:
-            with contextlib.suppress(AttributeError):
+            with contextlib.suppress(*_LOOKUP_ERRORS):
                 value = _lookup(model, note.spec.path)
         final[note.spec.pretty] = _note_answer(note, value)
     errors = tuple(_error_strings(failure)) if failure is not None else ()
@@ -2203,11 +2387,105 @@ async def _check_stated(
     await gather(*(one(leaves) for leaves in groups.values()))
 
 
+def _existing_items(
+    plan: CollectionPlan, record: Mapping[str, Any], spec: FieldSpec
+) -> tuple[list[ExistingRecord], list[str], int]:
+    """The items a record holds in a collection field, as existing records.
+
+    A list element's id is its index (as text); a mapping entry's id is its key
+    and its record the entry ``{"key", "value"}``. An element that is not an
+    object cannot be matched or patched and is skipped (it keeps its index).
+
+    Returns:
+        The records, the keys of a mapping and the size of a list.
+    """
+    value = record.get(doc_key(spec))
+    name = plan.item.name
+    if plan.is_dict:
+        if not isinstance(value, Mapping):
+            return [], [], 0
+        keys = [str(k) for k in value]
+        return (
+            [
+                ExistingRecord(str(k), name, {"key": str(k), "value": v})
+                for k, v in value.items()
+            ],
+            keys,
+            0,
+        )
+    if not isinstance(value, list):
+        return [], [], 0
+    return (
+        [
+            ExistingRecord(str(i), name, dict(element))
+            for i, element in enumerate(value)
+            if isinstance(element, Mapping)
+        ],
+        [],
+        len(value),
+    )
+
+
+async def _update_nested(
+    ctx: Ctx, root: _GroupResult, before: dict[str, Any], parent: EntityInfo
+) -> NestedUpdate:
+    """The operations that the nested items of an updated record need.
+
+    For each collection field of a group that stands, the collection engine runs
+    scoped to this entity with the record's items as the existing ones: each
+    discovered item is matched to one (or to none), an item matched to one is
+    updated by the full update path (its operations are rebased into the parent's
+    patch list), a new item is inserted, and with ``enable_item_removals`` the
+    items the input says to remove are removed. Items the input does not mention
+    are untouched, and nothing is computed from the old value ("two more" is read
+    as what the text states, never added to the quantity of the record).
+    """
+    from trustcall_system_one._collection import apply_collection
+
+    jobs = _collection_jobs(ctx, root)
+    out = NestedUpdate()
+    if not jobs:
+        return out
+
+    async def one(
+        job: tuple[_GroupResult, tuple[str, ...], FieldSpec, CollectionPlan],
+    ) -> NestedUpdate:
+        _, base, spec, plan = job
+        holder = lookup(before, base)
+        items, keys, size = _existing_items(
+            plan, holder if isinstance(holder, Mapping) else {}, spec
+        )
+        scope = _collection_scope(ctx, parent, base, spec, plan, tuple(items))
+        done = await apply_collection(
+            ctx.run,
+            scope,
+            enable_inserts=ctx.run.enable_inserts,
+            enable_updates=True,
+            enable_deletes=ctx.run.enable_item_removals,
+        )
+        return nested_update(
+            spec,
+            plan,
+            base,
+            done.records,
+            done.skipped,
+            existing=size,
+            keys=keys,
+            extracted=done.extracted,
+            attempts=done.attempts,
+        )
+
+    for part in await gather(*(one(job) for job in jobs)):
+        out.merge(part)
+    return out
+
+
 def _identity_conflict(
     plan: SchemaPlan,
     names: Sequence[str],
     by_wire: Mapping[str, FieldState],
     before: Mapping[str, Any],
+    mentions: Sequence[str] = (),
 ) -> str:
     """Why the entity cannot be the record it was matched to, or ``""``.
 
@@ -2215,6 +2493,11 @@ def _identity_conflict(
     record's own must be forms of one name (``identity_compatible``). With several
     identity fields the match stands as soon as one of them fits; a field the input
     gave no value for says nothing. A schema without identity never conflicts.
+
+    Any one of the entity's mentions that fits the record's identity settles it:
+    coreference linked the names, so an entity that the input calls both "Sarah
+    Johnson" and "Sarah Miller" is the record "Sarah Johnson", and the new name is
+    left to the change gate.
     """
     seen: list[tuple[str, str, str]] = []
     for name in names:
@@ -2225,7 +2508,9 @@ def _identity_conflict(
         new, old = state.resolved.value, before.get(spec.alias or name)
         if not isinstance(new, str) or not isinstance(old, str):
             continue
-        if identity_compatible(new, old):
+        if identity_compatible(new, old) or any(
+            identity_compatible(mention, old) for mention in mentions
+        ):
             return ""
         seen.append((name, new, old))
     if not seen:
@@ -2250,6 +2535,7 @@ async def update_one(
     focus: Focus | None = None,
     focus_plain: Focus | None = None,
     identity: Sequence[str] = (),
+    placement: Placement | None = None,
 ) -> UpdateOutcome:
     """Update one existing record of a schema from ``text``.
 
@@ -2294,6 +2580,7 @@ async def update_one(
             update is refused (every operation is ``RejectedOp(reason=
             "identity_conflict")``, nothing is gated or applied) and the outcome
             carries an ``ambiguous_match`` skip next to the no-change record.
+        placement: For an item of a nested list, whom it belongs to.
 
     Returns:
         The outcome.
@@ -2330,7 +2617,17 @@ async def update_one(
             focus_plain=focus_plain,
         )
         skip_presence = True
-    _note_unsupported(run, plan, updating=True)
+    placed = placement or Placement()
+    ctx = dataclasses.replace(
+        ctx,
+        parent=placed.parent,
+        lineage=placed.lineage,
+        nest=placed.nest
+        if placed.nest.chain
+        else Nest(placed.nest.depth, (plan.schema,)),
+        scope=placed.scope,
+    )
+    _note_plan(run, plan)
     qualify_p: float | None = presence
     if entity is not None and qualify_p is None:
         qualify_p = entity.qualify_p
@@ -2424,13 +2721,22 @@ async def update_one(
     await gather(verify_clairic(), _check_stated(plain, nodes, before))
     _settle(root)
     conflict = (
-        _identity_conflict(plan, identity, by_wire, before)
+        _identity_conflict(
+            plan,
+            identity,
+            by_wire,
+            before,
+            [m.text for m in entity.mentions] if entity is not None else (),
+        )
         if entity is not None
         else ""
     )
+    nested = NestedUpdate()
     if conflict:
         plain = dataclasses.replace(plain, vetoed=conflict)
-    record, rounds = await _finish_update(plain, root, before, target, info)
+    else:
+        nested = await _update_nested(plain, root, before, info)
+    record, rounds = await _finish_update(plain, root, before, target, info, nested)
     refused: SkippedEntity | None = None
     if conflict:
         options = dict(candidate_options(info.match_probs))
@@ -2444,4 +2750,11 @@ async def update_one(
             f"{conflict}; the update of record {target.record_id!r} was refused",
             tuple(sorted(options.items(), key=lambda item: (-item[1], item[0]))),
         )
-    return UpdateOutcome(record, refused, handle, True, 1 + rounds)
+    return UpdateOutcome(
+        record,
+        refused,
+        handle,
+        True,
+        max(1 + rounds, nested.attempts),
+        tuple(nested.skipped),
+    )

@@ -149,6 +149,7 @@ own), `field` = one per field.
 | `_collection.py`, `_coref.py`, `_match.py` | **collection engine**; mention clustering; record matching + assignment |
 | `_existing.py` | `existing` coercion (five shapes, policy, `__any__`), key normalisation, target selection |
 | `_entity.py`, `_verify.py` | per-entity passes (insert, update); attribution, cross-check, re-ask, borderline-null |
+| `_nested.py` | nested collections: the guard (`max_depth`/`max_recursion`), an insert's items as the parent's document and answers, an update's item records as operations of the parent |
 | `_diff.py`, `_gates.py`, `_repair.py` | ops + apply; thresholds + change gate; repair loop |
 | `_run.py`, `_extractor.py` | per-invoke context (usage, call log, semaphores); factory + sync bridge |
 | `testing.py` (public) | `FakeTransport`, `FakeWorld`, recording/cassette transports |
@@ -235,12 +236,13 @@ up, and a bare `spec(path)` that several members share raises instead of guessin
 | `Literal` / `Enum` / bool-as-choice that is nullable or has a default | the same `choice` plus an `unstated` option (`unstated_2`, … on a collision) mapping to the `UNSTATED` sentinel, so an unmentioned field is not forced to a real value: `coerce` gives `ok=True, value=None, reason="unstated"` for both (like a Clairic null; `prune_nulls` applies a default). A required non-nullable field gets no `unstated` option |
 | single-option `Literal` / `Enum` | required field: engine `const`, filled in code, no request (discriminator tags); nullable or defaulted: skipped with a `single_option` warning |
 | nested `BaseModel` / `TypedDict` (also self-referencing) | dotted leaf paths (`author.address.city`); each sub-model is its own `FieldGroup` and, when optional (nullable or defaulted), carries a Clef `noul` presence question (`<path>.__presence`). `limits.max_depth` is the longest leaf path and `limits.max_recursion` (default 2) how many times a model may reappear on its own ancestor chain: past either the field is `skip` with one `max_depth`/`max_recursion` warning per (model, field), so a self-referencing `Optional[Node]` unrolls to the limits and never further. `limits.max_groups` (default 128, union members included) turns a runaway schema into a compile-time `ValueError` naming the model, never a silent truncation. A union member is left out when it would reappear too often, or when a required field of it was skipped by a limit (it could never validate); a union with no member left is skipped, and one with a single option left asks nothing |
-| `list[BaseModel]`, `dict[str, prim]` | handed to the collection engine |
+| `list[BaseModel]` | `engine="collection"`: the items are entities of the item model, found and extracted by the collection engine scoped to the parent entity (see "Nested collections"). Item identity: `Annotated[list[Pet], Many(identity="name", label=...)]`, else the usual rules. A list of a union of models is not extracted (warning `unsupported_list_item`) |
+| `dict[str, X]` (`X` a primitive, a list of primitives, a `Literal`, a model, ...) | `engine="mapping"`: a collection keyed by the dict key; each entry is an entity of a synthetic model with a `key` text field (the identity: the key is extracted like a name) and a `value` field (the value type; a model is a sub-model `value.*`). The entry model is `<Parent><Field>Entry` (`StudentScoresEntry`), or the value model's own name for a model. `dict[int, X]` and a value the compiler cannot ask for are skipped with `unsupported_mapping_key` / that type's tag |
 | `Union[prim, prim]` | Clairic `text` + Clef `choice` over the member types (`<field>.__type`); `coerce_union` parses the text as the chosen member |
 | `Union` of models (also `Optional[A \| B]`) | one Clef `choice` (`UnionGroup.spec`): options are the discriminator's literal values (`Field(discriminator=...)`, else a required `Literal`/`Enum` field every member declares with values no other member shares), else the member names; an option's criteria is the member docstring, else its field list; an optional union adds an `unstated` option (the 255-option cap counts options, not models). Each member is compiled as a subtree (const tags included) and asked only after the choice resolves |
 | `dict[str, Any]`, `Any` | skipped (pydantic default), opt-in `limits.any_policy="text"` |
 | required / optional | `null_threshold` 0.7 / 0.3 |
-| recursion | sub-models and unions expand down to `limits.max_depth = 8`; collections (`list[Model]`) and `dict[str, X]` are recorded as deferred (`plan.deferred()`, at any depth) and warned about at run time until the collection engine lands |
+| recursion | sub-models and unions expand down to `limits.max_depth = 8`; collections (`list[Model]`) and `dict[str, X]` are recorded (`plan.collection_specs()`, at any depth) and their item plan is compiled on first use (`plan.collection(spec)`, memoised `compile_schema` of the item model or the synthetic entry model with the same gates and limits), never eagerly, so a model that holds a list of itself terminates. `limits.max_depth` and `limits.max_recursion` apply to the whole document: the engine carries the depth and the chain of item models (`Nest`) and skips a collection past either with one `max_depth` / `max_recursion` warning |
 
 `ge/le/gt/lt` go into prose (Clairic `min`/`max` are estimate/forecast-only); opt-in
 `limits.estimate_for_bounded_numbers`. Instructions = parent context (" → "-joined model title and ancestor field names, with the member after a union field: `Book → author → address`, `Owner → pet (Dog)`; always present for a nested field, and mandatory when a name was shortened) + description, templated through the owner chain (`the Book's author's address's city`; a leading article of the description is dropped so the template does not double it) (`Field.description` →
@@ -257,9 +259,10 @@ requests never put list indices in names.
 with `Scope{plan, source, cardinality (the Many), parent, pointer, existing}`; at the top level
 `parent is None` and `pointer == ""`. `insert_collection(run, scope)` runs `collect` and then
 step 6. Top-level and nested differ only in: discovery wording ("…belonging to {parent}"),
-existing items (records with ids vs list elements with indices), output (one `ResultRecord` per
-entity vs ops inside the parent's patch list such as `add /pets/-`), and removal flag
-(`enable_deletes` vs `enable_item_removals`). `collect` builds the discovery side (steps 1-5);
+existing items (records with ids vs list elements with indices, or mapping entries with their
+key), output (one `ResultRecord` per entity vs ops inside the parent's patch list such as
+`add /pets/-`), and removal flag (`enable_deletes` vs `enable_item_removals`). See "Nested
+collections" below. `collect` builds the discovery side (steps 1-5);
 `insert_collection` inserts every entity (step 6) and `apply_collection` is what a `Many(S)` WITH
 existing records of S runs (list-form `existing` of a schema without a wrapper implies `Many`, so
 it does too): `collect`, then steps 8 and 9 (matching, updates, inserts, deletes). An `"__any__"`
@@ -385,8 +388,14 @@ schema title: "Person").
    characters 11-24, 131-135.` The header names the entity ONCE and never quotes a mention: the
    first live run showed Clairic starting a text span at a quoted name in the header and ending
    it in the input, so the value held header text and the input tag. As a second line of defence
-   a text or list answer whose span is not ENTIRELY inside the input block is rejected
-   (`span_outside_input`; per element for a list) and never kept. Instructions are templated with
+   a text or list answer whose span touches the header or the blocks around the input of the
+   state Clairic says it read is rejected (`span_outside_input`; per element for a list) and
+   never kept. A span that merely cannot be mapped back (`state_text` agrees with what was sent
+   only up to some point: CRLF turned into LF, so everything after the first difference has no
+   anchor) says nothing against the value: if the value is found in the original input it
+   stays and its span is relocated there (the occurrence nearest to where the span would be,
+   else the first; note `span_relocated`), and only a value that the input does not contain
+   is rejected. Instructions are templated with
    the label ("Emma Thompson's full name"). The offsets are those of the whole input, so a request
    whose state holds only windows of it has no mentions line. Every Clef state about
    the entity (attribution, null check, typed fields, sub-model presence, repair) is `{"input",
@@ -403,9 +412,13 @@ schema title: "Person").
    `validation_failed`, in first-mention order) and the warnings; `responses` holds the valid
    models in the same order.
 7. **Attribution (default on):** Clef `noul` per non-null value and per list element: "Does
-   `input` state or directly imply (including simple arithmetic from stated figures, or date
-   math) that {desc} of `entity.label` is '{value}'?" (a computed value such as a total stated
-   only as its parts is a legitimate answer; an integral float is shown as `1080`, not `1080.0`)
+   `input` state that {desc} of `entity.label` is '{value}', or does it follow by simple
+   arithmetic or date math from figures the input states about `entity.label`?" (true: the
+   input states it about the entity, or it follows by simple arithmetic or date math from
+   figures stated about the entity; false: the input does not state it about `entity.label`,
+   or it concerns another entity. A computed value such as a total stated only as its parts is
+   a legitimate answer, a figure of somebody else is not; an integral float is shown as `1080`,
+   not `1080.0`)
    ≥ 0.75 keep, < 0.4 drop (`attribution`), between → isolated re-ask then one more check. The
    0.75/0.4 defaults come from one live observation (a bleed kept at 0.62); they are guesses to be
    tuned by the evals harness (M10a). On updates an op must pass
@@ -468,7 +481,12 @@ schema title: "Person").
      fewer words is a form of a different word of the other, i.e. the same word, a diminutive,
      an initial, a prefix or a small typo; or the initials of the whole name; words with digits
      must be equal). "Liz" fits "Elizabeth Smith", "Sarah" fits "Sarah Johnson", "Emma Watson"
-     does NOT fit "Emma Thompson" (a shared first name is not enough). With several identity
+     does NOT fit "Emma Thompson" (a shared first name is not enough). The check is made for
+     the extracted value AND for each of the entity's mentions: if ANY of them is compatible
+     with the record's identity the match stands (coreference linked the names), so "Sarah
+     Johnson got married and is now Sarah Miller" is the record "Sarah Johnson" and the new
+     name goes to the change gate like any other edit; an entity none of whose mentions fits
+     ("Emma Watson" onto "Emma Thompson") is still refused. With several identity
      fields the match stands as soon as one fits; a field the input gave no value for says
      nothing; a schema without an identity field has no guard. On a conflict the WHOLE update
      is refused: nothing is gated or applied, every proposed operation is
@@ -513,6 +531,97 @@ schema title: "Person").
      apart; no ops. With no entities at all (presence below `discovery.presence_absent`, or
      nothing found) nothing but the discovery requests is made.
 
+## Nested collections (M9, `_collection.py`, `_nested.py`, `_entity.py`)
+
+`list[Model]` and `dict[str, X]` fields go through the same engine as a top-level `Many`, scoped
+to the entity that holds them. Every entity (a `One` schema's single entity, each entity of a
+`Many`, an item of an outer list, at any depth within `limits.max_depth` / `max_recursion`) runs its
+own fields first (the groups, unions and Clef fields as before) and then, for every collection
+field of a group that stands (an optional sub-model that was absent, or a union member that was
+not chosen, has none), `collect(Scope(item_plan, source, cardinality, parent=<its EntityInfo>,
+pointer="/pets", existing=...))`. The item plan is `plan.collection(spec)`; the cardinality is the
+field's `Many` marker (identity, label), a mapping's is `Many(identity="key", label=<singular of
+the field name>)`.
+
+**What is scoped to the parent.** Discovery: "Every mention of a Pet belonging to Emma Thompson by
+their name ...", the focus header `<focus schema="Pet" task="discover" parent="Emma Thompson">` ("Look
+for every pet of the parent named above ... ignore any pet that belongs to someone else", with the
+parent's offsets); presence, one Clef `noul` per (parent, collection), "Does `input` mention any Pet
+... belonging to `parent.label`?" over `{input, parent: {label, mentions}}`; the count ("How many
+distinct Pets belonging to ..."); qualification ("Is `entities.e0.label` a Pet belonging to
+`parent.label`?", the state carries `parent`), which is what keeps Emma's dog out of Michael's
+record when discovery offers it for Michael (`not_qualified`, `EntityInfo.parent` = Michael's
+key); coreference and merge checks as at the top level. Item extraction: `<focus schema="Pet"
+entity="Rex" parent="Emma Thompson">` and every Clef state about the item is `{input, entity:
+{label, mentions, parent: {label, mentions}}, ...}`, so attribution, the change gate, null checks and
+repair are about that item of that parent. The label of a `One` parent is "the Order". Call
+metadata: `CallMeta.scope` is `"<parent key>/<pointer>"` (`e0/pets`) on every call of the
+collection and of its items, and run warnings start with the ancestors: `Emma Thompson (e0) ›
+pets: count_exceeds_discovered ...`, `Emma Thompson (e0) › Rex (e1): ...`.
+
+**Insert.** Each item runs `insert_one` (full pipeline, own repair loop); the valid ones are
+put into the parent's document in first-mention order (a list), or keyed by the extracted key
+(a mapping: `parent[key] = entry.value`; an entry without a usable key or repeating one is
+rejected, the first wins). A collection with nothing in it takes its default; a required one is
+`[]` / `{}`. The items' answers are answers of the parent, keyed by path (`pets.0.name`,
+`scores.math`, `stock.mugs.quantity`; `FieldAnswer.path` is `("pets", 0, "name")`), their
+rejections are the parent's, re-pointed (`/pets/0/weight`), and an item that fails validation
+after its own repair is left out (`RejectedOp(reason="invalid_item")` at the collection's
+pointer) and is a `SkippedEntity(reason="validation_failed")` whose `entity.parent` is the
+parent's key. `ExtractionResult.skipped` carries the skipped items (`not_qualified`,
+`validation_failed`, `inserts_disabled`, `ambiguous_match`, `conflict_update_delete`) in order
+after their parent's own.
+
+**Update.** The parent's existing items are the existing records of the scope: a list element
+has the id of its index (`"0"`, `"1"`), a mapping entry its key and the record `{"key", "value"}`;
+keys are normalised like any record's. `apply_collection` then does what it does for a `Many`
+with records (steps 8-9), about the items of this parent: Clef `choice` per discovered item over
+the parent's items plus `__new__` (the state carries the parent), one-to-one Hungarian
+assignment, thresholds, `on_ambiguous`, `match_collision` etc.; then
+* *matched item* → the full update path on the item against its element (`update_one`: Clairic
+  with the element in `<existing>`, input-only cross-check, ladder, per-op change gate against the
+  ELEMENT, identity guard per item, repair loop on the item), and the operations it applied are
+  rebased into the parent's patch list (`replace /items/1/quantity`; a mapping entry's `/value/qty` is
+  `/stock/mugs/qty` and its `/value` is `/stock/mugs`; an operation on the entry's key is dropped as
+  `key_fixed`); they were attributed and gated already and stand as they are. An item that is
+  invalid after its update contributes no operation (`invalid_item`);
+* *new item* (`__new__`) → `add /items/-` (a mapping: `add /stock/<key>`, escaped, a key the
+  record has is a `duplicate`) of the new item's document (values equal to a default left out),
+  if `enable_inserts` or the parent record held no items; else `SkippedEntity(inserts_disabled)`.
+  The parent judges it like any other addition: the near-duplicate check and one change gate
+  request over `{input, entity: <the parent>, record: <the parent>, proposed_change}`;
+* *existing item the input does not mention* → untouched, no request about it beyond the match
+  options and the removal question;
+* *removal* only with `enable_item_removals` (`create_extractor`): one Clef `noul` per existing
+  item, over `{input, records: {r0: <item>, ...}, parent}` ("Does `input` state that `records.r0`
+  should be deleted from `parent.label` ..."), at `match.delete_threshold` → `remove /items/<i>`
+  (a mapping: `remove /stock/<key>`); an item both matched and flagged is
+  `SkippedEntity(conflict_update_delete)` with no operation, like at the top level.
+
+All operations join the parent's list and follow its rules: replace → remove (highest index first,
+so indexes do not shift) → add (`/-`, in plan order); `apply_ops` knows the nested list pointers
+(`_fix_missing_parents` creates a list the record lacks); the patched parent is validated, an
+operation on the line of a validation error is dropped (`validation`, its path inside the item),
+and an error about an element the record already held is not the update's (`_held_element`: no
+request, the update's operations stay). The items' answers are `fields` of the parent
+(`items.1.quantity` with its `gate_p`); a position is the element's index in the RECORD (a new item
+is numbered after the existing ones), so a removal does not renumber the answers.
+
+**Relative edits are not supported** (settled). The library reads what the text *states* and never
+computes from the old value: "two more of the blue mugs" is extracted as 2, whether or not the order
+has a blue mugs line. For a line the order lacks that is the right quantity; for an existing line of
+3 it is the stated 2 and not 5, and it is the change gate's decision (and the author's: write "make
+it five") whether `replace quantity 2` stands. There is no arithmetic on the record anywhere in
+the update path. `examples/07_order_line_items.py` and `tests/unit/test_nested_collections.py`
+pin this.
+
+**Known limits.** A list of a union of models is not extracted (`unsupported_list_item`). A mapping
+key is its identity and is not renamed. The parent label that scopes a request is the label of
+the parent entity (the canonical label of its mentions; "the Order" for a `One`), and its mention
+spans settle which of two parents with one label is meant. A collection is extracted after its
+parent's own fields (one more sequential hop), and the items of an inserted parent are not
+re-extracted by the parent's repair loop (each item has its own).
+
 ## Verification ladder (`_verify.py`) and update path (`_diff.py`, `_gates.py`)
 
 | check | default | rule |
@@ -538,6 +647,23 @@ scalar lists use set semantics → `add /notes/-` for new elements only. Order: 
 remove (highest array index first) → add (`/-`), a deterministic sort key. Apply with
 `jsonpatch.apply_patch` on a deep copy, op by op; on conflict try `_fix_string_concat`
 then `_fix_missing_parents`, recording `repaired_from`. The full rules are in "Update path".
+
+Clairic's list `value` and `spans` are NOT index-aligned (the first live run returned a span for
+a second "Sarah" that the values left out, so the spans after it belonged to the wrong
+elements): a text list answer is therefore re-paired by text right after the response
+(`_verify.align_list_spans`; the spans as returned stay in `ClairicAnswer._raw_spans`): each
+element gets the first unused span whose covered text equals it (case and whitespace aside),
+else the first free occurrence of its text in the returned input block, and an element with
+none leaves the answer without spans. Discovery uses ALL the returned spans: every span whose
+text equals a listed value is a mention of it (so a repeated mention that the values list
+once is kept), a value no span covers (or listed more often than spans cover it) takes every
+whole-word occurrence in the input, and `mention_not_in_input` is warned only for a value the
+input does not contain at all.
+
+A required `list[...]` field the input says nothing about (null answer, or every element
+rejected) is assembled as `[]` on an insert, not as `null` (which fails validation: "Input
+should be a valid list"); a nullable one keeps `None` and a defaulted one its default. An update
+makes no operation for it.
 
 Clairic requests always send
 `options.return_state_text=true` so span offsets are re-anchored on sentinel markers;
@@ -669,8 +795,9 @@ ones).
 `unstated`, `type_uncertain`, `missing_answer`, `unparseable`, `invalid`; ladder
 `adjudication_failed`, `null_check`, `attribution`, `attribution_missing`, `none_of_these`
 (list element); update checks `echo_span`, `echo_crosscheck`, `crosscheck_disagree`;
-sub-models `invalid_optional_group`; `unsupported` (a collection or mapping field an update cannot extract before M9;
-the record keeps its value; `validation` for an error left after the drops). Computed operations that were thrown away (`op` is the
+sub-models `invalid_optional_group`; nested collections `invalid_item` (an item that failed validation,
+left out of the record; its path is the collection's) and `key_fixed` (an operation on the key of a
+mapping entry, which is its identity and is never renamed); `validation` for an error left after the drops. Computed operations that were thrown away (`op` is the
 operation): `identity_subset`, `duplicate`, `required_field`, `gate_noul`, `gate_missing`
 (no gate answer), `apply_failed`, `validation`; `identity_conflict` (a collection entity whose
 extracted identity shares no name with the record it was matched to: every operation of the
@@ -843,7 +970,17 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
   fields=, matches=, descriptive=)`, `.non_entity(label, schema=, mentions=)`, `.bleed(entity,
   field, value)`, `.low_confidence(entity, field, confidence)`, `.coref(a, b, p)`,
   `.count(schema, n)`, `.noise(pronouns=, determiners=, possessives=, missing_span=, shuffle=)`,
-  `.handler` (to wrap one kind of answer) and `.transport()`. The focused
+  `.handler` (to wrap one kind of answer) and `.transport()`. Nested items:
+  `world.entity("Rex", schema="Pet", parent="Emma Thompson", ...)` (and `non_entity(..., parent=)`)
+  declares an item of that parent's list: requests carry the parent (the focus header's `parent=`
+  attribute, or `state.entity.parent` / `state.parent` of a Clef state; a leading "the" does not
+  matter) and the world answers discovery, count, presence, qualification, matching and extraction
+  for the items of THAT parent only; `.bleed_item(parent, item)` makes discovery for `parent` also
+  offer another parent's item (qualification then refuses it); `.delete(record_id, p, parent=)`
+  declares the removal answer for an item (its id is its index, or the key of a mapping entry).
+  The parent is named as the library names it: a `One` is "the Order", an entity the canonical
+  label of its mentions. A mapping entry is declared with `fields={"key": ..., "value": ...}`
+  under the schema `<Parent><Field>Entry` (the value model's own name for a model value). The focused
   entity is read from the `<focus … entity="…">` header (Clairic) or `state.entity` (Clef): the
   label first, the mention spans (or contexts) settling which of several entities share it, then
   "the only entity of the schema" (the `One` path). The world fails loudly on a label that names
@@ -869,7 +1006,8 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
   (the scenarios below, end to end on `FakeWorld`);
   `test_collection.py` on `FakeWorld` (M7 covers the insert side: the README people without
   existing records, Sunny `not_qualified`, coreference, count reconciliation, presence,
-  attribution bleed, mixed `[Many, One]`; scenarios 1, 4, 5, 6, 9 and 10 below are M8, 8 is M9):
+  attribution bleed, mixed `[Many, One]`; scenarios 1, 4, 5, 6, 9 and 10 below are M8, 8 is M9,
+  `tests/unit/test_nested_collections.py`):
   (1) the trustcall README Emma/Michael/Sarah/Olivia
   scenario — three updates with ids 0/1/2 and appended notes, Olivia inserted, existing notes
   untouched, Sunny `not_qualified`, `enable_inserts=False` variant skips Olivia;
@@ -948,6 +1086,17 @@ library's logic.
   if `repair.allow_pattern_reask` and a verbatim piece of the input could satisfy it (a regex match
   of the pattern in the input); the answer is accepted only with a span in the input that meets the
   format, else the field fails fast. Repair fixes extraction mistakes, it does not normalise.
+* M9, relative edits are not supported: the update path reads what the text states and never
+  computes from the old value ("two more of the blue mugs" is 2, not "existing + 2"); see
+  "Nested collections".
+* M9, a nested item is an entity of the collection engine scoped to its parent: the item's field
+  changes are attributed and gated by the item's own update (against the element), the parent
+  only judges the addition of a new item; an item removal needs `enable_item_removals`.
+* M9, carry-overs of the M8 re-review: a span that cannot be mapped is rejected only when it lies
+  in the frame of the state Clairic read or its value is not in the input; the identity guard looks
+  at every mention of the entity; the attribution question separates "states it about the entity"
+  from "follows by simple arithmetic from figures stated about the entity"; list answers are
+  re-paired by text; a required list is `[]` when nothing is said.
 * M6, attempts: one repair round (every failing field in parallel) is one attempt;
   `repair.max_attempts` is a termination guard, not a cost cap; `ExtractionResult.attempts` counts
   the extraction round too.

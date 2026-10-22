@@ -371,10 +371,12 @@ class Extractor:
         clairic_model: Model id of the extraction model.
         clef_model: Model id of the decision and verification model.
         gate_model: Model id of the change-gate model (updates).
-        enable_inserts: Allow inserting new records next to existing ones.
+        enable_inserts: Allow inserting new records next to existing ones (and
+            new items next to the existing items of a nested list).
         enable_updates: Allow updating existing records.
         enable_deletes: Allow deleting existing records.
-        enable_item_removals: Allow removing items from nested lists.
+        enable_item_removals: Allow removing the items of nested lists (and the
+            entries of mappings) that the input says to remove.
         existing_schema_policy: How ``existing`` records of unknown schemas are
             treated.
         presence: Presence-gate thresholds.
@@ -618,6 +620,8 @@ class Extractor:
                 reference_date if reference_date is not None else self.reference_date
             ),
             strict=self.strict,
+            enable_inserts=self.enable_inserts,
+            enable_item_removals=self.enable_item_removals,
         )
         for warning in records.warnings:
             run.warn(warning)
@@ -825,7 +829,10 @@ class Extractor:
         )
         return _Done(
             (outcome.record,) if outcome.record is not None else (),
-            (outcome.skipped,) if outcome.skipped is not None else (),
+            (
+                *((outcome.skipped,) if outcome.skipped is not None else ()),
+                *outcome.nested_skipped,
+            ),
             (),
             outcome.extracted,
             outcome.attempts,
@@ -896,7 +903,10 @@ class Extractor:
         )
         return _Done(
             (outcome.record,) if outcome.record is not None else (),
-            (outcome.skipped,) if outcome.skipped is not None else (),
+            (
+                *((outcome.skipped,) if outcome.skipped is not None else ()),
+                *outcome.nested_skipped,
+            ),
             (outcome.handled,) if outcome.handled is not None else (),
             outcome.extracted,
             outcome.attempts,
@@ -1117,7 +1127,8 @@ def create_extractor(
         enable_updates: Allow updating existing records.
         enable_deletes: Allow deleting existing records of a ``Many`` schema that
             the input says should be removed.
-        enable_item_removals: Allow removing items from nested lists (M9).
+        enable_item_removals: Allow removing the items of nested lists that the
+            input says to remove.
         existing_schema_policy: How ``existing`` records of unknown schemas are
             treated: ``True`` raises ``ValueError``, ``False`` keeps them as
             context only (never patched, listed in ``untouched``, with a

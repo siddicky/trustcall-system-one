@@ -471,6 +471,8 @@ class WorldEntity:
         flat: The field values by dotted path.
         spans: Where the text mentions it (known once the world is used).
         hidden: The part of ``spans`` that are descriptive mentions.
+        parent: For an item of a nested list, the label of the entity it belongs
+            to (``None`` for an entity of a top-level schema).
     """
 
     label: str
@@ -485,6 +487,14 @@ class WorldEntity:
     flat: dict[str, Any] = field(default_factory=dict)
     spans: list[Span] = field(default_factory=list)
     hidden: list[Span] = field(default_factory=list)
+    parent: str | None = None
+
+
+def _pfold(label: str | None) -> str | None:
+    """A parent's label as compared: folded, without a leading article."""
+    if label is None:
+        return None
+    return re.sub(r"^the\s+", "", _fold(label))
 
 
 class _View:
@@ -584,6 +594,31 @@ class FakeWorld:
     focus). With ``check_state`` (the default) a Clef request about an entity whose
     input holds none of the entity's mentions is an ``AssertionError`` too.
 
+    Nested lists and mappings: an item of a ``list[Model]`` / ``dict[str, X]``
+    field is an entity declared with ``parent="<label of the entity that holds
+    it>"``::
+
+        world.entity(
+            "Rex",
+            schema=Pet,
+            parent="Emma Thompson",
+            mentions=["Rex"],
+            fields={"name": "Rex"},
+        )
+
+    The library scopes every request about the items to their parent (the focus
+    header's ``parent="..."`` attribute; ``state.entity.parent`` or ``state.parent``
+    of a Clef state), and the world answers it for the items declared with that
+    parent only. The parent is named as the library names it: the label of an
+    entity is the canonical label of its mentions, a ``One`` schema's parent is
+    ``"the <Title>"`` (a leading "the" does not matter here). A mapping entry is an
+    item whose fields are ``key`` and ``value`` (a model's fields below it:
+    ``{"key": "mugs", "value": {"quantity": 3}}``) of the schema
+    ``<Parent><Field>Entry`` (the value model's own name for a model value).
+    ``bleed_item(parent, item)`` offers another parent's item in discovery;
+    ``delete(id, p, parent=...)`` declares a removal (an item's id is its index in
+    the list, or the key of a mapping entry).
+
     The request shapes every call kind is answered from (the shapes the library
     sends; ``CallMeta.kind`` selects the answer):
 
@@ -663,7 +698,8 @@ class FakeWorld:
         self._doubts: list[tuple[str, str, float]] = []
         self._bleeds: list[tuple[str, str, Any]] = []
         self._low: list[tuple[str, str, float]] = []
-        self._deletes: dict[str, float] = {}
+        self._deletes: dict[tuple[str | None, str], float] = {}
+        self._item_bleeds: list[tuple[str | None, str]] = []
         self._ready = False
         self._transport: FakeTransport | None = None
 
@@ -685,6 +721,7 @@ class FakeWorld:
         match_odds: Mapping[str, float] | None = None,
         match_confidence: float | None = None,
         descriptive: Sequence[str | tuple[str, int]] = (),
+        parent: str | None = None,
     ) -> WorldEntity:
         def specs(
             items: Sequence[str | tuple[str, int]],
@@ -707,6 +744,7 @@ class FakeWorld:
             real=real,
             matches=matches,
             descriptive=specs(descriptive),
+            parent=parent,
         )
         element.odds = None if match_odds is None else dict(match_odds)
         element.odds_confidence = match_confidence
@@ -727,6 +765,7 @@ class FakeWorld:
         match_odds: Mapping[str, float] | None = None,
         match_confidence: float | None = None,
         descriptive: Sequence[str | tuple[str, int]] = (),
+        parent: str | None = None,
     ) -> "WorldEntity":
         """Declare an entity of a schema that the text really contains.
 
@@ -752,6 +791,12 @@ class FakeWorld:
             descriptive: Mentions of the entity that only a broadened discovery
                 (one that allows descriptive references such as "my cousin") finds;
                 the first, plain discovery does not list them.
+            parent: For an item of a nested list (``list[Pet]`` of a ``Person``),
+                the label of the entity it belongs to (``"Emma Thompson"``; the
+                label of a ``One`` parent is ``"the Order"``, and a leading "the"
+                does not matter). Requests about the items of one parent see only
+                the items declared with it. For a mapping, declare the entry's
+                ``key`` and ``value`` as its fields.
 
         Returns:
             The declared entity (pass it, or its label, to ``bleed`` and
@@ -770,17 +815,33 @@ class FakeWorld:
             match_odds=match_odds,
             match_confidence=match_confidence,
             descriptive=descriptive,
+            parent=parent,
         )
 
     def non_entity(
-        self, label: str, *, schema: Any, mentions: Sequence[str | tuple[str, int]]
+        self,
+        label: str,
+        *,
+        schema: Any,
+        mentions: Sequence[str | tuple[str, int]],
+        parent: str | None = None,
     ) -> "WorldEntity":
         """Declare something that looks like an entity of a schema and is not.
 
         Discovery finds its mentions (a model is easily fooled) and qualification
         says no: a dog called Sunny is not a ``Person``.
         """
-        return self._add(label, schema, mentions, None, real=False)
+        return self._add(label, schema, mentions, None, real=False, parent=parent)
+
+    def bleed_item(self, parent: str, item: "WorldEntity | str") -> "FakeWorld":
+        """Inject a fault: discovery for ``parent`` also offers another parent's item.
+
+        A model asked for Michael's pets that lists Emma's dog too. Qualification
+        ("is this a Pet belonging to Michael?") says no, so the item is skipped
+        as ``not_qualified`` and never reaches Michael's record.
+        """
+        self._item_bleeds.append((_pfold(parent), self._label(item)))
+        return self
 
     def bleed(
         self, entity: "WorldEntity | str", field_: str, value: Any
@@ -806,14 +867,18 @@ class FakeWorld:
         self._low.append((self._label(entity), field_, confidence))
         return self
 
-    def delete(self, record_id: str, p: float = 0.97) -> "FakeWorld":
+    def delete(
+        self, record_id: str, p: float = 0.97, *, parent: str | None = None
+    ) -> "FakeWorld":
         """Declare that the text says an existing record should be removed.
 
         ``delete`` calls about the record with this id answer ``p`` instead of the
         default 0.05 (a ``delete`` request names the ids of its records in
-        ``CallMeta.field``, comma-joined, in question order).
+        ``CallMeta.field``, comma-joined, in question order). For an item of a
+        nested list the id is its index in the list (a mapping entry's key) and
+        ``parent`` is the label of the entity whose list it is.
         """
-        self._deletes[record_id] = p
+        self._deletes[(_pfold(parent), record_id)] = p
         return self
 
     def coref(self, first: str, second: str, p: float) -> "FakeWorld":
@@ -903,14 +968,31 @@ class FakeWorld:
             element.hidden = [s for s in element.spans if s in hidden]
         self._ready = True
 
+    def _scoped(
+        self, items: Sequence[WorldEntity], parent: str | None
+    ) -> list[WorldEntity]:
+        """The elements that belong to a parent (to no parent: the top-level ones)."""
+        if parent is None:
+            top = [e for e in items if e.parent is None]
+            return top or list(items)
+        want = _pfold(parent)
+        return [e for e in items if e.parent is not None and _pfold(e.parent) == want]
+
     def _occurrences(
-        self, schema: str, *, broadened: bool = False
+        self, schema: str, *, broadened: bool = False, parent: str | None = None
     ) -> list[tuple[Span, WorldEntity]]:
         self._finalise()
+        pool = self._scoped([e for e in self._items if e.schema == schema], parent)
+        extra = [
+            e
+            for who, label in self._item_bleeds
+            if parent is not None and who == _pfold(parent)
+            for e in self._items
+            if e.schema == schema and _fold(e.label) == _fold(label) and e not in pool
+        ]
         found = [
             (span, e)
-            for e in self._items
-            if e.schema == schema
+            for e in [*pool, *extra]
             for span in e.spans
             if broadened or span not in e.hidden
         ]
@@ -949,14 +1031,16 @@ class FakeWorld:
         schema: str,
         label: str | None,
         spans: Sequence[Span],
+        parent: str | None = None,
     ) -> WorldEntity | None:
         """The focused element: by label, settled by spans, else the only entity.
 
         A label that names an element and spans that belong to another one are a
-        bug in whoever built the request: that fails loudly.
+        bug in whoever built the request: that fails loudly. The label and the
+        "only entity" are looked for among the items of the request's parent.
         """
         self._finalise()
-        pool = [e for e in self._items if e.schema == schema]
+        pool = self._scoped([e for e in self._items if e.schema == schema], parent)
         named: list[WorldEntity] = []
         if label:
             named = [e for e in pool if _fold(e.label) == _fold(label)] or [
@@ -993,20 +1077,38 @@ class FakeWorld:
 
     # -- the focused entity of a request ----------------------------------- #
 
+    @staticmethod
+    def _parent(payload: dict[str, Any]) -> str | None:
+        """The parent a request is about: the focus header's, or the state's."""
+        state = payload["state"]
+        if isinstance(state, str):
+            found = re.search(r'<focus[^>]*\bparent="([^"]*)"', state)
+            return found.group(1) if found else None
+        if not isinstance(state, dict):
+            return None
+        entity = state.get("entity")
+        holder = entity.get("parent") if isinstance(entity, dict) else None
+        if holder is None:
+            holder = state.get("parent")
+        return str(holder["label"]) if isinstance(holder, dict) else None
+
     def _focus(self, payload: dict[str, Any], meta: CallMeta) -> WorldEntity | None:
         state = payload["state"]
+        parent = self._parent(payload)
         if isinstance(state, str):
             found = re.search(r'<focus[^>]*\bentity="([^"]*)"', state)
             label = found.group(1) if found else None
-            line = re.search(r"is mentioned in the input at characters ([^\n]*)", state)
+            line = re.search(
+                r"entity is mentioned in the input at characters ([^\n]*)", state
+            )
             cited = [
                 (int(a), int(b))
                 for a, b in re.findall(r"(\d+)-(\d+)", line.group(1) if line else "")
             ]
-            return self._resolve(meta.schema, label, cited)
+            return self._resolve(meta.schema, label, cited, parent)
         entity = state.get("entity") if isinstance(state, dict) else None
         if not isinstance(entity, dict):
-            return self._resolve(meta.schema, None, [])
+            return self._resolve(meta.schema, None, [], parent)
         spans: list[Span] = []
         for m in entity.get("mentions", []):
             if not isinstance(m, dict):
@@ -1015,7 +1117,7 @@ class FakeWorld:
                 spans.append((m["span"][0], m["span"][1]))
             elif (placed := self._from_context(m)) is not None:
                 spans.append(placed)
-        element = self._resolve(meta.schema, entity.get("label"), spans)
+        element = self._resolve(meta.schema, entity.get("label"), spans, parent)
         if entity.get("mentions"):
             self._check_mentions(element, str(state.get("input", "")))
         return element
@@ -1119,7 +1221,11 @@ class FakeWorld:
                 )
                 answers[qid] = noul(0.97 if here else 0.03)
             else:
-                real = any(e.real for e in self._items if e.schema == meta.schema)
+                pool = self._scoped(
+                    [e for e in self._items if e.schema == meta.schema],
+                    self._parent(payload),
+                )
+                real = any(e.real for e in pool)
                 answers[qid] = noul(0.97 if real else 0.03)
         return clef_response(answers, model=payload["model"])
 
@@ -1136,7 +1242,12 @@ class FakeWorld:
             "descriptive references" in str(spec.get("instructions", ""))
             for spec in payload["fields"].values()
         )
-        found = [span for span, _ in self._occurrences(meta.schema, broadened=wide)]
+        found = [
+            span
+            for span, _ in self._occurrences(
+                meta.schema, broadened=wide, parent=self._parent(payload)
+            )
+        ]
         found = self._noisy(found)
         for index, span in enumerate(found):
             mapped = view.to_state(span)
@@ -1177,9 +1288,10 @@ class FakeWorld:
         return out
 
     def _count(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
-        n = self._counts.get(
-            meta.schema, sum(e.real for e in self._items if e.schema == meta.schema)
+        pool = self._scoped(
+            [e for e in self._items if e.schema == meta.schema], self._parent(payload)
         )
+        n = self._counts.get(meta.schema, sum(e.real for e in pool))
         answer = clairic_answer("number", n, p_null=0.01, confidence=0.9)
         return clairic_response(
             {name: answer for name in payload["fields"]}, state_text=payload["state"]
@@ -1237,15 +1349,21 @@ class FakeWorld:
 
     def _qualify(self, model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
         state = payload["state"]
+        parent = self._parent(payload)
         answers = {}
         for qid in payload["questions"]:
             entry = state["entities"][qid.removeprefix("qualify.")]
             spans = [
                 (m["span"][0], m["span"][1]) for m in entry["mentions"] if "span" in m
             ]
-            element = self._resolve(meta.schema, entry["label"], spans)
+            element = self._resolve(meta.schema, entry["label"], spans, parent)
             self._check_mentions(element, str(state.get("input", "")))
             real = element is not None and element.real
+            if real and element is not None and parent is not None:
+                # an item of somebody else's list is not one of this parent's
+                real = element.parent is not None and _pfold(element.parent) == _pfold(
+                    parent
+                )
             answers[qid] = noul(0.97 if real else 0.03)
         return clef_response(answers, model=payload["model"])
 
@@ -1457,7 +1575,11 @@ class FakeWorld:
         element = self._focus(payload, meta)
         answers = {}
         for qid, question in payload["questions"].items():
-            found = re.search(r'(?:is|:) "(.*)"\?\s*$', question["instructions"], re.S)
+            found = re.search(
+                r'(?:is|:) "(.*)"(?:\?\s*$|, or does it follow\b)',
+                question["instructions"],
+                re.S,
+            )
             text = found.group(1) if found else ""
             answers[qid] = noul(_ATTR_YES if self._belongs(element, text) else _ATTR_NO)
         return clef_response(answers, model=payload["model"])
@@ -1613,8 +1735,9 @@ class FakeWorld:
                 f"{sorted(state.get('records', {}))} but CallMeta.field "
                 f"{meta.field!r} holds {len(ids)} record id(s)"
             )
+        parent = _pfold(self._parent(payload))
         answers = {
-            qid: noul(self._deletes.get(rid, 0.05))
+            qid: noul(self._deletes.get((parent, rid), 0.05))
             for qid, rid in zip(questions, ids, strict=True)
         }
         return clef_response(answers, model=payload["model"])

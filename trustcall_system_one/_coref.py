@@ -498,6 +498,7 @@ async def _pairwise(
     noun: str,
     schema: str,
     cache: PairCache,
+    scope: str = "",
 ) -> dict[tuple[int, int], float]:
     """Ask about the pairs of mentions that the cache does not know yet.
 
@@ -552,7 +553,7 @@ async def _pairwise(
                 await run.call_clef(
                     {qid: questions[qid] for qid in chunk},
                     _state(run, source, dict(sorted(shown.items()))),
-                    meta=CallMeta(kind="coref", schema=schema),
+                    meta=CallMeta(kind="coref", schema=schema, scope=scope),
                 )
             )
 
@@ -607,6 +608,7 @@ async def _incremental(
     noun: str,
     schema: str,
     cache: PairCache,
+    scope: str = "",
 ) -> list[list[int]]:
     """Assign the mentions, a batch at a time, to a cluster so far or a new one."""
     clusters: list[list[int]] = [[0]] if mentions else []
@@ -643,7 +645,10 @@ async def _incremental(
             questions,
             _state(run, source, {k: mentions[k] for k in batch}, described),
             meta=CallMeta(
-                kind="coref", schema=schema, field=f"m{batch[0]}-m{batch[-1]}"
+                kind="coref",
+                schema=schema,
+                field=f"m{batch[0]}-m{batch[-1]}",
+                scope=scope,
             ),
         )
         fresh: list[int] = []
@@ -664,7 +669,13 @@ async def _incremental(
         elif fresh:
             sub = [mentions[k] for k in fresh]
             pairs = await _pairwise(
-                run, source=source, mentions=sub, noun=noun, schema=schema, cache=cache
+                run,
+                source=source,
+                mentions=sub,
+                noun=noun,
+                schema=schema,
+                cache=cache,
+                scope=scope,
             )
             groups = agglomerate(len(sub), _lookup_in(pairs), run.coref.merge_threshold)
             clusters.extend([fresh[i] for i in group] for group in groups)
@@ -685,6 +696,7 @@ async def cluster_mentions(
     noun: str,
     schema: str,
     cache: PairCache | None = None,
+    scope: str = "",
 ) -> Clustering:
     """Group mentions that name the same entity.
 
@@ -697,6 +709,8 @@ async def cluster_mentions(
         cache: Pair probabilities from an earlier call on a list that shares
             mentions with this one (the broadened re-discovery): those pairs are
             not asked again, and new answers are added.
+        scope: ``CallMeta.scope`` of the calls (the parent and field of a nested
+            list).
 
     Returns:
         The clusters and the probabilities of the pairs that were asked.
@@ -719,6 +733,7 @@ async def cluster_mentions(
             noun=noun,
             schema=schema,
             cache=shared,
+            scope=scope,
         )
         return Clustering(tuple(tuple(g) for g in groups), {}, "incremental")
     pairs = await _pairwise(
@@ -728,6 +743,7 @@ async def cluster_mentions(
         noun=noun,
         schema=schema,
         cache=shared,
+        scope=scope,
     )
     groups = agglomerate(n, lambda i, j: pairs.get((i, j), 0.0), config.merge_threshold)
     return Clustering(tuple(tuple(g) for g in groups), pairs, "pairwise")

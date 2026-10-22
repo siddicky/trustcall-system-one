@@ -1247,3 +1247,142 @@ async def test_discovery_noise_makes_the_answers_messy_and_spans_still_map() -> 
     assert answer["spans"][0] != []
     world.noise()  # all off again
     assert (await listed())["value"] == ["Smiths", "Sarah", "Bob"]
+
+
+# --------------------------------------------------------------------------- #
+# Nested items: a request about a parent sees only that parent's items
+# --------------------------------------------------------------------------- #
+
+
+class Pet(BaseModel):
+    """A pet."""
+
+    name: str
+
+
+NESTED = "Emma has Rex and Michael has Tom."
+
+
+def kennel() -> FakeWorld:
+    world = FakeWorld(NESTED)
+    world.entity("Emma", schema=Person, mentions=["Emma"], fields={"name": "Emma"})
+    world.entity(
+        "Michael", schema=Person, mentions=["Michael"], fields={"name": "Michael"}
+    )
+    world.entity(
+        "Rex", schema=Pet, parent="Emma", mentions=["Rex"], fields={"name": "Rex"}
+    )
+    world.entity(
+        "Tom",
+        schema=Pet,
+        parent="the Michael",
+        mentions=["Tom"],
+        fields={"name": "Tom"},
+    )
+    return world
+
+
+def header(parent: str, task: str = "discover") -> str:
+    return (
+        f'<focus schema="Pet" task="{task}" parent="{parent}">\nx\n</focus>\n'
+        f"<input>\n{NESTED}\n</input>"
+    )
+
+
+async def test_discovery_lists_only_the_items_of_the_asked_parent() -> None:
+    world = kennel()
+    fields = {"mentions": {"type": "list", "items": "text", "instructions": "m"}}
+    for parent, found in (("Emma", ["Rex"]), ("michael", ["Tom"])):
+        answers = await ask(
+            world,
+            "discover",
+            clairic=True,
+            state=header(parent),
+            schema="Pet",
+            fields=fields,
+        )
+        assert answers["mentions"]["value"] == found
+    # without a parent the world has no item to list (they all belong to someone)
+    answers = await ask(
+        world,
+        "discover",
+        clairic=True,
+        state=header("Emma").replace(' parent="Emma"', ""),
+        schema="Pet",
+        fields=fields,
+    )
+    assert answers["mentions"]["value"] == ["Rex", "Tom"]
+
+
+async def test_presence_and_count_are_per_parent() -> None:
+    world = kennel()
+    world.non_entity("Max", schema=Pet, parent="Emma", mentions=[])
+    state = {"input": NESTED, "parent": {"label": "Emma", "mentions": []}}
+    got = await ask(
+        world,
+        "presence",
+        state=state,
+        schema="Pet",
+        questions={"presence": question("p")},
+    )
+    assert got["presence"]["noul"] > 0.9
+    nobody = {"input": NESTED, "parent": {"label": "Nobody", "mentions": []}}
+    got = await ask(
+        world,
+        "presence",
+        state=nobody,
+        schema="Pet",
+        questions={"presence": question("p")},
+    )
+    assert got["presence"]["noul"] < 0.1
+    count = await ask(
+        world,
+        "count",
+        clairic=True,
+        state=header("Michael"),
+        schema="Pet",
+        fields={"count": {"type": "number", "instructions": "n", "integer": True}},
+    )
+    assert count["count"]["value"] == 1
+
+
+async def test_qualification_refuses_an_item_of_another_parent() -> None:
+    world = kennel()
+    world.bleed_item("Michael", "Rex")
+    rex = {"label": "Rex", "mentions": [{"text": "Rex", "span": [8, 11]}]}
+    for parent, p in (("Emma", 0.97), ("Michael", 0.03)):
+        state = {
+            "input": NESTED,
+            "entities": {"e0": rex},
+            "parent": {"label": parent, "mentions": []},
+        }
+        got = await ask(
+            world,
+            "qualify",
+            state=state,
+            schema="Pet",
+            questions={"qualify.e0": question("q")},
+        )
+        assert got["qualify.e0"]["noul"] == pytest.approx(p)
+
+
+async def test_removal_answers_are_per_parent() -> None:
+    world = kennel()
+    world.delete("0", 0.95, parent="Michael")
+    meta = CallMeta(kind="delete", schema="Pet", field="0")
+    for parent, p in (("Michael", 0.95), ("Emma", 0.05)):
+        state = {
+            "input": NESTED,
+            "records": {"r0": {"name": "Tom"}},
+            "parent": {"label": parent, "mentions": []},
+        }
+        response = await world.transport().run(
+            CLEF,
+            {
+                "model": "clef",
+                "state": state,
+                "questions": {"delete.r0": question("d")},
+            },
+            meta=meta,
+        )
+        assert response.body["answers"]["delete.r0"]["noul"] == pytest.approx(p)

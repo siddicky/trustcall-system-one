@@ -141,9 +141,9 @@ async def test_attribution_asks_one_noul_per_value_in_one_request() -> None:
     questions = call[1]["questions"]
     assert sorted(questions) == ["attr.age", "attr.city", "attr.name"]
     assert questions["attr.city"]["instructions"] == (
-        "Does `input` state or directly imply (including simple arithmetic from "
-        "stated figures, or date math) that city of `entity.label` is "
-        '"London"?'
+        'Does `input` state that city of `entity.label` is "London", or does it '
+        "follow by simple arithmetic or date math from figures the input states "
+        "about `entity.label`?"
     )
     assert call[1]["state"] == {
         "input": TEXT,
@@ -266,8 +266,9 @@ async def test_list_elements_are_attributed_one_by_one() -> None:
     assert answer.warnings == ("dropped 1 element(s): attribution",)
     (call,) = script.calls("attribution")
     assert call[1]["questions"]["attr.notes.1"]["instructions"] == (
-        "Does `input` state or directly imply (including simple arithmetic from "
-        'stated figures) this about `entity.label`: "green"?'
+        "Does `input` state this about `entity.label`, or does it follow by "
+        "simple arithmetic from figures the input states about "
+        '`entity.label`: "green"?'
     )
 
 
@@ -424,9 +425,9 @@ async def test_reasked_values_go_through_attribution_again() -> None:
     (call,) = script.calls("attribution")
     assert (
         call[1]["questions"]["attr.city"]["instructions"]
-        == "Does `input` state or directly imply (including simple arithmetic from "
-        "stated figures, or date math) that city of `entity.label` is "
-        '"Paris"?'
+        == 'Does `input` state that city of `entity.label` is "Paris", or does it '
+        "follow by simple arithmetic or date math from figures the input states "
+        "about `entity.label`?"
     )
     assert record.fields["city"].rejected_reason == "attribution"
 
@@ -1060,9 +1061,10 @@ async def test_attribution_accepts_what_the_input_directly_implies() -> None:
     (call,) = script.calls("attribution")
     question = call[1]["questions"]["attr.total"]
     assert question["instructions"] == (
-        "Does `input` state or directly imply (including simple arithmetic from "
-        "stated figures, or date math) that the amount due including shipping of "
-        '`entity.label` is "1080"?'
+        "Does `input` state that the amount due including shipping of "
+        '`entity.label` is "1080", or does it follow by simple arithmetic or date '
+        "math from figures the input states about `entity.label`?"
     )
-    assert "directly implies it" in question["criteria"]["true"]
+    assert "simple arithmetic or date math" in question["criteria"]["true"]
+    assert "concerns another entity" in question["criteria"]["false"]
     assert result.records[0].valid

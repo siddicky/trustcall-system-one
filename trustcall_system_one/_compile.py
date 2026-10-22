@@ -7,6 +7,7 @@ back to a Python value, and which wire names are used.
 """
 
 import collections.abc
+import dataclasses
 import datetime as dt
 import enum
 import functools
@@ -28,9 +29,10 @@ import pydantic
 import pydantic.networks
 import pydantic_core
 import typing_extensions
-from pydantic import AliasChoices, AliasPath, BaseModel
+from pydantic import AliasChoices, AliasPath, BaseModel, Field, create_model
 from pydantic.fields import FieldInfo
 
+from trustcall_system_one._cardinality import Many
 from trustcall_system_one._config import GateConfig, Limits
 from trustcall_system_one._names import (
     FieldNameMap,
@@ -49,7 +51,10 @@ from trustcall_system_one._wire import (
 )
 
 __all__ = [
+    "KEY_FIELD",
     "S1_KEY",
+    "VALUE_FIELD",
+    "CollectionPlan",
     "Engine",
     "FieldGroup",
     "FieldSpec",
@@ -87,11 +92,12 @@ Engine = Literal[
 value is filled in by code and nothing is asked. ``submodel`` and
 ``union_models`` are container fields: the compiler expands them into field
 groups (their ``clef`` is the presence question of an optional sub-model, or the
-member choice of a union). ``collection`` and ``mapping`` are recorded for later
-engines and not extracted yet.
+member choice of a union). ``collection`` (``list[Model]``) and ``mapping``
+(``dict[str, X]``) are containers of entities: the collection engine extracts
+them with the item's own plan (``SchemaPlan.collection``).
 """
 
-_DEFERRED_ENGINES = frozenset({"collection", "mapping"})
+_COLLECTION_ENGINES = frozenset({"collection", "mapping"})
 _CLAIRIC_TYPES = (
     "text",
     "number",
@@ -452,6 +458,9 @@ class FieldSpec:
             ``"pet (Dog)"`` below a union member); empty at the top level.
         member_labels: Labels of the union members this field is below, outermost
             first (empty outside unions of models).
+        many: For a ``collection`` or ``mapping`` field, the ``Many`` marker the
+            field was annotated with (``Annotated[list[Pet], Many(identity=
+            "name")]``), else a bare ``Many()``; ``None`` for every other engine.
     """
 
     path: Path
@@ -484,6 +493,7 @@ class FieldSpec:
     wire_path: Path = ()
     scope: str = ""
     member_labels: tuple[str, ...] = ()
+    many: Many | None = None
 
     @property
     def owners(self) -> tuple[str, ...]:
@@ -648,6 +658,9 @@ class SchemaPlan:
         member_groups: The groups inside the members of unions (member roots and
             their nested sub-models), depth first.
         member_specs: The specs of those groups, including nested union fields.
+        gates: The thresholds the plan was compiled with (a collection's item
+            plan is compiled with the same ones).
+        limits: The limits the plan was compiled with.
     """
 
     schema: type[BaseModel]
@@ -663,6 +676,8 @@ class SchemaPlan:
     unions: tuple[UnionGroup, ...] = ()
     member_groups: tuple[FieldGroup, ...] = ()
     member_specs: tuple[FieldSpec, ...] = ()
+    gates: GateConfig = field(default_factory=GateConfig)
+    limits: Limits = field(default_factory=Limits)
 
     @property
     def root(self) -> FieldGroup:
@@ -777,11 +792,38 @@ class SchemaPlan:
             if spec.clef is not None
         }
 
-    def deferred(self) -> tuple[FieldSpec, ...]:
-        """Return the specs that later engines expand (collections, mappings)."""
+    def collection_specs(self) -> tuple[FieldSpec, ...]:
+        """Return the collection (``list[Model]``) and mapping (``dict``) fields.
+
+        They are asked by the collection engine, once per entity of this schema
+        (see ``collection``), at any depth of sub-models and union members.
+        """
         return tuple(
-            spec for spec in self.all_specs() if spec.engine in _DEFERRED_ENGINES
+            spec for spec in self.all_specs() if spec.engine in _COLLECTION_ENGINES
         )
+
+    def collection(self, spec: FieldSpec) -> "CollectionPlan":
+        """Return the plan of a collection or mapping field's items.
+
+        The item plan is compiled on first use (and memoised) with
+        ``compile_schema``, never at compile time of the parent, so a model that
+        contains a list of itself does not compile forever.
+
+        Args:
+            spec: A spec of this plan with engine ``collection`` or ``mapping``.
+
+        Raises:
+            ValueError: If the field is neither, or a list of a union of models
+                (which the collection engine does not extract).
+        """
+        if spec.engine not in _COLLECTION_ENGINES:
+            raise ValueError(f"{spec.pretty!r} is not a collection or mapping field")
+        if spec.engine == "collection" and len(spec.models) != 1:
+            raise ValueError(
+                f"{spec.pretty!r} is a list of a union of models; its items have "
+                "no single plan"
+            )
+        return _collection_plan(self, spec)
 
 
 # --------------------------------------------------------------------------- #
@@ -1038,6 +1080,7 @@ class _Kind:
     models: tuple[type[BaseModel], ...] = ()
     union: "_UnionInfo | None" = None
     typed_dict: bool = False
+    many: Many | None = None
 
 
 @dataclass
@@ -1624,7 +1667,7 @@ def _classify(ctx: _Ctx, shape: _Shape) -> _Kind:
             return _any_kind(ctx)
         if args[0] is not str:
             return _Kind("skip", warnings=["unsupported_mapping_key"])
-        return _Kind("mapping")
+        return _mapping_kind(ctx, args[1])
     if origin in _LITERAL_ORIGINS or _is_enum(base):
         return _choice_kind(ctx, _candidates(base))
     if _is_model(base):
@@ -1686,6 +1729,24 @@ def _classify(ctx: _Ctx, shape: _Shape) -> _Kind:
     return _Kind("skip", warnings=["unsupported_type"])
 
 
+def _mapping_kind(ctx: _Ctx, value: Any) -> _Kind:
+    """Classify ``dict[str, value]``: the entries are a collection keyed by the key.
+
+    The value must be something the compiler can ask for (a primitive, a model,
+    a list of primitives, ...); if it is not, or a limit skips it, the field is
+    skipped with the reason.
+    """
+    shape = _strip(value)
+    value_ctx = dataclasses.replace(
+        ctx, path=(*ctx.path, "value"), nullable=False, required=True, options={}
+    )
+    inner = _classify(value_ctx, shape)
+    if inner.engine in ("skip", "union_models", "const"):
+        tags = inner.warnings or ["unsupported_mapping_value"]
+        return _Kind("skip", warnings=list(tags))
+    return _Kind("mapping")
+
+
 def _any_kind(ctx: _Ctx) -> _Kind:
     if ctx.limits.any_policy == "text":
         return _Kind("clairic", clairic={"type": "text"})
@@ -1710,6 +1771,26 @@ def _s1_options(info: FieldInfo, pretty_name: str) -> dict[str, Any]:
             f"field {pretty_name!r}: unknown s1_field options {sorted(unknown)}"
         )
     return dict(options)
+
+
+def _marker(metadata: Iterable[Any], kind: _Kind, pretty_name: str) -> Many:
+    """The ``Many`` marker of a collection field (a bare one when it has none).
+
+    Raises:
+        ValueError: If ``Many(identity=...)`` names a field the item model lacks.
+    """
+    found = next((item for item in metadata if isinstance(item, Many)), Many())
+    if kind.engine == "collection" and found.identity is not None and kind.models:
+        names = (found.identity,) if isinstance(found.identity, str) else found.identity
+        fields = kind.models[0].model_fields
+        unknown = [name for name in names if name not in fields]
+        if unknown:
+            raise ValueError(
+                f"field {pretty_name!r}: Many(identity=...) names {unknown}, which "
+                f"{kind.models[0].__name__} has no field of; its fields are "
+                f"{sorted(fields)}"
+            )
+    return found
 
 
 def _doc_text(metadata: list[Any]) -> str | None:
@@ -1944,6 +2025,8 @@ def _draft_field(
         chain=chain,
     )
     kind = _Kind("skip") if options.get("skip") else _classify(ctx, shape)
+    if kind.engine in _COLLECTION_ENGINES:
+        kind.many = _marker(metadata, kind, pretty_name)
     wanted_clef = options.get("clef")
     if (
         wanted_clef is not None
@@ -2166,6 +2249,7 @@ def _build_spec(
         wire_path=draft.wire_path,
         scope=" → ".join(_ancestors(path, draft.members)),
         member_labels=draft.member_labels,
+        many=kind.many,
     )
 
 
@@ -2614,6 +2698,125 @@ def _compile_model(
         unions=tuple(assembler.unions),
         member_groups=tuple(g for g in assembler.member_groups if g is not None),
         member_specs=tuple(assembler.member_specs),
+        gates=gates,
+        limits=limits,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Collections and mappings
+# --------------------------------------------------------------------------- #
+
+KEY_FIELD = "key"
+VALUE_FIELD = "value"
+
+
+@dataclass(frozen=True, eq=False)
+class CollectionPlan:
+    """How the items of a ``list[Model]`` or ``dict[str, X]`` field are asked.
+
+    The collection engine treats the items as entities of ``item``: a list item is
+    an entity of its model; a mapping entry is an entity of a synthetic model with
+    a ``key`` text field (the identity: the dict key is extracted like any other
+    name) and a ``value`` field (a primitive, or the value model as a sub-model).
+    A mapping entry's document is ``{"key": k, "value": v}``; it is written into
+    the parent as ``parent[k] = v``.
+
+    Attributes:
+        spec: The collection or mapping field in the parent's plan.
+        shape: ``"list"`` or ``"dict"``.
+        many: The cardinality (identity and label) the items are collected with.
+        item: The plan of one item (of one entry, for a mapping).
+        typed_dict: Whether the items are ``TypedDict`` values (plain dicts in
+            the parent, not model instances).
+    """
+
+    spec: FieldSpec
+    shape: Literal["list", "dict"]
+    many: Many
+    item: SchemaPlan
+    typed_dict: bool = False
+
+    @property
+    def is_dict(self) -> bool:
+        """Whether the field is a mapping."""
+        return self.shape == "dict"
+
+
+def _singular(name: str) -> str:
+    """A field name as one entry of it: ``scores`` -> ``score``."""
+    words = _humanise(name)
+    if words.endswith("ies") and len(words) > 4:
+        return words[:-3] + "y"
+    if words.endswith("s") and not words.endswith("ss") and len(words) > 3:
+        return words[:-1]
+    return f"{words} entry"
+
+
+def _pascal(name: str) -> str:
+    return "".join(part.capitalize() for part in re.split(r"[^A-Za-z0-9]+", name))
+
+
+@functools.lru_cache(maxsize=256)
+def _entry_model(
+    parent: type[BaseModel], name: str, description: str, value: Any, label: str
+) -> type[BaseModel]:
+    """The synthetic model of one mapping entry (memoised: one class per field)."""
+    shape = _strip(value)
+    base = _resolve_in(parent, shape.base)
+    model_name = (
+        base.__name__ if _is_model(base) else f"{parent.__name__}{_pascal(name)}Entry"
+    )
+    return create_model(  # type: ignore[call-overload, no-any-return]
+        model_name,
+        __doc__=f"One entry of {description}" if description else None,
+        **{
+            KEY_FIELD: (str, Field(description=f"the {label}'s key (its name)")),
+            VALUE_FIELD: (value, Field(description=description or label)),
+        },
+    )
+
+
+def _resolve_in(model: type[BaseModel], tp: Any) -> Any:
+    """Resolve a forward reference in the namespace of ``model``."""
+    ctx = _Ctx(
+        path=(),
+        pretty="",
+        options={},
+        constraints={},
+        nullable=False,
+        required=True,
+        gates=GateConfig(),
+        limits=Limits(),
+        model=model,
+    )
+    return _resolve(ctx, tp)
+
+
+@functools.lru_cache(maxsize=512)
+def _collection_plan(plan: SchemaPlan, spec: FieldSpec) -> CollectionPlan:
+    many = spec.many if spec.many is not None else Many()
+    if spec.engine == "collection":
+        model = spec.models[0]
+        args = typing_extensions.get_args(_strip(spec.annotation).base)
+        typed = bool(args) and typing_extensions.is_typeddict(_strip(args[0]).base)
+        return CollectionPlan(
+            spec,
+            "list",
+            many,
+            compile_schema(model, gates=plan.gates, limits=plan.limits),
+            typed_dict=typed,
+        )
+    shape = _strip(spec.annotation)
+    value = typing_extensions.get_args(shape.base)[1]
+    label = many.label or _singular(str(spec.path[-1]))
+    parent = plan.schema
+    entry = _entry_model(parent, str(spec.path[-1]), spec.description, value, label)
+    return CollectionPlan(
+        spec,
+        "dict",
+        Many(identity=KEY_FIELD, label=label),
+        compile_schema(entry, gates=plan.gates, limits=plan.limits),
     )
 
 

@@ -285,7 +285,7 @@ def test_nested_collections_stay_deferred() -> None:
         tags: dict[str, int] = {}
 
     plan = compile_schema(Shelf)
-    assert pretties(plan.deferred()) == ["series.books", "tags"]
+    assert pretties(plan.collection_specs()) == ["series.books", "tags"]
     assert plan.spec(("series", "books")).models == (Book,)
     assert plan.groups[1].specs[0].engine == "collection"
 
@@ -357,7 +357,7 @@ def test_recursive_collections_are_named_once_in_the_warnings() -> None:
 
     Tree.model_rebuild()
     plan = compile_schema(Tree)
-    assert [spec.pretty for spec in plan.deferred()] == [
+    assert [spec.pretty for spec in plan.collection_specs()] == [
         "parent.parent.children",
         "parent.children",
         "children",
@@ -1251,3 +1251,179 @@ def test_the_number_of_options_not_members_is_checked_against_255() -> None:
 
     with pytest.raises(ValueError, match="256 options"):
         compile_schema(TooTight)
+
+
+# --------------------------------------------------------------------------- #
+# Collections and mappings: the plan of one item (M9)
+# --------------------------------------------------------------------------- #
+
+
+class Pet(BaseModel):
+    """A pet."""
+
+    name: str
+    species: Optional[str] = None
+
+
+class Tag(BaseModel):
+    label: str
+    weight: int = 1
+
+
+def test_a_list_of_models_gets_the_item_plan_of_its_model() -> None:
+    from trustcall_system_one import Many
+
+    class Owner(BaseModel):
+        name: str
+        pets: Annotated[list[Pet], Many(identity="name", label="animal")] = []
+
+    plan = compile_schema(Owner)
+    (spec,) = plan.collection_specs()
+    assert (spec.pretty, spec.engine) == ("pets", "collection")
+    assert spec.many == Many(identity="name", label="animal")
+    item = plan.collection(spec)
+    assert (item.shape, item.is_dict, item.many) == ("list", False, spec.many)
+    assert item.item is compile_schema(Pet)  # the same, memoised plan
+    assert item.item.identity == ("name",)
+    assert plan.collection(spec) is item
+
+
+def test_the_items_identity_follows_the_usual_rules_without_a_marker() -> None:
+    from trustcall_system_one import Many
+
+    class Owner(BaseModel):
+        name: str
+        tags: list[Tag] = []
+
+    plan = compile_schema(Owner)
+    (spec,) = plan.collection_specs()
+    assert spec.many == Many()  # a bare marker
+    assert plan.collection(spec).item.identity == ("label",)  # the first required str
+
+
+def test_a_markers_identity_must_be_a_field_of_the_item() -> None:
+    from trustcall_system_one import Many
+
+    class Owner(BaseModel):
+        pets: Annotated[list[Pet], Many(identity="nickname")] = []
+
+    with pytest.raises(ValueError, match=r"pets.*nickname.*Pet has no field of"):
+        compile_schema(Owner)
+
+
+def test_a_mapping_of_primitives_is_a_collection_keyed_by_its_key() -> None:
+    class Student(BaseModel):
+        name: str
+        scores: dict[str, int] = Field({}, description="exam score per subject")
+
+    plan = compile_schema(Student)
+    (spec,) = plan.collection_specs()
+    assert (spec.pretty, spec.engine) == ("scores", "mapping")
+    item = plan.collection(spec)
+    assert item.is_dict
+    assert item.many.identity == ("key",) and item.many.label == "score"
+    assert item.item.name == "StudentScoresEntry"
+    assert item.item.description == "One entry of exam score per subject"
+    assert pretties(item.item.specs) == ["key", "value"]
+    value = item.item.spec(("value",))
+    assert value.engine == "clairic"
+    assert value.clairic is not None and value.clairic.type == "number"
+    assert item.item.identity == ("key",)
+
+
+def test_a_mapping_of_models_nests_the_value_model_below_the_key() -> None:
+    class Shop(BaseModel):
+        stock: dict[str, Tag] = {}
+
+    plan = compile_schema(Shop)
+    (spec,) = plan.collection_specs()
+    item = plan.collection(spec).item
+    assert item.name == "Tag"  # the value model's own name
+    assert pretties(item.specs) == ["key", "value", "value.label", "value.weight"]
+    assert item.spec(("value",)).engine == "submodel"
+    assert item.spec(("value", "weight")).clairic is not None
+
+
+def test_a_mapping_of_choices_and_lists_has_a_value_field_too() -> None:
+    class Panel(BaseModel):
+        moods: dict[str, Literal["good", "bad"]] = {}
+        notes: dict[str, list[str]] = {}
+
+    plan = compile_schema(Panel)
+    moods, notes = (plan.collection(s).item for s in plan.collection_specs())
+    assert moods.spec(("value",)).engine == "clef"
+    value = notes.spec(("value",)).clairic
+    assert value is not None and value.type == "list"
+
+
+def test_mappings_the_compiler_cannot_ask_for_are_skipped_with_a_reason() -> None:
+    class Odd(BaseModel):
+        blobs: dict[str, bytes] = {}
+        numbered: dict[int, str] = {}
+        anything: dict[str, Any] = {}
+
+    plan = compile_schema(Odd)
+    assert plan.collection_specs() == ()
+    assert plan.spec(("blobs",)).warnings == ("unsupported_type",)
+    assert plan.spec(("numbered",)).warnings == ("unsupported_mapping_key",)
+    assert plan.spec(("anything",)).engine == "skip"
+
+
+def test_item_plans_are_compiled_lazily_so_a_list_of_itself_terminates() -> None:
+    class Node(BaseModel):
+        label: str
+        children: list["Node"] = []
+
+    Node.model_rebuild()
+    plan = compile_schema(Node)
+    (spec,) = plan.collection_specs()
+    item = plan.collection(spec).item
+    assert item is plan  # the item plan of a list of itself is the plan itself
+    (again,) = item.collection_specs()
+    assert item.collection(again).item is plan
+
+
+def test_a_list_of_a_union_of_models_has_no_item_plan() -> None:
+    class Home(BaseModel):
+        pets: list[Union[Pet, Tag]] = []
+
+    plan = compile_schema(Home)
+    (spec,) = plan.collection_specs()
+    with pytest.raises(ValueError, match="union of models"):
+        plan.collection(spec)
+
+
+def test_only_collection_fields_have_an_item_plan() -> None:
+    plan = compile_schema(Pet)
+    with pytest.raises(ValueError, match="not a collection"):
+        plan.collection(plan.spec(("name",)))
+
+
+def test_the_depth_limit_skips_a_collection_with_a_warning() -> None:
+    class Owner(BaseModel):
+        pets: list[Pet] = []
+
+    plan = compile_schema(Owner, limits=Limits(max_depth=1))
+    assert plan.collection_specs() == ()
+    assert plan.spec(("pets",)).warnings == ("max_depth",)
+
+
+def test_collections_below_sub_models_and_union_members_are_found() -> None:
+    class Kennel(BaseModel):
+        pets: list[Pet] = []
+
+    class Cat(BaseModel):
+        kind: Literal["cat"]
+        toys: list[Tag] = []
+
+    class Dog(BaseModel):
+        kind: Literal["dog"]
+
+    class House(BaseModel):
+        kennel: Kennel
+        guest: Union[Cat, Dog]
+
+    plan = compile_schema(House)
+    assert pretties(plan.collection_specs()) == ["kennel.pets", "guest.toys"]
+    toys = next(s for s in plan.collection_specs() if s.pretty == "guest.toys")
+    assert plan.collection(toys).item is compile_schema(Tag)

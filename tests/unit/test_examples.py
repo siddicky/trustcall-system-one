@@ -456,7 +456,6 @@ async def test_05_offline_script_answers_the_real_discovery_shapes() -> None:
             assert module.CONVERSATION[slice(*mention.span)] == mention.text
 
 
-@pytest.mark.xfail(strict=True, reason="needs M9")
 def test_07_order_line_items(capsys: pytest.CaptureFixture[str]) -> None:
     module = load("07_order_line_items")
     result = run("07_order_line_items", capsys)
@@ -477,22 +476,14 @@ def test_07_order_line_items(capsys: pytest.CaptureFixture[str]) -> None:
         before["order_id"],
         before["customer"],
     )
-
-
-def test_07_update_path_reports_the_collection_it_cannot_extract_yet(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Until M9 the line items are left as the record has them, and it says so."""
-    result = run("07_order_line_items", capsys)
-    (record,) = result.records
-    assert record.kind == "update" and record.patches == ()
-    assert any(
-        "collection fields are not extracted until M9" in w for w in result.warnings
-    )
-    assert any("left as the record has it" in w for w in result.warnings)
-    unsupported = [r for r in record.rejected if r.reason == "unsupported"]
-    assert [(r.op, r.path) for r in unsupported] == [(None, "/items")]
-    assert record.after == record.before
+    # the quantity the text states (2), not a sum with anything: relative edits
+    # are not supported, and the new line has nothing to add to anyway
+    assert dict(record.patches[1].value) == {"name": "blue mugs", "quantity": 2}
+    # the items were found, matched and extracted inside the order (scope e0/items)
+    scoped = Counter(call.kind for call in result.calls if call.scope == "e0/items")
+    assert scoped["discover"] == scoped["count"] == 1
+    assert scoped["match"] == 2 and scoped["gate"] == 1
+    assert result.warnings == () and result.skipped == ()
 
 
 # --------------------------------------------------------------------------- #
