@@ -21,6 +21,7 @@ uv run python -m evals run --quiet    # offline baseline: 24/24 on the scripted 
 
 Use `UV_SYSTEM_CERTS` instead of the deprecated `UV_NATIVE_TLS` if uv warns. Do not print the
 variables (`env | grep CLOUDFLARE` leaks the token); `test -n "$CLOUDFLARE_ACCOUNT_ID"` is enough.
+To run the live smoke test from GitHub Actions instead, see [CONTRIBUTING.md](https://github.com/siddicky/trustcall-system-one/blob/main/CONTRIBUTING.md#live-smoke-test-in-ci).
 
 ## 1. Smoke
 

@@ -87,6 +87,16 @@ jobs:
       - name: Install dependencies
         run: uv sync --all-extras --frozen
 
+      - name: Check Cloudflare credentials
+        env:
+          ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          if [ -z "$ACCOUNT" ] || [ -z "$TOKEN" ]; then
+            echo "::error::Set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN as secrets of the cloudflare-live environment (Settings > Environments)"
+            exit 1
+          fi
+
       - name: Live smoke tests
         env:
           TRUSTCALL_S1_LIVE: "1"

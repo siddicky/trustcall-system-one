@@ -28,3 +28,14 @@ One-time setup: on pypi.org, open the project's Manage > Publishing page and add
 publisher for `trustcall-system-one` with owner `siddicky`, repository `trustcall-system-one`,
 workflow `release.yml` and environment `pypi`. The GitHub repository needs an environment named
 `pypi` (Settings > Environments).
+
+## Live smoke test in CI
+
+The `live` job in `.github/workflows/ci.yml` runs `make smoke` against the real Cloudflare API. It
+runs only from a manual dispatch, and it fails if the credentials are missing.
+
+1. Create the `cloudflare-live` environment under Settings > Environments.
+2. Add `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` as secrets of that environment.
+   Repository secrets with the same names also work.
+3. Optionally add required reviewers to the environment, so that each live run waits for approval.
+4. Run it from Actions > CI > Run workflow.
