@@ -519,7 +519,17 @@ schema title: "Person").
    {value} of `entity.label` (as the {desc})?": "add two more of the blue mugs" asks for a quantity of 2
    that no sentence states (live 0.34 for the "states" wording; this one 0.78 to 0.86 for 2, 0.02 to 0.04
    for 3, 0.92 to 0.98 for a stated 1). A total is not asked this way: "state or ask for" took a derived
-   total from 0.88 to 0.52. A list element names its field: "According to `input`, is '{value}' one of
+   total from 0.88 to 0.52. **For an INSERT the question adds one sentence**: "`entity.label` is new, nothing of it was
+   held before: an amount the input asks to add ("two more") is the whole amount of it." The engine knows the line is
+   not in the record (the match said `__new__`); the model reading the input does not, and with "two more" it
+   suspects a quantity already there (live: 0.48 for 2, a tiebreak by gpt-6-luna said "no" at every effort).
+   With the sentence 0.84 at the first look. It is never added to an update (`Ctx.fresh` is False on the
+   input-only copy of a record's context): there "two more" stays a relative edit and is refused as
+   `relative_edit_unsupported`. A description that is a CLAUSE (it starts with how, whether, when, where, why,
+   what, who or which: "how the person relates to the speaker") does not take "of `entity.label`", which hung
+   the entity on the clause's last noun ("the speaker of Olivia Davis"; live 0.69 for "cousin", the escalation
+   tiebreak answered "no" or "yes" by effort): it reads "state that for `entity.label`, {desc} is '{value}'"
+   (0.86). A list element names its field: "According to `input`, is '{value}' one of
    the {desc} of `entity.label`? Something the input asks to include counts." with the plain criteria
    "Yes."/"No." (without the field a non-contact scored higher than a contact). The scalar criteria:
    true: the input states it about the entity, or it follows by simple arithmetic or date math from

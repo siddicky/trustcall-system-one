@@ -242,6 +242,8 @@ async def test_only_a_quantity_may_be_asked_for() -> None:
     questions = call[1]["questions"]
     assert questions["attr.quantity"]["instructions"] == (
         "Does `input` ask for 2 of `entity.label` (as the number of units ordered)?"
+        " `entity.label` is new, nothing of it was held before: an amount the input "
+        'asks to add ("two more") is the whole amount of it.'
     )
     # a total is stated, not asked for; a name is stated
     assert questions["attr.total"]["instructions"].startswith(

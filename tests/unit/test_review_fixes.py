@@ -185,3 +185,98 @@ def test_without_a_count_a_screen_that_leaves_nothing_gives_back() -> None:
     # something survives and no count: the screen stands
     kept, _ = _screened(Row, ["L", "7", "Left engine"], None, identity=None)
     assert kept == ["Left engine"]
+
+
+# --------------------------------------------------------------------------- #
+# The attribution question: a clause description, and an amount added to a new item
+# --------------------------------------------------------------------------- #
+
+
+def test_a_clause_description_is_not_hung_on_its_last_noun() -> None:
+    from trustcall_system_one._verify import _attribution_question
+
+    clause = _attribution_question(
+        "how the guest knows the host", "colleague", element=False
+    ).instructions
+    # "the host of <entity>" would say whose host; the entity is the guest
+    assert "state that for `entity.label`, how the guest knows the host is" in clause
+    assert "host of `entity.label`" not in clause
+    for noun in ("product name", "the number of units"):
+        plain = _attribution_question(noun, "x", element=False).instructions
+        assert f"state that {noun} of `entity.label` is" in plain
+    for word in ("whether", "when", "where", "which", "what", "who"):
+        asked = _attribution_question(f"{word} it is", "x", element=False)
+        assert "for `entity.label`, " in asked.instructions
+    # a noun that merely starts like a wh-word is a noun
+    howl = _attribution_question("howler count", "x", element=False)
+    assert "howler count of `entity.label`" in howl.instructions
+
+
+class Seat(BaseModel):
+    """One line of a booking."""
+
+    name: str = Field(description="the name of the line")
+    seats: int = Field(description="number of seats to book")
+
+
+class Booking(BaseModel):
+    """A booking."""
+
+    ref: str
+    lines: list[Seat] = Field(default_factory=list)
+
+
+def test_the_ask_for_question_of_a_new_entity_says_it_is_new() -> None:
+    from trustcall_system_one._verify import _FRESH_NOTE, _attribution_question
+
+    wording = "number of seats to book"
+    new = _attribution_question(wording, 2, element=False, ask_for=True, fresh=True)
+    held = _attribution_question(wording, 2, element=False, ask_for=True)
+    assert new.instructions == str(held.instructions) + _FRESH_NOTE
+    assert "is the whole amount" in str(new.instructions)
+    # a value that is only stated is never said to be an amount to add
+    stated = _attribution_question("the amount due", 2, element=False, fresh=True)
+    assert "whole amount" not in str(stated.instructions)
+    assert "whole amount" not in str(held.instructions)
+
+
+async def test_only_an_insert_is_told_that_its_entity_is_new() -> None:
+    from tests.unit.extract_helpers import Script, ca, make_extractor
+    from trustcall_system_one import One
+
+    def asked(world: Script) -> list[str]:
+        return [
+            q["instructions"]
+            for call in world.calls("attribution")
+            for qid, q in call[1]["questions"].items()
+            if qid == "attr.seats"
+        ]
+
+    text = "Add two more seats in the stalls."
+
+    def script() -> Script:
+        world = Script()
+        world.clairic = {
+            "name": ca("text", "stalls", find="stalls"),
+            "seats": ca("number", 2, find="two"),
+        }
+        return world
+
+    # a record that is created: the entity is new
+    world = script()
+    await make_extractor([One(Seat)], world).ainvoke(text)
+    assert asked(world)
+    assert all("is new, nothing of it was held" in a for a in asked(world))
+
+    # a record that is updated: it holds seats already, "two more" is relative, and
+    # the question does not say the entity is new
+    world = script()
+    world.relative = {"two more": 0.95}  # Clef reads "two more" as a relative edit
+    result = await make_extractor([One(Seat)], world).ainvoke(
+        text, existing=[("s-1", "Seat", {"name": "stalls", "seats": 4})]
+    )
+    assert asked(world)
+    assert not [a for a in asked(world) if "is new" in a]
+    (record,) = result.records
+    assert record.after is not None and record.after["seats"] == 4  # never written as 2
+    assert [r.reason for r in record.rejected] == ["relative_edit_unsupported"]

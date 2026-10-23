@@ -1199,6 +1199,8 @@ async def test_a_new_line_whose_quantity_is_asked_for_gets_a_second_look() -> No
     ]
     assert first == (
         "Does `input` ask for 2 of `entity.label` (as the number of units ordered)?"
+        " `entity.label` is new, nothing of it was held before: an amount the input "
+        'asks to add ("two more") is the whole amount of it.'
     )
     assert second == (
         'Reading the passage "Please add two more of the blue mugs" of `input`: '

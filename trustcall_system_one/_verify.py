@@ -229,6 +229,11 @@ class Ctx:
             schema gave them; the diff protects them from a token-subset overwrite.
         sentence_fields: Names of the fields that were read by sentences in this
             context (shared by its input-only copy), for the novelty check.
+        fresh: Whether the entity is NEW: an insert, with no record held for it. The
+            verification ladder of an update runs on the input-only copy of a context
+            that holds a record, so there it is False. An amount the input asks to
+            ADD to a new entity ("two more of the blue mugs") has nothing to add to,
+            so it is the entity's whole amount (see ``_attribution_question``).
     """
 
     run: Run
@@ -257,6 +262,7 @@ class Ctx:
     identity_hint: str = ""
     identity: tuple[str, ...] = ()
     sentence_fields: set[str] = field(default_factory=set)
+    fresh: bool = False
 
     def input_only(self) -> "Ctx":
         """The same context without the record: every request is about the input.
@@ -2124,6 +2130,17 @@ def _today_note(ctx: Ctx, spec: FieldSpec) -> str:
     return f"Today is {today:%A}, {today.isoformat()}. "
 
 
+_CLAUSE = re.compile(r"^(?:how|whether|when|where|why|what|who|whom|which)\b", re.I)
+"""A description that is a clause ("how the person relates to the speaker"), not a
+noun phrase: "<description> of the entity" would hang the entity on its last noun
+("the speaker of Olivia Davis")."""
+
+_FRESH_NOTE = (
+    " `entity.label` is new, nothing of it was held before: an amount the input asks "
+    'to add ("two more") is the whole amount of it.'
+)
+
+
 def _attribution_question(
     description: str,
     value: Any,
@@ -2131,6 +2148,7 @@ def _attribution_question(
     element: bool,
     ask_for: bool = False,
     today: str = "",
+    fresh: bool = False,
 ) -> NoulQuestion:
     """The question "is this value stated about the entity?" for a value or element.
 
@@ -2157,9 +2175,16 @@ def _attribution_question(
         # stated 1 (0.92 to 0.98); the longer "state or ask for X to be V" did not
         noun = _ARTICLE.sub("", description.strip(), count=1)
         instructions = f"Does `input` ask for {text} of `entity.label` (as the {noun})?"
+        if fresh:
+            # the engine knows the entity is new; the model reading the input does not
+            # (live: "two more of the blue mugs" on an order that holds none, 0.48)
+            instructions += _FRESH_NOTE
     else:
+        clause = _CLAUSE.match(description.strip()) is not None
+        about = "for `entity.label`, " if clause else ""
+        of = "" if clause else " of `entity.label`"
         instructions = (
-            f"{today}Does `input` state that {description} of `entity.label` is "
+            f"{today}Does `input` state that {about}{description}{of} is "
             f'"{text}", or does it follow by simple arithmetic or date math from '
             "figures the input states about `entity.label`?"
         )
@@ -2316,6 +2341,7 @@ def _attribution_questions(
                 element=False,
                 ask_for=requestable(st.spec, plan),
                 today=today,
+                fresh=ctx.fresh,
             )
     return questions
 
@@ -2484,6 +2510,7 @@ async def _recheck_scalar(ctx: Ctx, st: FieldState) -> None:
                     element=False,
                     ask_for=requestable(st.spec, ctx.plan),
                     today=_today_note(ctx, st.spec),
+                    fresh=ctx.fresh,
                 ),
                 ctx.text,
                 checked.span,
@@ -2544,6 +2571,7 @@ async def _tiebreak_scalar(
         element=False,
         ask_for=requestable(st.spec, ctx.plan),
         today=_today_note(ctx, st.spec),
+        fresh=ctx.fresh,
     )
     q = await tiebreak(ctx, st, str(question.instructions), span=checked.span)
     if q is not None:

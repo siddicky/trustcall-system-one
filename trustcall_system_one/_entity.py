@@ -2144,7 +2144,7 @@ async def insert_one(
     """
     placed = placement or Placement()
     if entity is None:
-        ctx = Ctx(run=run, plan=plan, text=text, label=label)
+        ctx = Ctx(run=run, plan=plan, text=text, label=label, fresh=True)
     else:
         ctx = Ctx(
             run=run,
@@ -2156,6 +2156,7 @@ async def insert_one(
             info=entity,
             focus=focus,
             focus_plain=focus_plain,
+            fresh=True,
         )
         skip_presence = True
     ctx = dataclasses.replace(
