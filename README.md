@@ -1232,9 +1232,10 @@ commands are in [`docs/LIVE_RUNBOOK.md`](https://github.com/siddicky/trustcall-s
 
 ### Method
 
-- **Suites.** *dev* is the 29 cases of `evals/cases.py`. The library, its thresholds and the routing
-  below were tuned on it. *holdout2* is the 30 blind cases of `evals/holdout2_cases.py`, written after the
-  dev fixes and never used to tune the library; it is the generalisation number. A case passes when every
+- **Suites.** *dev* is the 29 cases of `evals/cases.py`. The library and its thresholds were tuned on it.
+  *holdout2* is the 30 blind cases of `evals/holdout2_cases.py`, written after the dev fixes and never used to tune
+  the library or its thresholds; it is the generalisation number (only the choice of B's routing was made from it,
+  see the caveats). A case passes when every
   expected operation is produced and no `must_not` is violated.
 - **Runs.** One live run per setup and suite (live, not replayed), on commit `353b33b`, on 2026-10-23, with the
   default thresholds (`--config default`) and `--concurrency 2` (two cases at a time, so a per-case latency
