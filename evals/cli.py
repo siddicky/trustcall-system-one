@@ -50,8 +50,9 @@ def select_cases(
     Args:
         ids: Case ids (all of the suite when empty).
         tags: Keep the cases with any of these tags.
-        suite: ``default`` (``evals/cases.py``) or ``holdout``
-            (``evals/holdout_cases.py``).
+        suite: ``default`` (``evals/cases.py``), ``holdout``
+            (``evals/holdout_cases.py``) or ``holdout2``
+            (``evals/holdout2_cases.py``).
 
     Raises:
         ValueError: If an id is unknown, the suite is unknown or missing, or
@@ -95,8 +96,9 @@ def _suite_arg(parser: argparse.ArgumentParser) -> None:
         "--suite",
         choices=SUITES,
         default=DEFAULT_SUITE,
-        help="the case suite: default (the dev cases of evals/cases.py) or holdout "
-        "(evals/holdout_cases.py: cases a search never sees)",
+        help="the case suite: default (the dev cases of evals/cases.py), holdout "
+        "(evals/holdout_cases.py) or holdout2 (evals/holdout2_cases.py, the clean "
+        "held-out set): cases a search never sees",
     )
 
 
