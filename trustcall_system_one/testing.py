@@ -2277,12 +2277,16 @@ class RecordingTransport:
             "duration_ms",
             "provider",
             "served_model",
+            "keep_uncertain",
         }
 
     ``provider`` and ``served_model`` say who answered (``typesafe`` and the Jev
     version, say) when the transport knows, so a replay accounts the call under the
     model that answered and a report says what a cassette was recorded on; a
-    cassette without them replays as it always did.
+    cassette without them replays as it always did. ``keep_uncertain`` is what the
+    wrapped transport says of the call (``prefers_keep_uncertain(model, kind)``): a
+    replay settles ``RepairConfig.keep_uncertain`` from it, so a cassette of Jev's
+    answers replays with the setting on and one of Cloudflare's with it off.
 
     ``key`` is ``request_key(model, request)``. ``request`` is the payload that was
     sent and ``response`` the bare response body. A Clef line also carries
@@ -2348,9 +2352,9 @@ class RecordingTransport:
         """The state budget of the wrapped transport (``None``: it says none)."""
         return state_token_budget(self._inner, model)
 
-    def prefers_keep_uncertain(self, model: str) -> bool:
+    def prefers_keep_uncertain(self, model: str, kind: str | None = None) -> bool:
         """The wrapped transport's preference (the ``keep_uncertain`` default)."""
-        return prefers_keep_uncertain(self._inner, model)
+        return prefers_keep_uncertain(self._inner, model, kind)
 
     def serves(self, model: str, payload: Mapping[str, Any] | None = None) -> bool:
         """Whether the wrapped transport can serve the request (a router asks)."""
@@ -2427,6 +2431,9 @@ class RecordingTransport:
             "field": meta.field,
             "request": request,
         }
+        # what the wrapped transport says of this call: a replay settles
+        # ``RepairConfig.keep_uncertain`` from it (``CassetteTransport``)
+        head["keep_uncertain"] = prefers_keep_uncertain(self._inner, model, meta.kind)
         if "questions" in request:  # a Clef request: the limit it was chunked by
             head["max_questions"] = self.max_questions(model)
             budget = self.state_token_budget(model)
@@ -2621,21 +2628,49 @@ class CassetteTransport:
                 found.append(inner)
         return min(found) if found else None
 
-    def prefers_keep_uncertain(self, model: str) -> bool:
-        """Whether what is replayed was answered by a provider that prefers it.
+    def prefers_keep_uncertain(self, model: str, kind: str | None = None) -> bool:
+        """What the recording said of a call of ``kind`` to ``model``, replayed.
 
-        A replay must settle ``RepairConfig.keep_uncertain`` as the live run did:
-        by the provider this cassette stands for, else by who answered the recorded
-        extraction calls (all of them), else by the ``inner`` transport that serves a
-        miss. A cassette that knows none of them says no.
+        ``RecordingTransport`` writes the decision itself (``keep_uncertain``) on
+        every call, so a replay settles ``RepairConfig.keep_uncertain`` as the live
+        run did: every recorded call of that model family and kind (of the provider
+        this cassette stands for, if it has one) must have said yes. A call kind
+        that was not recorded, or a recording that predates the field, falls back to
+        the provider this cassette stands for, then to the ``inner`` transport that
+        serves a miss; a cassette that knows none of them says no.
         """
-        label = self._provider
-        if label is None:
-            recorded = self.providers()["clairic"]
-            if recorded:
-                return all(name == _TYPESAFE for name in recorded)
-            return prefers_keep_uncertain(self._inner, model) if self._inner else False
-        return label == _TYPESAFE
+        try:
+            family = "clairic" if body_model(model) == "clairic" else "clef"
+        except ValueError:
+            family = None
+        said: list[bool] = []
+        for entries in self._entries.values():
+            for entry in entries:
+                value = entry.get("keep_uncertain")
+                if not isinstance(value, bool):
+                    continue
+                if (
+                    self._provider is not None
+                    and entry.get("provider") != self._provider
+                ):
+                    continue
+                if kind is not None and entry.get("kind") != kind:
+                    continue
+                try:
+                    of = (
+                        "clairic" if body_model(entry["model"]) == "clairic" else "clef"
+                    )
+                except ValueError:
+                    continue
+                if family is None or of == family:
+                    said.append(value)
+        if said:
+            return all(said)
+        if self._provider is not None:
+            return self._provider == _TYPESAFE
+        if self._inner is not None:
+            return prefers_keep_uncertain(self._inner, model, kind)
+        return False
 
     @property
     def provider(self) -> str | None:

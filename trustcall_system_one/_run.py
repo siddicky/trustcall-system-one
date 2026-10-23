@@ -858,14 +858,21 @@ class Run:
         """Whether an uncertain attribution may stand after the repair (an insert).
 
         ``repair.keep_uncertain`` when it was set (``True`` or ``False`` always
-        wins); otherwise on exactly when the transport that does the extraction
-        says it prefers it (``transport.prefers_keep_uncertain(clairic_model)``:
-        TypeSafe does, Cloudflare and the rest do not).
+        wins); otherwise on exactly when the provider that answers the attribution
+        question (``clef_model``, kind ``attribution``) and the one that answers the
+        repair and the isolated re-ask (``clairic_model``, kinds ``repair`` and
+        ``reask``) all say they prefer it (``prefers_keep_uncertain``: TypeSafe
+        does, the rest do not).
         """
         chosen = self.repair.keep_uncertain
         if chosen is not None:
             return chosen
-        return prefers_keep_uncertain(self.transport, self.clairic_model)
+        asked = (
+            (self.clef_model, "attribution"),
+            (self.clairic_model, "repair"),
+            (self.clairic_model, "reask"),
+        )
+        return all(prefers_keep_uncertain(self.transport, m, k) for m, k in asked)
 
     def clef_batch(self, model: str | None = None) -> int:
         """Most questions one Clef request to ``model`` may carry on this transport.

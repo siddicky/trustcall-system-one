@@ -185,31 +185,41 @@ def state_token_budget(transport: object, model: str) -> int | None:
     return None
 
 
-def prefers_keep_uncertain(transport: object, model: str = "clairic") -> bool:
-    """Whether the extraction ``transport`` turns ``keep_uncertain`` on by default.
+def prefers_keep_uncertain(
+    transport: object, model: str = "clairic", kind: str | None = None
+) -> bool:
+    """Whether ``transport`` answers a call of ``kind`` to ``model`` as Jev does.
 
-    A transport says it with a ``prefers_keep_uncertain`` attribute (a bool) or
-    method (``prefers_keep_uncertain(model)``), as it says its ``max_questions``.
-    ``TypeSafeTransport`` says ``True`` (Jev answers the attribution question of a
-    name or an id at 0.16 to 0.65, so a stated value can be doubted and a required
-    field lost); Cloudflare, Experiential Labs and the Decisions API say nothing
-    (``False``: the strict repair stays). A ``RoutingTransport``, a
-    ``KindRoutingTransport`` and a ``FieldTypeRoutingTransport`` answer for the
-    transport that does the TEXT extraction (the ``clairic`` model, kind ``extract``,
-    field type ``text``), a ``FallbackTransport`` for its primary (the fallback only
-    answers when the primary could not) and a wrapper for the transport it wraps. It
-    only sets the default: an explicit ``keep_uncertain=True`` or ``False`` always wins.
+    ``RepairConfig.keep_uncertain`` defaults to on only when the provider that
+    answers the attribution question AND the provider that answers the repair
+    re-ask both say yes (``Run.keeps_uncertain`` asks for ``(clef, "attribution")``,
+    ``(clairic, "repair")`` and ``(clairic, "reask")``): the setting exists for
+    Jev's uncalibrated attribution of a name or an id (0.16 to 0.65 for a stated
+    value), which no other provider shows, and it needs Jev to read the same value
+    again.
+
+    A transport says it with a ``prefers_keep_uncertain`` attribute (a bool, for
+    every call) or method (``prefers_keep_uncertain(model, kind)``), as it says its
+    ``max_questions``. ``TypeSafeTransport`` says ``True``; Cloudflare, Experiential
+    Labs and the Decisions API say nothing (``False``). A ``RoutingTransport``
+    answers for the transport serving the model, a ``KindRoutingTransport`` for the
+    one its routes pick for ``(kind, model)``, a ``FieldTypeRoutingTransport`` for
+    the ``text`` route when the model is Clairic and for its default otherwise, a
+    ``FallbackTransport`` for its primary (the fallback only answers when the primary
+    could not) and a wrapper for the transport it wraps. It only sets the default: an
+    explicit ``keep_uncertain=True`` or ``False`` always wins.
 
     Args:
         transport: The transport the requests go to.
-        model: The model of the extraction (the Clairic model).
+        model: The model of the call.
+        kind: The ``CallMeta.kind`` of the call (``None``: any).
 
     Returns:
         ``True`` when the transport says so, else ``False``.
     """
     said = getattr(transport, "prefers_keep_uncertain", None)
     if callable(said):
-        said = said(model)
+        said = said(model, kind)
     return said is True
 
 
@@ -2610,9 +2620,9 @@ class FallbackTransport:
         known = [b for b in found if b is not None]
         return min(known) if known else None
 
-    def prefers_keep_uncertain(self, model: str) -> bool:
-        """The primary's: it does the extraction, the fallback only stands in for it."""
-        return prefers_keep_uncertain(self._primary, model)
+    def prefers_keep_uncertain(self, model: str, kind: str | None = None) -> bool:
+        """The primary's: it answers, the fallback only stands in for it."""
+        return prefers_keep_uncertain(self._primary, model, kind)
 
     def _falls_back_on(self, exc: Exception) -> bool:
         if isinstance(exc, _NEVER_FALL_BACK):
@@ -2775,9 +2785,9 @@ class RoutingTransport:
         """The state budget of the transport serving the model (``None``: none)."""
         return state_token_budget(self.transport_for(model), model)
 
-    def prefers_keep_uncertain(self, model: str) -> bool:
+    def prefers_keep_uncertain(self, model: str, kind: str | None = None) -> bool:
         """The preference of the transport serving the model."""
-        return prefers_keep_uncertain(self.transport_for(model), model)
+        return prefers_keep_uncertain(self.transport_for(model), model, kind)
 
     async def run(
         self,
@@ -3039,9 +3049,9 @@ class _Wrapping:
         """The wrapped transport's state budget (``None``: it says none)."""
         return state_token_budget(self._inner, model)
 
-    def prefers_keep_uncertain(self, model: str) -> bool:
+    def prefers_keep_uncertain(self, model: str, kind: str | None = None) -> bool:
         """The wrapped transport's preference (``keep_uncertain`` default)."""
-        return prefers_keep_uncertain(self._inner, model)
+        return prefers_keep_uncertain(self._inner, model, kind)
 
     def serves(self, model: str, payload: Mapping[str, Any] | None = None) -> bool:
         """Whether the wrapped transport can serve the request."""
@@ -3230,9 +3240,9 @@ class KindRoutingTransport:
         known = [b for t in serving if (b := state_token_budget(t, model)) is not None]
         return min(known) if known else None
 
-    def prefers_keep_uncertain(self, model: str) -> bool:
-        """The preference of the transport a text extraction (``extract``) goes to."""
-        return prefers_keep_uncertain(self.transport_for(model, "extract"), model)
+    def prefers_keep_uncertain(self, model: str, kind: str | None = None) -> bool:
+        """The preference of the transport a call of ``kind`` to ``model`` goes to."""
+        return prefers_keep_uncertain(self.transport_for(model, kind), model, kind)
 
     def serves(self, model: str, payload: Mapping[str, Any] | None = None) -> bool:
         """Whether the request can be served.
@@ -3364,9 +3374,17 @@ class FieldTypeRoutingTransport:
         """The default's state budget."""
         return state_token_budget(self._default, model)
 
-    def prefers_keep_uncertain(self, model: str) -> bool:
-        """The preference of the transport the ``text`` fields go to."""
-        return prefers_keep_uncertain(self._routes.get("text", self._default), model)
+    def prefers_keep_uncertain(self, model: str, kind: str | None = None) -> bool:
+        """The preference of the transport the ``text`` fields go to (Clairic).
+
+        A Clef request is never split: it is the default's.
+        """
+        try:
+            clairic = body_model(model) == "clairic"
+        except ValueError:
+            clairic = False
+        route = self._routes.get("text", self._default) if clairic else self._default
+        return prefers_keep_uncertain(route, model, kind)
 
     def _split(
         self, model: str, payload: Mapping[str, Any]
