@@ -32,7 +32,11 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from trustcall_system_one._compile import SchemaPlan
+from trustcall_system_one._compile import (
+    IDENTITY_SEP,
+    SchemaPlan,
+    identity_doc_keys,
+)
 from trustcall_system_one._config import MatchConfig
 from trustcall_system_one._coref import (
     NEW,
@@ -43,7 +47,12 @@ from trustcall_system_one._coref import (
     strong_compatible,
 )
 from trustcall_system_one._errors import AmbiguousMatchError
-from trustcall_system_one._render import estimate_tokens, mention_windows
+from trustcall_system_one._render import (
+    CHOICE_OPTION_TOKENS,
+    estimate_json_tokens,
+    estimate_request_tokens,
+    mention_windows,
+)
 from trustcall_system_one._run import Run, gather
 from trustcall_system_one._types import EntityInfo, Mention, SkippedEntity
 from trustcall_system_one._verify import Ctx, Placement
@@ -72,6 +81,7 @@ __all__ = [
     "identity_keys",
     "identity_values",
     "match_entities",
+    "record_value",
     "similarity",
     "token_set_ratio",
 ]
@@ -343,19 +353,31 @@ def similarity(values: Sequence[str], mentions: Sequence[str]) -> float:
 
 
 def identity_keys(plan: SchemaPlan, names: Sequence[str]) -> tuple[str, ...]:
-    """The keys of a normalised record that hold the identity fields."""
-    keys: list[str] = []
-    for name in names:
-        spec = next((s for s in plan.specs if s.path == (name,)), None)
-        keys.append(spec.alias if spec is not None and spec.alias else name)
-    return tuple(keys)
+    """The keys of a normalised record that hold the identity fields.
+
+    A nested identity (``"identification.msn"``) gives the keys of its levels
+    joined by a dot, aliases applied at every level (``"identification.serial"``).
+    """
+    return tuple(IDENTITY_SEP.join(identity_doc_keys(plan, name)) for name in names)
+
+
+def record_value(data: Mapping[str, Any], key: str) -> Any:
+    """The value at an identity key of a record: a top-level key, or a dotted path."""
+    if key in data:
+        return data[key]
+    current: Any = data
+    for part in key.split(IDENTITY_SEP):
+        if not isinstance(current, Mapping) or part not in current:
+            return None
+        current = current[part]
+    return current
 
 
 def identity_values(data: Mapping[str, Any], keys: Sequence[str]) -> list[str]:
     """The record's identity values as text (else its first text values)."""
     values: list[str] = []
     for key in keys:
-        value = data.get(key)
+        value = record_value(data, key)
         if isinstance(value, str):
             values.append(value)
         elif isinstance(value, (list, tuple)):
@@ -391,6 +413,7 @@ def compact_record(
     """
     out: dict[str, Any] = {}
     kept = 0
+    nested = {key.split(IDENTITY_SEP, 1)[0] for key in identity if IDENTITY_SEP in key}
     for key, value in data.items():
         if key in identity:
             out[key] = (
@@ -398,6 +421,14 @@ def compact_record(
                 if isinstance(value, list)
                 else _clip(value)
             )
+        elif key in nested and isinstance(value, Mapping):
+            # a sub-model that holds an identity field: only the identity leaves
+            below = [
+                k.split(IDENTITY_SEP, 1)[1]
+                for k in identity
+                if k.startswith(key + IDENTITY_SEP)
+            ]
+            out[key] = compact_record(value, below, 0)
         elif isinstance(value, list):
             out[key] = [_clip(v) for v in value[:_LIST_ELEMENTS]]
         elif value is not None and not isinstance(value, dict) and kept < render_fields:
@@ -407,7 +438,16 @@ def compact_record(
 
 
 def _size(value: Any) -> float:
-    return estimate_tokens(value)
+    return estimate_json_tokens(value)
+
+
+_REQUEST_EXTRA = estimate_request_tokens("") + CHOICE_OPTION_TOKENS * 1.1
+"""What a request costs beyond its parts: the fixed overhead, and the NEW option."""
+
+
+def _option_size(key: str, row: Any) -> float:
+    """What one offered record costs in a choice question (its text and the extra)."""
+    return _size({key: row}) + CHOICE_OPTION_TOKENS * 1.1
 
 
 # --------------------------------------------------------------------------- #
@@ -490,7 +530,7 @@ class _Matcher:
 
     async def ask(self, info: EntityInfo) -> MatchAnswer:
         """Ask which record an entity is (or ``__new__``)."""
-        budget = self.run.limits.clef_state_token_budget
+        budget = self.run.clef_budget()
         ctx = self.ctx(info)
         keep = self._ranked(info)
         if len(keep) > MAX_OPTIONS:
@@ -498,15 +538,17 @@ class _Matcher:
             keep = keep[:MAX_OPTIONS]
         state = ctx.fitted()
         instructions = "Which listed record is `entity.label`?"
-        base = _size({"state": state, "instructions": instructions}) + _size(
-            {NEW: f"A {self.plan.title} not among the listed records"}
+        base = (
+            _size({"state": state, "instructions": instructions})
+            + _size({NEW: f"A {self.plan.title} not among the listed records"})
+            + _REQUEST_EXTRA
         )
         rows: Sequence[Any] = self._full
-        total = base + sum(_size({_option(i): self._full[i]}) for i in keep)
+        total = base + sum(_option_size(_option(i), self._full[i]) for i in keep)
         if total > budget:
             rows = self._small
             self.report.compacted += 1
-            sizes = [_size({_option(i): self._small[i]}) for i in keep]
+            sizes = [_option_size(_option(i), self._small[i]) for i in keep]
             running, fitting = base, 0
             for size in sizes:  # keep is in rank order: the best fit first
                 if running + size > budget:
@@ -576,7 +618,7 @@ class _Matcher:
         the input (windows around the entity's mentions), the entity and the record.
         """
         record = self._full[index]
-        budget = self.run.limits.clef_state_token_budget
+        budget = self.run.clef_budget()
         if _size(record) > budget // 2:
             record = self._small[index]
         ctx = self.ctx(info)
@@ -1030,7 +1072,7 @@ async def flag_deletes(
     Returns:
         The probability by record id (``None`` for a missing answer).
     """
-    budget = run.limits.clef_state_token_budget
+    budget = run.clef_budget()
     delete_batch = run.clef_batch()
     placed = placement or Placement()
     parent_ctx = Ctx(
@@ -1040,7 +1082,7 @@ async def flag_deletes(
     shared: dict[str, Any] = {"records": {}}
     if parent is not None:
         shared["parent"] = parent
-    base = estimate_tokens(run.clef_state(text, extra=shared))
+    base = estimate_request_tokens(run.clef_state(text, extra=shared))
     batches: list[dict[int, dict[str, Any]]] = []
     used = base
     compacted = 0

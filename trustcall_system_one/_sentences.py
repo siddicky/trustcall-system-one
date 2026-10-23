@@ -412,15 +412,14 @@ def _question(sentence: Sentence, described: str) -> NoulQuestion:
 def _tokens(value: Any) -> float:
     """Tokens of a Clef state or question set, with a floor for non-ASCII text.
 
-    ``estimate_tokens`` counts the JSON with every non-ASCII character escaped
-    (several characters each), which is generous for accented Latin text; a language
-    written in CJK or emoji still costs about a token per character, so that is the
-    least the estimate may say.
+    ``estimate_json_tokens`` is the calibrated estimate the budget is checked
+    with; a language written in CJK or emoji still costs about a token per
+    character, so that is the least the estimate may say.
     """
-    from trustcall_system_one._render import estimate_tokens
+    from trustcall_system_one._render import estimate_json_tokens
 
     wide = sum(1 for ch in json.dumps(value, ensure_ascii=False) if ord(ch) > 0x2E7F)
-    return max(estimate_tokens(value), float(wide))
+    return max(estimate_json_tokens(value), float(wide))
 
 
 async def read_sentences(ctx: "Ctx", spec: "FieldSpec") -> "Resolved":
@@ -479,7 +478,7 @@ async def read_sentences(ctx: "Ctx", spec: "FieldSpec") -> "Resolved":
     # narrowed to windows around the sentences ITS questions quote (the question
     # holds the sentence, so the state only has to place it) into whatever the
     # questions leave. When even that does not fit, the chunk is halved.
-    budget = limits.clef_state_token_budget
+    budget = ctx.run.clef_budget()
     ids = list(questions)
     span_of = {f"sentence.{i}": s.span for i, s in enumerate(candidates)}
 
@@ -543,6 +542,21 @@ async def read_sentences(ctx: "Ctx", spec: "FieldSpec") -> "Resolved":
     )
 
 
+ITEMS_VETO = 0.75
+"""Probability of ``items`` at or above which a list is NOT read by sentences.
+
+Only a clear ``items`` keeps a list of names out of the sentence path. The two
+mistakes are not equal: a wrong ``items`` drops the field (its Clairic answer was
+already distrusted), while a wrong ``statements`` only sends candidate sentences
+through the per-sentence question, the attribution check, the novelty check and the
+change gate, which refuse what is not stated. Clef answers this question sharply
+(0.95 to 0.97 for ``statements`` on a notes field), but a reader that hedges does not:
+live, Decisions gave ``items`` 0.65 to 0.67 for a notes field every time (15 of 15),
+which a plain ``statements >= min_choice_prob`` rule turned into "no notes, ever". It
+applies only to a hedging reader (the Decisions API or a hard pick, see
+``_hedged_veto``): a graded answer of Cloudflare's Clef keeps the plain rule."""
+
+
 async def _ask_kind(ctx: "Ctx", spec: "FieldSpec") -> str:
     description = " ".join(spec.description.split()) or spec.pretty
     question = ChoiceQuestion(
@@ -562,13 +576,40 @@ async def _ask_kind(ctx: "Ctx", spec: "FieldSpec") -> str:
         {"kind": question}, state, meta=ctx.meta("list_kind", field=spec.wire_name)
     )
     answer = answers.get("kind")
-    if (
-        isinstance(answer, ChoiceAnswer)
-        and answer.choice == "statements"
-        and answer.probabilities.get("statements", 0.0) >= ctx.run.gates.min_choice_prob
-    ):
+    if not isinstance(answer, ChoiceAnswer):
+        return "items"  # no answer: the field keeps its low-confidence rejection
+    p_statements = answer.probabilities.get("statements", 0.0)
+    if answer.choice == "statements" and p_statements >= ctx.run.gates.min_choice_prob:
         return "statements"
+    veto = _hedged_veto(ctx, spec, answer)
+    if veto is not None and answer.probabilities.get("items", 0.0) < veto:
+        return "statements"  # a hedging reader's 0.65 for ``items`` is not clear
     return "items"
+
+
+def _hedged_veto(ctx: "Ctx", spec: "FieldSpec", answer: ChoiceAnswer) -> float | None:
+    """The ``items`` probability that vetoes the sentence path, for a hedging reader.
+
+    Only an answer that is a hard pick (no probabilities, its confidence is the cap
+    of the transport) or that the Decisions API gave hedges this way. A graded answer
+    of any other provider keeps the plain rule (``statements`` chosen with at least
+    ``gates.min_choice_prob``): there a list of phone numbers that Clef calls items
+    at 0.70 must not be turned into sentences. ``ITEMS_VETO``, clamped to the cap of
+    a hard pick (``DecisionsTransport(decisions_hard_cap=...)``), so that a hard
+    ``items`` always vetoes.
+
+    Returns:
+        The veto probability, or ``None`` when the answer does not hedge.
+    """
+    from trustcall_system_one._run import _is_hard
+
+    if _is_hard(answer):
+        cap = answer.confidence
+        return min(ITEMS_VETO, cap) if cap is not None and cap > 0 else ITEMS_VETO
+    for call in reversed(ctx.run.calls):
+        if call.kind == "list_kind" and call.field == spec.wire_name:
+            return ITEMS_VETO if call.provider == "decisions" else None
+    return None
 
 
 async def list_kind(ctx: "Ctx", spec: "FieldSpec") -> str:
@@ -579,7 +620,11 @@ async def list_kind(ctx: "Ctx", spec: "FieldSpec") -> str:
     class, not its name): the answer is kept on the run (concurrent askers share one
     request). Only statements are worth reading by
     sentences; a list of names or languages that Clairic is unsure of is not turned
-    into sentences. An unclear or missing answer is ``"items"``.
+    into sentences. ``"statements"`` needs ``statements`` chosen with at least
+    ``gates.min_choice_prob``; for a hedging reader (the Decisions API, a hard pick)
+    ``items`` below ``ITEMS_VETO`` (0.75, at most the hard cap) is enough: only a
+    clear ``items`` keeps the list out of the sentence path (a hedging reader's 0.65
+    for ``items`` is not clear). A missing answer is ``"items"``.
 
     Args:
         ctx: The entity context.

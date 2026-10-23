@@ -5,6 +5,8 @@ same everywhere:
 
 * **live** when ``CLOUDFLARE_ACCOUNT_ID`` and ``CLOUDFLARE_API_TOKEN`` are both set
   and ``--offline`` is not passed: requests go to the real Clairic and Clef models;
+  or, with ``TRUSTCALL_S1_PROVIDER=typesafe``, when ``TYPESAFE_API_KEY`` is set:
+  TypeSafe's Jev answers both (a key alone never switches provider);
 * **offline** otherwise: requests are answered by a scripted transport
   (``examples/_offline.py``) and a banner says so. Offline output is a rehearsal of
   what the library does with plausible model answers, never a model's output.
@@ -35,6 +37,7 @@ from trustcall_system_one import (
     VerifyConfig,
     clef_provider_from_env,
     create_extractor,
+    provider_from_env,
 )
 
 __all__ = [
@@ -74,12 +77,15 @@ Span = tuple[int, int]
 
 
 def live_available(environ: Mapping[str, str] | None = None) -> bool:
-    """Whether both Cloudflare credentials are set (live mode is possible).
+    """Whether the credentials of the chosen provider are set (live mode is possible).
 
-    ``CLOUDFLARE_AUTH_TOKEN`` is accepted in place of ``CLOUDFLARE_API_TOKEN``, as
-    the transport does.
+    For TypeSafe (``TRUSTCALL_S1_PROVIDER=typesafe``) that is ``TYPESAFE_API_KEY``;
+    otherwise both Cloudflare credentials, ``CLOUDFLARE_AUTH_TOKEN`` being accepted
+    in place of ``CLOUDFLARE_API_TOKEN``, as the transport does.
     """
     env = os.environ if environ is None else environ
+    if provider_from_env(env) == "typesafe":
+        return bool((env.get("TYPESAFE_API_KEY") or "").strip())
     token = env.get("CLOUDFLARE_API_TOKEN") or env.get("CLOUDFLARE_AUTH_TOKEN")
     return bool(env.get("CLOUDFLARE_ACCOUNT_ID") and token)
 
@@ -108,26 +114,26 @@ def print_banner(offline: bool, *, live_hint: bool = True) -> None:
         )
         if live_hint:
             text += (
-                "\nSet CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN and drop "
-                "--offline to run on\nClairic and Clef."
+                "\nSet CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN (or "
+                "TRUSTCALL_S1_PROVIDER=typesafe and TYPESAFE_API_KEY) and drop "
+                "--offline to run on\nthe models."
             )
         else:
             text += "\nThis example has no live mode: tests never need one."
         print(paint(text, "dim"))
     else:
-        print(
-            paint(
+        if provider_from_env() == "typesafe":
+            where = "LIVE — requests go to TypeSafe (Jev answers Clairic and Clef)"
+        else:
+            where = (
                 "LIVE — requests go to Cloudflare (Clairic) and "
-                + (
-                    "Experiential Labs"
-                    if clef_provider_from_env() == "experiential"
-                    else "Cloudflare"
-                )
-                + " (Clef)",
-                "green",
-                "bold",
+                + {
+                    "experiential": "Experiential Labs",
+                    "decisions": "the Decisions API",
+                }.get(clef_provider_from_env(), "Cloudflare")
+                + " (Clef)"
             )
-        )
+        print(paint(where, "green", "bold"))
     print()
 
 
@@ -161,9 +167,10 @@ def build_extractor(
         return create_extractor(schemas, transport=script.transport, **options)
     # No transport given: the extractor creates one from the environment on first
     # use and closes it with the extractor: Cloudflare for both models, or Clef on
-    # Experiential Labs only when TRUSTCALL_S1_CLEF_PROVIDER=experiential (an
-    # EXPERIENTIAL_API_KEY alone never moves Clef), and with the Decisions API as
-    # its fallback only when TRUSTCALL_S1_CLEF_FALLBACK=decisions.
+    # Experiential Labs or the Decisions API only when TRUSTCALL_S1_CLEF_PROVIDER
+    # says so (an EXPERIENTIAL_API_KEY alone never moves Clef), with the Decisions
+    # API as its fallback only when TRUSTCALL_S1_CLEF_FALLBACK=decisions, or
+    # TypeSafe's Jev for both only when TRUSTCALL_S1_PROVIDER=typesafe.
     return create_extractor(schemas, **options)
 
 

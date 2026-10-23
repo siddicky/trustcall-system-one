@@ -48,6 +48,7 @@ from trustcall_system_one._compile import (
 )
 from trustcall_system_one._coref import has_context
 from trustcall_system_one._errors import StateTruncatedError
+from trustcall_system_one._escalate import tiebreak
 from trustcall_system_one._render import (
     Focus,
     RenderedState,
@@ -223,8 +224,21 @@ class Ctx:
             name it next to the label ("the Bill INV-2291"), so a figure that
             belongs to another invoice in the same input is not attributed to
             this one.
+        identity: For an update of a collection entity, the names of its identity
+            fields (a dotted path for a nested one), as ``Many(identity=...)`` or the
+            schema gave them; the diff protects them from a token-subset overwrite.
         sentence_fields: Names of the fields that were read by sentences in this
             context (shared by its input-only copy), for the novelty check.
+        fresh: Whether the entity is NEW: an insert, with no record held for it. The
+            verification ladder of an update runs on the input-only copy of a context
+            that holds a record, so there it is False. An amount the input asks to
+            ADD to a new entity ("two more of the blue mugs") has nothing to add to,
+            so it is the entity's whole amount (see ``_attribution_question``).
+        held: For a NEW item of a list that already holds an item it resembles (the
+            match said ``__new__``, yet the item's words are those of a held one:
+            "mugs" and "blue mug"), that held item's record. ``fresh`` is False
+            then, and a quantity the input asks to ADD ("two more mugs") is refused
+            as a relative edit of the held item's (``_refuse_relative_adds``).
     """
 
     run: Run
@@ -251,7 +265,10 @@ class Ctx:
     scope: str = ""
     others: tuple[Span, ...] = ()
     identity_hint: str = ""
+    identity: tuple[str, ...] = ()
     sentence_fields: set[str] = field(default_factory=set)
+    fresh: bool = False
+    held: dict[str, Any] | None = None
 
     def input_only(self) -> "Ctx":
         """The same context without the record: every request is about the input.
@@ -587,7 +604,7 @@ def compact_block(ctx: Ctx, fields: Iterable[str]) -> ExistingBlock | None:
         return None
     plan = ctx.plan
     by_wire = {spec.wire_name: spec for spec in plan.all_specs() if spec.wire_name}
-    keep = {_root_key(plan, name) for name in plan.identity}
+    keep = {_root_key(plan, name.split(".", 1)[0]) for name in plan.identity}
     keep.update(
         _root_key(plan, str(by_wire[wire].path[0]))
         for wire in fields
@@ -1140,6 +1157,18 @@ class FieldState:
             ``sentences`` list strategy). They come from the input alone, so there
             is no input-only cross-check to run, and Clairic's list type, which
             cannot read such a field, is never asked to re-read it.
+        settle: The answer is a repair of a field that is null, so that the record
+            is invalid without it (``RepairConfig.keep_uncertain``): a value whose
+            attribution stays between the drop and the keep bar after the second
+            look stands.
+        escalated: The escalation kind that proposed the value (``relative_dates``,
+            ``list_rows``), empty for an answer of the default setup. There is no
+            Clairic reading to cross-check it against, and no tie-break to ask the
+            model that proposed it: the attribution check (Clef) has to agree.
+        backup: What the default setup had read, when a ROUTED escalation proposal
+            (``mode="route"``) took its place: if the ladder refuses the proposal, the
+            backup is restored and judged normally (``run_ladder``), so asking the
+            tier first can never leave a field null that the default setup read.
     """
 
     spec: FieldSpec
@@ -1155,6 +1184,9 @@ class FieldState:
     cross: Resolved | None = None
     crosscheck_agree: bool | None = None
     sentences: bool = False
+    settle: bool = False
+    escalated: str = ""
+    backup: Resolved | None = None
 
     @property
     def value(self) -> Any:
@@ -1205,6 +1237,16 @@ def _code(reason: str | None) -> str:
     return reason if reason in _SHORT_CODES else "unparseable"
 
 
+def _reference_day(run: Run) -> date | None:
+    """The invoke's reference date as a ``date`` (``None`` without one)."""
+    if not run.reference_date:
+        return None
+    try:
+        return date.fromisoformat(run.reference_date[:10])
+    except ValueError:
+        return None
+
+
 async def resolve(
     ctx: Ctx,
     spec: FieldSpec,
@@ -1245,7 +1287,7 @@ async def resolve(
         coerced = coerce_union(spec, answer, type_answer, gates)
         raw = {"text": answer.value, "type": type_answer.choice}
     else:
-        coerced = coerce(spec, answer, gates)
+        coerced = coerce(spec, answer, gates, today=_reference_day(ctx.run))
     notes: list[str] = []
     echo_lost: list[tuple[int, str, str]] = []
     if coerced.ok and rendered is not None and rendered.existing_span is not None:
@@ -2070,8 +2112,70 @@ def requestable(spec: FieldSpec, plan: SchemaPlan | None = None) -> bool:
     return _ORDERED_UNITS.search(spec.description) is not None
 
 
+def _today_note(ctx: Ctx, spec: FieldSpec) -> str:
+    """Say what day it is to the attribution of a date.
+
+    The note reads ``Today is Monday, 2026-03-23.``
+
+    Only for a date or datetime field (or a list of them). The day is the invoke's
+    ``Run.today``: its reference date, or the UTC date pinned when it began (so the
+    note is there without a reference date too, and is the date TypeSafe resolved a
+    relative date against). The attribution requests of date fields therefore carry
+    the date in every run, which changes their request keys: a cassette recorded
+    before this note no longer replays those requests strictly, and an invoke without
+    a ``reference_date`` asks a different question each day, so a strict replay needs
+    one (or the cassette has to be recorded again).
+
+    A date that the input gives as "yesterday", "three days ago" or "last Tuesday" was
+    resolved against the reference date; a question that asks whether the input states
+    that date cannot be answered by a model that does not know what day it is (live:
+    0.03 for ``2026-03-17`` over "Completed last Tuesday", 0.09 for yesterday's date).
+    """
+    clairic = spec.clairic
+    if clairic is None:
+        return ""
+    kind = clairic.items if clairic.type == "list" else clairic.type
+    if kind not in ("date", "datetime"):
+        return ""
+    today = date.fromisoformat(ctx.run.today)
+    return f"Today is {today:%A}, {today.isoformat()}. "
+
+
+_CLAUSE = re.compile(
+    r"^(?:how|whether|when|where|why|what|who|whom|which)[ \t]+\S", re.I
+)
+"""A description that is a clause ("how the person relates to the speaker"), not a
+noun phrase: "<description> of the entity" would hang the entity on its last noun
+("the speaker of Olivia Davis"). The clause word has to stand alone and be followed by
+more words: "Which-way sign text" and "Who's Who entry title" are noun phrases."""
+
+
+def _clause_of(description: str) -> str | None:
+    """The description as a clause to put into a sentence (first letter lowercase).
+
+    ``None`` when it is a noun phrase. "How the person relates to the speaker" reads
+    "how the person relates to the speaker" in the middle of a question.
+    """
+    text = " ".join(description.split())
+    if _CLAUSE.match(text) is None:
+        return None
+    return text[:1].lower() + text[1:]
+
+
+_FRESH_NOTE = (
+    " `entity.label` is new, nothing of it was held before: an amount the input asks "
+    'to add ("two more") is the whole amount of it.'
+)
+
+
 def _attribution_question(
-    description: str, value: Any, *, element: bool, ask_for: bool = False
+    description: str,
+    value: Any,
+    *,
+    element: bool,
+    ask_for: bool = False,
+    today: str = "",
+    fresh: bool = False,
 ) -> NoulQuestion:
     """The question "is this value stated about the entity?" for a value or element.
 
@@ -2082,11 +2186,23 @@ def _attribution_question(
     order's "add two more") is asked as "does the input ask for it".
     """
     text = display(value)
+    clause = _clause_of(description)
     if element:
+        if clause is not None:  # "an answer to ...", not "a how the person ..."
+            return NoulQuestion(
+                type="noul",
+                instructions=(
+                    f'{today}According to `input`, is "{text}" an answer, for '
+                    f'`entity.label`, to "{clause}"? Something the input asks to '
+                    "include counts."
+                ),
+                criteria=NoulCriteria(true=_YES, false=_NO),
+            )
         return NoulQuestion(
             type="noul",
             instructions=(
-                f'According to `input`, is "{text}" {_element_phrase(description)} '
+                f'{today}According to `input`, is "{text}" '
+                f"{_element_phrase(description)} "
                 "of `entity.label`? Something the input asks to include counts."
             ),
             criteria=NoulCriteria(true=_YES, false=_NO),
@@ -2095,13 +2211,26 @@ def _attribution_question(
         # "Does the input ask for 2 of the entity (as the number of units ordered)?"
         # is the shape that told 2 (0.78 to 0.86) from 3 (0.02 to 0.04) and kept a
         # stated 1 (0.92 to 0.98); the longer "state or ask for X to be V" did not
-        noun = _ARTICLE.sub("", description.strip(), count=1)
-        instructions = f"Does `input` ask for {text} of `entity.label` (as the {noun})?"
+        if clause is not None:
+            instructions = (
+                f"Does `input` ask for {text} of `entity.label` (as {clause})?"
+            )
+        else:
+            noun = _ARTICLE.sub("", description.strip(), count=1)
+            instructions = (
+                f"Does `input` ask for {text} of `entity.label` (as the {noun})?"
+            )
+        if fresh:
+            # the engine knows the entity is new; the model reading the input does not
+            # (live: "two more of the blue mugs" on an order that holds none, 0.48)
+            instructions += _FRESH_NOTE
     else:
+        about = "for `entity.label`, " if clause is not None else ""
+        of = "" if clause is not None else " of `entity.label`"
         instructions = (
-            f'Does `input` state that {description} of `entity.label` is "{text}", '
-            "or does it follow by simple arithmetic or date math from figures the "
-            "input states about `entity.label`?"
+            f"{today}Does `input` state that {about}{clause or description}{of} is "
+            f'"{text}", or does it follow by simple arithmetic or date math from '
+            "figures the input states about `entity.label`?"
         )
     return NoulQuestion(
         type="noul",
@@ -2239,14 +2368,15 @@ def _attr_id(st: FieldState, index: int | None) -> str:
 
 
 def _attribution_questions(
-    states: list[FieldState], plan: SchemaPlan
+    states: list[FieldState], plan: SchemaPlan, ctx: Ctx
 ) -> dict[str, Question]:
     questions: dict[str, Question] = {}
     for st in states:
+        today = _today_note(ctx, st.spec)
         if _is_list(st):
             for index, element in enumerate(st.resolved.value):
                 questions[_attr_id(st, index)] = _attribution_question(
-                    st.spec.scoped, element, element=True
+                    st.spec.scoped, element, element=True, today=today
                 )
         else:
             questions[_attr_id(st, None)] = _attribution_question(
@@ -2254,6 +2384,8 @@ def _attribution_questions(
                 st.resolved.value,
                 element=False,
                 ask_for=requestable(st.spec, plan),
+                today=today,
+                fresh=ctx.fresh,
             )
     return questions
 
@@ -2283,7 +2415,7 @@ async def _attribution(ctx: Ctx, targets: list[FieldState]) -> None:
     """Check that each value, and each list element, is stated about the entity."""
     if not targets:
         return
-    questions = _attribution_questions(targets, ctx.plan)
+    questions = _attribution_questions(targets, ctx.plan, ctx)
     known: dict[str, Answer] = {}
     for st in targets:
         hint = ctx.attribution_hints.get(st.spec.wire_name)
@@ -2330,6 +2462,16 @@ async def _judge(ctx: Ctx, st: FieldState, answers: dict[str, Answer]) -> None:
     if not _is_list(st):
         p = _p(answers, _attr_id(st, None))
         st.attribution_p = p
+        if p is None and ctx.run.was_refused(
+            ctx.meta("attribution"), _attr_id(st, None)
+        ):
+            # the model declined to answer: that is final, and not asked again
+            st.set_reject(
+                "attribution_missing",
+                "the model refused the attribution question (decisions_refusal)",
+                None,
+            )
+            return
         if p is None:  # no answer is not a pass: check again, in isolation
             await _recheck_scalar(ctx, st)
             return
@@ -2355,6 +2497,11 @@ async def _judge(ctx: Ctx, st: FieldState, answers: dict[str, Answer]) -> None:
         elif answered is not None and answered < verify.attribution_drop:
             keep.append(False)
             _drop(st, index, elements[index], answered, missing=False)
+        elif answered is None and ctx.run.was_refused(
+            ctx.meta("attribution"), _attr_id(st, index)
+        ):  # declined: final, not asked again
+            keep.append(False)
+            _drop(st, index, elements[index], None, missing=True)
         else:  # in the middle band, or unanswered (which is not a pass)
             keep.append(False)
             pending.append(index)
@@ -2406,6 +2553,8 @@ async def _recheck_scalar(ctx: Ctx, st: FieldState) -> None:
                     checked.value,
                     element=False,
                     ask_for=requestable(st.spec, ctx.plan),
+                    today=_today_note(ctx, st.spec),
+                    fresh=ctx.fresh,
                 ),
                 ctx.text,
                 checked.span,
@@ -2425,10 +2574,54 @@ async def _recheck_scalar(ctx: Ctx, st: FieldState) -> None:
         )
     elif p >= verify.attribution_keep:
         _adopt(st, checked)
+    elif p >= verify.attribution_drop and (
+        broken := await _tiebreak_scalar(ctx, st, checked, p)
+    ):
+        if broken >= verify.attribution_keep:
+            _adopt(st, checked)
+        else:
+            st.set_reject(
+                "attribution",
+                "the escalation model says the input does not state it either",
+                broken,
+            )
+    elif st.settle and p >= verify.attribution_drop:
+        # neither confirmed nor refuted, and a null here loses the whole record
+        _adopt(st, checked)
+        st.notes.append(
+            f"attribution_uncertain: p={p:.2f} (kept: a required field, the same "
+            "value twice)"
+        )
     else:
         st.set_reject(
             "attribution", "still not stated about the entity after a re-ask", p
         )
+
+
+async def _tiebreak_scalar(
+    ctx: Ctx, st: FieldState, checked: Resolved, p: float
+) -> float | None:
+    """The escalation tier's answer to an attribution the second look left in the band.
+
+    ``None`` when the tier is off, out of calls, failed or has nothing to say (the
+    value's fate is then what it was without the tier). Never for a removal: the
+    probability it returns is at most ``prob_cap``, below every removal gate.
+    """
+    if not ctx.run.escalation.runs("attribution_tiebreak"):
+        return None
+    question = _attribution_question(
+        st.spec.scoped,
+        checked.value,
+        element=False,
+        ask_for=requestable(st.spec, ctx.plan),
+        today=_today_note(ctx, st.spec),
+        fresh=ctx.fresh,
+    )
+    q = await tiebreak(ctx, st, str(question.instructions), span=checked.span)
+    if q is not None:
+        st.attribution_p = q
+        st.notes.append(f"attribution_tiebreak: clef {p:.2f} -> escalation {q:.2f}")
+    return q
 
 
 async def _recheck_elements(
@@ -2466,7 +2659,11 @@ async def _recheck_elements(
         return
     questions: dict[str, Question] = {
         _attr_id(st, index): _recheck_question(
-            _attribution_question(st.spec.scoped, value, element=True), ctx.text, span
+            _attribution_question(
+                st.spec.scoped, value, element=True, today=_today_note(ctx, st.spec)
+            ),
+            ctx.text,
+            span,
         )
         for index, (value, span) in candidates.items()
     }
@@ -2481,6 +2678,22 @@ async def _recheck_elements(
         p = _p(answers, _attr_id(st, index))
         if p is not None:
             probabilities[index] = p
+        if p is not None and verify.attribution_drop <= p < verify.attribution_keep:
+            asked = await tiebreak(
+                ctx,
+                st,
+                _attribution_question(
+                    st.spec.scoped,
+                    value,
+                    element=True,
+                    today=_today_note(ctx, st.spec),
+                ).instructions,
+                span=candidates[index][1],
+                detail=f"[{index}]",
+            )
+            if asked is not None:
+                st.notes.append(f"attribution_tiebreak: clef {p:.2f} -> {asked:.2f}")
+                p = probabilities[index] = asked
         if p is not None and p >= verify.attribution_keep:
             keep[index] = True
             elements[index] = value
@@ -2671,7 +2884,7 @@ async def crosscheck(
     lookup = new_elements or {}
 
     async def one(st: FieldState) -> None:
-        if st.sentences:  # read from the input alone: nothing to check against
+        if st.sentences or st.escalated:  # no Clairic reading to check against
             st.crosscheck_agree = True
         elif _is_list(st):
             _cross_list(st, lookup.get(st.spec.wire_name))
@@ -2684,6 +2897,112 @@ async def crosscheck(
 # --------------------------------------------------------------------------- #
 # The ladder
 # --------------------------------------------------------------------------- #
+
+
+def _held_value(held: dict[str, Any], spec: Any) -> Any:
+    """What a held item's record holds at a field's path (``None``: nothing)."""
+    current: Any = held
+    for part in spec.path:
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+async def _refuse_relative_adds(ctx: Ctx, states: Sequence[FieldState]) -> None:
+    """Refuse an amount that the input only asks to ADD to an item the list holds.
+
+    "Add two more mugs" against an order that holds "blue mug" (3): the new entity
+    ("mugs") was matched as new, but it is the held item's words, so the 2 is how the
+    held amount changes, not the amount of another item; writing it as a new line
+    would double the item with the wrong quantity. The question that refuses a
+    relative replacement (call kind ``relative_edit``) is asked of this add, with the
+    held item's amount as the current value; at ``verify.relative_edit`` or above the
+    field is rejected as ``relative_edit_unsupported`` (a required one then makes the
+    entity invalid, so nothing is written). Only for an entity with a ``held`` item:
+    a new item that resembles nothing held is the whole amount (``Ctx.fresh``).
+
+    Args:
+        ctx: The insert context of the entity.
+        states: Its Clairic field states, after the ladder.
+    """
+    from trustcall_system_one._diff import Change
+    from trustcall_system_one._gates import relative_edits
+
+    held = ctx.held
+    floor = ctx.run.verify.relative_edit
+    if held is None or floor <= 0:
+        return
+    asked: list[tuple[FieldState, Change]] = []
+    for st in states:
+        value, old = st.resolved.value, _held_value(held, st.spec)
+        if (
+            not st.has_value()
+            or not relative_candidate(st.spec)
+            or any(
+                isinstance(v, bool) or not isinstance(v, (int, float))
+                for v in (value, old)
+            )
+            or not float(value).is_integer()
+            or not float(old).is_integer()
+            or value == old
+        ):
+            continue
+        change = Change(
+            op="replace",
+            path="/" + "/".join(str(p) for p in st.spec.path),
+            value=value,
+            old=old,
+            field_path=st.spec.pretty,
+            spans=tuple(st.spans),
+        )
+        asked.append((st, change))
+    if not asked:
+        return
+    answers = await relative_edits(ctx, held, [change for _, change in asked])
+    for (st, change), p in zip(asked, answers, strict=True):
+        if p is None or p < floor:
+            continue
+        st.set_reject(
+            "relative_edit_unsupported",
+            f"the input states a change relative to the held item's current value "
+            f"{change.old!r} (p={p:.2f}), not a new item's amount; relative edits are "
+            f"not computed, so {change.value!r} was not written",
+            p,
+        )
+        ctx.run.warn(
+            f"relative_edit_unsupported: {ctx.plan.name}.{st.spec.pretty}: the input "
+            "asks to add to an item the list already holds, so no new item was "
+            f"written (p={p:.2f})"
+        )
+
+
+async def _restore_backups(ctx: Ctx, states: Sequence[FieldState]) -> None:
+    """Give a field back what the default setup read when the ladder refused the tier.
+
+    A routed escalation proposal (``mode="route"``) replaces a standing answer of
+    Clairic before the ladder runs. When the ladder (attribution) then refuses the
+    proposal, the field would be null although Clairic had read a value; the answer
+    that was replaced is restored and goes through the ladder as it would have
+    without the tier. A proposal the ladder accepted drops its backup.
+    """
+    redo: list[FieldState] = []
+    for st in states:
+        if st.backup is None:
+            continue
+        if st.reject is None:
+            st.backup = None  # the proposal stands
+            continue
+        st.resolved, st.backup = st.backup, None
+        st.reject, st.reject_detail, st.reject_p = None, "", None
+        st.escalated, st.attribution_p, st.dropped = "", None, []
+        st.notes.append(
+            "escalation_refused: the proposal of the escalation tier was refused; "
+            "the default setup's answer is judged instead"
+        )
+        redo.append(st)
+    if redo:
+        await run_ladder(ctx, redo)
 
 
 async def run_ladder(ctx: Ctx, states: list[FieldState]) -> None:
@@ -2717,3 +3036,5 @@ async def run_ladder(ctx: Ctx, states: list[FieldState]) -> None:
                 if st.has_value() and not (_is_list(st) and not st.resolved.value)
             ],
         )
+    await _restore_backups(ctx, states)
+    await _refuse_relative_adds(ctx, states)

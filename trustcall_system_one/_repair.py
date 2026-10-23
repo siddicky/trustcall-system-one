@@ -513,6 +513,8 @@ class Target:
         spec: The field's spec as it stands now (an earlier repair may have
             adapted it).
         previous: The rejected value (``None`` when there was none).
+        first: The value of the first answer, standing or not (``None`` when it
+            was null): ``keep_uncertain`` settles only a re-ask that gave it again.
         type_answer: For a union of primitives, the Clef choice of the member
             type, which a re-ask keeps.
         show_input: Whether ``<validation_errors>`` may show the input a
@@ -523,6 +525,7 @@ class Target:
     hit: Hit
     spec: FieldSpec
     previous: Any = None
+    first: Any = None
     type_answer: ChoiceAnswer | None = None
     show_input: bool = True
     sentences: FieldState | None = None
@@ -920,6 +923,10 @@ class RepairState:
             but not yet known to be needed (see ``repair_loop``).
         bad: ``(wire name, value)`` pairs that an error implicated by name and
             that a repair then replaced: never put back.
+        settle: The record is an insert and the run keeps uncertain values
+            (``Run.keeps_uncertain``): a
+            text value for a field that was null may stand on an uncertain
+            attribution (see ``FieldState.settle``).
     """
 
     rounds: int = 0
@@ -928,6 +935,7 @@ class RepairState:
     formatted: set[str] = field(default_factory=set)
     tentative: list["Outcome"] = field(default_factory=list)
     bad: set[tuple[str, str]] = field(default_factory=set)
+    settle: bool = False
 
 
 @dataclass
@@ -1026,6 +1034,8 @@ async def _ask_clairic(
     target: Target,
     blocks: _Blocks,
     label: str,
+    *,
+    settle: bool = False,
 ) -> Outcome:
     spec = ask.spec
     wire = spec.wire_name
@@ -1074,8 +1084,51 @@ async def _ask_clairic(
         spec,
         note,
         ask.category,
-        state=FieldState(spec, resolved, target.type_answer),
+        state=FieldState(
+            spec,
+            resolved,
+            target.type_answer,
+            settle=settle and _may_settle(ctx, spec, target, resolved),
+        ),
     )
+
+
+def _gap(a: tuple[int, int], b: tuple[int, int]) -> int:
+    """Characters between two spans (0 when they touch or overlap)."""
+    return max(0, max(a[0], b[0]) - min(a[1], b[1]))
+
+
+def _may_settle(ctx: Ctx, spec: FieldSpec, target: Target, resolved: Resolved) -> bool:
+    """Whether an uncertain value of this re-ask may stand (``keep_uncertain``).
+
+    Only for a text field that the record cannot do without (required, not
+    nullable: a field an optional validator implicated is not lost, and a value
+    taken for it may be somebody else's), that was null, whose re-ask gave the
+    SAME value as the first answer (a different one is a new guess nobody judged
+    twice), and whose value is not nearer to a mention of another entity of the
+    collection than to the entity's own (the neighbour's value is not this one's).
+    """
+    if not (
+        spec.required
+        and not spec.nullable
+        and target.previous is None
+        and spec.clairic is not None
+        and spec.clairic.type == "text"
+    ):
+        return False
+    if target.first is None or not _same(resolved.value, target.first):
+        return False
+    own = set(ctx.mention_spans())
+    others = [o for o in ctx.others if o not in own]
+    if not others:
+        return True
+    span = resolved.span
+    if span is None:
+        return False  # cannot tell whose it is
+    nearest = min(_gap(span, o) for o in others)
+    if not own:
+        return nearest > 0
+    return nearest > 0 and nearest >= min(_gap(span, m) for m in own)
 
 
 async def _ask_one(ctx: Ctx, state: RepairState, target: Target) -> Outcome:
@@ -1087,7 +1140,7 @@ async def _ask_one(ctx: Ctx, state: RepairState, target: Target) -> Outcome:
         state.formatted.add(target.wire)
     if ask.spec.engine == "clef":
         return await _ask_clef(ctx, ask, target, blocks, label)
-    return await _ask_clairic(ctx, ask, target, blocks, label)
+    return await _ask_clairic(ctx, ask, target, blocks, label, settle=state.settle)
 
 
 def sentence_repair(state: "RepairState", target: Target) -> Outcome:

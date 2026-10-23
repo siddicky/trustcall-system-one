@@ -202,6 +202,16 @@ def score(case: Case, result: ExtractionResult) -> CaseResult:
             out.rejections_found += 1
         else:
             out.missing.append(f"rejected {wanted.reason} {wanted.path or ''}".strip())
+    for reason, wanted_id in case.expect_skipped:
+        out.n_skipped += 1
+        if any(
+            skip.reason == reason
+            and (wanted_id is None or wanted_id in (c[0] for c in skip.candidates))
+            for skip in result.skipped
+        ):
+            out.skipped_found += 1
+        else:
+            out.missing.append(f"skipped {reason} {wanted_id or ''}".strip())
     for rule in case.must_not:
         if _violated(rule, ops, docs):
             out.violations.append((rule.category, rule.label()))

@@ -51,6 +51,7 @@ from trustcall_system_one._wire import (
 )
 
 __all__ = [
+    "IDENTITY_SEP",
     "KEY_FIELD",
     "S1_KEY",
     "VALUE_FIELD",
@@ -66,6 +67,9 @@ __all__ = [
     "UnionMember",
     "choice_for",
     "compile_schema",
+    "identity_doc_keys",
+    "identity_problem",
+    "identity_spec",
     "render_instructions",
     "s1_field",
 ]
@@ -125,6 +129,7 @@ _S1_KEYS = frozenset(
         "clef",
         "criteria",
         "list_strategy",
+        "placeholders",
     }
 )
 _IDENTITY_NAMES = (
@@ -265,6 +270,7 @@ def s1_field(
     clef: str | None = None,
     criteria: Mapping[str, Any] | list[Any] | None = None,
     list_strategy: str | None = None,
+    placeholders: bool | None = None,
 ) -> dict[str, Any]:
     """Build ``json_schema_extra`` carrying per-field extraction options.
 
@@ -294,6 +300,10 @@ def s1_field(
             such as "things worth remembering") or ``"auto"`` (ask Clairic first,
             use sentences when its confidence is low). Unset follows
             ``Limits.list_strategy``.
+        placeholders: ``False`` keeps a placeholder text (``TBA``, ``N/A``, see
+            ``GateConfig.placeholders``) as the value of this plain text field,
+            whatever the run's setting: a field whose value may legitimately be
+            ``N/A``. ``None`` or ``True`` follow ``GateConfig.placeholders``.
 
     Returns:
         ``{"trustcall_system_one": {...}}``.
@@ -354,6 +364,10 @@ def s1_field(
                 f"got {list_strategy!r}"
             )
         options["list_strategy"] = list_strategy
+    if placeholders is not None:
+        if not isinstance(placeholders, bool):
+            raise ValueError("placeholders must be a bool")
+        options["placeholders"] = placeholders
     return {S1_KEY: options}
 
 
@@ -1031,13 +1045,24 @@ def _ancestors(path: Path, members: Mapping[int, str] | None = None) -> list[str
     return names
 
 
-def _context(title: str, path: Path, members: Mapping[int, str] | None = None) -> str:
+def _context(
+    title: str,
+    path: Path,
+    members: Mapping[int, str] | None = None,
+    parent_doc: str = "",
+) -> str:
     """Return the " → "-joined model title and ancestor field names.
 
     Below a union of models the member follows the union field:
-    ``"Owner → pet (Dog)"``.
+    ``"Owner → pet (Dog)"``. ``parent_doc`` is the docstring of the model that
+    declares the field, shown after the last ancestor: ``"Aircraft → hours
+    (Hours and minutes; ...)"``, so the fields of a sub-model are asked with what
+    the sub-model says about them.
     """
-    return " → ".join([title, *_ancestors(path, members)])
+    context = " → ".join([title, *_ancestors(path, members)])
+    if parent_doc and parent_doc not in context:
+        context = f"{context} ({parent_doc})"
+    return context
 
 
 def _member_description(member: enum.Enum) -> str | None:
@@ -1799,15 +1824,76 @@ def _marker(metadata: Iterable[Any], kind: _Kind, pretty_name: str) -> Many:
     found = next((item for item in metadata if isinstance(item, Many)), Many())
     if kind.engine == "collection" and found.identity is not None and kind.models:
         names = (found.identity,) if isinstance(found.identity, str) else found.identity
-        fields = kind.models[0].model_fields
-        unknown = [name for name in names if name not in fields]
-        if unknown:
-            raise ValueError(
-                f"field {pretty_name!r}: Many(identity=...) names {unknown}, which "
-                f"{kind.models[0].__name__} has no field of; its fields are "
-                f"{sorted(fields)}"
-            )
+        for name in names:
+            problem = identity_problem(kind.models[0], name)
+            if problem:
+                raise ValueError(f"field {pretty_name!r}: Many(identity=...) {problem}")
     return found
+
+
+IDENTITY_SEP = "."
+"""Joins the field names of a nested identity path (``"identification.msn"``)."""
+
+
+def identity_problem(model: type[BaseModel], name: str) -> str:
+    """Why ``name`` cannot identify a record of ``model``, or ``""`` when it can.
+
+    ``name`` is a field name, or a dotted path through sub-models to a scalar leaf
+    (``"identification.msn"``). The leaf of a dotted path must be a plain value
+    (text, a number, an enum, a list of plain values), not a sub-model, a list of
+    models or a mapping. A plain top-level name is accepted whatever it holds, as it
+    always was (a sub-model used as the identity is a workaround that works, if
+    poorly: ``collect`` warns and suggests the dotted path).
+    """
+    current = model
+    parts = name.split(IDENTITY_SEP)
+    for index, part in enumerate(parts):
+        fields = current.model_fields
+        if part not in fields:
+            where = f" (at {IDENTITY_SEP.join(parts[:index])!r})" if index else ""
+            return (
+                f"names {[name]}, which {current.__name__} has no field of{where}; "
+                f"its fields are {sorted(fields)}"
+            )
+        annotation = fields[part].annotation
+        base = _strip(annotation).base
+        is_model = isinstance(base, type) and issubclass(base, BaseModel)
+        last = index == len(parts) - 1
+        if last and len(parts) == 1:
+            return ""
+        if last:
+            if is_model or _model_of(annotation) is not None:
+                return (
+                    f"names {name!r}, which is a sub-model or a list of models, not a "
+                    "scalar field; name the field inside it (for example "
+                    f"'{name}.<field>')"
+                )
+            if typing_extensions.get_origin(base) in (dict, collections.abc.Mapping):
+                return f"names {name!r}, which is a mapping, not a scalar field"
+            return ""
+        if not is_model:
+            return (
+                f"names {name!r}, but {part!r} is not a sub-model of "
+                f"{current.__name__}, so there is nothing below it"
+            )
+        current = base
+    return ""
+
+
+def identity_spec(plan: "SchemaPlan", name: str) -> "FieldSpec | None":
+    """The spec of an identity field, by name or dotted path (``None`` if unknown)."""
+    path = tuple(name.split(IDENTITY_SEP))
+    return next((s for s in plan.specs if s.path == path), None)
+
+
+def identity_doc_keys(plan: "SchemaPlan", name: str) -> tuple[str, ...]:
+    """The keys that reach an identity field in a record (aliases at every level)."""
+    path = tuple(name.split(IDENTITY_SEP))
+    keys: list[str] = []
+    for end in range(1, len(path) + 1):
+        spec = next((s for s in plan.specs if s.path == path[:end]), None)
+        keys.append(spec.alias if spec is not None and spec.alias else path[end - 1])
+    return tuple(keys)
 
 
 def _doc_text(metadata: list[Any]) -> str | None:
@@ -1822,8 +1908,102 @@ def _doc_text(metadata: list[Any]) -> str | None:
     return None
 
 
+_CONTEXT_DOC_CHARS = 160
+"""Longest piece of a model's docstring that goes into the context of its fields."""
+
+
+def _own_doc(model: Any) -> str:
+    """A model's OWN docstring on one line (pydantic's default one is not it)."""
+    if not isinstance(model, type):
+        return ""
+    doc = vars(model).get("__doc__")
+    if not (isinstance(doc, str) and doc.strip()):
+        # a parametrised generic (``Box[int]``) is a subclass that has no docstring
+        # of its own: the docstring is the generic's
+        meta = getattr(model, "__pydantic_generic_metadata__", None) or {}
+        origin = meta.get("origin")
+        return _own_doc(origin) if origin is not None else ""
+    return _clean(inspect.cleandoc(doc))
+
+
+def _model_of(annotation: Any) -> type[BaseModel] | None:
+    """The model a field holds, or the model of its items (``list[Model]``, ...)."""
+    seen: Any = annotation
+    for _ in range(8):
+        base = _strip(seen).base
+        if isinstance(base, type) and issubclass(base, BaseModel):
+            return base
+        args = typing_extensions.get_args(base)
+        if not args:
+            return None
+        seen = args[-1]
+    return None
+
+
+def _doc_for_context(doc: str) -> str:
+    """The start of a docstring, ended at a sentence, for a field's context."""
+    if len(doc) <= _CONTEXT_DOC_CHARS:
+        return doc.rstrip(" .")
+    cut = doc[:_CONTEXT_DOC_CHARS]
+    stop = max(cut.rfind(". "), cut.rfind("; "))
+    clipped = cut[:stop] if stop > 40 else cut.rsplit(" ", 1)[0]
+    return _close_parentheses(clipped).rstrip(" .;,") + "…"
+
+
+def _close_parentheses(text: str) -> str:
+    """``text`` without a parenthesis it opened and never closed.
+
+    A docstring clipped inside ``(...)`` would leave the context unbalanced
+    (``"Aircraft → times (Total time (including ...…): Airframe hours"``), and the
+    field's own text could no longer be told from it: it is cut where the first
+    unclosed ``(`` opens.
+    """
+    opened: list[int] = []
+    for i, char in enumerate(text):
+        if char == "(":
+            opened.append(i)
+        elif char == ")" and opened:
+            opened.pop()
+    if not opened or opened[0] == 0:
+        return text if not opened else text[1:]
+    return text[: opened[0]].rstrip(" ,;:-")
+
+
+_WORD = re.compile(r"[a-z0-9]+")
+_ARTICLES = frozenset({"a", "an", "the"})
+_LEADING_WORDS = frozenset({"one", "each", "every", "this", "that", "some", "any"})
+
+
+def _says_nothing_new(doc: str, *names: str) -> bool:
+    """Whether a docstring only repeats the names it is about (``"An address."``)."""
+    known = {w for name in names for w in _WORD.findall(_humanise(name).lower())}
+    words = set(_WORD.findall(doc.lower())) - _ARTICLES
+    return words <= known
+
+
+def _as_description(doc: str) -> str:
+    """A docstring as the description of a field: its first sentence, no final stop.
+
+    The first word starts in lower case unless it is an acronym or a name
+    (``"A duration ..."`` reads as ``"a duration ..."``); the rest of the
+    docstring reaches the model through the context of the model's own fields.
+    """
+    first = re.split(r"(?<=[.!?])\s", doc, maxsplit=1)[0]
+    text = _doc_for_context(first)
+    word = text.split(" ", 1)[0]
+    if word.istitle() and word.lower() in {*_ARTICLES, *_LEADING_WORDS}:
+        text = text[0].lower() + text[1:]
+    return text or doc
+
+
 def _description(info: FieldInfo, shape: _Shape, name: str, metadata: list[Any]) -> str:
-    """Pick the field description: Field, ``Doc``, title, then the name."""
+    """Pick the field description.
+
+    The order is the ``Field`` description, ``Doc``, the title, then the humanised
+    name, which carries the class docstring of the model the field holds (a
+    sub-model, or the items of a list of models) in parentheses: ``billing address
+    (a postal address)``. The docstring never replaces the name.
+    """
     extra = info.json_schema_extra
     schema_description = extra.get("description") if isinstance(extra, dict) else None
     for candidate in (
@@ -1835,6 +2015,15 @@ def _description(info: FieldInfo, shape: _Shape, name: str, metadata: list[Any])
     ):
         if isinstance(candidate, str) and candidate.strip():
             return _clean(candidate)
+    held = _model_of(info.annotation)
+    if (
+        held is not None
+        and (doc := _own_doc(held))
+        and not _says_nothing_new(doc, held.__name__, name)
+    ):
+        # the field's own name stays: two fields of one model (a billing and a
+        # shipping address) must not become the same question
+        return f"{_humanise(name)} ({_as_description(doc)})"
     return _humanise(name)
 
 
@@ -2146,7 +2335,14 @@ def _build_spec(
     clef_question: Question | None = None
     instructions = description
     nested = len(path) > 1  # nested fields always carry their parent context
-    context = _context(title, path, draft.members)
+    # below a union member the member's tag already carries its docstring
+    doc = _own_doc(draft.model) if nested and not draft.members else ""
+    parent_doc = (
+        ""
+        if not doc or _says_nothing_new(doc, draft.model.__name__, str(path[-2]))
+        else _doc_for_context(doc)
+    )
+    context = _context(title, path, draft.members, parent_doc)
 
     if kind.clairic is not None:
         prefix = context if shortened_clairic or nested else ""

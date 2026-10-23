@@ -83,6 +83,7 @@ CallKind = Literal[
     "relative_edit",
     "repair",
     "raw",
+    "escalate",
 ]
 
 _TOKEN_FIELDS = (
@@ -91,6 +92,7 @@ _TOKEN_FIELDS = (
     "schema_tokens",
     "input_tokens",
     "output_tokens",
+    "reasoning_tokens",
     "passes",
     "requests",
     "reported_requests",
@@ -114,6 +116,9 @@ class Usage:
     Both are kept apart from any estimate made from token prices
     (``Prices.cost``).
 
+    ``reasoning_tokens`` counts the reasoning tokens of the escalation model; they are
+    part of ``output_tokens`` (OpenAI reports them as a breakdown of it).
+
     The nested ``Usage`` values in ``by_model`` and ``by_kind`` are leaf totals
     and have empty breakdowns of their own.
     """
@@ -123,6 +128,7 @@ class Usage:
     schema_tokens: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
+    reasoning_tokens: int = 0
     passes: int = 0
     requests: int = 0
     reported_requests: int = 0
@@ -154,6 +160,7 @@ class Usage:
             schema_tokens=getattr(usage, "schema_tokens", None) or 0,
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
+            reasoning_tokens=getattr(usage, "reasoning_tokens", None) or 0,
             passes=getattr(usage, "passes", None) or 0,
             requests=1,
             reported_requests=0 if reported is None else 1,

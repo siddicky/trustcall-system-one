@@ -30,6 +30,7 @@ from trustcall_system_one._config import (
     ConcurrencyConfig,
     CorefConfig,
     DiscoveryConfig,
+    EscalationConfig,
     GateConfig,
     Limits,
     MatchConfig,
@@ -60,11 +61,16 @@ from trustcall_system_one._types import (
 from trustcall_system_one._wire import CLAIRIC, CLEF
 from trustcall_system_one.transport import (
     CloudflareTransport,
+    EscalatingTransport,
     RoutingTransport,
     Transport,
+    TypeSafeTransport,
     clef_fallback_from_env,
     clef_fallback_on_from_env,
     clef_provider_from_env,
+    escalation_from_env,
+    escalation_of,
+    provider_from_env,
     system_one_transport,
 )
 
@@ -106,6 +112,46 @@ def _close_at_exit(ref: "weakref.ReferenceType[_Core]") -> None:
             core.close()
 
 
+class _Closing:
+    """Two owned transports (the main one and the escalation's) closed as one."""
+
+    def __init__(self, *members: Any) -> None:
+        self._members = members
+
+    async def aclose(self) -> None:
+        for member in self._members:
+            with contextlib.suppress(Exception):
+                await member.aclose()
+
+    def close(self) -> None:
+        for member in self._members:
+            with contextlib.suppress(Exception):
+                member.close()
+
+
+def _closing(*members: Any) -> Any:
+    """What to close: nothing, the one transport, or both."""
+    held = [m for m in members if m is not None]
+    if len(held) > 1:
+        return _Closing(*held)
+    return held[0] if held else None
+
+
+def _refuse_typesafe_escalation(what: str) -> None:
+    """Raise when the default transport is TypeSafe's and the escalation tier is on.
+
+    ``TRUSTCALL_S1_PROVIDER=typesafe`` is TypeSafe only: ``what`` would send text to
+    OpenAI, as ``system_one_transport(provider="typesafe", escalate="openai")`` refuses
+    to. Name the contradiction instead of choosing one side.
+    """
+    if provider_from_env() == "typesafe":
+        raise ValueError(
+            "TRUSTCALL_S1_PROVIDER=typesafe is TypeSafe only: "
+            f"{what} would send text to OpenAI (unset one of them, or use a "
+            "combination spec, which names every provider)"
+        )
+
+
 class _Core:
     """Shared by an extractor and its ``with_options`` copies.
 
@@ -120,13 +166,24 @@ class _Core:
         self, transport: Transport | None, concurrency: ConcurrencyConfig | None
     ) -> None:
         if transport is None:
-            # a bad TRUSTCALL_S1_CLEF_PROVIDER or ..._FALLBACK fails here
+            # a bad TRUSTCALL_S1_PROVIDER, ..._CLEF_PROVIDER or ..._FALLBACK fails
+            # here (a contradiction between them, on first use)
+            provider_from_env()
             clef_provider_from_env()
             clef_fallback_from_env()
             clef_fallback_on_from_env()
+            if escalation_from_env() is not None:
+                _refuse_typesafe_escalation("TRUSTCALL_S1_ESCALATE=openai")
         self._given = transport
         self._concurrency = concurrency
-        self._owned: CloudflareTransport | RoutingTransport | None = None
+        self._owned: (
+            CloudflareTransport
+            | RoutingTransport
+            | TypeSafeTransport
+            | EscalatingTransport
+            | None
+        ) = None
+        self._owned_escalation: Transport | None = None
         self._lock = threading.RLock()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
@@ -142,14 +199,52 @@ class _Core:
             return self._given
         with self._lock:
             if self._owned is None:
-                cloudflare = CloudflareTransport(concurrency=self._concurrency)
-                self._owned = system_one_transport(
-                    clef_provider_from_env(),
-                    clef_fallback=clef_fallback_from_env(),
-                    cloudflare=cloudflare,
+                if provider_from_env() == "typesafe":
+                    self._owned = system_one_transport(
+                        provider="typesafe", concurrency=self._concurrency
+                    )
+                else:
+                    cloudflare = CloudflareTransport(concurrency=self._concurrency)
+                    self._owned = system_one_transport(
+                        clef_provider_from_env(),
+                        provider="cloudflare",
+                        clef_fallback=clef_fallback_from_env(),
+                        cloudflare=cloudflare,
+                        concurrency=self._concurrency,
+                    )
+            return self._owned
+
+    def escalation(self, explicit: EscalationConfig | None) -> EscalationConfig | None:
+        """The escalation tier of an invoke, with its transport, or ``None`` (off).
+
+        Chosen explicitly: ``create_extractor(escalation=...)``, else the tier the
+        transport carries (``system_one_transport(escalate="openai")``), else, for the
+        default transport only, ``TRUSTCALL_S1_ESCALATE=openai``. A key in the
+        environment never selects it. An enabled tier without a transport gets an
+        ``OpenAIResponsesTransport`` (owned, closed with this core).
+        """
+        config = explicit
+        if config is None:
+            config = escalation_of(self._given)
+        if config is None and self._given is None:
+            config = escalation_from_env()
+        if config is None or not config.enabled:
+            return None
+        if self._given is None:
+            _refuse_typesafe_escalation("an enabled escalation tier")
+        if config.transport is not None:
+            return config
+        with self._lock:
+            if self._owned_escalation is None:
+                from trustcall_system_one.openai_transport import (
+                    OpenAIResponsesTransport,
+                )
+
+                self._owned_escalation = OpenAIResponsesTransport(
+                    reasoning_effort=config.reasoning_effort or "none",
                     concurrency=self._concurrency,
                 )
-            return self._owned
+            return dataclasses.replace(config, transport=self._owned_escalation)
 
     # -- the bridge loop --------------------------------------------------- #
 
@@ -265,6 +360,8 @@ class _Core:
         loop, thread = self._take_loop()
         with self._lock:
             owned, self._owned = self._owned, None
+            extra, self._owned_escalation = self._owned_escalation, None
+        owned = _closing(owned, extra)
         if loop is not None and thread is not None and not loop.is_closed():
             if threading.current_thread() is thread:
                 if owned is None:
@@ -290,6 +387,8 @@ class _Core:
         loop, thread = self._take_loop()
         with self._lock:
             owned, self._owned = self._owned, None
+            extra, self._owned_escalation = self._owned_escalation, None
+        owned = _closing(owned, extra)
         if owned is not None:
             with contextlib.suppress(Exception):
                 await owned.aclose()
@@ -413,6 +512,7 @@ class Extractor:
         prices: Input-token prices used for ``ExtractionResult.cost``.
         reference_date: Default date relative dates are resolved against.
         strict: Raise on a terminal validation failure.
+        escalation: The opt-in escalation tier (see ``create_extractor``).
     """
 
     schemas: tuple[Any, ...]
@@ -438,6 +538,7 @@ class Extractor:
     prices: Prices = field(default_factory=Prices)
     reference_date: date | str | None = None
     strict: bool = False
+    escalation: EscalationConfig | None = None
     _core: _Core | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -455,6 +556,20 @@ class Extractor:
                 f"{self.existing_schema_policy!r}"
             )
         _iso_date(self.reference_date)
+        if self.escalation is not None and self.escalation.enabled:
+            if self.transport is None:
+                _refuse_typesafe_escalation("create_extractor(escalation=...)")
+            cap = self.escalation.prob_cap
+            for name, bar in (
+                ("gates.remove_threshold", self.gates.remove_threshold),
+                ("match.delete_threshold", self.match.delete_threshold),
+            ):
+                if cap >= bar:
+                    raise ValueError(
+                        f"escalation.prob_cap ({cap}) must stay below {name} ({bar}): "
+                        "an answer of the escalation tier must never authorise a "
+                        "removal or a delete"
+                    )
         names: list[str] = []
         for item in self.schemas:
             plan = self.plan_for(_inner(item))
@@ -474,6 +589,20 @@ class Extractor:
         """The shared transport and bridge holder."""
         assert self._core is not None
         return self._core
+
+    def _escalation_for_run(self) -> EscalationConfig:
+        """The escalation tier this invoke runs with (a disabled one when off)."""
+        config = self.core.escalation(self.escalation)
+        if config is None:
+            return EscalationConfig()
+        cap = config.prob_cap
+        if cap >= self.gates.remove_threshold or cap >= self.match.delete_threshold:
+            raise ValueError(
+                f"escalation.prob_cap ({cap}) must stay below gates.remove_threshold "
+                f"({self.gates.remove_threshold}) and match.delete_threshold "
+                f"({self.match.delete_threshold})"
+            )
+        return config
 
     def plan_for(self, schema: SchemaLike | One | Many) -> SchemaPlan:
         """Return the compiled plan for a schema (cached).
@@ -641,6 +770,7 @@ class Extractor:
             strict=self.strict,
             enable_inserts=self.enable_inserts,
             enable_item_removals=self.enable_item_removals,
+            escalation=self._escalation_for_run(),
         )
         for warning in records.warnings:
             run.warn(warning)
@@ -1129,6 +1259,7 @@ def create_extractor(
     prices: Prices | None = None,
     reference_date: date | str | None = None,
     strict: bool = False,
+    escalation: EscalationConfig | None = None,
 ) -> Extractor:
     """Create an extractor for one or more schemas.
 
@@ -1170,6 +1301,13 @@ def create_extractor(
         reference_date: Default date relative dates are resolved against.
         strict: Raise ``ExtractionValidationError`` (or ``StateTruncatedError``)
             instead of returning an invalid record (or a warning).
+        escalation: The opt-in escalation tier (``EscalationConfig``): the few cases
+            the default setup fails are asked of ``gpt-6-luna`` through the OpenAI
+            Responses API, **which sends their text to OpenAI**. Off unless it is
+            passed enabled here, carried by the transport
+            (``system_one_transport(escalate="openai")``) or, with the default
+            transport, ``TRUSTCALL_S1_ESCALATE=openai``; an ``OPENAI_API_KEY`` alone
+            never turns it on.
 
     Returns:
         The extractor.
@@ -1204,4 +1342,5 @@ def create_extractor(
         prices=prices or Prices(),
         reference_date=reference_date,
         strict=strict,
+        escalation=escalation,
     )

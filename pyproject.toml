@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "trustcall-system-one"
-version = "0.1.0a1"
+version = "0.1.0a2"
 description = "Validated multi-entity extraction and JSON-Patch updates on Cloudflare System One models (Clairic + Clef)."
 readme = "README.md"
 license = "Unlicense"

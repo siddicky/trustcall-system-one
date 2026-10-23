@@ -15,6 +15,8 @@ uv run python examples/01_invoice.py --offline  # force the scripted transport
   `CLOUDFLARE_API_TOKEN` (a token with Workers AI access) and do not pass `--offline`.
   Confidences, spans and verification events then come from Clairic and Clef, and will
   differ from the offline output.
+* **TypeSafe** (Jev for both models) is live too: set `TRUSTCALL_S1_PROVIDER=typesafe` and
+  `TYPESAFE_API_KEY` (a key alone changes nothing, and no Cloudflare variable is needed).
 * **Offline** is used when either variable is missing or `--offline` is passed. A
   banner says `OFFLINE DEMO — answers come from a scripted transport, not the models`.
   The answers are scripted to be what the models would plausibly return, with spans

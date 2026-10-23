@@ -12,6 +12,7 @@ echoes them).
 cd trustcall-system-one                # your checkout of the repository
 export CLOUDFLARE_ACCOUNT_ID=...      # from the environment only
 export CLOUDFLARE_API_TOKEN=...       # (CLOUDFLARE_AUTH_TOKEN also works)
+# TypeSafe-only run instead: see section 4e (TYPESAFE_API_KEY and TRUSTCALL_S1_PROVIDER=typesafe)
 git rev-parse --short HEAD            # the commit under test: put it in the report
 git status --short                    # must be clean; if not, say what is not
 uv sync --all-extras --group dev
@@ -293,6 +294,168 @@ How to read it:
 - Never re-run only the failed cases quietly: each request that reached either provider may have
   been charged.
 
+## 4d. The Decisions API as the primary for Clef
+
+```bash
+export EXPERIENTIAL_API_KEY=...                  # from the environment only
+export TRUSTCALL_S1_CLEF_PROVIDER=decisions      # required: a key alone enables nothing
+uv run python -m evals run --live --clef-provider decisions --config default \
+    --out evals/results/decisions-primary
+```
+
+The Decisions API (`gpt-6-luna-decisions`, served by OpenAI through Experiential Labs) answers
+every Clef request; Clairic stays on Cloudflare. It takes 32 questions per request and its bare
+picks are capped at 0.8 (`decisions_hard_cap`), so compare it with the default run before
+trusting it. It is a different model from Clef: a case that only passes with it is a finding.
+`summary.md` prints "Extraction: cloudflare clairic; decisions: experiential decisions
+(gpt-6-luna-decisions, hard cap 0.8)", and `results.json` has the same as `extraction` and
+`decisions`.
+
+Reading a Decisions-primary run:
+
+- The warning is `clef_hard_picks: N Clef answer(s) from decisions were hard picks ...; by call
+  kind: ...` (saturated or missing probabilities, capped at 0.8). It is not `clef_fallback_used`,
+  which is only for a request a fallback answered and is absent here.
+- A `decisions_refusal` warning names the questions the model refused (`{"type": "refusal"}`):
+  they are unanswered, never a pass, and the case goes on.
+- A delete needs a graded 0.85 or more (a saturated yes is 0.8 by design), so expect fewer
+  deletes than with Clef: `visit_cancel_one`, `listing_no_longer_pets` and
+  `order_remove_item` were such cases. An input that removes AND changes a record may be read as
+  a plain change (no `conflict_update_delete`): that expectation is provider-specific.
+- Notes: a notes field is classified (call kind `list_kind`); a hedged `items` below 0.75 no
+  longer keeps notes out, so a Decisions run has `sentences` and `novelty` calls where the first
+  live run had none.
+
+## 4e. TypeSafe-only: Jev for Clairic and Clef
+
+```bash
+export TYPESAFE_API_KEY=...                      # from the environment only; do not echo it
+test -n "$TYPESAFE_API_KEY" && echo set          # enough to check it
+export TRUSTCALL_S1_PROVIDER=typesafe            # required: the key alone never switches
+# no Cloudflare variable is needed
+
+# live smoke: the four scenarios of section 1 on Jev
+TRUSTCALL_S1_LIVE=1 TRUSTCALL_S1_PROVIDER=typesafe uv run pytest -m live -s tests/live
+# the evals on Jev (start with --concurrency 2; raise it while there is no 429)
+uv run python -m evals run --live --provider typesafe --config default --concurrency 2 \
+    --out evals/results/typesafe-default
+# the examples
+uv run python examples/01_invoice.py
+```
+
+In the report, for each case or for the totals: the requests (a Clairic call is a stitch request, a
+selection request and a verification request, so expect about twice the requests of the Cloudflare
+run), the input tokens (the state is repeated in each; Jev's input is $0.042 per Mtok and its output is
+free), the wall seconds, and which warnings fired. Per call the log has `provider` `typesafe` and
+`model` `jev-<version>` (the model that answered; `jev-latest` moves). Read these first:
+
+- `escalated` in a field's `raw` answers (the verification doubted a selection) and `needs_review` on a
+  date. Report how many selections were doubted and whether the ladder rejected them rightly.
+- A case whose expected value is not among the candidates can never pass (Jev only selects): report the
+  value and the sentence, that is a finding for the candidate generators, not for Jev.
+- Calibration: the library's thresholds were tuned on Cloudflare. Report the attribution
+  probabilities (`probabilities` in `results.json`) next to the Cloudflare run before changing any.
+- An `UncertainOutcomeError` (a timeout, a 408 or any 5xx including 529 Overloaded, never resent: the
+  call may have been charged; a Clairic call that fails after an earlier request answered keeps those
+  tokens in the call log and counts as uncertain), a `RateLimitError` after the retries (only 429 is
+  retried, with backoff), and a 422 (the message names the field; the body and the user's text are not
+  echoed).
+- `needs_review` on a date whose year or week was inferred (confidence capped at 0.8: those are re-asked),
+  and `escalated: hook_error` / `hook_invalid` if you passed an escalation hook.
+- Before committing anything run `grep -rnE "apikey_[0-9a-f]{20,}" . --exclude-dir=.git
+  --exclude-dir=.venv`: it must find nothing.
+
+To tabulate the three combinations (Cloudflare, Cloudflare Clairic + Decisions Clef, Jev for both) run
+sections 3, 4d and 4e into separate `--out` directories and compare `aggregate` (`passed`, `requests`,
+`input_tokens`, `wall_s`) and the `extraction` / `decisions` labels of each `results.json`.
+
+## 4f. Mixing providers per call kind and field type
+
+Everything in this section is opt-in and names its providers: a spec file says which provider
+extracts which field type and answers which call kind (`docs/DESIGN.md`, "Mixing providers per call kind
+and field type"). Offline first (scripted worlds, nothing is sent), then live:
+
+```bash
+uv run python -m evals combo --spec spec.json --quiet                    # offline
+uv run python -m evals combo --spec spec.json --live --record evals/cassettes --tag NAME \
+    --out evals/results/combo-NAME            # cassettes go to evals/cassettes/NAME
+uv run python -m evals search --base spec.json --live --providers cloudflare,typesafe,decisions \
+    --price cloudflare=P:P --price typesafe=P:P --price decisions=P:P --max-runs 40 --budget-usd 10 \
+    --record evals/cassettes --out evals/results/search     # dev suite only
+# calibration of the winner: record it once, then search the shifts over the raw recording
+uv run python -m evals combo --spec evals/results/search/best.json --live --record evals/cassettes --tag BEST
+uv run python -m evals search --base evals/results/search/best.json --calibrate-only \
+    --replay evals/cassettes/BEST --out evals/results/search-cal         # --live: misses go to the API
+uv run python -m evals combo --spec evals/results/search-cal/best.json --suite holdout --live
+```
+
+A failed case is reported, never retried; a trial that raises is a row in the leaderboard and the search
+goes on; `--resume DIR` reuses the combinations already evaluated there IN THE SAME MODE (an offline
+search resumed with `--live` reuses nothing). `--replay` is for the calibration search alone, and a
+recording only answers the provider that made it: a spec that routes a call elsewhere gets a miss, never
+another provider's answer. A positive shift of `gate`, `null_check` or `delete` raises the probability that
+decides a removal: the search leaves those kinds out unless they are named in `--calibrate-kinds`, tries
+only shifts of 0 or less for them unless `--allow-positive-removal-shift`, and flags them in the
+leaderboard. An improvement has to beat the incumbent by `--min-margin` (default 1 case or 0.02 F1).
+Hand back `leaderboard.md`, `best.json` and the holdout result of the winner (its directory is named
+`...-holdout-...`).
+
+## 4g. Escalation tier (gpt-6-luna): with and without
+
+**Opt-in, and it sends the text of the cases the default setup fails to OpenAI.** Needs
+`OPENAI_API_KEY` in the environment (the error names the variable, never a value); a key alone changes
+nothing. Offline (no flag needed to be safe) the tier is a stand-in that never answers, so offline runs
+are unchanged. Run the same suite twice, with and without, on the same recorded Cloudflare answers:
+
+```bash
+export OPENAI_API_KEY=...   # from the environment only; never in a file or a command line
+
+# 1. the default setup, recorded (Cloudflare Clairic + Clef)
+uv run python -m evals run --suite holdout --live --record evals/cassettes/esc-base \
+    --out evals/results/holdout-no-escalation
+# 2. the same cases with the tier: Cloudflare is replayed, only the tier's calls (and what
+#    the tier changed) go live
+uv run python -m evals run --suite holdout --live --replay evals/cassettes/esc-base \
+    --record evals/cassettes/esc-low --escalate openai --escalate-effort low \
+    --out evals/results/holdout-escalate-low
+# one case, to read what was asked (the call log has the kind "escalate", field "relative_dates:<field>")
+uv run python -m evals run --suite holdout --cases CASE_ID --live --escalate openai --out /tmp/one
+```
+
+`--escalate-mode` (or `"mode"` in the spec's `escalate`, or `TRUSTCALL_S1_ESCALATE_MODE`) decides when each
+kind is asked: `on_failure` (default), `route` (the relative dates, the rows of nested lists and the discovery of
+dotted identities go to the tier first), `recommended`, or `kind=mode` pairs, comma separated
+(`relative_dates=route,list_rows=route,dotted_discovery=on_failure`; a kind left out is `on_failure`;
+`attribution_tiebreak` can only be `on_failure`). `recommended` is exactly the pairs
+`relative_dates=route,list_rows=route,dotted_discovery=on_failure,attribution_tiebreak=on_failure`. **That
+mapping was chosen from the holdout2 results, so holdout2 is no longer fully clean for that choice:** compare
+modes on the dev suite, and read a holdout2 score under `recommended` as a selected number, not a blind one.
+Run the modes (and no tier) on the same suite to compare; a mode alone enables nothing, it needs `--escalate openai`.
+
+Compare the efforts on the dev suite (never on the holdout: a search chooses by score), with the cost
+and latency of each in the leaderboard (`esc calls`, `esc reasoning tok`, `esc ms/call`; reasoning
+tokens are output tokens, so give the output price):
+
+```bash
+cat > escalate.json <<'EOF'
+{"name": "escalate", "escalate": {"provider": "openai", "model": "gpt-6-luna", "reasoning_effort": "none"}}
+EOF
+uv run python -m evals search --base escalate.json --live --order escalate.effort \
+    --price cloudflare=P:P --price openai=IN:OUT --max-runs 8 --budget-usd 10 \
+    --record evals/cassettes --out evals/results/search-effort   # none (base), low, medium, high
+# the winner, once, on the holdout
+uv run python -m evals combo --spec evals/results/search-effort/best.json --suite holdout --live \
+    --out evals/results/holdout-escalate-best
+```
+
+Read, per effort: passed cases (the margin is one case or 0.02 F1, and a rise in bleed or wrong deletes
+is a veto), `escalation_calls`, the calls that failed, `escalation_reasoning_tokens`,
+`escalation_mean_latency_ms` and the estimated cost. A timeout is an uncertain outcome (the call may have
+been charged) and is never sent again; a higher effort has a longer read timeout (60 s at `none` up to
+900 s at `max`). In each run, check the `escalation:` warnings (one per use: kind, schema and field, no
+text), `escalation_failed` / `escalation_no_answer` (what the default result stood in for), and that no
+record lost a value or a row it had without the tier (the tier only adds proposals that pass the ladder).
+
 ## 5. What to hand back
 
 1. The commit hash, the date, and whether the working tree was clean.
@@ -306,6 +469,9 @@ How to read it:
    saved example.
 7. The paths of `evals/results/*` and `evals/cassettes/` (not committed) and of
    `tests/recorded/smoke_*.jsonl`.
-8. Anything that surprised you: an HTTP error, a rate limit, a warning that appears in every run,
+8. If the escalation tier ran (section 4g): the effort(s), the `escalation:` warnings, the calls that failed
+   and their messages and request ids, reasoning tokens and mean latency per effort, and the cases
+   that changed against the run without it.
+9. Anything that surprised you: an HTTP error, a rate limit, a warning that appears in every run,
    a request count far from the offline one (offline: `uv run python -m evals run`, 190 requests for
    the 24 cases).

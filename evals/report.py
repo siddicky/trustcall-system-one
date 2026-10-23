@@ -8,7 +8,13 @@ from typing import Any
 from evals.runner import SuiteResult, aggregate
 from trustcall_system_one.testing import scrub
 
-__all__ = ["suite_markdown", "sweep_markdown", "write_suite", "write_sweep"]
+__all__ = [
+    "combo_record",
+    "suite_markdown",
+    "sweep_markdown",
+    "write_suite",
+    "write_sweep",
+]
 
 
 def _pct(value: float | None) -> str:
@@ -39,6 +45,30 @@ def suite_markdown(suite: SuiteResult) -> str:
     lines = [
         f"# Evals: config `{suite.config}` ({suite.mode})",
         "",
+        f"Extraction: {suite.extraction or 'scripted world'}; "
+        f"decisions: {suite.decisions or 'scripted world'}",
+        "",
+        *(
+            [f"Combination: `{suite.combo.describe()}`", ""]
+            if suite.combo is not None
+            else []
+        ),
+        *(
+            [
+                "**REMOVAL SHIFT:** this combination raises the probability that "
+                "decides a removal, a set-null or a delete "
+                f"({', '.join(suite.combo.removal_shifts())}): it makes the engine "
+                "remove more data. Read bleed and wrong deletes before the rest.",
+                "",
+            ]
+            if suite.combo is not None and suite.combo.removal_shifts()
+            else []
+        ),
+        *(
+            [f"Suite: {suite.suite}" + (f"; tag: {suite.tag}" if suite.tag else ""), ""]
+            if suite.suite != "default" or suite.tag
+            else []
+        ),
         *(
             [
                 f"Clef provider: {suite.clef_provider}"
@@ -49,6 +79,15 @@ def suite_markdown(suite: SuiteResult) -> str:
                 "",
             ]
             if suite.clef_provider
+            else []
+        ),
+        *(
+            [
+                f"Escalation tier: {suite.escalation} (the text of the cases the "
+                "default setup fails goes to OpenAI)",
+                "",
+            ]
+            if suite.escalation
             else []
         ),
         f"Overrides: `{dict(suite.overrides)}`"
@@ -77,6 +116,17 @@ def suite_markdown(suite: SuiteResult) -> str:
         )
     if suite.skipped:
         lines += ["", f"Skipped (no offline world): {', '.join(suite.skipped)}"]
+    if suite.replay:
+        lines += [
+            "",
+            f"Replay of `{suite.replay}`: a call is answered only by a recording of "
+            "the provider it is routed to (a combination), and "
+            + (
+                "a call with no such recording went to its provider (--live)."
+                if suite.mode == "replay+live"
+                else "a call with none failed its case (nothing is sent)."
+            ),
+        ]
     if agg["forwarded"]:
         lines += ["", f"Requests sent live during the replay: {agg['forwarded']}"]
     if agg["unknown_outcomes"]:
@@ -87,6 +137,15 @@ def suite_markdown(suite: SuiteResult) -> str:
         ]
     if agg["reported_cost_usd"]:
         lines += ["", f"Cost reported by the provider: ${agg['reported_cost_usd']:.6f}"]
+    if suite.escalation:
+        lines += [
+            "",
+            f"Escalation calls: {agg['escalation_calls']} "
+            f"({agg['escalation_failed']} failed), tokens in/out "
+            f"{agg['escalation_input_tokens']}/{agg['escalation_output_tokens']} "
+            f"(reasoning {agg['escalation_reasoning_tokens']}), mean latency "
+            f"{agg['escalation_mean_latency_ms']:.0f} ms",
+        ]
     if suite.mode == "offline":
         lines += [
             "",
@@ -97,14 +156,48 @@ def suite_markdown(suite: SuiteResult) -> str:
     return "\n".join(lines) + "\n"
 
 
+def combo_record(suite: SuiteResult) -> dict[str, Any] | None:
+    """The combination a suite ran on, for ``results.json``: the spec and its labels.
+
+    ``spec`` is the spec as given, ``key`` its canonical form (two specs with the same
+    key behave the same), ``labels`` the labels of the spec plus what answered
+    extraction and decisions, and ``companies`` who saw the text. ``None`` for a run
+    on the usual provider settings.
+    """
+    spec = suite.combo
+    if spec is None:
+        return None
+    return {
+        "spec": spec.model_dump(),
+        "key": spec.key(),
+        "describe": spec.describe(),
+        "labels": {
+            **spec.labels,
+            "extraction": suite.extraction,
+            "decisions": suite.decisions,
+            **({"escalation": suite.escalation} if suite.escalation else {}),
+        },
+        "companies": list(spec.companies()),
+    }
+
+
 def write_suite(suite: SuiteResult, out: Path) -> tuple[Path, Path]:
     """Write ``results.json`` and ``summary.md`` into ``out``."""
     out.mkdir(parents=True, exist_ok=True)
     payload = {
         "config": suite.config,
         "mode": suite.mode,
+        "provider": suite.provider,
+        "extraction": suite.extraction,
+        "decisions": suite.decisions,
         "clef_provider": suite.clef_provider,
         "clef_fallback": suite.clef_fallback,
+        "escalation": suite.escalation,
+        "escalate_effort": suite.escalate_effort,
+        "suite": suite.suite,
+        "tag": suite.tag,
+        "replay": suite.replay,
+        "combo": combo_record(suite),
         "overrides": dict(suite.overrides),
         "aggregate": aggregate(suite.results),
         "skipped": suite.skipped,

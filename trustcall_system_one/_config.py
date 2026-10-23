@@ -3,16 +3,19 @@
 import math
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
-from typing import Literal, TypeVar
+from typing import Any, Literal, TypeVar
 
 from trustcall_system_one._types import Usage
 from trustcall_system_one._wire import CLAIRIC, CLEF, CLEF_FLASH, normalize_model_id
 
 __all__ = [
+    "ESCALATION_KINDS",
+    "REASONING_EFFORTS",
     "ConcurrencyConfig",
     "CorefConfig",
     "CostReport",
     "DiscoveryConfig",
+    "EscalationConfig",
     "GateConfig",
     "Limits",
     "MatchConfig",
@@ -130,20 +133,35 @@ class Prices:
     """Input-token prices in USD per million tokens, keyed by model id.
 
     Keys may be bare names or full ids; they are stored as full ids. The
-    instance is immutable and hashable.
+    instance is immutable and hashable. TypeSafe's Jev has no default price
+    ($0.042 per million input tokens): give the version that answers
+    (``"jev-1.14.0"``, shown in ``Usage.by_model``) or the alias ``"jev-latest"``,
+    which prices any ``jev-*`` version that has no price of its own.
+
+    ``per_million_output`` prices the output tokens of the models that also have an
+    input price: OpenAI's output tokens include its reasoning tokens, so a higher
+    ``reasoning.effort`` of the escalation tier costs more only with it. ``gpt-6-luna``
+    has no default price: without one it is in ``CostReport.unpriced_models``.
     """
 
     per_million_input: Mapping[str, float] = field(default_factory=_default_prices)
+    per_million_output: Mapping[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        """Validate the prices and freeze the mapping."""
+        """Validate the prices and freeze the mappings."""
         if any(
             not math.isfinite(price) or price < 0
-            for price in self.per_million_input.values()
+            for price in (
+                *self.per_million_input.values(),
+                *self.per_million_output.values(),
+            )
         ):
             raise ValueError("prices must be finite and non-negative")
         object.__setattr__(
             self, "per_million_input", _FrozenMap(self.per_million_input)
+        )
+        object.__setattr__(
+            self, "per_million_output", _FrozenMap(self.per_million_output)
         )
 
     def cost(self, usage: Usage) -> CostReport:
@@ -172,8 +190,16 @@ class Prices:
             if all_reported:
                 reported += used.reported_cost_usd
             price = self.per_million_input.get(model)
+            if price is None and model.startswith("jev-"):
+                # a price for the alias covers every version the alias points to
+                price = self.per_million_input.get("jev-latest")
             if price is not None:
                 total += used.input_tokens * price / 1_000_000
+                # OpenAI's output tokens include the reasoning tokens (see
+                # ``Usage.reasoning_tokens``), so a higher effort costs more here
+                out_price = self.per_million_output.get(model)
+                if out_price is not None:
+                    total += used.output_tokens * out_price / 1_000_000
             elif not all_reported:
                 unpriced.add(normalize_model_id(model))
         if not usage.by_model and usage.input_tokens:
@@ -192,6 +218,32 @@ def _check_probability(name: str, value: float) -> None:
         raise ValueError(f"{name} must be a number, got {value!r}")
     if not math.isfinite(value) or not 0 < value <= 1:
         raise ValueError(f"{name} must be in (0, 1], got {value!r}")
+
+
+DEFAULT_PLACEHOLDERS: tuple[str, ...] = (
+    "tba",
+    "tbd",
+    "n/a",
+    "n.a.",
+    "n/d",
+    "--",
+    "\u2013",
+    "\u2014",
+    "to be advised",
+    "to be announced",
+    "to be confirmed",
+    "to be determined",
+    "not available",
+    "not applicable",
+)
+"""Text values that say "no value yet", not a value (compared without case, markup or
+a closing full stop). ``GateConfig(placeholders=())`` keeps them as values.
+Deliberately short: ``none``, ``unknown`` and ``na`` can be real values (a status, a
+country code), ``tbc`` is ambiguous (to be confirmed, or "to be continued", or an
+abbreviation) and a lone ``-`` or ``?`` can be a result or a status (a check that
+reads ``-``, a question mark that answers "unknown"), so none of them is listed:
+add them to ``GateConfig(placeholders=...)`` when the data uses them as "no value"
+(``s1_field(placeholders=False)`` keeps ``N/A`` as the value of one field)."""
 
 
 @dataclass(frozen=True)
@@ -214,6 +266,13 @@ class GateConfig:
         replace_threshold: Change-gate probability needed to replace a value.
         remove_threshold: Change-gate probability needed to remove a value.
         allow_null_removals: Whether a null answer may remove an existing value.
+        placeholders: Text values that are no value (``DEFAULT_PLACEHOLDERS``: TBA,
+            TBD, N/A, a double dash ...). A plain text field whose answer is one of
+            these is null (``"placeholder"`` in the field's warnings), so ``"TBA"`` is
+            neither kept as a serial number nor put in a record that is updated;
+            matching ignores case, markup and a closing full stop. List elements and
+            Clef-typed fields are not touched. Pass ``()`` to keep such text as a
+            value, or ``s1_field(placeholders=False)`` on one field.
     """
 
     required_null_threshold: float = 0.7
@@ -226,6 +285,7 @@ class GateConfig:
     replace_threshold: float = 0.6
     remove_threshold: float = 0.85
     allow_null_removals: bool = False
+    placeholders: tuple[str, ...] = DEFAULT_PLACEHOLDERS
 
     def __post_init__(self) -> None:
         """Validate every threshold."""
@@ -247,6 +307,10 @@ class GateConfig:
             raise ValueError(f"noul_margin must be in [0, 0.5), got {margin!r}")
         if not isinstance(self.allow_null_removals, bool):
             raise ValueError("allow_null_removals must be a bool")
+        if not isinstance(self.placeholders, tuple) or not all(
+            isinstance(p, str) and p.strip() for p in self.placeholders
+        ):
+            raise ValueError("placeholders must be a tuple of non-empty strings")
 
 
 @dataclass(frozen=True)
@@ -270,9 +334,13 @@ class Limits:
         estimate_for_bounded_numbers: Emit a Clairic ``estimate`` field for a
             number with both a lower and an upper bound.
         max_instruction_chars: Longest instruction string sent to a model.
-        clef_state_token_budget: Estimated tokens above which a Clef state is
-            narrowed to mention windows. Clef silently truncates at 65,536
-            tokens, so the budget leaves headroom for the estimate's error.
+        clef_state_token_budget: Estimated tokens (state AND questions,
+            ``_render.estimate_request_tokens``, calibrated on recorded
+            table-heavy requests) above which a Clef request is split by
+            questions or has its state narrowed to mention windows. Clef silently
+            truncates at 65,536 tokens and refuses a request over 65,529 (HTTP
+            422), so the budget leaves headroom for the estimate's error. A
+            transport may advertise a smaller one (``state_token_budget``).
         list_strategy: How a ``list[str]`` field of free text is read unless the
             field says otherwise (``s1_field(list_strategy=...)``). ``"list"``
             asks Clairic's ``list`` type, which is a span picker: confident for
@@ -567,17 +635,42 @@ class RepairConfig:
             ``pattern`` (or another format check) when the input holds text that
             could satisfy it. Clairic only quotes the input, so it cannot
             reformat; without this switch such a field is never asked again.
+        keep_uncertain: A REQUIRED text field (not optional, not nullable) that is
+            null makes the record invalid; when the repair gets the SAME value for
+            it again and the attribution check can neither confirm nor refute it
+            (its probability stays between ``verify.attribution_drop`` and
+            ``verify.attribution_keep`` after the second look), the value stands,
+            noted ``attribution_uncertain``, instead of the record being lost with
+            every other field it holds. A value the check refutes (below
+            ``attribution_drop``), a different value, an optional field (a model
+            validator that implicates it does not make it required) and a value
+            nearer to another entity of the collection than to this one never
+            stand. No threshold changes; off, the repair is as strict as the first
+            pass. ``None`` (the default, "auto") is on only when TypeSafe answers
+            BOTH the attribution question (``clef_model``, kind ``attribution``)
+            and the repair re-ask (``clairic_model``, kinds ``repair`` and
+            ``reask``): Jev's attribution of a name or an id is uncalibrated and
+            doubts stated values, which no other provider does
+            (``transport.prefers_keep_uncertain``; routers answer by model and
+            call kind). ``True`` or ``False`` always wins, whatever the transport.
     """
 
     enabled: bool = True
     max_attempts: int = 5
     stop_on_repeat: bool = True
     allow_pattern_reask: bool = True
+    keep_uncertain: bool | None = None
 
     def __post_init__(self) -> None:
         """Validate every setting."""
         for name in ("enabled", "stop_on_repeat", "allow_pattern_reask"):
             _check_flag(name, getattr(self, name))
+        if self.keep_uncertain is not None and not isinstance(
+            self.keep_uncertain, bool
+        ):
+            raise ValueError(
+                f"keep_uncertain must be a bool or None, got {self.keep_uncertain!r}"
+            )
         if isinstance(self.max_attempts, bool) or not isinstance(
             self.max_attempts, int
         ):
@@ -633,6 +726,15 @@ class DiscoveryConfig:
             check off.
         record_presence_max: Records asked about at most; above it the check is
             skipped for the collection (one request per record).
+        screen_above: With more than this many mentions found, the mentions of a
+            collection that has an identity are screened in code (bare figures, one
+            or two letters, markup, headings, the names of the item's own fields) and
+            qualified one by one before they are clustered, as the items of a list
+            without an identity always are. It applies to a nested list and to a
+            top-level ``Many`` whose identity is a dotted path (``"a.b"``) only, and
+            never takes the candidates below Clairic's count. A table of
+            cells is what that many mentions are (live: 1,663 refused maintenance
+            checks in one sheet); prose has a handful. 0 switches it off.
     """
 
     presence_absent: float = 0.2
@@ -642,6 +744,7 @@ class DiscoveryConfig:
     qualify_min: float = 0.4
     record_presence: float = 0.5
     record_presence_max: int = 20
+    screen_above: int = 12
 
     def __post_init__(self) -> None:
         """Validate every setting."""
@@ -654,6 +757,7 @@ class DiscoveryConfig:
         _check_unit("qualify_min", self.qualify_min)
         _check_unit("record_presence", self.record_presence, allow_zero=True)
         _check_int("record_presence_max", self.record_presence_max, 0, 500)
+        _check_int("screen_above", self.screen_above, 0, 1000)
 
 
 @dataclass(frozen=True)
@@ -791,3 +895,320 @@ class MatchConfig:
                 "on_ambiguous must be 'skip', 'insert' or 'raise', got "
                 f"{self.on_ambiguous!r}"
             )
+
+
+ESCALATION_KINDS: tuple[str, ...] = (
+    "relative_dates",
+    "list_rows",
+    "attribution_tiebreak",
+    "dotted_discovery",
+)
+"""What the escalation tier can be asked to do (``EscalationConfig.kinds``)."""
+ESCALATION_MODES: tuple[str, ...] = ("on_failure", "route")
+"""What ``EscalationConfig.mode`` says of one kind: ask the tier where the default
+setup failed, or send the kind to it first (only the kinds in ``ROUTED_KINDS``)."""
+ROUTED_KINDS: tuple[str, ...] = ("relative_dates", "list_rows", "dotted_discovery")
+"""The kinds that may be routed: sent to the tier before the default setup answers.
+``attribution_tiebreak`` is asked after the second look by nature and can only be
+``on_failure``."""
+ESCALATION_MODE_PRESETS: Mapping[str, Mapping[str, str]] = {
+    "recommended": {
+        "relative_dates": "route",
+        "list_rows": "route",
+        "dotted_discovery": "on_failure",
+        "attribution_tiebreak": "on_failure",
+    },
+}
+"""Named per-kind mappings (``EscalationConfig.mode="recommended"``).
+
+``recommended`` was chosen from the holdout2 results (dates and table rows asked of the
+tier first, dotted discovery only on failure), so holdout2 is no longer a clean
+measurement for that choice (see "Escalation tier" in the design doc)."""
+REASONING_EFFORTS: tuple[str, ...] = ("none", "low", "medium", "high", "xhigh", "max")
+"""The values of ``reasoning.effort`` that the escalation tier accepts."""
+
+
+class _KindModes(Mapping[str, str]):
+    """An immutable, hashable mapping of every escalation kind to its mode."""
+
+    def __init__(self, items: Mapping[str, str]) -> None:
+        self._data: dict[str, str] = dict(items)
+        self._hash = hash(frozenset(self._data.items()))
+
+    def __getitem__(self, key: str) -> str:
+        return self._data[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __hash__(self) -> int:
+        return self._hash
+
+    def __repr__(self) -> str:
+        return f"{self._data!r}"
+
+
+def resolve_escalation_mode(mode: str | Mapping[str, str]) -> dict[str, str]:
+    """The mode of every escalation kind that ``mode`` stands for.
+
+    Args:
+        mode: ``"on_failure"`` or ``"route"`` (every kind that can be routed, the others
+            stay ``on_failure``), a preset name (``"recommended"``), or a mapping of
+            kind to ``"on_failure"`` / ``"route"`` (a kind it omits is ``on_failure``).
+
+    Returns:
+        A mapping with all of ``ESCALATION_KINDS``.
+
+    Raises:
+        ValueError: For an unknown mode, preset or kind, or ``route`` for a kind that
+            cannot be routed (``attribution_tiebreak``).
+    """
+    if isinstance(mode, str):
+        if mode in ESCALATION_MODE_PRESETS:
+            return dict(ESCALATION_MODE_PRESETS[mode])
+        if mode not in ESCALATION_MODES:
+            raise ValueError(
+                f"mode must be one of {list(ESCALATION_MODES)}, a preset "
+                f"{list(ESCALATION_MODE_PRESETS)} or a mapping of kind to mode, "
+                f"got {mode!r}"
+            )
+        return {
+            kind: mode if kind in ROUTED_KINDS else "on_failure"
+            for kind in ESCALATION_KINDS
+        }
+    if not isinstance(mode, Mapping):
+        raise ValueError(
+            f"mode must be a string or a mapping of kind to mode, got {mode!r}"
+        )
+    unknown = sorted(str(k) for k in set(mode) - set(ESCALATION_KINDS))
+    if unknown:
+        raise ValueError(
+            f"mode names unknown escalation kind(s) {unknown}; expected a subset of "
+            f"{list(ESCALATION_KINDS)}"
+        )
+    out = dict.fromkeys(ESCALATION_KINDS, "on_failure")
+    for kind, value in mode.items():
+        if value not in ESCALATION_MODES:
+            raise ValueError(
+                f"mode[{kind!r}] must be one of {list(ESCALATION_MODES)}, got {value!r}"
+            )
+        if value == "route" and kind not in ROUTED_KINDS:
+            raise ValueError(
+                f"mode[{kind!r}] cannot be 'route': it is asked after the second look "
+                f"and can only be 'on_failure' (routable: {list(ROUTED_KINDS)})"
+            )
+        out[kind] = value
+    return out
+
+
+def parse_escalation_mode(text: str) -> str | dict[str, str]:
+    """Parse the text of ``--escalate-mode`` or ``TRUSTCALL_S1_ESCALATE_MODE``.
+
+    The syntax is ``on_failure``, ``route``, ``recommended`` or a comma-separated list
+    of ``kind=mode`` pairs (``relative_dates=route,list_rows=route``; a kind it omits is
+    ``on_failure``). Case and surrounding blanks do not matter.
+
+    Args:
+        text: The text to parse.
+
+    Returns:
+        A mode string, or a mapping of kind to mode; both are valid for
+        ``EscalationConfig.mode`` and ``EscalateSpec.mode``.
+
+    Raises:
+        ValueError: For a malformed pair, a repeated kind, or anything
+            ``resolve_escalation_mode`` refuses.
+    """
+    raw = text.strip().lower()
+    if "=" not in raw:
+        resolve_escalation_mode(raw)
+        return raw
+    mapping: dict[str, str] = {}
+    for part in raw.split(","):
+        kind, sep, value = (piece.strip() for piece in part.partition("="))
+        if not sep or not kind or not value:
+            raise ValueError(
+                f"escalation mode {text!r}: expected kind=mode pairs, got {part!r}"
+            )
+        if kind in mapping:
+            raise ValueError(f"escalation mode {text!r}: {kind!r} is given twice")
+        mapping[kind] = value
+    resolve_escalation_mode(mapping)
+    return mapping
+
+
+def compact_escalation_mode(mode: str | Mapping[str, str]) -> str | dict[str, str]:
+    """The shortest spelling of ``mode``.
+
+    Returns:
+        ``on_failure``, ``route`` or a preset name when ``mode`` stands for one of
+        them, else a mapping of the routed kinds to ``route``.
+    """
+    resolved = resolve_escalation_mode(mode)
+    for name in ("on_failure", "route", *ESCALATION_MODE_PRESETS):
+        if resolved == resolve_escalation_mode(name):
+            return name
+    return {k: "route" for k in ESCALATION_KINDS if resolved[k] == "route"}
+
+
+def describe_escalation_mode(mode: str | Mapping[str, str]) -> str:
+    """A short label of ``mode``.
+
+    Returns:
+        ``on_failure``, ``route``, ``recommended`` or the routed kinds, as in
+        ``route(relative_dates+list_rows)``.
+    """
+    compact = compact_escalation_mode(mode)
+    if isinstance(compact, str):
+        return compact
+    return "route(" + "+".join(compact) + ")"
+
+
+_DEFAULT_KIND_LIMITS: Mapping[str, int] = {
+    "relative_dates": 8,
+    "list_rows": 4,
+    "attribution_tiebreak": 12,
+    "dotted_discovery": 2,
+}
+_REMOVAL_FLOOR = 0.85
+"""The default ``gates.remove_threshold`` and ``match.delete_threshold``: what a
+probability that came from the escalation tier must stay under."""
+
+
+@dataclass(frozen=True)
+class EscalationConfig:
+    """The opt-in escalation tier: a stronger model for what the default fails.
+
+    The default setup (Clairic for extraction, Clef for decisions) answers everything;
+    this tier asks OpenAI's ``gpt-6-luna`` (Responses API) about the few cases in
+    which it demonstrably fails, and **the text of those cases goes to OpenAI**. It is
+    off unless ``enabled`` is true, and a key in the environment never turns it on.
+    Whatever it says is a *proposal*: it goes through the same verification ladder and
+    change gates as an answer of the default setup, a quoted value must occur verbatim
+    in the input, and it can never write, delete or override a confident Clef answer.
+
+    The four kinds (see "Escalation tier" in the design doc):
+
+    * ``relative_dates``: a date or datetime field that is invalid or null while its
+      mention window holds a relative phrase ("yesterday", "last Tuesday"; needs a
+      ``reference_date``) is asked as ``{phrase, iso_date}``;
+    * ``list_rows``: the rows of a nested ``list[Model]`` (a count that disagrees with
+      discovery, a row that came back empty or incomplete, a mentioned row whose
+      update was not proposed) are asked as quoted values;
+    * ``attribution_tiebreak``: an attribution answer still in
+      ``[verify.attribution_drop, verify.attribution_keep)`` after the second look is
+      asked as ``{answer: yes|no}``; yes counts as ``prob_cap``, no as ``1 - prob_cap``;
+    * ``dotted_discovery``: a top-level ``Many`` with a dotted identity that finds no
+      entity although presence says there are some is asked for each entity's
+      descriptive label and identity value.
+
+    ``mode`` decides WHEN each kind is asked. ``"route"`` changes it for three of them
+    (``ROUTED_KINDS``): the date and datetime fields whose mention window holds a
+    relative phrase, every nested ``list[Model]`` (its rows, instead of Clairic's
+    discovery and its values) and the discovery of a top-level ``Many`` with a dotted
+    identity go to the tier first. What it answers is verified, coerced and judged
+    exactly as in ``on_failure``: quotes must occur verbatim in the input, the
+    attribution check (Clef) has to agree, the probability stays under ``prob_cap``,
+    nothing is deleted on its word and a confident Clef "no" is final. An answer that
+    fails verification, or a call that fails, leaves the normal Clairic path as it
+    was. The tie-break is asked after the second look, always (``on_failure``).
+
+    The mode can differ by kind: a mapping such as ``{"relative_dates": "route",
+    "list_rows": "route", "dotted_discovery": "on_failure"}`` (a kind it does not name
+    is ``on_failure``); a plain string means the same mode for every kind that can be
+    routed; ``"recommended"`` is the preset in ``ESCALATION_MODE_PRESETS`` (dates and
+    table rows first, dotted discovery on failure), **chosen from the holdout2
+    results**, so holdout2 is no longer clean for that choice. ``"route"`` for
+    ``attribution_tiebreak`` is refused.
+
+    Attributes:
+        enabled: Whether the tier runs at all.
+        transport: Where its requests go (an ``OpenAIResponsesTransport``); ``None``
+            with ``enabled`` creates one from ``OPENAI_API_KEY`` on first use.
+        kinds: The kinds that may run, a subset of ``ESCALATION_KINDS``.
+        reasoning_effort: ``reasoning.effort`` of every call (``none``, ``low``,
+            ``medium``, ``high``, ``xhigh``, ``max``); ``None`` leaves it to the
+            transport (``none`` by default). Higher effort makes calls slower and
+            dearer (reasoning tokens are output tokens).
+        limits: Most calls per invoke of each kind (a kind not listed has no limit of
+            its own); defaults: 8 dates, 4 row sets, 12 tie-breaks, 2 discoveries.
+        max_calls_per_invoke: Most escalation calls of all kinds in one invoke.
+        mode: ``"on_failure"`` (default: ask only where the default setup failed),
+            ``"route"`` (the classes in ``ROUTED_KINDS`` go to the tier first),
+            ``"recommended"`` (a preset) or a mapping of kind to one of the two modes.
+            It is stored as a frozen mapping of every kind to its mode; ask it with
+            ``mode_for(kind)``.
+        prob_cap: The most probability an escalation answer can stand for. It stays
+            under ``gates.remove_threshold`` and ``match.delete_threshold`` (0.85), so
+            an answer of this tier can authorise an add or a replace but never a
+            removal, a set-null or a delete.
+    """
+
+    enabled: bool = False
+    transport: Any = None
+    kinds: frozenset[str] = frozenset(ESCALATION_KINDS)
+    reasoning_effort: str | None = None
+    limits: Mapping[str, int] = field(
+        default_factory=lambda: dict(_DEFAULT_KIND_LIMITS)
+    )
+    max_calls_per_invoke: int = 20
+    prob_cap: float = 0.8
+    mode: str | Mapping[str, str] = "on_failure"
+
+    def __post_init__(self) -> None:
+        """Validate the settings and freeze the collections."""
+        _check_flag("enabled", self.enabled)
+        object.__setattr__(self, "mode", _KindModes(resolve_escalation_mode(self.mode)))
+        kinds = frozenset(self.kinds)
+        unknown = sorted(kinds - set(ESCALATION_KINDS))
+        if unknown:
+            raise ValueError(
+                f"unknown escalation kind(s) {unknown}; expected a subset of "
+                f"{list(ESCALATION_KINDS)}"
+            )
+        object.__setattr__(self, "kinds", kinds)
+        if self.reasoning_effort is not None and (
+            self.reasoning_effort not in REASONING_EFFORTS
+        ):
+            raise ValueError(
+                f"reasoning_effort must be one of {list(REASONING_EFFORTS)} or None, "
+                f"got {self.reasoning_effort!r}"
+            )
+        bad = sorted(set(self.limits) - set(ESCALATION_KINDS))
+        if bad:
+            raise ValueError(f"limits names unknown escalation kind(s) {bad}")
+        for kind, limit in self.limits.items():
+            _check_int(f"limits[{kind!r}]", limit, 0)
+        object.__setattr__(self, "limits", _FrozenMap(dict(self.limits)))
+        _check_int("max_calls_per_invoke", self.max_calls_per_invoke, 0)
+        cap = self.prob_cap
+        if isinstance(cap, bool) or not isinstance(cap, (int, float)):
+            raise ValueError(f"prob_cap must be a number, got {cap!r}")
+        if not math.isfinite(cap) or not 0.5 < cap < _REMOVAL_FLOOR:
+            raise ValueError(
+                f"prob_cap must be above 0.5 and below {_REMOVAL_FLOOR} (the removal "
+                f"and delete gates), got {cap!r}"
+            )
+
+    def limit_for(self, kind: str) -> int | None:
+        """The most calls of ``kind`` in one invoke, or ``None`` for no limit."""
+        return self.limits.get(kind)
+
+    def runs(self, kind: str) -> bool:
+        """Whether the tier is on and ``kind`` may run."""
+        return self.enabled and kind in self.kinds
+
+    def mode_for(self, kind: str) -> str:
+        """The mode of ``kind``: ``"on_failure"`` or ``"route"``."""
+        modes = self.mode
+        assert isinstance(modes, Mapping)  # normalised in __post_init__
+        return modes[kind]
+
+    def routes(self, kind: str) -> bool:
+        """Whether ``kind`` goes to the tier first (mode ``route``) and may run."""
+        return (
+            self.runs(kind) and self.mode_for(kind) == "route" and kind in ROUTED_KINDS
+        )

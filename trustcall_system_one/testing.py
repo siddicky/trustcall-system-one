@@ -14,10 +14,11 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from datetime import time as dtime
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel
 
+from trustcall_system_one._config import EscalationConfig
 from trustcall_system_one._coref import identity_compatible
 from trustcall_system_one._errors import (
     AuthError,
@@ -49,12 +50,22 @@ from trustcall_system_one.transport import (
     CallMeta,
     Transport,
     TransportResponse,
+    _can_serve,
+    classify_failure,
+    escalation_of,
     max_questions,
+    prefers_keep_uncertain,
+    state_token_budget,
 )
+
+_TYPESAFE = "typesafe"
+"""``TypeSafeTransport.provider``: the label a cassette of Jev's answers carries."""
 
 __all__ = [
     "CassetteMissError",
     "CassetteTransport",
+    "EscalationHandler",
+    "FakeEscalation",
     "FakeTransport",
     "FakeWorld",
     "RecordingTransport",
@@ -79,6 +90,9 @@ Handler = Callable[
 
 
 _FULL_IDS = (CLAIRIC, CLEF, CLEF_FLASH)
+
+EscalationHandler = Callable[[dict[str, Any], CallMeta], "dict[str, Any] | None"]
+"""``handler(payload, meta)`` of a ``FakeEscalation``: the JSON the model writes."""
 
 
 def route(*, default: Handler | None = None, **by_kind: Handler) -> Handler:
@@ -276,6 +290,102 @@ class FakeTransport:
             retries=0,
             duration_ms=(time.perf_counter() - started) * 1000,
             status_code=200,
+        )
+
+
+class FakeEscalation:
+    """A scripted stand-in for the escalation model (``OpenAIResponsesTransport``).
+
+    It answers the escalation tier's calls from ``handler(payload, meta)``, which
+    returns the JSON object the model would write (``None``: the model gave no
+    answer). Like the real transport it takes a payload with ``input`` and ``schema``
+    and checks that an answer has exactly the keys of the schema (strict mode). The
+    default handler never answers, so an escalation configured with it changes
+    nothing.
+
+    Attributes:
+        calls: Every ``(model, payload, meta)`` seen, in order.
+        model: The model it stands for (``gpt-6-luna``).
+        provider: ``openai``.
+    """
+
+    provider = "openai"
+    max_questions = 8
+    state_token_budget = 100_000
+
+    def __init__(
+        self,
+        handler: EscalationHandler | None = None,
+        *,
+        model: str = "gpt-6-luna",
+        reasoning_tokens: int | Mapping[str, int] = 0,
+    ) -> None:
+        """Create the stand-in.
+
+        Args:
+            handler: ``handler(payload, meta)``: the JSON the model writes, or
+                ``None`` for no answer (the default: it never answers).
+            model: The model it stands for.
+            reasoning_tokens: The reasoning tokens each call reports (part of its
+                output tokens): a number, or a mapping from the call's
+                ``reasoning_effort`` to one (0 for an effort not listed).
+        """
+        self._handler = handler
+        self.model = model
+        self._reasoning = reasoning_tokens
+        self.calls: list[tuple[str, dict[str, Any], CallMeta]] = []
+
+    def serves(self, model: str, payload: Mapping[str, Any] | None = None) -> bool:
+        """Whether this stands in for ``model``: not Clairic and not Clef."""
+        return model not in ("clairic", "clef", "clef-flash", *_FULL_IDS)
+
+    async def run(
+        self,
+        model: str,
+        payload: Mapping[str, Any],
+        *,
+        meta: CallMeta,
+        timeout: float | None = None,
+    ) -> TransportResponse:
+        """Answer one escalation call (see the class docstring)."""
+        body = json.loads(json.dumps(payload, allow_nan=False))
+        self.calls.append((model, body, meta))
+        if meta.kind != "escalate":
+            raise AssertionError(f"FakeEscalation got a {meta.kind!r} call")
+        schema = body.get("schema")
+        if not isinstance(schema, dict) or not isinstance(body.get("input"), str):
+            raise AssertionError("an escalation payload needs 'input' and 'schema'")
+        answer = self._handler(body, meta) if self._handler is not None else None
+        if answer is not None and set(answer) != set(schema.get("properties", {})):
+            raise AssertionError(
+                f"the answer's keys {sorted(answer)} are not the schema's "
+                f"{sorted(schema.get('properties', {}))} (strict mode)"
+            )
+        reasoning = (
+            self._reasoning
+            if isinstance(self._reasoning, int)
+            else self._reasoning.get(str(body.get("reasoning_effort") or "none"), 0)
+        )
+        reply = {
+            "model": model,
+            "status": "completed",
+            "parsed": answer,
+            "text": None if answer is None else json.dumps(answer),
+            "refusal": None,
+            "no_answer": None if answer is not None else "scripted: no answer",
+            "logprobs": None,
+            "usage": {
+                "input_tokens": 10 + len(body["input"]) // 4,
+                "output_tokens": 5 + reasoning,
+                "reasoning_tokens": reasoning,
+            },
+        }
+        return TransportResponse(
+            body=reply,
+            status_code=200,
+            duration_ms=1.0,
+            provider="openai",
+            served_model=model,
         )
 
 
@@ -2116,6 +2226,8 @@ _SECRET_ENV = (
     "CLOUDFLARE_API_TOKEN",
     "CLOUDFLARE_AUTH_TOKEN",
     "EXPERIENTIAL_API_KEY",
+    "TYPESAFE_API_KEY",
+    "OPENAI_API_KEY",
 )
 _REDACTED = "<redacted>"
 _MIN_SECRET = 16
@@ -2163,6 +2275,8 @@ _GATEWAY_PATH = re.compile(
     r"(?<=gateway\.ai\.cloudflare\.com/v1/)[^/\s\"'?#]+", re.IGNORECASE
 )
 _EXPERIENTIAL_KEY = re.compile(r"\bxpl_[A-Za-z0-9_-]{16,}")
+_TYPESAFE_KEY = re.compile(r"\bapikey_[A-Za-z0-9_-]{16,}")
+_OPENAI_KEY = re.compile(r"\bsk-[A-Za-z0-9_-]{16,}")
 _ACCOUNT_ID = re.compile(r"(?<=accounts/)[0-9a-fA-F]{32}(?![0-9A-Za-z])")
 _BEARER_HEADER = re.compile(
     r"(?i)(authorization[\"']?\s*[:=]\s*[\"']?)bearer\s+[^\s\"',}]+"
@@ -2177,10 +2291,12 @@ def scrub(text: str, extra: Iterable[str] = ()) -> str:
 
     For error messages, reports and other text that is not replayed as data: the
     exact values of the Cloudflare environment variables, of
-    ``EXPERIENTIAL_API_KEY`` and of ``extra`` (for example
+    ``EXPERIENTIAL_API_KEY``, ``TYPESAFE_API_KEY``, ``OPENAI_API_KEY`` and of
+    ``extra`` (for example
     ``CloudflareTransport.sensitive_values()`` or
-    ``ExperientialTransport.sensitive_values()``), any ``xpl_`` Experiential
-    Labs key, the account id in a
+    ``ExperientialTransport.sensitive_values()`` or ``TypeSafeTransport``), any
+    ``xpl_`` Experiential Labs key, any ``apikey_`` TypeSafe key, any ``sk-`` OpenAI key
+    (``sk-proj-...`` too), the account id in a
     Cloudflare API URL (``api.cloudflare.com/client/v4/accounts/<id>``), an AI
     Gateway URL (``gateway.ai.cloudflare.com/v1/<id>/``) or an ``accounts/<32 hex
     characters>`` path, and the bearer token of an ``Authorization`` header (or a
@@ -2206,6 +2322,8 @@ def scrub(text: str, extra: Iterable[str] = ()) -> str:
     text = _GATEWAY_PATH.sub(_REDACTED, text)
     text = _ACCOUNT_ID.sub(_REDACTED, text)
     text = _EXPERIENTIAL_KEY.sub(_REDACTED, text)
+    text = _TYPESAFE_KEY.sub(_REDACTED, text)
+    text = _OPENAI_KEY.sub(_REDACTED, text)
     text = _BEARER_HEADER.sub(rf"\1Bearer {_REDACTED}", text)
     return _BEARER_TOKEN.sub(f"Bearer {_REDACTED}", text)
 
@@ -2265,7 +2383,18 @@ class RecordingTransport:
             "response",
             "status",
             "duration_ms",
+            "provider",
+            "served_model",
+            "keep_uncertain",
         }
+
+    ``provider`` and ``served_model`` say who answered (``typesafe`` and the Jev
+    version, say) when the transport knows, so a replay accounts the call under the
+    model that answered and a report says what a cassette was recorded on; a
+    cassette without them replays as it always did. ``keep_uncertain`` is what the
+    wrapped transport says of the call (``prefers_keep_uncertain(model, kind)``): a
+    replay settles ``RepairConfig.keep_uncertain`` from it, so a cassette of Jev's
+    answers replays with the setting on and one of Cloudflare's with it off.
 
     ``key`` is ``request_key(model, request)``. ``request`` is the payload that was
     sent and ``response`` the bare response body. A Clef line also carries
@@ -2279,8 +2408,8 @@ class RecordingTransport:
     Only payloads and bodies are written: never headers, tokens or account ids
     (the wrapped transport owns those). As a second line of defence a call whose
     request or response holds the exact value of ``CLOUDFLARE_ACCOUNT_ID``,
-    ``CLOUDFLARE_API_TOKEN``, ``CLOUDFLARE_AUTH_TOKEN``, ``EXPERIENTIAL_API_KEY``
-    or of the credentials of the wrapped ``CloudflareTransport``,
+    ``CLOUDFLARE_API_TOKEN``, ``CLOUDFLARE_AUTH_TOKEN``, ``EXPERIENTIAL_API_KEY``,
+    ``TYPESAFE_API_KEY`` or of the credentials of the wrapped ``CloudflareTransport``,
     ``ExperientialTransport`` or ``RoutingTransport`` (``sensitive_values()``; 16
     characters or more) is NOT written, with a ``RuntimeWarning``: a cassette
     replays exactly what was asked and answered, so it is never edited. The message
@@ -2319,6 +2448,11 @@ class RecordingTransport:
             with open(self.path, "w", encoding="utf-8"):
                 pass
 
+    @property
+    def escalation(self) -> EscalationConfig | None:
+        """The escalation tier the wrapped transport carries (``None``: none)."""
+        return escalation_of(self._inner)
+
     def max_questions(self, model: str) -> int:
         """Questions one Clef request may carry: the wrapped transport's limit.
 
@@ -2326,6 +2460,30 @@ class RecordingTransport:
         64 that a transport without a limit gets.
         """
         return max_questions(self._inner, model)
+
+    def state_token_budget(self, model: str) -> int | None:
+        """The state budget of the wrapped transport (``None``: it says none)."""
+        return state_token_budget(self._inner, model)
+
+    def prefers_keep_uncertain(self, model: str, kind: str | None = None) -> bool:
+        """The wrapped transport's preference (the ``keep_uncertain`` default)."""
+        return prefers_keep_uncertain(self._inner, model, kind)
+
+    def serves(self, model: str, payload: Mapping[str, Any] | None = None) -> bool:
+        """Whether the wrapped transport can serve the request (a router asks)."""
+        return _can_serve(self._inner, model, payload)
+
+    def classify_failure(self, exc: Exception) -> str | None:
+        """The wrapped transport's category of a failure."""
+        classify = getattr(self._inner, "classify_failure", None)
+        if callable(classify):
+            return cast("str | None", classify(exc))
+        return classify_failure(exc)
+
+    def sensitive_values(self) -> tuple[str, ...]:
+        """The credentials passed explicitly to the wrapped transport."""
+        sensitive = getattr(self._inner, "sensitive_values", None)
+        return tuple(sensitive()) if callable(sensitive) else ()
 
     def _write(self, line: Mapping[str, Any]) -> None:
         sensitive = getattr(self._inner, "sensitive_values", None)
@@ -2386,8 +2544,14 @@ class RecordingTransport:
             "field": meta.field,
             "request": request,
         }
+        # what the wrapped transport says of this call: a replay settles
+        # ``RepairConfig.keep_uncertain`` from it (``CassetteTransport``)
+        head["keep_uncertain"] = prefers_keep_uncertain(self._inner, model, meta.kind)
         if "questions" in request:  # a Clef request: the limit it was chunked by
             head["max_questions"] = self.max_questions(model)
+            budget = self.state_token_budget(model)
+            if budget is not None:  # and the size its state was narrowed to
+                head["state_token_budget"] = budget
         started = time.perf_counter()
         try:
             result = await self._inner.run(model, payload, meta=meta, timeout=timeout)
@@ -2403,15 +2567,19 @@ class RecordingTransport:
                     }
                 )
             raise
-        self._write(
-            {
-                **head,
-                "response": result.body,
-                "status": result.status_code,
-                "duration_ms": result.duration_ms
-                or (time.perf_counter() - started) * 1000,
-            }
-        )
+        line = {
+            **head,
+            "response": result.body,
+            "status": result.status_code,
+            "duration_ms": result.duration_ms or (time.perf_counter() - started) * 1000,
+        }
+        if result.provider:
+            line["provider"] = result.provider
+        if result.served_model:
+            line["served_model"] = result.served_model
+        if result.warnings:  # what the transport changed in the request
+            line["warnings"] = list(result.warnings)
+        self._write(line)
         return result
 
 
@@ -2426,6 +2594,10 @@ _ERRORS: dict[str, type[Exception]] = {
         TransportError,
     )
 }
+
+
+def _no_usage() -> dict[str, float]:
+    return {"requests": 0, "input_tokens": 0, "output_tokens": 0, "cost": 0.0}
 
 
 class CassetteTransport:
@@ -2449,6 +2621,9 @@ class CassetteTransport:
         misses: ``(model, payload, meta)`` of each call that was not found
             (whether it then fell through or raised).
         forwarded: Calls the inner transport answered.
+        replayed: What the calls answered from the cassette used (``requests``,
+            ``input_tokens``, ``output_tokens`` and the ``cost`` they reported): a
+            replay spends none of it, which a cost estimate must not count.
     """
 
     def __init__(
@@ -2457,6 +2632,7 @@ class CassetteTransport:
         *,
         strict: bool = True,
         inner: Transport | None = None,
+        provider: str | None = None,
     ) -> None:
         """Load a cassette.
 
@@ -2465,6 +2641,11 @@ class CassetteTransport:
             strict: Raise on a miss. When false, a miss goes to ``inner``.
             inner: Where a miss goes when ``strict`` is false. Without one, a
                 miss raises even when not strict.
+            provider: Replay only what this provider recorded (the ``provider`` of
+                the recording): a request is a miss when only another provider (or
+                a provider-less, older recording) answered it. For a cassette that
+                stands in for ONE provider of a routed stack, so that a spec that
+                routes a call elsewhere never gets another provider's answer.
 
         Raises:
             FileNotFoundError: If a path does not exist.
@@ -2472,12 +2653,15 @@ class CassetteTransport:
         """
         self.strict = strict
         self._inner = inner
+        self._provider = provider
         self._entries: dict[str, list[dict[str, Any]]] = {}
         self._cursor: dict[str, int] = {}
         self._lock = threading.Lock()
         self._recorded_limit: int | None = None
+        self._recorded_budgets: dict[str, int] = {}
         self.hits = 0
         self.forwarded = 0
+        self.replayed: dict[str, float] = _no_usage()
         self.misses: list[tuple[str, dict[str, Any], CallMeta]] = []
         paths = [path] if isinstance(path, (str, os.PathLike)) else list(path)
         for entry in paths:
@@ -2506,6 +2690,19 @@ class CassetteTransport:
                         self._recorded_limit is None or limit < self._recorded_limit
                     )
                     self._recorded_limit = limit if smaller else self._recorded_limit
+                budget = entry.get("state_token_budget")
+                if (
+                    isinstance(budget, int)
+                    and not isinstance(budget, bool)
+                    and budget > 0
+                ):
+                    try:
+                        name = body_model(entry["model"])
+                    except ValueError:
+                        continue
+                    known = self._recorded_budgets.get(name)
+                    if known is None or budget < known:  # the smallest of each model
+                        self._recorded_budgets[name] = budget
 
     def max_questions(self, model: str) -> int:
         """Questions one Clef request may carry when it is replayed.
@@ -2522,8 +2719,129 @@ class CassetteTransport:
             limits.append(max_questions(self._inner, model))
         return min(limits) if limits else DEFAULT_MAX_QUESTIONS
 
+    def state_token_budget(self, model: str) -> int | None:
+        """The state budget the requests of ``model`` were recorded with (smallest).
+
+        Per model: a cassette recorded through a routing transport holds ``clef`` and
+        ``clef-flash`` requests narrowed to different budgets, and each must be
+        replayed with its own for the request keys to match. When a miss can go to an
+        ``inner`` transport, no larger than that one takes for the model. ``None`` if
+        neither says one.
+        """
+        found: list[int] = []
+        try:
+            recorded = self._recorded_budgets.get(body_model(model))
+        except ValueError:
+            recorded = None
+        if recorded is not None:
+            found.append(recorded)
+        if self._inner is not None:
+            inner = state_token_budget(self._inner, model)
+            if inner is not None:
+                found.append(inner)
+        return min(found) if found else None
+
+    @property
+    def escalation(self) -> EscalationConfig | None:
+        """The escalation tier the ``inner`` transport carries (``None``: none)."""
+        return escalation_of(self._inner)
+
+    def prefers_keep_uncertain(self, model: str, kind: str | None = None) -> bool:
+        """What the recording said of a call of ``kind`` to ``model``, replayed.
+
+        ``RecordingTransport`` writes the decision itself (``keep_uncertain``) on
+        every call, so a replay settles ``RepairConfig.keep_uncertain`` as the live
+        run did: every recorded call of that model family and kind (of the provider
+        this cassette stands for, if it has one) must have said yes. A call kind
+        that was not recorded, or a recording that predates the field, falls back to
+        the provider this cassette stands for, then to the ``inner`` transport that
+        serves a miss; a cassette that knows none of them says no.
+        """
+        try:
+            family = "clairic" if body_model(model) == "clairic" else "clef"
+        except ValueError:
+            family = None
+        said: list[bool] = []
+        for entries in self._entries.values():
+            for entry in entries:
+                value = entry.get("keep_uncertain")
+                if not isinstance(value, bool):
+                    continue
+                if (
+                    self._provider is not None
+                    and entry.get("provider") != self._provider
+                ):
+                    continue
+                if kind is not None and entry.get("kind") != kind:
+                    continue
+                try:
+                    of = (
+                        "clairic" if body_model(entry["model"]) == "clairic" else "clef"
+                    )
+                except ValueError:
+                    continue
+                if family is None or of == family:
+                    said.append(value)
+        if said:
+            return all(said)
+        if self._provider is not None:
+            return self._provider == _TYPESAFE
+        if self._inner is not None:
+            return prefers_keep_uncertain(self._inner, model, kind)
+        return False
+
+    @property
+    def provider(self) -> str | None:
+        """The provider this cassette stands for (``None``: it replays any)."""
+        return self._provider
+
+    def serves(self, model: str, payload: Mapping[str, Any] | None = None) -> bool:
+        """Whether a request can be served: what the ``inner`` transport says.
+
+        A cassette with no ``inner`` answers whatever it recorded and says nothing
+        (so, true); a router above it that must know what the provider behind a
+        recording can serve wraps it in an adapter that does (the evals do).
+        """
+        return _can_serve(self._inner, model, payload) if self._inner else True
+
+    def classify_failure(self, exc: Exception) -> str | None:
+        """The ``inner`` transport's category of a failure (else by type)."""
+        classify = getattr(self._inner, "classify_failure", None)
+        if callable(classify):
+            return cast("str | None", classify(exc))
+        return classify_failure(exc)
+
+    def sensitive_values(self) -> tuple[str, ...]:
+        """The credentials passed explicitly to the ``inner`` transport."""
+        sensitive = getattr(self._inner, "sensitive_values", None)
+        return tuple(sensitive()) if callable(sensitive) else ()
+
+    def providers(self) -> dict[str, tuple[str, ...]]:
+        """Who answered the recorded calls: ``{"clairic": (...), "clef": (...)}``.
+
+        The ``provider`` of each recording by the model it was for; a recording
+        made before the field existed has none and is not listed.
+        """
+        found: dict[str, dict[str, None]] = {"clairic": {}, "clef": {}}
+        for entries in self._entries.values():
+            for entry in entries:
+                provider = entry.get("provider")
+                try:
+                    family = (
+                        "clairic" if body_model(entry["model"]) == "clairic" else "clef"
+                    )
+                except ValueError:
+                    continue
+                if isinstance(provider, str) and provider:
+                    found[family][provider] = None
+        return {k: tuple(sorted(v)) for k, v in found.items()}
+
     def fork(
-        self, *, strict: bool | None = None, inner: Transport | None = None
+        self,
+        *,
+        strict: bool | None = None,
+        inner: Transport | None = None,
+        provider: str | None = None,
     ) -> "CassetteTransport":
         """A new cassette over the same recordings, replaying from the start.
 
@@ -2533,15 +2851,20 @@ class CassetteTransport:
         Args:
             strict: Raise on a miss; defaults to this cassette's setting.
             inner: Where a miss goes when not strict; defaults to this cassette's.
+            provider: Replay only what this provider recorded (see the constructor);
+                defaults to this cassette's.
         """
         other = CassetteTransport.__new__(CassetteTransport)
         other.strict = self.strict if strict is None else strict
         other._inner = self._inner if inner is None else inner
+        other._provider = self._provider if provider is None else provider
         other._entries = self._entries
         other._recorded_limit = self._recorded_limit
+        other._recorded_budgets = dict(self._recorded_budgets)
         other._cursor = {}
         other._lock = threading.Lock()
         other.hits = other.forwarded = 0
+        other.replayed = _no_usage()
         other.misses = []
         return other
 
@@ -2554,6 +2877,7 @@ class CassetteTransport:
         with self._lock:
             self._cursor.clear()
             self.hits = self.forwarded = 0
+            self.replayed = _no_usage()
             self.misses.clear()
 
     def unused(self) -> list[dict[str, Any]]:
@@ -2597,7 +2921,12 @@ class CassetteTransport:
         body = json.loads(json.dumps(payload, allow_nan=False))
         key = request_key(model, body)
         with self._lock:
-            entries = self._entries.get(key, [])
+            everything = self._entries.get(key, [])
+            entries = (
+                everything
+                if self._provider is None
+                else [e for e in everything if e.get("provider") == self._provider]
+            )
             index = self._cursor.get(key, 0)
             # with a live fallback a recorded failure is a transient accident, not
             # an answer: it is skipped and the request goes to the inner transport
@@ -2616,7 +2945,9 @@ class CassetteTransport:
             if not self.strict and self._inner is not None:
                 self.forwarded += 1
                 return await self._inner.run(model, payload, meta=meta, timeout=timeout)
-            raise self._miss(model, key, meta, len(entries))
+            raise self._miss(
+                model, key, meta, len(entries), other=len(everything) - len(entries)
+            )
         error = entry.get("error")
         if error:
             cls = _ERRORS.get(error.get("type", ""), TransportError)
@@ -2624,21 +2955,44 @@ class CassetteTransport:
             if isinstance(failure, TransportError):
                 failure.status_code = entry.get("status")
             raise failure
+        self._count_replayed(entry["response"])
         return TransportResponse(
             body=copy.deepcopy(entry["response"]),
             retries=0,
             duration_ms=float(entry.get("duration_ms") or 0.0),
             status_code=entry.get("status"),
+            provider=entry.get("provider"),
+            served_model=entry.get("served_model"),
+            warnings=tuple(str(w) for w in entry.get("warnings") or ()),
         )
 
+    def _count_replayed(self, body: Any) -> None:
+        usage = body.get("usage") if isinstance(body, dict) else None
+        if not isinstance(usage, dict):
+            return
+        with self._lock:
+            self.replayed["requests"] += 1
+            for key in ("input_tokens", "output_tokens"):
+                value = usage.get(key)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    self.replayed[key] += value
+            cost = usage.get("cost")
+            if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+                self.replayed["cost"] += float(cost)
+
     @staticmethod
-    def _miss(model: str, key: str, meta: CallMeta, recorded: int) -> CassetteMissError:
+    def _miss(
+        model: str, key: str, meta: CallMeta, recorded: int, other: int = 0
+    ) -> CassetteMissError:
         what = f"a {meta.kind!r} call" + (
             f" about field {meta.field!r}" if meta.field else ""
         )
         why = (
             f"all {recorded} recording(s) of it were already replayed"
             if recorded
+            else f"{other} recording(s) of it were made by another provider, not "
+            "the one this call is routed to"
+            if other
             else "no call with this request was recorded"
         )
         return CassetteMissError(

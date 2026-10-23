@@ -35,12 +35,15 @@ from pydantic import BaseModel, ValidationError
 from pydantic_core import PydanticUndefined
 
 from trustcall_system_one._compile import (
+    IDENTITY_SEP,
     CollectionPlan,
     FieldGroup,
     FieldSpec,
     SchemaPlan,
     UnionGroup,
     UnionMember,
+    identity_doc_keys,
+    identity_spec,
 )
 from trustcall_system_one._diff import (
     MISSING,
@@ -65,6 +68,7 @@ from trustcall_system_one._diff import (
     sort_changes,
 )
 from trustcall_system_one._errors import ExtractionValidationError
+from trustcall_system_one._escalate import escalate_states
 from trustcall_system_one._existing import ExistingRecord, normalise_record
 from trustcall_system_one._gates import (
     dedup_elements,
@@ -78,6 +82,7 @@ from trustcall_system_one._match import (
     candidate_options,
     identity_compatible,
     identity_keys,
+    record_value,
 )
 from trustcall_system_one._names import Path
 from trustcall_system_one._nested import (
@@ -210,8 +215,12 @@ async def _presence(ctx: Ctx) -> float:
         ctx.run.clef_state(ctx.text),
         meta=ctx.meta("presence"),
     )
-    answer = answers["presence"]
-    assert isinstance(answer, NoulAnswer)
+    answer = answers.get("presence")
+    if not isinstance(answer, NoulAnswer):
+        # the request was refused (see ``Run.call_clef``): neither present nor absent,
+        # so the entity is extracted and judged by what comes back
+        presence = ctx.run.presence
+        return (presence.threshold_absent + presence.threshold_present) / 2
     return answer.noul
 
 
@@ -1138,9 +1147,19 @@ def _name_like(spec: FieldSpec) -> bool:
     return spec.identity and bool(_NAME_WORDS.search(spec.description))
 
 
+_ABBREVIATION = re.compile(r"(?<![A-Za-z])(?:[A-Z]|Mr|Mrs|Ms|Mx|Dr|Prof|Sr|Jr|St)\.$")
+"""An initial ("J.") or a title ("Dr."): its period does not end a sentence."""
+
+
 def _sentence_initial(source: str, at: int) -> bool:
-    """Whether the text at ``at`` starts the input or a sentence."""
+    """Whether the text at ``at`` starts the input or a sentence.
+
+    The period of an initial or a title ("J. Okafor", "Dr. Wu") does not end a
+    sentence, so the word after it does not start one.
+    """
     before = source[:at].rstrip(" \t\"'(\N{LEFT DOUBLE QUOTATION MARK}")
+    if before.endswith(".") and _ABBREVIATION.search(before):
+        return False
     return not before or before[-1] in _SENTENCE_END
 
 
@@ -1219,7 +1238,7 @@ def _identity_target(ctx: Ctx, spec: FieldSpec) -> bool:
         ctx.info is not None
         and ctx.existing is None
         and bool(ctx.info.mentions)
-        and spec.path in {(name,) for name in ctx.plan.identity}
+        and IDENTITY_SEP.join(str(p) for p in spec.path) in ctx.plan.identity
         and spec.clairic is not None
         and spec.clairic.type == "text"
         and _name_like(spec)
@@ -1265,6 +1284,50 @@ def _identity_bleed(
     return refused, [reject]
 
 
+def _own_span(source: str, value: str, near: Span | None) -> Span | None:
+    """Where ``value`` is written in ``source``: exactly its own words, or ``None``.
+
+    The name of an entity is the entity's label, which can be shorter than the
+    mention that was found for it (a mention of ``Her name is Olivia Davis`` for the
+    entity labelled ``Olivia Davis``): its span must be the words of the value, not
+    the words around them. The occurrence inside ``near`` (the mention's span) wins,
+    else the one closest to it, else the first.
+
+    Args:
+        source: The input.
+        value: The value (words, whitespace and case aside).
+        near: Where the mention that supplied the value lies, if known.
+
+    Returns:
+        The span of the value's words, or ``None`` when the input does not hold them.
+    """
+    words = value.split()
+    if not words:
+        return None
+    wanted = " ".join(words).casefold()
+    if (
+        near is not None
+        and 0 <= near[0] < near[1] <= len(source)
+        and " ".join(source[near[0] : near[1]].split()).casefold() == wanted
+    ):
+        return near
+    lead = r"(?<!\w)" if words[0][0].isalnum() else ""
+    tail = r"(?!\w)" if words[-1][-1].isalnum() else ""
+    body = r"\s+".join(re.escape(word) for word in words)
+    found = [
+        (m.start(), m.end())
+        for m in re.finditer(f"{lead}{body}{tail}", source, re.IGNORECASE)
+    ]
+    if not found:
+        return None
+    if near is None:
+        return found[0]
+    inside = [f for f in found if near[0] <= f[0] and f[1] <= near[1]]
+    if inside:
+        return inside[0]
+    return min(found, key=lambda f: min(abs(f[0] - near[1]), abs(f[1] - near[0])))
+
+
 def _from_mention(ctx: Ctx, spec: FieldSpec, answer: FieldAnswer) -> FieldAnswer:
     """The mention's own words for the name of a new entity, if extraction gave none.
 
@@ -1307,6 +1370,7 @@ def _from_mention(ctx: Ctx, spec: FieldSpec, answer: FieldAnswer) -> FieldAnswer
     if chosen is None:
         return answer
     value, span = chosen
+    span = _own_span(ctx.text, value, span)
     was = answer.rejected_reason or "no value"
     ctx.warn(f"{ctx.plan.name}.{spec.pretty}: identity_from_mention: {was}")
     return dataclasses.replace(
@@ -1838,7 +1902,7 @@ async def _finish_insert(
         ExtractionValidationError: In strict mode, if the record stays invalid.
     """
     run, plan = ctx.run, ctx.plan
-    state = RepairState()
+    state = RepairState(settle=run.keeps_uncertain)
     built = _build(ctx, root)
     chosen = _chosen_of(root, ())
     leaves = {
@@ -1853,8 +1917,14 @@ async def _finish_insert(
             if leaf is None:
                 return None
             kind = leaf.state.type_answer if leaf.state is not None else None
+            first = leaf.state.resolved.value if leaf.state is not None else None
             return Target(
-                hit, leaf.spec, leaf.final(), kind, sentences=_by_sentences(leaf)
+                hit,
+                leaf.spec,
+                leaf.final(),
+                type_answer=kind,
+                sentences=_by_sentences(leaf),
+                first=first,
             )
 
         async def apply(outcomes: list[Outcome]) -> None:
@@ -2037,6 +2107,7 @@ async def insert_one(
     focus: Focus | None = None,
     focus_plain: Focus | None = None,
     placement: Placement | None = None,
+    held: dict[str, Any] | None = None,
 ) -> InsertOutcome:
     """Extract one entity of a schema from ``text``.
 
@@ -2062,6 +2133,10 @@ async def insert_one(
         focus_plain: The same without offsets, for requests that carry only
             windows of the input.
         placement: For an item of a nested list, whom it belongs to.
+        held: The record of the item the list already holds that this new entity
+            resembles, if any. The entity is then not "fresh": nothing says that the
+            held item is another thing, so an amount to ADD ("two more") is a
+            relative edit of its amount and is refused (``_verify.run_ladder``).
 
     Returns:
         The outcome: no record when the gate finds no entity, else an insert
@@ -2074,7 +2149,9 @@ async def insert_one(
     """
     placed = placement or Placement()
     if entity is None:
-        ctx = Ctx(run=run, plan=plan, text=text, label=label)
+        ctx = Ctx(
+            run=run, plan=plan, text=text, label=label, fresh=held is None, held=held
+        )
     else:
         ctx = Ctx(
             run=run,
@@ -2086,6 +2163,8 @@ async def insert_one(
             info=entity,
             focus=focus,
             focus_plain=focus_plain,
+            fresh=held is None,
+            held=held,
         )
         skip_presence = True
     ctx = dataclasses.replace(
@@ -2109,6 +2188,7 @@ async def insert_one(
         return InsertOutcome(None, extracted=False)
 
     root = await _run_unit(ctx, plan.root)
+    await escalate_states(ctx, list(_leaf_states(root)))
     await run_ladder(ctx, list(_leaf_states(root)))
     _settle(root)
     nested = await _insert_nested(ctx, root)
@@ -2178,8 +2258,20 @@ def _json_default(model: type[BaseModel], spec: FieldSpec) -> Any:
         return MISSING
 
 
-def _group_node(result: _GroupResult, key: str) -> GroupNode:
-    """The tree the diff walks, from the groups as they were asked and answered."""
+def _identity_names(ctx: Ctx) -> frozenset[str]:
+    """The identity fields of an update (dotted when nested), whoever named them."""
+    return frozenset((*ctx.plan.identity, *ctx.identity))
+
+
+def _group_node(
+    result: _GroupResult, key: str, identity: frozenset[str] = frozenset()
+) -> GroupNode:
+    """The tree the diff walks, from the groups as they were asked and answered.
+
+    ``identity`` are the names of the identity fields (a dotted path for a nested
+    one) beyond the ones a spec or a group marks: the diff never replaces such a
+    field by a token subset of its value.
+    """
     group = result.group
     node = GroupNode(key, group, present=result.present)
     if not result.present:
@@ -2196,18 +2288,20 @@ def _group_node(result: _GroupResult, key: str) -> GroupNode:
                 spec=spec,
                 value=leaf.final(),
                 handled=handled,
-                identity=spec.identity or str(spec.path[-1]) in group.identity,
+                identity=spec.identity
+                or str(spec.path[-1]) in group.identity
+                or IDENTITY_SEP.join(str(p) for p in spec.path) in identity,
                 spans=tuple(state.spans) if state is not None else (),
                 default=_json_default(group.model, spec),
                 ref=leaf,
             )
         )
     for child in result.children:
-        node.children.append(_group_node(child, _key(child.group)))
+        node.children.append(_group_node(child, _key(child.group), identity))
     for union in result.unions:
         union_key = _key(union.union)
         member = (
-            _group_node(union.members[union.chosen.label], union_key)
+            _group_node(union.members[union.chosen.label], union_key, identity)
             if union.chosen is not None
             else None
         )
@@ -2593,7 +2687,7 @@ async def _evaluate(
     the removal question, so they stand as they are.
     """
     run, plan = ctx.run, ctx.plan
-    nodes = _group_node(root, "")
+    nodes = _group_node(root, "", _identity_names(ctx))
     diff = diff_group(nodes, before, allow_null_removals=run.gates.allow_null_removals)
     changes = [*diff.changes, *nested.changes]
     for settled in nested.fixed:
@@ -2749,7 +2843,10 @@ async def _repair_update(
             return
         # a Clef answer always resolves: ask whether the input states it
         await _check_stated(
-            ctx, _group_node(root, ""), before, only={id(leaf) for leaf in clef}
+            ctx,
+            _group_node(root, "", _identity_names(ctx)),
+            before,
+            only={id(leaf) for leaf in clef},
         )
         for leaf in clef:
             resolved = leaf.resolved
@@ -3126,11 +3223,12 @@ def _identity_conflict(
     """
     seen: list[tuple[str, str, str]] = []
     for name in names:
-        spec = next((s for s in plan.specs if s.path == (name,)), None)
+        spec = identity_spec(plan, name)
         state = by_wire.get(spec.wire_name) if spec is not None else None
         if spec is None or state is None or not state.has_value():
             continue
-        new, old = state.resolved.value, before.get(spec.alias or name)
+        new = state.resolved.value
+        old = record_value(before, IDENTITY_SEP.join(identity_doc_keys(plan, name)))
         if not isinstance(new, str) or not isinstance(old, str):
             continue
         if not new.strip() or not old.strip():
@@ -3185,9 +3283,10 @@ def _record_identity(plan: SchemaPlan, data: Mapping[str, Any], record_id: str) 
     """
     keys = identity_keys(plan, plan.identity)
     values = [
-        str(data[key]).strip()
+        str(value).strip()
         for key in keys
-        if isinstance(data.get(key), (str, int)) and str(data.get(key)).strip()
+        if isinstance(value := record_value(data, key), (str, int))
+        and str(value).strip()
     ]
     if values:
         return _clip_label(", ".join(values))
@@ -3312,6 +3411,7 @@ async def update_one(
     placed = placement or Placement()
     ctx = dataclasses.replace(
         ctx,
+        identity=tuple(identity),
         parent=placed.parent,
         lineage=placed.lineage,
         nest=placed.nest
@@ -3345,8 +3445,9 @@ async def update_one(
 
     root = await _run_unit(ctx, plan.root)
     plain = ctx.input_only()
-    nodes = _group_node(root, "")
+    nodes = _group_node(root, "", _identity_names(ctx))
     states = list(_leaf_states(root))
+    await escalate_states(ctx, states)
     by_wire = {st.spec.wire_name: st for st in states}
     unchanged: set[str] = set()
     new_at: dict[str, list[int]] = {}
@@ -3431,7 +3532,7 @@ async def update_one(
         refused_answers.append(f"{leaf.spec.pretty} ({asked.reject})")
     if propose_only:
         found = diff_group(
-            _group_node(root, ""),
+            _group_node(root, "", _identity_names(ctx)),
             before,
             allow_null_removals=run.gates.allow_null_removals,
         )

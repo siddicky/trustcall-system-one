@@ -587,8 +587,38 @@ def parse_clairic(body: Mapping[str, Any]) -> ClairicResponse:
         return ClairicResponse.model_validate(body)
     except ValidationError as exc:
         raise ModelResponseError(
-            f"Clairic response does not match the schema: {exc}", raw=body
+            f"Clairic response does not match the schema: {validation_summary(exc)}",
+            raw=body,
         ) from exc
+
+
+def safe_loc_parts(loc: Any) -> list[str]:
+    """The parts of a pydantic error location, cut where user data could start.
+
+    After ``criteria`` and ``probabilities`` the next keys are option ids, which can
+    be the user's text.
+    """
+    parts: list[str] = []
+    for part in loc if isinstance(loc, (list, tuple)) else (loc,):
+        parts.append(str(part))
+        if part in ("criteria", "probabilities"):
+            break
+    return parts
+
+
+def safe_loc(loc: Any) -> str:
+    """A pydantic error location without the keys that hold the user's data."""
+    return ".".join(safe_loc_parts(loc))
+
+
+def validation_summary(exc: ValidationError) -> str:
+    """``loc: message`` of the first errors, never the values that failed."""
+    notes = []
+    for e in exc.errors(include_input=False)[:5]:
+        # a tag error's message quotes the tag it was given
+        msg = "unknown tag" if e["type"] == "union_tag_invalid" else e["msg"]
+        notes.append(f"{safe_loc(e['loc'])}: {msg}")
+    return "; ".join(notes)[:400]
 
 
 def parse_clef(body: Mapping[str, Any]) -> ClefResponse:
@@ -607,5 +637,6 @@ def parse_clef(body: Mapping[str, Any]) -> ClefResponse:
         return ClefResponse.model_validate(body)
     except ValidationError as exc:
         raise ModelResponseError(
-            f"Clef response does not match the schema: {exc}", raw=body
+            f"Clef response does not match the schema: {validation_summary(exc)}",
+            raw=body,
         ) from exc

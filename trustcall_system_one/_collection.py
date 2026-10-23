@@ -31,10 +31,16 @@ import dataclasses
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
 from trustcall_system_one._cardinality import Many
-from trustcall_system_one._compile import SchemaPlan
+from trustcall_system_one._compile import (
+    IDENTITY_SEP,
+    SchemaPlan,
+    identity_problem,
+    identity_spec,
+)
 from trustcall_system_one._coref import (
     Clustering,
     PairCache,
@@ -52,6 +58,7 @@ from trustcall_system_one._entity import (
     insert_one,
     update_one,
 )
+from trustcall_system_one._escalate import escalate_discovery, route_discovery
 from trustcall_system_one._existing import ExistingRecord, normalise_record
 from trustcall_system_one._match import (
     Candidate,
@@ -62,6 +69,7 @@ from trustcall_system_one._match import (
     identity_keys,
     identity_values,
     match_entities,
+    record_value,
 )
 from trustcall_system_one._render import (
     Parent,
@@ -69,6 +77,7 @@ from trustcall_system_one._render import (
     discovery_focus,
     entity_focus,
     mention_windows,
+    segment_around,
 )
 from trustcall_system_one._run import Run, gather
 from trustcall_system_one._types import (
@@ -155,7 +164,10 @@ _PARTICLES = frozenset(
 """Lower-case name particles ("Vincent van Gogh") that may lie inside one name."""
 _DETERMINER = re.compile(r"^(?:the|an|a|this|that|these|those)\s+", re.IGNORECASE)
 _POSSESSIVE = re.compile("['\u2019]s$", re.IGNORECASE)
-_EDGE = " \t\r\n\"'\u201c\u201d\u2018\u2019`,;:.!?()[]{}"
+_EDGE = " \t\r\n\"'\u201c\u201d\u2018\u2019`,;:.!?()[]{}|*_~\\\u2013\u2014"
+"""Characters stripped from the edges of a mention: spaces and punctuation, and the
+markup of a markdown table or of bold text (``8547 |`` is ``8547``, ``AIRCRAFTS**``
+is ``AIRCRAFTS``, a trailing en dash goes too)."""
 
 
 # --------------------------------------------------------------------------- #
@@ -371,7 +383,8 @@ def _only_function_words(words: Sequence[str]) -> bool:
 def clean_mention(text: str, span: Span | None = None) -> Mention | None:
     """Make a discovered mention a clean one, or drop it.
 
-    Surrounding punctuation, a trailing possessive (``Emma's``) and a leading
+    Surrounding punctuation and table or emphasis markup (a trailing ``|``, ``**``, a
+    dash), a trailing possessive (``Emma's``) and a leading
     lower-case determiner (``the``, ``a``, ``this`` ...) are stripped, the span
     shrinking with the text. A capitalised determiner is part of a proper name
     when what follows is capitalised too ("The Hague", "An Nguyen", "This Is Us")
@@ -451,6 +464,11 @@ def _name_gap(gap: str, *, words: bool, particles: bool = False) -> bool:
     return True
 
 
+def _initial(text: str) -> bool:
+    """Whether a mention is a single capital letter: the initial of a name."""
+    return len(text) == 1 and text.isupper()
+
+
 def _one_name(source: str, whole: Span, parts: Sequence[Span]) -> bool:
     """Whether ``whole`` is ONE name that ``parts`` (inside it) merely quote.
 
@@ -468,11 +486,21 @@ def _one_name(source: str, whole: Span, parts: Sequence[Span]) -> bool:
     # a particle ("van") lies inside a name only between capitalised single tokens
     particles = words and all(source[start : start + 1].isupper() for start, _ in parts)
     cursor = whole[0]
+    after_initial = False
     for start, end in sorted(parts):
-        if not _name_gap(source[cursor:start], words=words, particles=particles):
+        gap = source[cursor:start]
+        if after_initial and gap.startswith("."):
+            gap = gap[
+                1:
+            ]  # "J" and "Okafor" of "J. Okafor": the period is the initial's
+        if not _name_gap(gap, words=words, particles=particles):
             return False
         cursor = end
-    return _name_gap(source[cursor : whole[1]], words=words, particles=particles)
+        after_initial = _initial(source[start:end])
+    tail = source[cursor : whole[1]]
+    if after_initial and tail.startswith("."):
+        tail = tail[1:]
+    return _name_gap(tail, words=words, particles=particles)
 
 
 def _resolve_overlaps(mentions: Sequence[Mention], source: str) -> list[Mention]:
@@ -687,7 +715,8 @@ def identity_fields(plan: SchemaPlan, many: Many) -> tuple[str, ...]:
 
     ``Many(identity=...)`` wins; else the schema's own identity (a field marked
     ``s1_field(identity=True)``, a ``str`` field named like an identity, the first
-    required ``str``); else none.
+    required ``str``); else none. A name may be a dotted path through sub-models to
+    a scalar field (``"identification.msn"``).
 
     Args:
         plan: The compiled schema.
@@ -697,27 +726,52 @@ def identity_fields(plan: SchemaPlan, many: Many) -> tuple[str, ...]:
         The field names, possibly empty.
 
     Raises:
-        ValueError: If ``Many(identity=...)`` names a field the schema lacks.
+        ValueError: If ``Many(identity=...)`` names a field the schema lacks, or a
+            dotted path that does not lead to a scalar field.
     """
     if many.identity is None:
         return plan.identity
     names = (many.identity,) if isinstance(many.identity, str) else tuple(many.identity)
-    known = {str(spec.path[0]) for spec in plan.specs if spec.path}
-    unknown = [name for name in names if name not in known]
-    if unknown:
-        raise ValueError(
-            f"Many({plan.name}, identity=...) names {unknown}, which "
-            f"{plan.name} has no field of; its fields are {sorted(known)}"
-        )
+    for name in names:
+        problem = identity_problem(plan.schema, name)
+        if problem:
+            raise ValueError(f"Many({plan.name}, identity=...) {problem}")
+        if identity_spec(plan, name) is None:
+            raise ValueError(
+                f"Many({plan.name}, identity=...) names {name!r}, which is not "
+                "extracted (it is skipped or too deep to expand)"
+            )
     return names
+
+
+def _scalar_hint(plan: SchemaPlan, name: str) -> str:
+    """A dotted path to a text field below an identity that is not a plain value.
+
+    ``""`` when ``name`` is a plain field, or has no text field below it.
+    """
+    spec = identity_spec(plan, name)
+    if spec is None or spec.engine in ("clairic", "clef"):
+        return ""
+    below = [
+        s
+        for s in plan.specs
+        if s.path[: len(spec.path)] == spec.path
+        and len(s.path) > len(spec.path)
+        and s.engine == "clairic"
+        and s.clairic is not None
+        and s.clairic.type == "text"
+        and all(isinstance(p, str) for p in s.path)
+    ]
+    pick = next((s for s in below if s.identity), None) or next(iter(below), None)
+    return IDENTITY_SEP.join(str(p) for p in pick.path) if pick else ""
 
 
 def _identity_phrase(plan: SchemaPlan, names: Sequence[str]) -> str:
     """How the identity reads in a question: ``name (full name)``."""
     parts: list[str] = []
     for name in names:
-        spec = next((s for s in plan.specs if s.path == (name,)), None)
-        text = _humane(name)
+        spec = identity_spec(plan, name)
+        text = _humane(name.rsplit(IDENTITY_SEP, 1)[-1])
         if spec is not None and spec.description:
             said = " ".join(spec.description.split()).rstrip(" .")
             if said and said.casefold() != text.casefold() and len(said) <= 80:
@@ -1047,25 +1101,64 @@ async def _discover(
     """Ask Clairic for every mention of an entity, and clean what comes back."""
     noun = scope.noun
     of = f" belonging to {scope.parent.label}" if scope.parent is not None else ""
-    if phrase:
+    rows = _nested_without_identity(scope, phrase)
+    # a nested identity (an msn) is asked by how the input names the entity, except in
+    # the broader second pass: when that found too few, the identity itself is the
+    # fallback ("by their msn": the table cells that hold one)
+    by_words = bool(phrase) and not broaden and _dotted(scope.plan, scope.cardinality)
+    if (rows or by_words) and scope.cardinality.label is None:
+        noun = scope.kind  # "engine", not the class name "EngineInfo"
+    if by_words:
+        what = f"Every mention of {article(noun)} {noun}{of}"
+    elif phrase:
         what = f"Every mention of a {noun}{of} by their {phrase}"
     else:
         described = _described(scope.plan)
-        what = f"Every mention of a {noun}{of}" + (
+        a_noun = f"{article(noun)} {noun}" if rows else f"a {noun}"
+        what = f"Every mention of {a_noun}{of}" + (
             f" ({described})" if described else ""
         )
-    instructions = (
-        f"{what}, in the order they appear in the input. Include repeated "
-        "mentions and shortened ones (a first name alone). Do not list pronouns. "
-        "Each item is the exact words the input uses."
-    ) + (_BROADER if broaden else "")
+    if rows:
+        # nothing names one item: say what an item is, and what is not one
+        labels = _field_labels(scope.plan)
+        instructions = (
+            f"{what}, in the order they appear in the input. Give one entry per "
+            f"{noun}: the exact words of the input that label it or tell it apart "
+            "from the others, such as its position, number or model"
+            + (f" ({article(noun)} {noun} has {labels})" if labels else "")
+            + ". Do not list headings or units, or the values of those fields on "
+            f"their own. A number or a code is an entry only when it is what "
+            f"labels the row (a position, a number, a serial number). List "
+            f"{article(noun)} {noun} once for each row or place that describes it."
+        )
+    elif by_words:
+        # the identity (a serial number nested in a sub-model) tells one entity from
+        # another, but it is not what the input calls it
+        instructions = (
+            f"{what}, in the order they appear in the input. Give one entry per "
+            f"mention: the exact words the input uses to name or describe the "
+            f"{noun} (its model, type, name or heading), not the "
+            f"{_identifier(scope.plan, scope.cardinality)} or another number or code "
+            "on its own. A table cell is a mention when it names or describes the "
+            f"{noun}: its model or type, such as the cell next to a label like "
+            f"'{noun}', 'model' or 'type'. Include repeated and shortened mentions. "
+            "Do not list pronouns, headings, labels, dates or figures."
+        )
+    else:
+        instructions = (
+            f"{what}, in the order they appear in the input. Include repeated "
+            "mentions and shortened ones (a first name alone). Do not list "
+            "pronouns. Each item is the exact words the input uses."
+        )
+    instructions += _BROADER if broaden else ""
     fields = {
         "mentions": ClairicField(type="list", items="text", instructions=instructions)
     }
     ctx = _discovery_ctx(run, scope)
     asked = await ask_clairic(ctx, fields, meta=scope.meta("discover"))
     answer, anchored = asked["mentions"]
-    return parse_mentions(scope.source, answer, anchored, run, scope)
+    found = parse_mentions(scope.source, answer, anchored, run, scope)
+    return found
 
 
 async def _count(run: Run, scope: Scope) -> int | None:
@@ -1103,6 +1196,311 @@ async def _count(run: Run, scope: Scope) -> int | None:
 
 
 # --------------------------------------------------------------------------- #
+# Items without an identity (a nested list of rows)
+# --------------------------------------------------------------------------- #
+#
+# A nested list whose item model has no text field to name an item by (an engine
+# with a position and a serial number, a landing gear leg) cannot be discovered by
+# name: asked for "every mention of an engine", Clairic lists the words of a
+# table, and every one of them used to be clustered and qualified (live: 40 to 70
+# entities per document, 134 to 208 requests for a one-aircraft sheet). Such a
+# collection is therefore (1) asked for in terms of what an item IS, from the
+# model's docstring and fields, (2) screened in code (`_prefilter`: numbers, single
+# letters, markup, headings and the labels of the item's own fields are no item),
+# (3) screened by one cheap qualify question per remaining mention BEFORE
+# coreference (`_group`), so only the plausible ones are clustered, and (4) cut to
+# the count Clairic gave, best qualified first, instead of merge-checked.
+
+_GENERIC = frozenset(
+    {
+        "model", "type", "name", "no", "number", "total", "date", "status",
+        "remark", "remarks", "note", "notes", "yes", "none", "n/a", "na", "tba",
+        "tbc", "unit", "units", "value", "values", "item", "items", "description",
+        "position", "check", "interval", "last", "next", "first", "zero", "hours",
+        "cycles", "last done", "next due", "installed", "capability", "summary",
+        "specification", "specifications", "details", "detail", "data", "table",
+        "page", "section", "line", "row", "column", "performance",
+    }
+)  # fmt: skip
+"""Words that head a column or a row of a table, never one item of a list."""
+
+_LINE_BREAK = re.compile(r"<br\b[^>]*>?", re.IGNORECASE)
+_MARKUP = re.compile(r"[*_|`~#<>\\\[\]()]+")
+_NUMERIC = re.compile(r"[\d\s.,'`\\/%:+\-\u2013]+")
+_NUMBER_TYPES = frozenset({"number", "estimate", "forecast", "duration"})
+
+
+def _bare(text: str) -> str:
+    """A mention without markup, edge punctuation and case: ``'Engine Type:**'``."""
+    cleaned = _MARKUP.sub(" ", _LINE_BREAK.sub(" ", text))
+    return " ".join(cleaned.replace("\\", " ").split()).strip(" .,:;-\u2013").casefold()
+
+
+@dataclass(frozen=True)
+class _Screen:
+    """What the code screen of an identity-less list knows about its item model.
+
+    Attributes:
+        generic: Words no item is called (see ``_screens``).
+        numbers: Whether a bare number may be an item (a required numeric field).
+        options: The options of the item's own choice fields (``Literal`` values,
+            enum names and values), bare: a mention that IS one (the position
+            ``1``, ``L``) names a row.
+    """
+
+    generic: frozenset[str]
+    numbers: bool
+    options: frozenset[str]
+    identity: "re.Pattern[str] | None" = None
+    named: bool = False
+    """Items of a nested list that has a plain identity (names): a name of two letters
+    (``Jo``, ``Al``) is a name, not a code."""
+
+
+_PATTERN_HINT = "Must match the pattern "
+
+
+def _identity_shape(scope: "Scope") -> "re.Pattern[str] | None":
+    """The ``pattern`` of the identity field, when it has one (else ``None``).
+
+    The compiler keeps a text field's regex only as the sentence "Must match the
+    pattern ..." of its hints; a figure that does not match it (an MTOW of 78000 for
+    an ``msn`` of four or five digits) is not an identity, so it is not
+    offered to qualification as one. Only for a dotted identity (an identifier nested
+    in a sub-model): that is where a table's figures are proposed as entities.
+    """
+    try:
+        names = identity_fields(scope.plan, scope.cardinality)
+    except ValueError:
+        return None
+    for name in names:
+        if IDENTITY_SEP not in name:
+            continue
+        path = tuple(name.split(IDENTITY_SEP))
+        spec = next((s for s in scope.plan.specs if s.path == path), None)
+        for hint in spec.hints if spec is not None else ():
+            if hint.startswith(_PATTERN_HINT):
+                try:
+                    return re.compile(hint[len(_PATTERN_HINT) :].removesuffix("."))
+                except re.error:
+                    return None
+    return None
+
+
+def _identity_names(scope: "Scope") -> tuple[str, ...]:
+    try:
+        return identity_fields(scope.plan, scope.cardinality)
+    except ValueError:
+        return ()
+
+
+def _named(scope: "Scope") -> bool:
+    """Whether the collection is a nested list of items that are told apart by name."""
+    names = _identity_names(scope)
+    return (
+        scope.parent is not None
+        and bool(names)
+        and not any(IDENTITY_SEP in name for name in names)
+    )
+
+
+def _screens(scope: "Scope") -> _Screen:
+    """The words no item is called, and what may name a row on its own.
+
+    The words are the stoplist, what the collection and its item are called, and the
+    names of the item's own fields (a mention that is only the label of a field is
+    a column heading). A number may be an item when the item model has a required
+    numeric field (``Reading.value``), and a short code or a number is one when it
+    is an option of one of the item's choice fields.
+    """
+    plan = scope.plan
+    names: set[str] = set(_GENERIC)
+    for word in (plan.name, plan.title, scope.noun, scope.kind, scope.name):
+        names.add(_bare(word))
+        names.add(_bare(plural(word)))
+    options: set[str] = set()
+    for spec in plan.specs:
+        label = _bare(_humane(str(spec.path[-1])))
+        names.add(label)
+        names.update(label.split())  # "tsn" heads the column of "tsn hours"
+        names.add(_bare(spec.description))
+        for key, value in (spec.key_map or {}).items():
+            options.add(_bare(str(key)))
+            options.add(_bare(str(getattr(value, "value", value))))
+    numbers = any(
+        spec.required
+        and spec.clairic is not None
+        and spec.clairic.type in _NUMBER_TYPES
+        for spec in plan.specs
+    )
+    names.discard("")
+    options.discard("")
+    return _Screen(
+        frozenset(names),
+        numbers,
+        frozenset(options - names),
+        _identity_shape(scope),
+        _named(scope),
+    )
+
+
+_CONFIDENT_ITEM = 0.8
+"""Qualification at or above which an item is kept whatever the count says."""
+_SERIAL = re.compile(r"\d{4,}")
+
+
+def _rank(text: str, screen: _Screen) -> int:
+    """How plausible a mention is as one item: 3 or more passes the code screen.
+
+    * 4: an option of one of the item's choice fields (``1``, ``L``);
+    * 3: a serial or part number (four digits or more, or letters with a figure), a
+      required-number item's figure, or any word that is not a heading;
+    * 2: a short capitalised code of one to three letters (``L``, ``LH``, ``NLG``);
+    * 1: a bare figure;
+    * 0: markup, a heading or a field label, which are never an item.
+    """
+    bare = _bare(text)
+    if not any(ch.isalnum() for ch in bare):
+        return 0
+    if bare in screen.options:
+        return 4
+    if not any(ch.isalpha() for ch in bare):  # figures, dates, money amounts
+        if screen.numbers and _NUMERIC.fullmatch(text.strip()):
+            return 3
+        figure = bare.replace(" ", "")
+        if screen.identity is not None and not screen.identity.fullmatch(figure):
+            return 1  # the identity has a shape and this figure is not it
+        return 3 if _SERIAL.fullmatch(figure) else 1
+    if bare in screen.generic:
+        return 0
+    if len(bare.split()) > 1 or len(bare) > 2 or any(ch.isdigit() for ch in bare):
+        return 3
+    shown = text.strip(" *_|`.:")
+    if screen.named and len(bare) == 2 and bare.isalpha() and shown.istitle():
+        return 3  # "Jo", "Al": a name in a list of named items
+    return 2 if shown.isupper() else 1
+
+
+def _table_of_mentions(
+    run: Run, scope: "Scope", names: Sequence[str], mentions: Sequence[Mention]
+) -> bool:
+    """Whether the mentions of a collection WITH an identity are screened like rows.
+
+    Discovery of "every mention of a check by its check type" (or of an aircraft by
+    its msn) on a table-heavy input returns the cells of the table: live, 1,663 of
+    the 1,705 refused entities of a 591-line sheet were maintenance checks, and the
+    38 refused aircraft were figures, single letters and markup, all of them clustered
+    first (513 coreference requests). The code screen of ``_prefilter`` (bare figures,
+    one or two letters, markup, headings and the names of the item's own fields) and
+    the one-by-one qualification before coreference are those of an item without an
+    identity, and apply here when it is safe to: the collection is nested in a record
+    or its identity is a path through a sub-model (an identifier, not a name), and
+    discovery returned more than ``discovery.screen_above`` mentions, which prose
+    never does. ``_prefilter`` never takes the mentions below the count Clairic
+    gave. A top-level collection with a plain identity (a person's name) is never
+    screened.
+    """
+    limit = run.discovery.screen_above
+    if not limit or len(mentions) <= limit:
+        return False
+    return scope.parent is not None or any(IDENTITY_SEP in name for name in names)
+
+
+def _plausible_item(text: str, screen: _Screen) -> bool:
+    """Whether a mention could be one item of a list of rows (see ``_prefilter``)."""
+    return _rank(text, screen) >= 3
+
+
+def _prefilter(
+    run: Run, scope: "Scope", mentions: Sequence[Mention], count: int | None
+) -> list[Mention]:
+    """Drop what cannot be one item of an identity-less list; say how many.
+
+    The screen never takes the candidates below the count Clairic gave: when fewer
+    mentions survive than the input holds items, the best of the dropped (a short
+    code like ``L`` or ``LH``, a bare figure; never a heading or markup) come back,
+    in rank order, up to ten per item, and go on to the one-by-one qualification,
+    which is what decides about them.
+    """
+    screen = _screens(scope)
+    ranked = [(_rank(m.text, screen), m) for m in mentions]
+    kept = [m for rank, m in ranked if rank >= 3]
+    dropped = len(mentions) - len(kept)
+    back: list[Mention] = []
+    # the count is of ENTITIES: with an identity an entity has several mentions, so
+    # the survivors are counted by distinct (normalised) mention, not one per mention;
+    # without a count at least one is expected, so a screen that leaves nothing gives
+    # back the best of what it dropped
+    expected = count if count is not None else 1
+    survivors = (
+        len({_bare(m.text) for m in kept}) if _identity_names(scope) else len(kept)
+    )
+    if survivors < expected:
+        pool = sorted(
+            ((rank, m) for rank, m in ranked if 1 <= rank < 3),
+            key=lambda item: (-item[0], item[1].span or (0, 0)),
+        )
+        back = [m for _, m in pool[: max(expected * 10, 10)]]
+        kept = sorted([*kept, *back], key=lambda m: (m.span or (0, 0), m.text))
+    if dropped:
+        run.warn(
+            scope.scoped(
+                f"junk_mentions_dropped: {dropped - len(back)} of {len(mentions)} "
+                f"mention(s) of {article(scope.kind)} {scope.kind} were dropped before "
+                "clustering "
+                "(bare figures, one or two letters, markup, headings and the names "
+                f"of the {scope.kind}'s own fields)"
+                + (
+                    f"; {len(back)} of them came back because "
+                    + (
+                        f"Clairic counted {count} and fewer survived"
+                        if count is not None
+                        else "nothing else survived"
+                    )
+                    if back
+                    else ""
+                )
+            )
+        )
+    return kept
+
+
+def _field_labels(plan: SchemaPlan, limit: int = 8) -> str:
+    """The item's own fields as words, for the discovery request."""
+    seen: list[str] = []
+    for spec in plan.specs:
+        if spec.engine in ("clairic", "clef") and len(spec.path) == 1:
+            label = _humane(str(spec.path[-1]))
+            if label not in seen:
+                seen.append(label)
+    return ", ".join(seen[:limit])
+
+
+def _nested_without_identity(scope: "Scope", phrase: str) -> bool:
+    return scope.parent is not None and not phrase
+
+
+def _dotted(plan: SchemaPlan, many: Many) -> bool:
+    """Whether the identity is a path through a sub-model (``identification.msn``).
+
+    Such a value (a serial number, a registration) is an identifier that sits inside
+    the entity, not what the input calls it: asked for "every mention of an aircraft
+    by its msn", discovery lists the numbers of a table, and a bare ``12345`` cannot
+    be told to be an aircraft (live: qualification said 0.14, and the second aircraft
+    of a sheet was lost). Discovery and qualification therefore work with how the
+    input names or describes the entity.
+    """
+    names = identity_fields(plan, many)
+    return any(IDENTITY_SEP in name for name in names)
+
+
+def _identifier(plan: SchemaPlan, many: Many) -> str:
+    """The identity as words, without its description: ``msn``."""
+    names = identity_fields(plan, many)
+    return " and ".join(_humane(name.rsplit(IDENTITY_SEP, 1)[-1]) for name in names)
+
+
+# --------------------------------------------------------------------------- #
 # Steps 3-5: clusters, qualification, reconciliation
 # --------------------------------------------------------------------------- #
 
@@ -1116,6 +1514,9 @@ class _Group:
     adopted: bool = False
     """Brought back by an existing record (``discovery.record_presence``), with
     ``qualify_p`` left as qualification said it."""
+    capped: bool = False
+    """Left out because the input holds fewer items than were found and it qualified
+    only weakly (``capped_to_count``; identity-less items only)."""
 
     @property
     def label(self) -> str:
@@ -1171,6 +1572,11 @@ async def _qualify(
         return {"label": group.label, "mentions": mentions}
 
     nested = scope.parent is not None
+    identifier = (
+        _identifier(scope.plan, scope.cardinality)
+        if _dotted(scope.plan, scope.cardinality)
+        else ""
+    )
 
     async def ask(chunk: Sequence[tuple[int, _Group]]) -> dict[str, float | None]:
         anchors = [m.span for _, g in chunk for m in g.mentions if m.span is not None]
@@ -1191,16 +1597,27 @@ async def _qualify(
             if nested:
                 state["parent"] = scope.parent_entry(context, spans=False)
         belonging = " belonging to `parent.label`" if nested else ""
+        # an identity nested in a sub-model (a serial number) is judged in context: a
+        # bare "12345" is no aircraft, the number of one is
+        or_its = (
+            f", or the {identifier} of {article(kind)} {kind}" if identifier else ""
+        )
         questions = {
             f"qualify.{_provisional(n)}": NoulQuestion(
                 type="noul",
                 instructions=(
                     f"Is `entities.{_provisional(n)}.label` {article(kind)} {kind}"
+                    + or_its
                     + belonging
                     + "?"
                 ),
                 criteria=NoulCriteria(
                     true=f"The entity is {article(kind)} {kind}"
+                    + (
+                        f", or the {identifier} that identifies one"
+                        if identifier
+                        else ""
+                    )
                     + (" belonging to the parent." if nested else "."),
                     false=f"The entity is clearly something else, not {article(kind)} "
                     + f"{kind}"
@@ -1231,8 +1648,44 @@ async def _group(
     mentions: Sequence[Mention],
     pair_cache: PairCache,
     known: dict[frozenset[Mention], float | None],
+    *,
+    screen: bool = False,
 ) -> tuple[list[_Group], Clustering]:
-    """Cluster the mentions and qualify every cluster that is new."""
+    """Cluster the mentions and qualify every cluster that is new.
+
+    With ``screen`` (the items of a list that has no identity) every mention is
+    first qualified on its own, in the capped requests of ``_qualify``, and only
+    those that are not refused are clustered: a table of 70 words costs two
+    requests instead of the coreference of 70 mentions. The mentions that are
+    refused are not entities and are not clustered; one warning counts them and
+    quotes the first few (listing a hundred table cells as skipped entities would
+    bury the real skips).
+    """
+    refused: list[_Group] = []
+    if screen and len(mentions) > 1:
+        singles = [(n, _Group((m,))) for n, m in enumerate(mentions)]
+        fresh_singles = [(n, g) for n, g in singles if g.signature not in known]
+        for (_, g), p in zip(
+            fresh_singles, await _qualify(run, scope, fresh_singles), strict=True
+        ):
+            known[g.signature] = p
+        keep: list[Mention] = []
+        for _, g in singles:
+            p = known[g.signature]
+            if p is not None and p < run.discovery.qualify_min:
+                refused.append(g)
+            else:
+                keep.append(g.mentions[0])
+        if refused:
+            shown = ", ".join(repr(g.label) for g in refused[:5])
+            run.warn(
+                scope.scoped(
+                    f"mentions_screened_out: {len(refused)} of {len(mentions)} "
+                    f"mention(s) of {article(scope.kind)} {scope.kind} were refused "
+                    f"one by one before clustering (for example {shown})"
+                )
+            )
+        mentions = keep
     clustering = await cluster_mentions(
         run,
         source=scope.source,
@@ -1284,7 +1737,9 @@ def _distinct_names(groups: Sequence[_Group]) -> int:
 def _qualified(groups: Sequence[_Group], minimum: float) -> list[_Group]:
     """The groups that qualify: adopted by a record, unasked, or at ``minimum``."""
     return [
-        g for g in groups if g.adopted or g.qualify_p is None or g.qualify_p >= minimum
+        g
+        for g in groups
+        if not g.capped and (g.adopted or g.qualify_p is None or g.qualify_p >= minimum)
     ]
 
 
@@ -1756,6 +2211,8 @@ async def _adopt_records(
     keys = identity_keys(scope.plan, names)
     asked: list[tuple[str, dict[str, Any], str]] = []
     wanted: dict[str, list[str]] = {}
+    dotted = _dotted(scope.plan, scope.cardinality)
+    groups = list(groups)
     for record in scope.existing:
         data = normalise_record(scope.plan, record.data)
         values = [v for v in identity_values(data, keys) if v.strip()]
@@ -1766,6 +2223,8 @@ async def _adopt_records(
             for v in values
         ):
             continue
+        if dotted and _adopt_by_identifier(scope, values, groups, live):
+            continue  # its identifier is in the input: no request
         if not any(
             _mentioned(v, scope.source, nested=scope.parent is not None) for v in values
         ):
@@ -1827,6 +2286,63 @@ async def _adopt_records(
     return groups
 
 
+def _distinctive(value: str) -> bool:
+    """An identifier that cannot be an everyday word: four characters, one a digit."""
+    flat = "".join(value.split())
+    return len(flat) >= 4 and any(ch.isdigit() for ch in flat)
+
+
+def _adopt_by_identifier(
+    scope: Scope, values: Sequence[str], groups: list[_Group], live: list[_Group]
+) -> bool:
+    """An existing record whose identifier is in the input needs no presence request.
+
+    For a dotted identity (a serial number nested in a sub-model) the discovered
+    mentions are the words that name the entity (``A320``, ``fuel pump``), never the
+    identifier, so ``identity_compatible`` cannot say that the record is covered and a
+    ``record_presence`` request was made for every record. An identifier that is
+    distinctive (``_distinctive``) and written verbatim in the input is the evidence:
+    when a qualified entity has a mention in the same line or sentence the record is
+    covered; else the group qualification refused there is brought back (as for a
+    presence answer, only from ``REVIVE_MIN``), else the identifier's own words
+    become the entity's mention. Matching still decides which record each entity is.
+
+    Returns:
+        Whether the record was settled here (the caller asks nothing about it).
+    """
+    found: tuple[str, Span] | None = None
+    for value in sorted(values, key=len, reverse=True):
+        text = value.strip()
+        if not _distinctive(text):
+            continue
+        hit = re.search(_word_pattern(text, flat=True), scope.source)
+        if hit is not None:
+            found = (hit.group(0), hit.span())
+            break
+    if found is None:
+        return False
+    text, span = found
+    around = segment_around(scope.source, span)
+
+    def inside(group: _Group) -> bool:
+        return any(
+            m.span is not None and _overlap(m.span, around) for m in group.mentions
+        )
+
+    if any(inside(g) for g in live):
+        return True
+    refused = next((g for g in groups if g not in live and inside(g)), None)
+    if refused is not None:
+        if refused.qualify_p is None or refused.qualify_p >= REVIVE_MIN:
+            refused.adopted = True
+            live.append(refused)
+        return True
+    group = _Group((Mention(text, span),), None, adopted=True)
+    groups.append(group)
+    live.append(group)
+    return True
+
+
 async def collect(
     scope: Scope, run: Run, *, skip_presence: bool = False
 ) -> CollectionOutcome:
@@ -1860,7 +2376,17 @@ async def collect(
             "entity, so discovery relies on the schema's description; name one "
             "with Many(..., identity=...) or s1_field(identity=True)"
         )
+    for name in names:
+        hint = _scalar_hint(plan, name)
+        if hint:
+            warn(
+                f"identity_not_scalar: Many({plan.name}, identity={name!r}) names a "
+                "field that holds more than a value, so it tells no two entities "
+                f"apart by value; name a field inside it, for example "
+                f"identity={hint!r}"
+            )
     phrase = _identity_phrase(plan, names)
+    rows = _nested_without_identity(scope, phrase)
     if scope.kind_fell_back:
         warn(
             f"kind_fallback: the description of {plan.name} names no kind of thing "
@@ -1868,16 +2394,94 @@ async def collect(
             f"{scope.kind!r}; give it with Many(kind=...)"
         )
 
-    jobs: list[Any] = [_discover(run, scope, phrase), _count(run, scope)]
+    # escalation mode "route": the rows of a nested list and the entities of a dotted
+    # identity are asked of the tier first; when it gives none (off, failed, nothing
+    # verifiable) Clairic discovers and counts as usual
+    routed = await route_discovery(
+        run,
+        plan=plan,
+        source=scope.source,
+        parent=scope.parent,
+        scope_key=scope.call_scope,
+        noun=scope.kind if (rows or _dotted(plan, scope.cardinality)) else scope.noun,
+        identifier=_identifier(plan, scope.cardinality),
+        dotted=_dotted(plan, scope.cardinality),
+        meta_like=SimpleNamespace(plan=plan, key=None, scope=scope.call_scope),
+        lineage=scope.lineage,
+    )
+
+    async def given(value: Any) -> Any:
+        return value
+
+    if routed and scope.parent is None:
+        # the entities of a dotted identity: a label that is no name (a generic word)
+        # is no entity, as for Clairic's discovery
+        routed = _prefilter(run, scope, routed, None)
+    if routed:
+        warn(
+            f"escalation_routed: {plan.name}: {len(routed)} mention(s) came from the "
+            "escalation tier; Clairic's discovery was not asked first (its count is, "
+            "and a count above them brings discovery in)"
+        )
+    jobs: list[Any] = (
+        [given(routed), _count(run, scope)]
+        if routed
+        else [_discover(run, scope, phrase), _count(run, scope)]
+    )
     if not skip_presence:
         jobs.append(_presence(run, scope))
     results = await gather(*jobs)
     mentions: list[Mention] = results[0]
     count: int | None = results[1]
+    if routed and count is not None and count > len(routed):
+        # the tier gave fewer than Clairic counts (a partial answer): discovery runs
+        # after all and its mentions join the tier's, as for a broadened discovery
+        wider = await _discover(run, scope, phrase)
+        if rows or _table_of_mentions(run, scope, names, wider):
+            wider = _prefilter(run, scope, wider, count)
+        warn(
+            f"escalation_routed_partial: {plan.name}: the tier gave {len(routed)} of "
+            f"{count} counted; Clairic's discovery added {len(wider)} mention(s)"
+        )
+        mentions = _union(mentions, wider, scope.source)
+    # items nothing names are always screened; so are the mentions of a collection
+    # with an identity when discovery returned a table's worth of them
+    screen = rows or _table_of_mentions(run, scope, names, mentions)
+    if screen and not routed:  # the tier's quotes are verified rows, not stray figures
+        mentions = _prefilter(run, scope, mentions, count)
     presence: float | None = None
     cut = False
     if not skip_presence:
         presence, cut = results[2]
+
+    async def escalated(found: int) -> list[Mention]:
+        """What the opt-in escalation tier finds where discovery came up short."""
+        return await escalate_discovery(
+            run,
+            plan=plan,
+            source=scope.source,
+            parent=scope.parent,
+            scope_key=scope.call_scope,
+            noun=scope.kind
+            if (rows or _dotted(plan, scope.cardinality))
+            else scope.noun,
+            identifier=_identifier(plan, scope.cardinality),
+            dotted=_dotted(plan, scope.cardinality),
+            found=found,
+            count=count,
+            present=presence is None or presence >= config.presence_present,
+            meta_like=SimpleNamespace(plan=plan, key=None, scope=scope.call_scope),
+            lineage=scope.lineage,
+        )
+
+    if not mentions:
+        # no mention at all although presence says the kind is there: the escalation
+        # tier (opt-in) is asked for them, and its quotes go the normal way
+        extra = await escalated(0)
+        if extra:
+            mentions = extra
+            if screen:
+                mentions = _prefilter(run, scope, mentions, count)
 
     def empty() -> CollectionOutcome:
         return CollectionOutcome((), (), tuple(warnings), presence, count)
@@ -1931,7 +2535,7 @@ async def collect(
         groups = rescued
         live = _qualified(groups, config.qualify_min)
     else:
-        groups, _ = await _group(run, scope, mentions, pair_cache, known)
+        groups, _ = await _group(run, scope, mentions, pair_cache, known, screen=screen)
         live = _qualified(groups, config.qualify_min)
         groups = await _adopt_records(run, scope, names, groups, live, warn)
         live = _qualified(groups, config.qualify_min)
@@ -1953,17 +2557,56 @@ async def collect(
         )
         if act and count > len(live) and not explained:
             wider = await _discover(run, scope, phrase, broaden=True)
+            if screen:
+                wider = _prefilter(run, scope, wider, count)
             merged = _union(mentions, wider, scope.source)
             if merged != mentions:
                 mentions = merged
-                groups, _ = await _group(run, scope, mentions, pair_cache, known)
+                groups, _ = await _group(
+                    run, scope, mentions, pair_cache, known, screen=screen
+                )
                 live = _qualified(groups, config.qualify_min)
                 groups = await _adopt_records(run, scope, names, groups, live, warn)
                 live = _qualified(groups, config.qualify_min)
         checked = 0
+        if count > len(live) and not explained and scope.parent is not None:
+            # a nested list with fewer rows than its count: the rows the escalation
+            # tier (opt-in) quotes join the mentions, like a broadened discovery
+            extra = await escalated(len(live))
+            merged = _union(mentions, extra, scope.source) if extra else mentions
+            if merged != mentions:
+                mentions = merged
+                groups, _ = await _group(
+                    run, scope, mentions, pair_cache, known, screen=screen
+                )
+                live = _qualified(groups, config.qualify_min)
+                groups = await _adopt_records(run, scope, names, groups, live, warn)
+                live = _qualified(groups, config.qualify_min)
         if act and count < len(live):
             groups, checked = await _merge(run, scope, groups, count, pair_cache)
             live = _qualified(groups, config.qualify_min)
+        if act and rows and count < len(live):
+            # items nothing names: those the qualification was only lukewarm about
+            # go first (a confidently qualified item is kept even when Clairic
+            # undercounts, and the warning below says so)
+            weak = sorted(
+                (
+                    g
+                    for g in live
+                    if g.qualify_p is not None and g.qualify_p < _CONFIDENT_ITEM
+                ),
+                key=lambda g: (g.qualify_p or 0.0, g.first),
+            )
+            left_out = weak[: len(live) - count]
+            for g in left_out:
+                g.capped = True
+            if left_out:
+                live = _qualified(groups, config.qualify_min)
+                warn(
+                    f"items_capped_to_count: {len(left_out)} weakly qualified "
+                    f"{scope.kind}(s) were left out because the input holds "
+                    f"{count}"
+                )
         why = (
             ""
             if act
@@ -2020,16 +2663,19 @@ async def collect(
             entities.append(info)
         else:
             p = group.qualify_p
-            skipped.append(
-                SkippedEntity(
-                    plan.name,
-                    info,
-                    "not_qualified",
-                    f"{group.label!r} is not a {scope.noun} (p={p:.2f})"
-                    if p is not None
-                    else f"{group.label!r} is not a {scope.noun}",
-                )
+            detail = (
+                f"{group.label!r} is not a {scope.noun} (p={p:.2f})"
+                if p is not None
+                else f"{group.label!r} is not a {scope.noun}"
             )
+            reason = "not_qualified"
+            if group.capped:
+                reason = "capped_to_count"
+                detail = (
+                    f"{group.label!r} qualified only weakly (p={p:.2f}) and the "
+                    f"input holds fewer {plural(scope.noun)} than were found"
+                )
+            skipped.append(SkippedEntity(plan.name, info, reason, detail))
     return CollectionOutcome(
         tuple(entities), tuple(skipped), tuple(warnings), presence, count
     )
@@ -2066,9 +2712,99 @@ def _focuses(scope: Scope, info: EntityInfo) -> tuple[Any, Any]:
     return focus, plain
 
 
+_FIGURE = re.compile(r"[\d\s.,'`/\-]+")
+
+
+def _is_bare_number(label: str) -> bool:
+    """Whether a label is only a number: ``78000``, ``12,345``, ``2024``."""
+    text = _bare(label)
+    return (
+        bool(text)
+        and any(ch.isdigit() for ch in text)
+        and bool(_FIGURE.fullmatch(text))
+    )
+
+
+def _digits(text: str) -> str:
+    return "".join(ch for ch in text if ch.isalnum()).casefold()
+
+
+def _not_its_identifier(run: Run, scope: Scope, info: EntityInfo, record: Any) -> str:
+    """Why an entity called by a bare number is not one, or ``""``.
+
+    An entity of a collection whose identity is a path through a sub-model, called by
+    a bare number (live: a table's MTOW, an hours figure, a year), is only an
+    aircraft when the number IS its identity. The identity the extraction found for
+    it must equal the number; a
+    different or missing one means a figure of the table was taken for an entity,
+    however the qualification judged it. The message names the kind, never a value.
+    """
+    if not _is_bare_number(info.label) or record is None or record.after is None:
+        return ""
+    if not _dotted(scope.plan, scope.cardinality):
+        return ""  # items of a plain identity are legitimately called by a number
+    names = identity_fields(scope.plan, scope.cardinality)
+    data = normalise_record(scope.plan, record.after)
+    found: list[str] = []
+    for key in identity_keys(scope.plan, names):
+        value = record_value(data, key)
+        if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+            found.append(str(value))
+        elif isinstance(value, (list, tuple)):
+            found.extend(str(v) for v in value if isinstance(v, (str, int, float)))
+    wanted = _digits(info.label)
+    if any(_digits(v) == wanted for v in found):
+        return ""
+    return (
+        f"the entity of {article(scope.kind)} {scope.kind} was called by a bare "
+        "number that is not its identity"
+    )
+
+
+def _stems(text: str) -> frozenset[str]:
+    """The words of a name with a plural "s" or "es" taken off (``mugs`` is ``mug``)."""
+    words = re.findall(r"[a-z0-9]+", text.casefold())
+    return frozenset(
+        w[:-2]
+        if len(w) > 4 and w.endswith("es")
+        else w[:-1]
+        if len(w) > 3 and w.endswith("s")
+        else w
+        for w in words
+    )
+
+
+def _held_item(scope: Scope, info: EntityInfo) -> dict[str, Any] | None:
+    """The record of the held item that a NEW entity of the list resembles, if any.
+
+    The match said the entity is new, yet its words ("mugs") are all among those of a
+    held item's identity ("blue mug"), or all of the item's are among the entity's:
+    the input may well be about the held item ("add two more mugs"). ``None`` when no
+    held item is that close, so a new item that resembles nothing there is new
+    (``Ctx.fresh``): "two more notebooks" next to a mug line is the whole amount.
+    """
+    if not scope.existing:
+        return None
+    words = _stems(" ".join([info.label, *(m.text for m in info.mentions)]))
+    own = _stems(info.label)
+    if not words:
+        return None
+    names = identity_fields(scope.plan, scope.cardinality)
+    for record in scope.existing:
+        data = getattr(record, "data", None)
+        if not isinstance(data, dict):
+            continue
+        normal = normalise_record(scope.plan, data)
+        for text in identity_values(normal, identity_keys(scope.plan, names)):
+            held = _stems(text)
+            if held and (own <= held or held <= own or held <= words):
+                return dict(normal)
+    return None
+
+
 async def _insert_entity(run: Run, scope: Scope, info: EntityInfo) -> InsertOutcome:
     focus, plain = _focuses(scope, info)
-    return await insert_one(
+    done = await insert_one(
         run,
         scope.plan,
         scope.source,
@@ -2077,6 +2813,16 @@ async def _insert_entity(run: Run, scope: Scope, info: EntityInfo) -> InsertOutc
         focus=focus,
         focus_plain=plain,
         placement=scope.placement(),
+        held=_held_item(scope, info),
+    )
+    why = _not_its_identifier(run, scope, info, done.record)
+    if not why:
+        return done
+    run.warn(scope.scoped(f"bare_number_entity_dropped: {why}"))
+    return dataclasses.replace(
+        done,
+        record=None,
+        skipped=SkippedEntity(scope.plan.name, info, "not_qualified", why),
     )
 
 
