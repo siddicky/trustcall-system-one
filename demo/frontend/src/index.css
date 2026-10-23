@@ -1,0 +1,105 @@
+@import url("https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500&family=Geist+Mono:wght@400;500;600&family=Geist:wght@300..700&display=swap");
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+    --font-heading: var(--font-sans);
+    --font-sans: 'Geist', ui-sans-serif, system-ui, sans-serif;
+    --font-mono: 'Geist Mono', ui-monospace, monospace;
+    --font-code: 'Fira Code', ui-monospace, monospace;
+    --color-success: var(--success);
+    --color-sidebar-ring: var(--sidebar-ring);
+    --color-sidebar-border: var(--sidebar-border);
+    --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+    --color-sidebar-accent: var(--sidebar-accent);
+    --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+    --color-sidebar-primary: var(--sidebar-primary);
+    --color-sidebar-foreground: var(--sidebar-foreground);
+    --color-sidebar: var(--sidebar);
+    --color-ring: var(--ring);
+    --color-input: var(--input);
+    --color-border: var(--border);
+    --color-destructive: var(--destructive);
+    --color-accent-foreground: var(--accent-foreground);
+    --color-accent: var(--accent);
+    --color-muted-foreground: var(--muted-foreground);
+    --color-muted: var(--muted);
+    --color-secondary-foreground: var(--secondary-foreground);
+    --color-secondary: var(--secondary);
+    --color-primary-foreground: var(--primary-foreground);
+    --color-primary: var(--primary);
+    --color-popover-foreground: var(--popover-foreground);
+    --color-popover: var(--popover);
+    --color-card-foreground: var(--card-foreground);
+    --color-card: var(--card);
+    --color-foreground: var(--foreground);
+    --color-background: var(--background);
+    --radius-sm: calc(var(--radius) * 0.6);
+    --radius-md: calc(var(--radius) * 0.8);
+    --radius-lg: var(--radius);
+    --radius-xl: calc(var(--radius) * 1.4);
+    --radius-2xl: calc(var(--radius) * 1.8);
+    --radius-3xl: calc(var(--radius) * 2.2);
+    --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+/* Siddicky dark theme. Dark only: variables live on :root, html carries class="dark". */
+:root {
+    --background: #0f1115;            /* surface-page (space) */
+    --foreground: #f3f4f6;            /* text-body (cloud) */
+    --card: #171a20;                  /* surface-section (base) */
+    --card-foreground: #f3f4f6;
+    --popover: #171a20;
+    --popover-foreground: #f3f4f6;
+    --primary: #ff7a1a;               /* accent (Ember Orange) */
+    --primary-foreground: #111111;    /* text-on-accent */
+    --secondary: #1f232b;             /* surface-raised */
+    --secondary-foreground: #f3f4f6;
+    --muted: #1f232b;
+    --muted-foreground: #a3a9b6;      /* text-muted (steel) */
+    --accent: #1f232b;                /* hover surface, not orange */
+    --accent-foreground: #f3f4f6;
+    --destructive: #ff5c8a;           /* status-danger (signal) */
+    --success: #3ddc97;               /* mint */
+    --border: #363b46;                /* border-strong (ink-200) */
+    --input: #a3a9b61a;               /* steel at ~10% */
+    --ring: #ff7a1a4d;                /* accent at 30% */
+    --radius: 0.625rem;
+    --sidebar: #171a20;
+    --sidebar-foreground: #f3f4f6;
+    --sidebar-primary: #ff7a1a;
+    --sidebar-primary-foreground: #111111;
+    --sidebar-accent: #1f232b;
+    --sidebar-accent-foreground: #f3f4f6;
+    --sidebar-border: #363b46;
+    --sidebar-ring: #ff7a1a4d;
+    color-scheme: dark;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+    }
+  body {
+    @apply bg-background text-foreground;
+    }
+  html {
+    @apply font-sans;
+    }
+}
+
+@utility font-code {
+  font-family: var(--font-code);
+}
+
+@utility mono-label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.4;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted-foreground);
+}
