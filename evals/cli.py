@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import datetime as dt
 import itertools
+import os
 import re
 import sys
 from collections.abc import Sequence
@@ -36,6 +37,7 @@ from evals.search import (
 )
 from evals.suites import DEFAULT_SUITE, SUITES, load_suite
 from trustcall_system_one.combos import PROVIDERS, ComboSpec, companies, load_combo
+from trustcall_system_one.openai_transport import REASONING_EFFORTS
 
 __all__ = ["main", "select_cases"]
 
@@ -168,6 +170,25 @@ def _common(parser: argparse.ArgumentParser) -> None:
         "with its hard-pick cap of 0.8 and 32-question limit; it only matters "
         "with --live",
     )
+    parser.add_argument(
+        "--escalate",
+        choices=("openai",),
+        default=None,
+        help="turn on the opt-in escalation tier: the cases the default setup fails "
+        "(relative dates, nested rows, mid-band attributions, dotted identities) "
+        "are asked of gpt-6-luna through the OpenAI Responses API. LIVE THIS SENDS "
+        "THEIR TEXT TO OPENAI (needs OPENAI_API_KEY); offline a stand-in that never "
+        "answers is used. Default: TRUSTCALL_S1_ESCALATE, else off (an "
+        "OPENAI_API_KEY alone never turns it on)",
+    )
+    parser.add_argument(
+        "--escalate-effort",
+        choices=REASONING_EFFORTS,
+        default=None,
+        help="reasoning.effort of the escalation tier (default: "
+        "TRUSTCALL_S1_ESCALATE_EFFORT, else none); higher is slower and dearer, "
+        "recorded in results.json. Only with --escalate (or the variable)",
+    )
     _output_args(parser)
 
 
@@ -269,7 +290,9 @@ def _parser() -> argparse.ArgumentParser:
     search.add_argument(
         "--order",
         help="the dimensions to search, in order, comma separated, or none (default: "
-        f"{','.join(DEFAULT_ORDER)}; also: extract, other)",
+        f"{','.join(DEFAULT_ORDER)}; also: extract, other, and escalate.effort, "
+        "which sweeps reasoning.effort of the base spec's escalate over none, low, "
+        "medium and high)",
     )
     search.add_argument("--max-runs", type=int, help="stop after this many evaluations")
     search.add_argument(
@@ -366,6 +389,20 @@ def _settings(args: argparse.Namespace, overrides: dict[str, Any]) -> Settings:
         or args.clef_fallback
         or args.clef_fallback_on
     )
+    if args.escalate_effort and not (
+        args.escalate or os.environ.get("TRUSTCALL_S1_ESCALATE")
+    ):
+        raise ValueError(
+            "--escalate-effort needs --escalate openai (or TRUSTCALL_S1_ESCALATE): "
+            "the effort belongs to the escalation tier"
+        )
+    if args.escalate and not args.live:
+        print(
+            "note: --escalate without --live answers the escalation tier with a "
+            "stand-in that never answers: nothing is sent to OpenAI and nothing "
+            "changes",
+            file=sys.stderr,
+        )
     if given and not args.live:
         print(
             "note: --provider, --clef-provider, --clef-fallback and "
@@ -384,6 +421,8 @@ def _settings(args: argparse.Namespace, overrides: dict[str, Any]) -> Settings:
         clef_provider=args.clef_provider,
         clef_fallback=args.clef_fallback,
         clef_fallback_on=args.clef_fallback_on,
+        escalate=args.escalate,
+        escalate_effort=args.escalate_effort,
         suite=args.suite,
     )
 
@@ -528,7 +567,7 @@ def _prices(items: Sequence[str]) -> dict[str, tuple[float, float]]:
         name, sep, rest = item.partition("=")
         low, colon, high = rest.partition(":")
         try:
-            if name not in PROVIDERS or not sep or not colon:
+            if name not in (*PROVIDERS, "openai") or not sep or not colon:
                 raise ValueError
             out[name] = (float(low), float(high))
         except ValueError:
@@ -598,7 +637,7 @@ def _search(args: argparse.Namespace) -> int:
     base = load_combo(args.base) if args.base else ComboSpec(name="base")
     providers = _split([args.providers]) if args.providers else []
     if not providers:
-        if args.live:
+        if args.live and _split([args.order or ""]) != ["escalate.effort"]:
             raise ValueError(
                 "--live needs --providers: naming the candidates is the opt-in to "
                 f"send text to them (of {', '.join(PROVIDERS)})"
@@ -614,7 +653,8 @@ def _search(args: argparse.Namespace) -> int:
         )
     prices = _prices(args.price)
     if args.budget_usd is not None and args.live:
-        unpriced = sorted((set(providers) | set(base.providers())) - set(prices))
+        used = {*providers, *base.providers(), *(["openai"] if base.escalate else [])}
+        unpriced = sorted(used - set(prices))
         if unpriced:
             raise ValueError(
                 f"--budget-usd needs a price for every provider that can be used: "
@@ -659,8 +699,11 @@ def _search(args: argparse.Namespace) -> int:
     if args.live:
         every = list(dict.fromkeys([*base.providers(), *providers]))
         print(
-            f"live: the text may go to {', '.join(companies(every))} (providers: "
-            f"{', '.join(every)}); no request that may have been charged is ever "
+            f"live: the text may go to "
+            f"{', '.join(dict.fromkeys([*companies(every), *base.companies()]))} "
+            f"(providers: {', '.join(every)}"
+            f"{'; escalation: ' + base.escalate.describe() if base.escalate else ''}"
+            "); no request that may have been charged is ever "
             "retried, a failed case is reported and the search goes on",
             file=sys.stderr,
         )

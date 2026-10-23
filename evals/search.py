@@ -47,6 +47,8 @@ from trustcall_system_one.transport import CLAIRIC_KINDS
 __all__ = [
     "DEFAULT_ORDER",
     "DIMENSIONS",
+    "EFFORT_CANDIDATES",
+    "EFFORT_DIMENSION",
     "GRID",
     "Margin",
     "Objective",
@@ -73,6 +75,10 @@ DIMENSIONS: Mapping[str, tuple[str, ...]] = {
 """The call kinds of each decision dimension. A candidate provider is applied to the
 kinds it can serve (``count``, ``crosscheck`` and ``reask`` are Clairic calls: only
 ``cloudflare`` and ``typesafe`` can take them)."""
+EFFORT_DIMENSION = "escalate.effort"
+"""The dimension that sweeps ``reasoning.effort`` of the spec's escalation tier."""
+EFFORT_CANDIDATES: tuple[str, ...] = ("none", "low", "medium", "high")
+"""The efforts the search tries (a spec can name ``xhigh`` and ``max`` itself)."""
 EXTRACTION_TYPES: tuple[str, ...] = (
     "text",
     "number",
@@ -376,13 +382,13 @@ def _why(exc: ValueError) -> str:
 
 def _check_order(order: Sequence[str]) -> None:
     for name in order:
-        if name in DIMENSIONS or name == "extract":
+        if name in DIMENSIONS or name in ("extract", EFFORT_DIMENSION):
             continue
         if name.startswith("extract:") and name.partition(":")[2]:
             continue
         raise ValueError(
             f"unknown dimension {name!r}; dimensions: "
-            f"{[*DIMENSIONS, 'extract', 'extract:<field type>']}"
+            f"{[*DIMENSIONS, 'extract', 'extract:<field type>', EFFORT_DIMENSION]}"
         )
 
 
@@ -614,6 +620,23 @@ async def run_search(
         best = first
         record(first, first_suite, best)
         for dimension in order:
+            if dimension == EFFORT_DIMENSION:
+                # the tier's reasoning effort: same margin and veto as any dimension,
+                # on the dev suite (a search never runs on the holdout)
+                tier = best.spec.escalate
+                if tier is None:
+                    not_run.append(
+                        f"{EFFORT_DIMENSION}: the base spec has no escalate to sweep"
+                    )
+                    continue
+                for effort in EFFORT_CANDIDATES:
+                    if effort == best.spec.escalate.reasoning_effort:  # type: ignore[union-attr]
+                        continue
+                    swept = best.spec.replace(
+                        escalate=tier.model_copy(update={"reasoning_effort": effort})
+                    )
+                    await consider(swept, dimension, f"{dimension}={effort}")
+                continue
             for provider in providers:
                 try:
                     spec = _apply(best.spec, dimension, provider)
@@ -720,6 +743,10 @@ def leaderboard_markdown(result: SearchResult) -> str:
     cases, op F1, value accuracy, bleed, wrong deletes, requests, tokens (in/out),
     estimated cost (``~`` when a provider had no price) and seconds per case.
     """
+    tiered = any(
+        t.spec.escalate is not None or (t.aggregate or {}).get("escalation_calls")
+        for t in result.trials
+    )
     lines = [
         "# Combination search",
         "",
@@ -731,8 +758,10 @@ def leaderboard_markdown(result: SearchResult) -> str:
         + (f"; stopped: {result.stopped}" if result.stopped else ""),
         "",
         "| # | combination | change | result | pass | op F1 | value acc | bleed "
-        "| wrong del | requests | tokens in/out | cost | s/case |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "| wrong del | requests | tokens in/out | cost | s/case |"
+        + (" esc calls | esc reasoning tok | esc ms/call |" if tiered else ""),
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+        + ("---|---|---|" if tiered else ""),
     ]
     done = [t for t in result.trials if t.aggregate]
     ranked = sorted(done, key=lambda t: t.objective.rank, reverse=True)
@@ -744,6 +773,7 @@ def leaderboard_markdown(result: SearchResult) -> str:
             lines.append(
                 f"| {t.n} | `{t.spec.describe()}`{_flag(t)} | {t.change} | {outcome}: "
                 f"{t.error or t.note} | - | - | - | - | - | - | - | - | - |"
+                + (" - | - | - |" if tiered else "")
             )
             continue
         per_case = agg["wall_s"] / agg["cases"] if agg["cases"] else 0.0
@@ -754,6 +784,13 @@ def leaderboard_markdown(result: SearchResult) -> str:
             f"| {agg['wrong_deletes']} | {agg['requests']} "
             f"| {agg['input_tokens']}/{agg.get('output_tokens', 0)} | {_cost(t)} "
             f"| {per_case:.2f} |"
+            + (
+                f" {agg.get('escalation_calls', 0)} "
+                f"| {agg.get('escalation_reasoning_tokens', 0)} "
+                f"| {agg.get('escalation_mean_latency_ms', 0):.0f} |"
+                if tiered
+                else ""
+            )
         )
     failing = [t for t in result.trials if t.failures and t is result.best]
     for t in failing:

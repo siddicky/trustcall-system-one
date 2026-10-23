@@ -27,6 +27,7 @@ from trustcall_system_one.transport import (
     CALL_KINDS,
     CLAIRIC_KINDS,
     CLEF_KINDS,
+    ESCALATE_KINDS,
     max_questions,
     state_token_budget,
 )
@@ -118,8 +119,10 @@ def served_by(transport: Any, kind: str = "attribution", model: str = CLEF) -> s
 
 
 def test_the_kinds_split_into_clairic_clef_and_both() -> None:
-    assert CLAIRIC_KINDS | CLEF_KINDS | {"repair", "raw"} == set(CALL_KINDS)
+    both = {"repair", "raw"}
+    assert CLAIRIC_KINDS | CLEF_KINDS | ESCALATE_KINDS | both == set(CALL_KINDS)
     assert not CLAIRIC_KINDS & CLEF_KINDS
+    assert {"escalate"} == ESCALATE_KINDS and not ESCALATE_KINDS & CLEF_KINDS
     assert "attribution" in CLEF_KINDS and "extract" in CLAIRIC_KINDS
 
 

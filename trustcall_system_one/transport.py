@@ -39,7 +39,7 @@ from typing import (
 import httpx
 
 from trustcall_system_one._calibrate import calibrate_body
-from trustcall_system_one._config import ConcurrencyConfig
+from trustcall_system_one._config import ConcurrencyConfig, EscalationConfig
 from trustcall_system_one._decisions import (
     DECISIONS_MODEL,
     DEFAULT_HARD_CAP,
@@ -92,6 +92,7 @@ __all__ = [
     "CLEF_KINDS",
     "DEFAULT_FALLBACK_ON",
     "DEFAULT_MAX_QUESTIONS",
+    "ESCALATE_KINDS",
     "AdaptiveLimiter",
     "CalibratedTransport",
     "CallKind",
@@ -112,6 +113,7 @@ __all__ = [
     "clef_fallback_from_env",
     "clef_fallback_on_from_env",
     "clef_provider_from_env",
+    "escalation_from_env",
     "max_questions",
     "prefers_keep_uncertain",
     "provider_from_env",
@@ -125,7 +127,12 @@ CLAIRIC_KINDS: frozenset[str] = frozenset(
     {"discover", "count", "extract", "crosscheck", "reask"}
 )
 """The call kinds that are always Clairic requests (typed extraction)."""
-CLEF_KINDS: frozenset[str] = frozenset(CALL_KINDS) - CLAIRIC_KINDS - {"repair", "raw"}
+ESCALATE_KINDS: frozenset[str] = frozenset({"escalate"})
+"""The call kinds that never go through the Clairic/Clef stack: the escalation tier's
+(``EscalationConfig.transport``)."""
+CLEF_KINDS: frozenset[str] = (
+    frozenset(CALL_KINDS) - CLAIRIC_KINDS - ESCALATE_KINDS - {"repair", "raw"}
+)
 """The call kinds that are always Clef requests (decisions). ``repair`` and ``raw``
 are both: a Clef question or a Clairic field, depending on the call."""
 
@@ -1298,6 +1305,14 @@ class ExperientialTransport(_HttpTransport):
         """Seconds the server asked to wait, from the response headers."""
         return _parse_retry_after(response.headers.get("Retry-After"))
 
+    def _refused_unprocessed(self, response: httpx.Response) -> bool:
+        """Whether a non-2xx response means the request was refused unprocessed.
+
+        Only such a refusal may be sent again (a 429 here); a subclass can say no
+        to one that will not clear by waiting (an exhausted quota).
+        """
+        return response.status_code in self._unprocessed_statuses
+
     def __init__(
         self,
         *,
@@ -1592,7 +1607,7 @@ class ExperientialTransport(_HttpTransport):
                         failure = self._error_for_status(
                             response, retry_after=retry_after
                         )
-                        if status not in self._unprocessed_statuses or (
+                        if not self._refused_unprocessed(response) or (
                             retry_after is None and self._retry_needs_hint
                         ):
                             failure.retries = retries
@@ -3603,6 +3618,11 @@ def _checked_shifts(shifts: Mapping[str, float], what: str) -> dict[str, float]:
                 f"{what}: unknown call kind {kind!r}; expected one of "
                 f"{sorted(CALL_KINDS)}"
             )
+        if kind in ESCALATE_KINDS:
+            raise ValueError(
+                f"{what}: {kind!r} calls go to the escalation model, not to Clef: "
+                "there is no Clef probability to shift"
+            )
         if (
             isinstance(shift, bool)
             or not isinstance(shift, (int, float))
@@ -3861,6 +3881,40 @@ def clef_fallback_on_from_env(
     return frozenset(names)
 
 
+EscalateChoice = Literal["openai", "none"]
+
+
+def escalation_from_env(
+    environ: Mapping[str, str] | None = None,
+) -> EscalationConfig | None:
+    """The escalation tier the environment asks for, or ``None``.
+
+    ``TRUSTCALL_S1_ESCALATE=openai`` turns the tier on (``none`` or unset: off);
+    ``TRUSTCALL_S1_ESCALATE_EFFORT`` sets ``reasoning.effort`` (``none``, ``low``,
+    ``medium``, ``high``, ``xhigh``, ``max``). **An ``OPENAI_API_KEY`` alone never
+    does**: it would send a user's text to OpenAI because of a variable they set for
+    something else.
+
+    Args:
+        environ: The environment to read (default ``os.environ``).
+
+    Returns:
+        An enabled ``EscalationConfig`` (its transport is created from
+        ``OPENAI_API_KEY`` on first use), or ``None``.
+
+    Raises:
+        ValueError: For a value that names no provider or effort.
+    """
+    env = os.environ if environ is None else environ
+    raw = (env.get("TRUSTCALL_S1_ESCALATE") or "").strip().lower()
+    if raw in ("", "none"):
+        return None
+    if raw != "openai":
+        raise ValueError(f"TRUSTCALL_S1_ESCALATE={raw!r}: expected 'openai' or 'none'")
+    effort = (env.get("TRUSTCALL_S1_ESCALATE_EFFORT") or "").strip().lower() or None
+    return EscalationConfig(enabled=True, reasoning_effort=effort)
+
+
 def system_one_transport(
     clef: ClefProvider | None = None,
     *,
@@ -3872,6 +3926,8 @@ def system_one_transport(
     decisions: DecisionsTransport | None = None,
     typesafe: TypeSafeTransport | None = None,
     concurrency: ConcurrencyConfig | None = None,
+    escalate: EscalateChoice | EscalationConfig | None = None,
+    openai: Transport | None = None,
 ) -> CloudflareTransport | RoutingTransport | TypeSafeTransport:
     """Build the usual transport: Clairic on Cloudflare, Clef where you choose.
 
@@ -3908,6 +3964,17 @@ def system_one_transport(
         decisions: The Decisions transport to use; by default a new one.
         typesafe: The TypeSafe transport to use; by default a new one.
         concurrency: Concurrency limits for the transports created here.
+        escalate: ``"openai"`` (or an ``EscalationConfig``) opts in to the escalation
+            tier: the few cases the default setup fails are asked of ``gpt-6-luna``
+            through the OpenAI Responses API, **which sends their text to OpenAI**.
+            The returned transport then carries the choice (``transport.escalation``),
+            which ``create_extractor`` reads. ``None`` (the default) adds nothing and
+            reads nothing from the environment here: ``TRUSTCALL_S1_ESCALATE`` is for
+            the extractor's default transport. Contradicts ``provider="typesafe"``
+            (TypeSafe only).
+        openai: The ``OpenAIResponsesTransport`` the tier uses (close it yourself:
+            it is yours); by default the extractor creates one from ``OPENAI_API_KEY``
+            on first use and closes it with itself.
 
     Returns:
         A plain ``CloudflareTransport`` when Clef is on Cloudflare without a
@@ -3921,9 +3988,64 @@ def system_one_transport(
         ValueError: If an argument or the environment names an unknown provider or
             fallback, or contradicts the TypeSafe-only provider or itself.
     """
+    if escalate is not None and not isinstance(escalate, (EscalationConfig, str)):
+        raise ValueError(f"unknown escalate {escalate!r}")
+    if isinstance(escalate, str) and escalate not in ("openai", "none"):
+        raise ValueError(f"unknown escalate {escalate!r}: expected 'openai' or 'none'")
+    config: EscalationConfig | None = None
+    if escalate == "openai":
+        config = EscalationConfig(enabled=True, transport=openai)
+    elif isinstance(escalate, EscalationConfig) and escalate.enabled:
+        config = (
+            dataclasses.replace(escalate, transport=openai)
+            if openai is not None
+            else escalate
+        )
+    elif openai is not None and escalate != "none":
+        raise ValueError(
+            "an OpenAI transport was passed without escalate='openai': the tier is "
+            "never switched on for you"
+        )
+    inner = _system_one_stack(
+        clef,
+        provider=provider,
+        clef_fallback=clef_fallback,
+        clef_fallback_on=clef_fallback_on,
+        cloudflare=cloudflare,
+        experiential=experiential,
+        decisions=decisions,
+        typesafe=typesafe,
+        concurrency=concurrency,
+        escalating=config is not None,
+    )
+    if config is not None:
+        # the transport carries the choice: ``create_extractor`` reads it from there
+        setattr(inner, "escalation", config)  # noqa: B010
+    return inner
+
+
+def _system_one_stack(
+    clef: ClefProvider | None,
+    *,
+    provider: Provider | None,
+    clef_fallback: ClefFallback | None,
+    clef_fallback_on: Iterable[FallbackTrigger] | str | None,
+    cloudflare: CloudflareTransport | None,
+    experiential: ExperientialTransport | None,
+    decisions: DecisionsTransport | None,
+    typesafe: TypeSafeTransport | None,
+    concurrency: ConcurrencyConfig | None,
+    escalating: bool,
+) -> CloudflareTransport | RoutingTransport | TypeSafeTransport:
+    """The transport ``system_one_transport`` builds without the escalation tier."""
     chosen = provider_from_env() if provider is None else provider
     if chosen not in ("cloudflare", "typesafe"):
         raise ValueError(f"unknown provider {chosen!r}")
+    if escalating and chosen == "typesafe":
+        raise ValueError(
+            "the TypeSafe provider is TypeSafe only: the escalation tier would send "
+            "text to OpenAI (use a combination spec, which names every provider)"
+        )
     if typesafe is not None and chosen != "typesafe":
         raise ValueError(
             "a TypeSafe transport was passed but the provider is "

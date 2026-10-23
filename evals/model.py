@@ -341,6 +341,9 @@ class CaseResult:
         reported_cost_usd: The cost in USD that responses reported (Experiential
             Labs reports one per call); it covers the calls that answered.
         output_tokens: Output tokens over all requests.
+        escalation: What the opt-in escalation tier used (``calls``, ``failed``,
+            ``input_tokens``, ``output_tokens`` with the ``reasoning_tokens`` among
+            them, ``latency_ms`` and the calls ``by_kind``); empty when it was off.
         by_provider: Requests, tokens and reported cost per provider that answered
             (``requests``, ``input_tokens``, ``output_tokens``, ``cost_usd``), from
             the call log (failed calls included), and, for a replay, what the calls
@@ -385,6 +388,7 @@ class CaseResult:
     reported_cost_usd: float = 0.0
     output_tokens: int = 0
     by_provider: dict[str, dict[str, float]] = field(default_factory=dict)
+    escalation: dict[str, Any] = field(default_factory=dict)
 
     @property
     def precision(self) -> float:

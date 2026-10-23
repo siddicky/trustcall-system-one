@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 import time
-from collections.abc import Awaitable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any, TypeVar, Union
@@ -14,6 +14,7 @@ from typing import Any, TypeVar, Union
 from trustcall_system_one._config import (
     CorefConfig,
     DiscoveryConfig,
+    EscalationConfig,
     GateConfig,
     Limits,
     MatchConfig,
@@ -23,8 +24,10 @@ from trustcall_system_one._config import (
     VerifyConfig,
 )
 from trustcall_system_one._errors import (
+    AuthError,
     BadRequestError,
     RequestTooLargeError,
+    TrustcallSystemOneError,
     exception_chain,
     is_request_rejection,
     is_size_rejection,
@@ -49,6 +52,7 @@ from trustcall_system_one._wire import (
     ClairicResponse,
     ClairicUsage,
     ClefRequest,
+    ClefUsage,
     NoulAnswer,
     NoulQuestion,
     ScoreAnswer,
@@ -57,6 +61,7 @@ from trustcall_system_one._wire import (
     parse_clairic,
     parse_clef,
 )
+from trustcall_system_one.openai_transport import OPENAI_DEFAULT_MODEL
 from trustcall_system_one.transport import (
     CallMeta,
     Transport,
@@ -135,6 +140,16 @@ def _refusal_signature(exc: BadRequestError) -> str:
         text = text.replace(str(request_id), "")
     text = _REQUEST_ID.sub("", text)
     return re.sub(r"\d+", "N", f"{exc.status_code} {text}")
+
+
+_CONTEXT_CODES = frozenset(
+    {"context_length_exceeded", "string_above_max_length", "max_tokens_exceeded"}
+)
+
+
+def _is_context_refusal(exc: BadRequestError) -> bool:
+    """Whether a 400 says the request was too large (the escalation can go without)."""
+    return any(entry.get("code") in _CONTEXT_CODES for entry in exc.cf_errors)
 
 
 def _pack(
@@ -383,6 +398,12 @@ class Run:
             kind, schema and field), also when an answer is replayed from
             ``clef_memo``.
         fallback_route: ``(fallback provider, primary provider)`` of the warning.
+        escalation: The opt-in escalation tier (``EscalationConfig``); off by default.
+        escalation_calls: Escalation calls made so far (all kinds), against
+            ``escalation.max_calls_per_invoke``.
+        escalation_by_kind: ... and per kind, against ``escalation.limits``.
+        escalation_memo: Single-flight results of the escalation calls that several
+            entities share (the rows of one nested list, the entities of one schema).
     """
 
     transport: Transport
@@ -423,6 +444,10 @@ class Run:
     hard_kinds: dict[str, int] = field(default_factory=dict)
     fallback_fields: dict[str, None] = field(default_factory=dict)
     fallback_route: tuple[str, str] | None = None
+    escalation: EscalationConfig = field(default_factory=EscalationConfig)
+    escalation_calls: int = 0
+    escalation_by_kind: dict[str, int] = field(default_factory=dict)
+    escalation_memo: "dict[Any, asyncio.Future[Any]]" = field(default_factory=dict)
 
     def warn(self, message: str) -> None:
         """Record a warning once."""
@@ -548,6 +573,7 @@ class Run:
         payload: dict[str, Any],
         meta: CallMeta,
         n_items: int,
+        transport: Transport | None = None,
     ) -> _Sent:
         """Send one request; a failure is logged first and then re-raised.
 
@@ -558,7 +584,9 @@ class Run:
         """
         started = time.perf_counter()
         try:
-            response = await self.transport.run(model, payload, meta=meta)
+            response = await (transport or self.transport).run(
+                model, payload, meta=meta
+            )
         except asyncio.CancelledError as cancelled:
             self._record_primary(model, meta, n_items, cancelled)
             self._record_siblings(model, meta, n_items, cancelled)
@@ -1279,6 +1307,116 @@ class Run:
         return {
             qid: response.answers[qid] for qid, _ in chunk if qid in response.answers
         }
+
+    # ------------------------------------------------------------------ #
+    # The escalation tier (opt-in, ``_escalate``)
+    # ------------------------------------------------------------------ #
+
+    def escalation_budget(self, sub: str) -> bool:
+        """Whether one more escalation call of kind ``sub`` may be made.
+
+        Counts against ``escalation.max_calls_per_invoke`` and the kind's own limit,
+        and warns once per limit that was reached.
+        """
+        cfg = self.escalation
+        if not cfg.runs(sub):
+            return False
+        limit = cfg.limit_for(sub)
+        if self.escalation_calls >= cfg.max_calls_per_invoke:
+            self.warn(
+                f"escalation_limit: max_calls_per_invoke={cfg.max_calls_per_invoke} "
+                f"was reached; further escalations ({sub} and the rest) were skipped"
+            )
+            return False
+        if limit is not None and self.escalation_by_kind.get(sub, 0) >= limit:
+            self.warn(
+                f"escalation_limit: the limit of {limit} {sub} call(s) per invoke "
+                "was reached; further ones were skipped"
+            )
+            return False
+        return True
+
+    async def call_escalate(
+        self, sub: str, payload: dict[str, Any], meta: CallMeta
+    ) -> dict[str, Any] | None:
+        """Ask the escalation model one question and return its parsed JSON answer.
+
+        The call is logged as a ``CallRecord`` of kind ``escalate`` whose ``field``
+        starts with the sub-kind. It returns ``None`` (the escalation did not
+        happen) when the kind is off, a limit was reached, the model gave no answer
+        (a refusal, an incomplete response) or the call failed in a way that says
+        nothing about the request (a timeout, a rate limit): the default setup's
+        result then stands, with a warning. A rejected key, a malformed request and
+        every failure in ``strict`` mode are raised.
+        """
+        if not self.escalation_budget(sub):
+            return None
+        cfg = self.escalation
+        transport = cfg.transport
+        if transport is None:
+            raise RuntimeError(
+                "escalation is enabled but has no transport (the extractor creates "
+                "one from the configuration)"
+            )
+        self.escalation_calls += 1
+        self.escalation_by_kind[sub] = self.escalation_by_kind.get(sub, 0) + 1
+        model = str(getattr(transport, "model", None) or OPENAI_DEFAULT_MODEL)
+        body = dict(payload)
+        if cfg.reasoning_effort is not None:
+            body["reasoning_effort"] = cfg.reasoning_effort
+        try:
+            sent = await self._send(model, body, meta, 1, transport=transport)
+        except AuthError:
+            raise
+        except BadRequestError as exc:
+            if self.strict or not _is_context_refusal(exc):
+                raise
+            self.warn(f"escalation_failed: {sub}: {_shown(exc)}")
+            return None
+        except TrustcallSystemOneError as exc:
+            if self.strict:
+                raise
+            self.warn(f"escalation_failed: {sub}: {_shown(exc)}")
+            return None
+        reply = sent.body
+        raw_usage = reply.get("usage")
+        usage_in: dict[str, Any] = raw_usage if isinstance(raw_usage, dict) else {}
+        usage = ClefUsage(
+            input_tokens=int(usage_in.get("input_tokens") or 0),
+            output_tokens=int(usage_in.get("output_tokens") or 0),
+            reasoning_tokens=int(usage_in.get("reasoning_tokens") or 0),
+        )
+        self._record(
+            sent.served_model or model,
+            meta,
+            1,
+            usage=usage,
+            duration_ms=sent.duration_ms,
+            retries=sent.retries,
+            status_code=sent.status_code,
+            request_id=sent.request_id,
+            provider=sent.provider,
+        )
+        parsed = reply.get("parsed")
+        if not isinstance(parsed, dict):
+            self.warn(
+                f"escalation_no_answer: {sub}: the model gave no answer "
+                f"({reply.get('no_answer') or 'empty'})"
+            )
+            return None
+        return parsed
+
+    async def once(self, key: Any, make: "Callable[[], Awaitable[T]]") -> T:
+        """Run ``make`` once for ``key`` in this run; every caller gets its result.
+
+        The entities of one nested list share one escalation call for their rows.
+        """
+        future = self.escalation_memo.get(key)
+        if future is None:
+            future = asyncio.ensure_future(make())
+            self.escalation_memo[key] = future
+        result: T = await asyncio.shield(future)
+        return result
 
     def clef_state(
         self,

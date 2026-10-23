@@ -68,6 +68,7 @@ from trustcall_system_one._diff import (
     sort_changes,
 )
 from trustcall_system_one._errors import ExtractionValidationError
+from trustcall_system_one._escalate import escalate_states
 from trustcall_system_one._existing import ExistingRecord, normalise_record
 from trustcall_system_one._gates import (
     dedup_elements,
@@ -2178,6 +2179,7 @@ async def insert_one(
         return InsertOutcome(None, extracted=False)
 
     root = await _run_unit(ctx, plan.root)
+    await escalate_states(ctx, list(_leaf_states(root)))
     await run_ladder(ctx, list(_leaf_states(root)))
     _settle(root)
     nested = await _insert_nested(ctx, root)
@@ -3436,6 +3438,7 @@ async def update_one(
     plain = ctx.input_only()
     nodes = _group_node(root, "", _identity_names(ctx))
     states = list(_leaf_states(root))
+    await escalate_states(ctx, states)
     by_wire = {st.spec.wire_name: st for st in states}
     unchanged: set[str] = set()
     new_at: dict[str, list[int]] = {}

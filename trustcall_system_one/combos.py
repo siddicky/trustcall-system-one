@@ -53,9 +53,12 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from trustcall_system_one._config import (
+    ESCALATION_KINDS,
+    REASONING_EFFORTS,
     ConcurrencyConfig,
     CorefConfig,
     DiscoveryConfig,
+    EscalationConfig,
     GateConfig,
     Limits,
     MatchConfig,
@@ -91,6 +94,7 @@ __all__ = [
     "PROVIDERS",
     "REMOVAL_KINDS",
     "ComboSpec",
+    "EscalateSpec",
     "Provider",
     "build_combo_transport",
     "calibrate_transport",
@@ -132,6 +136,7 @@ _COMPANIES = {
     "experiential-clef": ("Experiential Labs",),
     "decisions": ("Experiential Labs", "OpenAI"),
     "typesafe": ("TypeSafe",),
+    "openai": ("OpenAI",),
 }
 """Who sees the text a provider is given."""
 
@@ -230,6 +235,11 @@ def _split_kind_key(key: str) -> tuple[str, str | None]:
         raise ValueError(
             f"by_kind: unknown call kind {kind!r}; expected one of {sorted(CALL_KINDS)}"
         )
+    if kind == "escalate":
+        raise ValueError(
+            "by_kind: 'escalate' calls never go through the Clairic/Clef stack; "
+            "configure the tier with the spec's escalate"
+        )
     if not at:
         return kind, None
     try:
@@ -241,6 +251,81 @@ def _split_kind_key(key: str) -> tuple[str, str | None]:
     if ("clairic" if name == "clairic" else "clef") not in _kind_families(kind, None):
         raise ValueError(f"by_kind: {key!r}: {kind!r} is never asked of {name}")
     return kind, name
+
+
+class EscalateSpec(BaseModel):
+    """The escalation tier of a combination (``ComboSpec.escalate``).
+
+    ``"escalate": "openai"`` is the shorthand of ``{"provider": "openai"}``. Naming it
+    is the opt-in to send the text of the few cases the default setup fails to OpenAI
+    (``ComboSpec.companies`` says so).
+
+    Attributes:
+        provider: ``openai`` (the Responses API).
+        model: The model (``gpt-6-luna``).
+        reasoning_effort: ``none``, ``low``, ``medium``, ``high``, ``xhigh`` or
+            ``max``; higher is slower and dearer (reasoning tokens are output tokens).
+        kinds: The escalation kinds that may run (default: all of
+            ``ESCALATION_KINDS``).
+        limits: Most calls per invoke by kind (``EscalationConfig.limits``).
+        max_calls_per_invoke: Most escalation calls in one invoke.
+        prob_cap: The most probability an escalation answer stands for.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    provider: Literal["openai"] = "openai"
+    model: str = "gpt-6-luna"
+    reasoning_effort: str = "none"
+    kinds: tuple[str, ...] | None = None
+    limits: dict[str, int] | None = None
+    max_calls_per_invoke: int | None = None
+    prob_cap: float | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _shorthand(cls, value: Any) -> Any:
+        if value == "openai":
+            return {"provider": "openai"}
+        return value
+
+    @model_validator(mode="after")
+    def _check(self) -> "EscalateSpec":
+        if self.reasoning_effort not in REASONING_EFFORTS:
+            raise ValueError(
+                f"escalate.reasoning_effort must be one of {list(REASONING_EFFORTS)}, "
+                f"got {self.reasoning_effort!r}"
+            )
+        unknown = sorted(set(self.kinds or ()) - set(ESCALATION_KINDS))
+        if unknown:
+            raise ValueError(
+                f"escalate.kinds: unknown {unknown}; expected a subset of "
+                f"{list(ESCALATION_KINDS)}"
+            )
+        self.config()  # a bad limit or prob_cap fails here
+        return self
+
+    def config(self, transport: Any = None) -> EscalationConfig:
+        """The enabled ``EscalationConfig`` of the spec."""
+        extra: dict[str, Any] = {}
+        if self.kinds is not None:
+            extra["kinds"] = frozenset(self.kinds)
+        if self.limits is not None:
+            extra["limits"] = dict(self.limits)
+        if self.max_calls_per_invoke is not None:
+            extra["max_calls_per_invoke"] = self.max_calls_per_invoke
+        if self.prob_cap is not None:
+            extra["prob_cap"] = self.prob_cap
+        return EscalationConfig(
+            enabled=True,
+            transport=transport,
+            reasoning_effort=self.reasoning_effort,
+            **extra,
+        )
+
+    def describe(self) -> str:
+        """A short label: ``openai gpt-6-luna effort=low``."""
+        return f"{self.provider} {self.model} effort={self.reasoning_effort}"
 
 
 class ComboSpec(BaseModel):
@@ -267,6 +352,9 @@ class ComboSpec(BaseModel):
         options: ``create_extractor`` knobs: ``group.field`` overrides
             (``verify.attribution_keep``, ``gates.add_threshold``,
             ``match.accept``...) and the top-level flags.
+        escalate: The opt-in escalation tier (``EscalateSpec``; ``"openai"`` is the
+            shorthand): a stronger model for the few cases the default setup fails.
+            Naming it sends their text to OpenAI; ``only`` refuses it.
         only: When set, no other provider may be named anywhere in the spec (the
             TypeSafe-only guarantee, for any provider).
         labels: Free-form labels, recorded with the results.
@@ -281,6 +369,7 @@ class ComboSpec(BaseModel):
     by_kind: dict[str, Provider] = Field(default_factory=dict)
     calibration: dict[Provider, dict[str, float]] = Field(default_factory=dict)
     options: dict[str, Any] = Field(default_factory=dict)
+    escalate: EscalateSpec | None = None
     only: Provider | None = None
     labels: dict[str, str] = Field(default_factory=dict)
 
@@ -365,6 +454,11 @@ class ComboSpec(BaseModel):
                     f"calibration names {provider!r}, which the spec never uses "
                     f"(it uses {list(named)})"
                 )
+        if self.only is not None and self.escalate is not None:
+            raise ValueError(
+                f"only={self.only!r} but the spec also names the escalation tier "
+                f"({self.escalate.provider}): text would go to another company"
+            )
         if self.only is not None:
             others = [p for p in named if p != self.only]
             if others:
@@ -402,7 +496,8 @@ class ComboSpec(BaseModel):
 
     def companies(self) -> tuple[str, ...]:
         """The companies that will see the text (naming a provider is the opt-in)."""
-        return tuple(dict.fromkeys(c for p in self.providers() for c in _COMPANIES[p]))
+        found = [*self.providers(), *(["openai"] if self.escalate else [])]
+        return tuple(dict.fromkeys(c for p in found for c in _COMPANIES[p]))
 
     def canonical(self) -> "ComboSpec":
         """The same combination with every redundant entry removed.
@@ -436,6 +531,7 @@ class ComboSpec(BaseModel):
             by_kind=by_kind,
             calibration={p: t for p, t in calibration.items() if t},
             options=dict(self.options),
+            escalate=self.escalate,
             only=self.only,
             labels=dict(self.labels),
         )
@@ -462,6 +558,8 @@ class ComboSpec(BaseModel):
             for k, s in sorted(table.items())
         ]
         parts += [f"{k}={v}" for k, v in sorted(spec.options.items())]
+        if spec.escalate is not None:
+            parts.append(f"escalate {spec.escalate.describe()}")
         return ", ".join(parts)
 
     def replace(self, **changes: Any) -> "ComboSpec":

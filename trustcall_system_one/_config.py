@@ -3,16 +3,19 @@
 import math
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
-from typing import Literal, TypeVar
+from typing import Any, Literal, TypeVar
 
 from trustcall_system_one._types import Usage
 from trustcall_system_one._wire import CLAIRIC, CLEF, CLEF_FLASH, normalize_model_id
 
 __all__ = [
+    "ESCALATION_KINDS",
+    "REASONING_EFFORTS",
     "ConcurrencyConfig",
     "CorefConfig",
     "CostReport",
     "DiscoveryConfig",
+    "EscalationConfig",
     "GateConfig",
     "Limits",
     "MatchConfig",
@@ -134,19 +137,31 @@ class Prices:
     ($0.042 per million input tokens): give the version that answers
     (``"jev-1.14.0"``, shown in ``Usage.by_model``) or the alias ``"jev-latest"``,
     which prices any ``jev-*`` version that has no price of its own.
+
+    ``per_million_output`` prices the output tokens of the models that also have an
+    input price: OpenAI's output tokens include its reasoning tokens, so a higher
+    ``reasoning.effort`` of the escalation tier costs more only with it. ``gpt-6-luna``
+    has no default price: without one it is in ``CostReport.unpriced_models``.
     """
 
     per_million_input: Mapping[str, float] = field(default_factory=_default_prices)
+    per_million_output: Mapping[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        """Validate the prices and freeze the mapping."""
+        """Validate the prices and freeze the mappings."""
         if any(
             not math.isfinite(price) or price < 0
-            for price in self.per_million_input.values()
+            for price in (
+                *self.per_million_input.values(),
+                *self.per_million_output.values(),
+            )
         ):
             raise ValueError("prices must be finite and non-negative")
         object.__setattr__(
             self, "per_million_input", _FrozenMap(self.per_million_input)
+        )
+        object.__setattr__(
+            self, "per_million_output", _FrozenMap(self.per_million_output)
         )
 
     def cost(self, usage: Usage) -> CostReport:
@@ -180,6 +195,11 @@ class Prices:
                 price = self.per_million_input.get("jev-latest")
             if price is not None:
                 total += used.input_tokens * price / 1_000_000
+                # OpenAI's output tokens include the reasoning tokens (see
+                # ``Usage.reasoning_tokens``), so a higher effort costs more here
+                out_price = self.per_million_output.get(model)
+                if out_price is not None:
+                    total += used.output_tokens * out_price / 1_000_000
             elif not all_reported:
                 unpriced.add(normalize_model_id(model))
         if not usage.by_model and usage.input_tokens:
@@ -875,3 +895,122 @@ class MatchConfig:
                 "on_ambiguous must be 'skip', 'insert' or 'raise', got "
                 f"{self.on_ambiguous!r}"
             )
+
+
+ESCALATION_KINDS: tuple[str, ...] = (
+    "relative_dates",
+    "list_rows",
+    "attribution_tiebreak",
+    "dotted_discovery",
+)
+"""What the escalation tier can be asked to do (``EscalationConfig.kinds``)."""
+REASONING_EFFORTS: tuple[str, ...] = ("none", "low", "medium", "high", "xhigh", "max")
+"""The values of ``reasoning.effort`` that the escalation tier accepts."""
+
+_DEFAULT_KIND_LIMITS: Mapping[str, int] = {
+    "relative_dates": 8,
+    "list_rows": 4,
+    "attribution_tiebreak": 12,
+    "dotted_discovery": 2,
+}
+_REMOVAL_FLOOR = 0.85
+"""The default ``gates.remove_threshold`` and ``match.delete_threshold``: what a
+probability that came from the escalation tier must stay under."""
+
+
+@dataclass(frozen=True)
+class EscalationConfig:
+    """The opt-in escalation tier: a stronger model for what the default fails.
+
+    The default setup (Clairic for extraction, Clef for decisions) answers everything;
+    this tier asks OpenAI's ``gpt-6-luna`` (Responses API) about the few cases in
+    which it demonstrably fails, and **the text of those cases goes to OpenAI**. It is
+    off unless ``enabled`` is true, and a key in the environment never turns it on.
+    Whatever it says is a *proposal*: it goes through the same verification ladder and
+    change gates as an answer of the default setup, a quoted value must occur verbatim
+    in the input, and it can never write, delete or override a confident Clef answer.
+
+    The four kinds (see "Escalation tier" in the design doc):
+
+    * ``relative_dates``: a date or datetime field that is invalid or null while its
+      mention window holds a relative phrase ("yesterday", "last Tuesday"; needs a
+      ``reference_date``) is asked as ``{phrase, iso_date}``;
+    * ``list_rows``: the rows of a nested ``list[Model]`` (a count that disagrees with
+      discovery, a row that came back empty or incomplete, a mentioned row whose
+      update was not proposed) are asked as quoted values;
+    * ``attribution_tiebreak``: an attribution answer still in
+      ``[verify.attribution_drop, verify.attribution_keep)`` after the second look is
+      asked as ``{answer: yes|no}``; yes counts as ``prob_cap``, no as ``1 - prob_cap``;
+    * ``dotted_discovery``: a top-level ``Many`` with a dotted identity that finds no
+      entity although presence says there are some is asked for each entity's
+      descriptive label and identity value.
+
+    Attributes:
+        enabled: Whether the tier runs at all.
+        transport: Where its requests go (an ``OpenAIResponsesTransport``); ``None``
+            with ``enabled`` creates one from ``OPENAI_API_KEY`` on first use.
+        kinds: The kinds that may run, a subset of ``ESCALATION_KINDS``.
+        reasoning_effort: ``reasoning.effort`` of every call (``none``, ``low``,
+            ``medium``, ``high``, ``xhigh``, ``max``); ``None`` leaves it to the
+            transport (``none`` by default). Higher effort makes calls slower and
+            dearer (reasoning tokens are output tokens).
+        limits: Most calls per invoke of each kind (a kind not listed has no limit of
+            its own); defaults: 8 dates, 4 row sets, 12 tie-breaks, 2 discoveries.
+        max_calls_per_invoke: Most escalation calls of all kinds in one invoke.
+        prob_cap: The most probability an escalation answer can stand for. It stays
+            under ``gates.remove_threshold`` and ``match.delete_threshold`` (0.85), so
+            an answer of this tier can authorise an add or a replace but never a
+            removal, a set-null or a delete.
+    """
+
+    enabled: bool = False
+    transport: Any = None
+    kinds: frozenset[str] = frozenset(ESCALATION_KINDS)
+    reasoning_effort: str | None = None
+    limits: Mapping[str, int] = field(
+        default_factory=lambda: dict(_DEFAULT_KIND_LIMITS)
+    )
+    max_calls_per_invoke: int = 20
+    prob_cap: float = 0.8
+
+    def __post_init__(self) -> None:
+        """Validate the settings and freeze the collections."""
+        _check_flag("enabled", self.enabled)
+        kinds = frozenset(self.kinds)
+        unknown = sorted(kinds - set(ESCALATION_KINDS))
+        if unknown:
+            raise ValueError(
+                f"unknown escalation kind(s) {unknown}; expected a subset of "
+                f"{list(ESCALATION_KINDS)}"
+            )
+        object.__setattr__(self, "kinds", kinds)
+        if self.reasoning_effort is not None and (
+            self.reasoning_effort not in REASONING_EFFORTS
+        ):
+            raise ValueError(
+                f"reasoning_effort must be one of {list(REASONING_EFFORTS)} or None, "
+                f"got {self.reasoning_effort!r}"
+            )
+        bad = sorted(set(self.limits) - set(ESCALATION_KINDS))
+        if bad:
+            raise ValueError(f"limits names unknown escalation kind(s) {bad}")
+        for kind, limit in self.limits.items():
+            _check_int(f"limits[{kind!r}]", limit, 0)
+        object.__setattr__(self, "limits", _FrozenMap(dict(self.limits)))
+        _check_int("max_calls_per_invoke", self.max_calls_per_invoke, 0)
+        cap = self.prob_cap
+        if isinstance(cap, bool) or not isinstance(cap, (int, float)):
+            raise ValueError(f"prob_cap must be a number, got {cap!r}")
+        if not math.isfinite(cap) or not 0.5 < cap < _REMOVAL_FLOOR:
+            raise ValueError(
+                f"prob_cap must be above 0.5 and below {_REMOVAL_FLOOR} (the removal "
+                f"and delete gates), got {cap!r}"
+            )
+
+    def limit_for(self, kind: str) -> int | None:
+        """The most calls of ``kind`` in one invoke, or ``None`` for no limit."""
+        return self.limits.get(kind)
+
+    def runs(self, kind: str) -> bool:
+        """Whether the tier is on and ``kind`` may run."""
+        return self.enabled and kind in self.kinds

@@ -153,6 +153,7 @@ own), `field` = one per field.
 | `_entity.py`, `_verify.py` | per-entity passes (insert, update); attribution, cross-check, re-ask, borderline-null |
 | `_nested.py` | nested collections: the guard (`max_depth`/`max_recursion`), an insert's items as the parent's document and answers, an update's item records as operations of the parent |
 | `_sentences.py` | sentence splitter, entity scoping and the Clef pass of the `sentences` list strategy |
+| `openai_transport.py` (public), `_escalate.py`, `_relative.py` | the opt-in escalation tier: `OpenAIResponsesTransport` (`gpt-6-luna`, Responses API); its four kinds and their verification; relative dates read in code |
 | `_diff.py`, `_gates.py`, `_repair.py` | ops + apply; thresholds + change gate; repair loop |
 | `_run.py`, `_extractor.py` | per-invoke context (usage, call log, semaphores); factory + sync bridge |
 | `testing.py` (public) | `FakeTransport`, `FakeWorld`, `RecordingTransport`, `CassetteTransport` (+ `CassetteMissError`, `request_key`, `trace_to_cassette`) |
@@ -2479,6 +2480,172 @@ repair, Decisions with images, partial usage and the deadline, the hook, the eva
 case end to end: `tests/unit/jev_mock.py` plays Jev from the case's `FakeWorld`, validating each request
 against the OpenAPI schema, with the real transport and engine in between: `One` inserts, updates and
 `Many` scenarios). All offline (`httpx.MockTransport`).
+
+## Escalation tier (gpt-6-luna)
+
+An **opt-in** tier that asks OpenAI's `gpt-6-luna` (Responses API) about the few cases in which the
+default setup (Cloudflare Clairic for extraction, Clef for decisions) was observed to fail. **The text
+of those cases goes to OpenAI.** It is off unless it is configured explicitly, and a key in the
+environment never turns it on (the rule of every other provider here: an `OPENAI_API_KEY` set for
+something else must not move a user's text to another company).
+
+**What failed (a live run of Clairic + Clef on a 30-case held-out set, 14 cases):**
+
+| group | symptom | handled by |
+| --- | --- | --- |
+| relative dates | "yesterday", "three days ago", "last Tuesday", "in two weeks" make a required date invalid, so the record is rejected | the coercion (code) and `relative_dates` |
+| nested `list[Model]` rows, often markdown tables | the count says 1 for 3 rows and one row gets values; rows named by position codes (`ENG-1`, `NLG`) come out empty; an update to one row's fields is not written | `list_rows` |
+| mid-band attribution | "does the input state that X of Y is V?" answers 0.4 to 0.75 and drops correct values (a phone number next to a name, a commitment spoken by a labelled speaker, a relationship in the speaker's voice) | `attribution_tiebreak` |
+| dotted identity inserts | `Many(X, identity="identification.serial")` inserts nothing | `dotted_discovery` |
+
+**Relative dates: the root cause, and what is fixed without the tier.** Clairic documents
+`reference_date` as the "ISO date that anchors dates written *without a year*"
+(`docs/schemas/clairic-input.json`); nothing in its contract says that it resolves a relative phrase,
+and the date answer's `value` is untyped (`{}`) with no span. No recorded Clairic response in
+`tests/recorded` has a date field, so what Clairic returns for "three days ago" cannot be read from the
+repository: the fix covers what is certain. `_coerce._parse_date` accepts an ISO date or datetime
+*string* and nothing else (a number is refused on purpose: pydantic would read it as a Unix
+timestamp), so any other shape is `ok=False` ("is not an ISO date") and a required date field then
+fails validation, whatever the repair re-ask says. The README and the docstrings claimed that
+`reference_date` "anchors relative dates"; it does not, as far as the API says. **Fixed in code, no
+model involved (`_relative.py`, `_coerce._relative`):** a date or datetime answer that is a phrase
+naming ONE date whatever the convention (`today`, `tomorrow`, `yesterday`, the day after tomorrow
+or before yesterday, `N days|weeks|fortnights|months|years ago|from now|later|earlier`, `in N ...`;
+numbers as digits or words) is resolved against the invoke's `reference_date` (a datetime is that day at
+midnight, noted `relative_date: resolved in code (midnight)`); without a reference date the answer stays
+invalid (the code never uses today's date). A weekday phrase ("last Tuesday", "next Friday") is NOT
+resolved in code: on a Friday "last Tuesday" can mean either of two dates, so the code does not pick.
+What is left (a null answer, a weekday phrase, any other shape) is the tier's.
+
+**Never on its own word.** Every escalation result is a *proposal*. It goes through the same
+verification ladder (attribution by Clef, and for updates the input-only pass is skipped for it, since
+the model that failed is the Clairic pass) and the same change gates as an answer of the default setup;
+a quoted value must occur verbatim in the input; and the tier never writes, deletes or overrides a
+confident Clef answer. `prob_cap` (default 0.8, validated to lie in (0.5, 0.85) and below
+`gates.remove_threshold` and `match.delete_threshold` when the extractor is made) is the most
+probability an answer of the tier stands for: it can keep a value (the attribution keep bar is 0.75) or
+pass an add or a replace gate, never authorise a removal, a set-null or a delete. A state the tier
+proposed is never sent to the tier again (the tie-break would confirm itself).
+
+### The transport: `OpenAIResponsesTransport` (`openai_transport.py`, public)
+
+`POST {base_url}/v1/responses`, `Authorization: Bearer <key>` (key: `api_key=` or `OPENAI_API_KEY`, read
+on each call; missing is `AuthError` before anything is sent; `base_url=` or `OPENAI_BASE_URL`, default
+`https://api.openai.com`, a value ending `/v1` or `/v1/responses` is taken as it is). Body: `model`
+(default `gpt-6-luna`), `reasoning: {"effort": ...}`, `input`, optional `instructions`, `text.format` a
+strict `json_schema`, and `store: false` (the live probe did not send it and the response said
+`store: true`: OpenAI keeps a response unless told not to, so the text is not left behind).
+
+* **Reasoning effort** is a first-class setting: `none` (default), `low`, `medium`, `high`, `xhigh`,
+  `max`, on the transport (`reasoning_effort=`), on `EscalationConfig.reasoning_effort` (it rides on the
+  payload, so one transport serves several efforts), on `ComboSpec.escalate`, on the evals
+  (`--escalate-effort`) and as a search dimension (`escalate.effort`). A higher effort thinks longer
+  before the first byte, so the per-attempt read timeout scales with it (`EFFORT_TIMEOUTS`: 60, 120,
+  180, 300, 600, 900 s; overridden by `timeout=` or a call's own; the call deadline is 300 s or 2.5 times
+  the read timeout, whichever is more). **The retry rules do not change with the effort: a timeout after
+  the request was sent is an uncertain outcome and is never retried.**
+* **Response.** The answer is found by item type: the `message` item's `output_text` content (a
+  `reasoning` item before it, present when the effort is above `none`, is ignored and its summary is
+  never kept; the live probe showed `output[0]` as the message at effort `none`, `phase:
+  "final_answer"`). The reply body is normalised to `{model, status, parsed, text, refusal, no_answer,
+  logprobs, usage}`. A `refusal` content item, a `status` other than `completed` (`incomplete`,
+  `failed`) and a response without an `output_text` are **no answer** (`parsed: None`,
+  `no_answer` says why): the response arrived and was charged, so it is not an uncertain outcome, nothing
+  is retried, and the engine only warns (`escalation_no_answer`). Text that is not a JSON object under a
+  strict schema is a `ModelResponseError` (its message never holds the text).
+* **Usage.** `input_tokens`, `output_tokens` and `output_tokens_details.reasoning_tokens` become the
+  call's usage with `provider="openai"` and the served model. OpenAI's `output_tokens` already include the
+  reasoning tokens, so a higher effort is more output tokens, in `Usage.output_tokens`, in
+  `Usage.reasoning_tokens` (a new counter, also in `CallRecord.usage`) and in the cost. **No default
+  price**: without one `CallRecord.cost_usd` is `None` and the model is in `CostReport.unpriced_models`
+  (`complete` is false); the caller passes `Prices` with an input price and, new, `per_million_output`
+  (an output price needs the same model's input price) to get a cost; the evals' `--price
+  openai=IN:OUT` does the same for the search.
+* **Retries and errors (the library's rules, as `ExperientialTransport`).** A connect error (nothing was
+  sent) and a 429 are retried, a 429 honouring `Retry-After`, else the `x-ratelimit-reset-*` hints
+  (`6m0s`, `20ms`, `1.5s`; the reset of an exhausted resource per the `x-ratelimit-remaining-*`, else the
+  shortest), else a jittered backoff; a wait over `max_retry_after` (60 s) fails at once with
+  `RateLimitError`, and a 429 with `insufficient_quota` is not retried (waiting does not refill a quota).
+  A timeout, a dropped connection, a 408 and any 5xx (a 529 too) raise `UncertainOutcomeError` after
+  exactly ONE request. 401/403 are `AuthError`, other 4xx `BadRequestError`.
+* **No user text in an error.** The message and the kept body hold the HTTP status, OpenAI's
+  `error.type`, `error.code` and `error.param` (each only if it is a short identifier) and the request
+  id, never `error.message`, which can quote the request (and a 401's quotes part of the key).
+* **Limits.** `max_questions` is 8 (the transport serves no Clef; the number keeps what it advertises
+  small), `state_token_budget` 100,000 tokens (the escalation skips a request whose input is longer, with
+  a warning), `serves` is true for any model but Clairic and Clef, `classify_failure` is the library's,
+  `sensitive_values()` holds an explicit key.
+* **Logprobs** are opt-in (`top_logprobs` in the payload sends `include:
+  ["message.output_text.logprobs"]` and returns the entries untouched) and the library does not use them:
+  the live probe showed that under a strict schema constrained decoding masks the alternatives
+  (`top_logprobs` holds only the chosen token), so P(yes) against P(no) cannot be computed. The tie-break
+  uses the hard mapping below.
+
+**Scrubbing.** `testing.scrub` replaces the value of `OPENAI_API_KEY` and any `sk-` key
+(`sk-proj-...` too); `RecordingTransport` writes no call whose request or response holds an exact
+credential (the key passed explicitly is in `sensitive_values()`), and a recording never holds a header.
+The key sits in the httpx request that an `UncertainOutcomeError` chains (`__cause__`): scrub
+`Authorization` headers and `sk-` keys in an error tracker.
+
+### Configuration and wiring
+
+`EscalationConfig(enabled=False, transport=None, kinds=<all four>, reasoning_effort=None, limits={...},
+max_calls_per_invoke=20, prob_cap=0.8)` (`_config.py`): `limits` are per kind and invoke (defaults 8
+dates, 4 row sets, 12 tie-breaks, 2 discoveries; 0 switches a kind off), `max_calls_per_invoke` counts
+all kinds, a limit that is reached warns once (`escalation_limit`) and the call is not made. An enabled
+config without a transport gets an `OpenAIResponsesTransport` from `OPENAI_API_KEY` on first use (owned,
+closed with the extractor).
+
+The opt-in, in order of precedence: `create_extractor(escalation=EscalationConfig(enabled=True))`; the
+tier a transport carries (`system_one_transport(escalate="openai")` sets `transport.escalation`; it is a
+`ValueError` with `provider="typesafe"` (TypeSafe only) and an `openai=` transport without `escalate=`
+is one too); for the default transport only, `TRUSTCALL_S1_ESCALATE=openai` (and
+`TRUSTCALL_S1_ESCALATE_EFFORT`; a bad value fails when the extractor is made); `ComboSpec.escalate`
+(`"openai"` or `{"provider": "openai", "model", "reasoning_effort", "kinds", "limits",
+"max_calls_per_invoke", "prob_cap"}`; part of `spec.key()` and `describe()`, `spec.companies()` adds
+OpenAI, `only` refuses it, `by_kind` and `calibration` refuse the `escalate` kind); evals `--escalate
+openai --escalate-effort EFFORT`.
+
+Every call is a `CallRecord` of the new `CallKind` `"escalate"` (never routed through the Clairic/Clef
+stack: `ESCALATE_KINDS`, outside `CLEF_KINDS`), `CallRecord.field` starts with the sub-kind
+(`relative_dates:done_on`, `list_rows`, `attribution_tiebreak:phone`, `dotted_discovery`), `provider`
+is `openai`, `Usage.by_kind["escalate"]` and `by_model["gpt-6-luna"]` carry its tokens, and each use is a
+warning `escalation:<kind>: ...` (field paths and counts, no text). **Failure policy:** the tier is an
+optional improvement, so a call that fails in a way that says nothing about the request (a timeout, a
+rate limit that did not clear, an uncertain outcome, a refusal) leaves the default setup's result, with
+`escalation_failed` / `escalation_no_answer` in the warnings and the failed call in the log (never sent
+again); a rejected key (`AuthError`), a malformed request and every failure under `strict=True` raise.
+
+### The four kinds
+
+| kind | trigger | prompt | verification | tests |
+| --- | --- | --- | --- | --- |
+| `relative_dates` | a date/datetime field (`_verify.FieldState`) with no usable value (null, unparseable, missing answer) whose entity's mention windows (the whole input for a `One`) hold a relative phrase (`_relative.find_phrases`), with a `reference_date` | the text of the windows, the reference date with its weekday, the field's description; strict `{phrase, iso_date, time}`; `time` only for a datetime | the phrase occurs verbatim in a window and holds a relative phrase; `iso_date` is `YYYY-MM-DD` and a real date; `_relative.plausible`: a phrase that names one date must equal it, a weekday phrase must fall on that weekday on the right side of today within 14 days; a datetime needs `HH:MM`; then the state is marked `escalated`, goes through attribution (with the "Today is ..." note) and the gates | `test_escalation.py` (reproduced off, fixed on, 7 rejections, no call without a phrase or a reference date, no override of a confident answer, datetime) |
+| `list_rows` | (1) a nested list with no mention while presence says there are some, or a count above the rows found (`collect`): the verified identities join the mentions (a broadened discovery); (2) a nested row that came back empty, or without a required field (insert), or for which nothing at all was proposed (update) (`escalate_states`) | the text, the item fields with their descriptions; strict `{rows: [{identity, fields: {name: quote or null}}]}`, ONE call per list and invoke (single-flight) | the identity occurs verbatim; every value occurs verbatim (near the identity), and is coerced like a Clairic answer (`_coerce.coerce`); only fields that have no usable value are filled, and only for the row whose identity lies on the entity's mention; the rows then go through qualification, attribution, the gates and the diff. No row, no op and no delete is ever created from the model's list of rows | rows empty (position codes), count above the rows found, update not written, invented rows and values rejected, no removal with `enable_item_removals` |
+| `attribution_tiebreak` | an attribution still in `[verify.attribution_drop, verify.attribution_keep)` after the existing second look (scalar, and each list element) | the text (windows around the value), the entity label and the attribution question as Clef was asked it; strict `{answer: yes|no}` | yes counts as `prob_cap` (0.8), no as `1 - prob_cap`; only adopts the value when that reaches the keep bar; never asked for a gate, a delete or a removal, never about a value the tier itself proposed, never outside the band | `test_escalation.py` (two synthetic domains, yes/no, confident answers untouched, `prob_cap` 0.7 cannot keep, delete not escalated) |
+| `dotted_discovery` | a top-level `Many` with a dotted identity whose discovery found no mention while presence says there are some (or presence was not asked) | the text; strict `{entities: [{label, identity}]}` | both quotes occur verbatim; the entity becomes a mention (the label quote), then the normal qualify, extract and match path | reproduced off, fixed on, an entity with an invented label or identity rejected, no call when discovery works |
+
+### Evals, combinations, search
+
+`python -m evals run --escalate openai [--escalate-effort low]` (also `TRUSTCALL_S1_ESCALATE`): live it sends
+the text of failing cases to OpenAI (needs `OPENAI_API_KEY`; the error names the variable, never a value);
+offline the tier is answered by a stand-in that never answers (`FakeEscalation`; `Settings.escalation`
+scripts it), so a run with the tier on is the same run and the offline evals stay green. `results.json`
+has `escalation` (`openai gpt-6-luna effort=low`) and `escalate_effort`, the aggregate has
+`escalation_calls`, `_failed`, `_input_tokens`, `_output_tokens`, `_reasoning_tokens`,
+`_latency_ms` and `_mean_latency_ms`, a case has `escalation` (and `by_provider.openai` with
+`latency_ms`: every provider row now has it), a combination records `labels.escalation` and OpenAI in
+`companies`. Record and replay treat the tier as the provider `openai` (a cassette replays only what
+`openai` recorded). `evals search --order escalate.effort` (alone or with other dimensions) sweeps the
+base spec's `escalate.reasoning_effort` over `none, low, medium, high` with the usual margin and veto, on
+the dev suite only; the leaderboard gains `esc calls`, `esc reasoning tok` and `esc ms/call`, and with
+`--price openai=IN:OUT` the cost counts the output (reasoning) tokens, so the table shows the cost and the
+latency of each effort.
+
+**Left out on purpose:** probabilities from logprobs (the strict schema masks them); a fallback for the
+tier; the tier for `strict`-schema features the Responses API does not take (a JSON schema that is not an
+object); `xhigh` and `max` in the search's default candidates (a spec can name them); retrying an
+uncertain escalation; escalating `gate`, `null_check` and `delete` (they can authorise a removal).
 
 ## Testing
 

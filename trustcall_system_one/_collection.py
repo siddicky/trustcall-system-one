@@ -31,6 +31,7 @@ import dataclasses
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
 from trustcall_system_one._cardinality import Many
@@ -57,6 +58,7 @@ from trustcall_system_one._entity import (
     insert_one,
     update_one,
 )
+from trustcall_system_one._escalate import escalate_discovery
 from trustcall_system_one._existing import ExistingRecord, normalise_record
 from trustcall_system_one._match import (
     Candidate,
@@ -2419,6 +2421,35 @@ async def collect(
     if not skip_presence:
         presence, cut = results[2]
 
+    async def escalated(found: int) -> list[Mention]:
+        """What the opt-in escalation tier finds where discovery came up short."""
+        return await escalate_discovery(
+            run,
+            plan=plan,
+            source=scope.source,
+            parent=scope.parent,
+            scope_key=scope.call_scope,
+            noun=scope.kind
+            if (rows or _dotted(plan, scope.cardinality))
+            else scope.noun,
+            identifier=_identifier(plan, scope.cardinality),
+            dotted=_dotted(plan, scope.cardinality),
+            found=found,
+            count=count,
+            present=presence is None or presence >= config.presence_present,
+            meta_like=SimpleNamespace(plan=plan, key=None, scope=scope.call_scope),
+            lineage=scope.lineage,
+        )
+
+    if not mentions:
+        # no mention at all although presence says the kind is there: the escalation
+        # tier (opt-in) is asked for them, and its quotes go the normal way
+        extra = await escalated(0)
+        if extra:
+            mentions = extra
+            if screen:
+                mentions = _prefilter(run, scope, mentions, count)
+
     def empty() -> CollectionOutcome:
         return CollectionOutcome((), (), tuple(warnings), presence, count)
 
@@ -2505,6 +2536,19 @@ async def collect(
                 groups = await _adopt_records(run, scope, names, groups, live, warn)
                 live = _qualified(groups, config.qualify_min)
         checked = 0
+        if count > len(live) and not explained and scope.parent is not None:
+            # a nested list with fewer rows than its count: the rows the escalation
+            # tier (opt-in) quotes join the mentions, like a broadened discovery
+            extra = await escalated(len(live))
+            merged = _union(mentions, extra, scope.source) if extra else mentions
+            if merged != mentions:
+                mentions = merged
+                groups, _ = await _group(
+                    run, scope, mentions, pair_cache, known, screen=screen
+                )
+                live = _qualified(groups, config.qualify_min)
+                groups = await _adopt_records(run, scope, names, groups, live, warn)
+                live = _qualified(groups, config.qualify_min)
         if act and count < len(live):
             groups, checked = await _merge(run, scope, groups, count, pair_cache)
             live = _qualified(groups, config.qualify_min)
