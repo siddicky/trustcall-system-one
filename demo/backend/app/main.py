@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from trustcall_system_one import Transport, __version__
 
+from app.auth import require_user
 from app.documents import MAX_BYTES, read_document
 from app.extract import ExtractRequest, detect_provider, get_transport, run_extraction
 from app.limits import BodyLimitMiddleware, default_limits
@@ -40,6 +41,10 @@ app.add_middleware(
 )
 
 
+# Every route but /api/health needs a signed-in user once DEMO_TOKEN_SECRET is set.
+SIGNED_IN = [Depends(require_user)]
+
+
 class SchemaParseRequest(BaseModel):
     """Body of ``POST /api/schema/parse``.
 
@@ -56,7 +61,7 @@ async def health() -> dict[str, Any]:
     return {"ok": True, "provider": detect_provider(), "version": __version__}
 
 
-@app.post("/api/document")
+@app.post("/api/document", dependencies=SIGNED_IN)
 def document(file: Annotated[UploadFile, File()]) -> dict[str, Any]:
     """Read an uploaded .md, .markdown, .txt or .pdf file into text.
 
@@ -67,7 +72,7 @@ def document(file: Annotated[UploadFile, File()]) -> dict[str, Any]:
     return read_document(file.filename or "", data)
 
 
-@app.post("/api/schema/parse")
+@app.post("/api/schema/parse", dependencies=SIGNED_IN)
 def schema_parse(body: SchemaParseRequest) -> dict[str, Any]:
     """Turn the source of pydantic models into JSON Schemas.
 
@@ -81,7 +86,7 @@ def schema_parse(body: SchemaParseRequest) -> dict[str, Any]:
         raise to_http(exc) from exc
 
 
-@app.post("/api/extract")
+@app.post("/api/extract", dependencies=SIGNED_IN)
 async def extract(
     body: ExtractRequest,
     transport: Annotated[Transport | None, Depends(get_transport)],

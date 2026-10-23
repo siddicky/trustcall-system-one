@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 
 import {
   authSecret,
+  createApiToken,
   createSessionToken,
   isAllowed,
   parseAllowlist,
@@ -140,5 +141,21 @@ describe("cookies", () => {
     expect(serializeCookie("n", "v:/", { maxAge: 60, secure: true })).toBe(
       "n=v%3A%2F; Path=/; Max-Age=60; HttpOnly; SameSite=Lax; Secure"
     )
+  })
+})
+
+describe("createApiToken", () => {
+  it("signs {email, aud, exp} with the API secret", async () => {
+    const { token, exp } = await createApiToken("ada@example.com", "api")
+    const [payload, signature] = token.split(".")
+    const { createHmac } = await import("node:crypto")
+    expect(signature).toBe(
+      createHmac("sha256", "api").update(payload).digest("hex")
+    )
+    expect(JSON.parse(Buffer.from(payload, "base64url").toString())).toEqual({
+      email: "ada@example.com",
+      aud: "trustcall-demo-api",
+      exp,
+    })
   })
 })

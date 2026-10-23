@@ -55,11 +55,65 @@ async function toApiError(res: Response): Promise<ApiError> {
   return new ApiError(res.status, code, message, line)
 }
 
+type ApiToken = { token: string; exp: number }
+
+let cachedToken: ApiToken | null = null
+// When the site mints no tokens, ask again only after this time (seconds).
+let noTokensUntil = 0
+
+/**
+ * A bearer token for the backend from the site's own `/api/auth/token`, cached
+ * until a minute before it expires. Null where the site mints none (`vite dev`,
+ * or a backend without DEMO_TOKEN_SECRET).
+ */
+async function apiToken(fresh = false): Promise<string | null> {
+  const now = Date.now() / 1000
+  if (!fresh && cachedToken && cachedToken.exp - 60 > now) {
+    return cachedToken.token
+  }
+  if (!fresh && noTokensUntil > now) return null
+  cachedToken = null
+  try {
+    const res = await fetch("/api/auth/token", { cache: "no-store" })
+    if (res.status === 401) {
+      throw new ApiError(
+        401,
+        "signed_out",
+        "Your sign-in has expired. Reload the page to sign in again."
+      )
+    }
+    const body = res.ok ? ((await res.json()) as Partial<ApiToken>) : null
+    if (typeof body?.token !== "string" || typeof body.exp !== "number") {
+      noTokensUntil = now + 300
+      return null
+    }
+    cachedToken = { token: body.token, exp: body.exp }
+    return cachedToken.token
+  } catch (err) {
+    if (err instanceof ApiError) throw err
+    noTokensUntil = now + 300
+    return null
+  }
+}
+
+async function send(
+  path: string,
+  init: RequestInit,
+  token: string | null
+): Promise<Response> {
+  const headers = new Headers(init.headers)
+  if (token) headers.set("Authorization", `Bearer ${token}`)
+  return fetch(`${API_URL}${path}`, { ...init, headers })
+}
+
 async function request<T>(path: string, init: RequestInit): Promise<T> {
   let res: Response
   try {
-    res = await fetch(`${API_URL}${path}`, init)
+    res = await send(path, init, await apiToken())
+    // A token can expire in flight or be refused after a secret rotation.
+    if (res.status === 401) res = await send(path, init, await apiToken(true))
   } catch (err) {
+    if (err instanceof ApiError) throw err
     if (err instanceof DOMException && err.name === "AbortError") throw err
     throw new ApiError(
       0,

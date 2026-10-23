@@ -38,6 +38,7 @@ local development has no gate. Run `vercel dev` to try the gate locally.
 | `GOOGLE_CLIENT_SECRET` | Its secret |
 | `AUTH_SECRET` | Random string that signs sessions: `openssl rand -hex 32`. Changing it signs everyone out. |
 | `ALLOWED_EMAILS` | Comma-separated addresses (`me@example.com`) or domains (`@example.com`). Empty admits nobody. |
+| `DEMO_TOKEN_SECRET` | Shared with the backend. `/api/auth/token` signs 10-minute bearer tokens with it, and `src/lib/api.ts` sends them on every backend call. |
 
 A deployment without `AUTH_SECRET` answers 503 instead of opening up.
 Removing an address from `ALLOWED_EMAILS` locks it out on its next request.
@@ -47,5 +48,7 @@ authorised redirect URIs, for example
 `https://trustcall.siddicky.ca/api/auth/google/callback`. Preview deployments
 use other hostnames, so Google sign-in only works on origins you register.
 
-The gate covers this site only. The backend at `VITE_API_URL` is not gated:
-anyone with its URL can call it directly (CORS limits browsers, not scripts).
+The backend at `VITE_API_URL` is on another origin and never sees the session
+cookie, so it checks a bearer token instead: the frontend asks its own
+`/api/auth/token` (signed-in, allowlisted users only) and attaches the token to
+every backend request, retrying once with a fresh token after a 401.
