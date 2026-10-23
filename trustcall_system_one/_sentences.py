@@ -542,6 +542,19 @@ async def read_sentences(ctx: "Ctx", spec: "FieldSpec") -> "Resolved":
     )
 
 
+ITEMS_VETO = 0.75
+"""Probability of ``items`` at or above which a list is NOT read by sentences.
+
+Only a clear ``items`` keeps a list of names out of the sentence path. The two
+mistakes are not equal: a wrong ``items`` drops the field (its Clairic answer was
+already distrusted), while a wrong ``statements`` only sends candidate sentences
+through the per-sentence question, the attribution check, the novelty check and the
+change gate, which refuse what is not stated. Clef answers this question sharply
+(0.95 to 0.97 for ``statements`` on a notes field), but a reader that hedges does not:
+live, Decisions gave ``items`` 0.65 to 0.67 for a notes field every time (15 of 15),
+which a plain ``statements >= min_choice_prob`` rule turned into "no notes, ever"."""
+
+
 async def _ask_kind(ctx: "Ctx", spec: "FieldSpec") -> str:
     description = " ".join(spec.description.split()) or spec.pretty
     question = ChoiceQuestion(
@@ -561,13 +574,13 @@ async def _ask_kind(ctx: "Ctx", spec: "FieldSpec") -> str:
         {"kind": question}, state, meta=ctx.meta("list_kind", field=spec.wire_name)
     )
     answer = answers.get("kind")
-    if (
-        isinstance(answer, ChoiceAnswer)
-        and answer.choice == "statements"
-        and answer.probabilities.get("statements", 0.0) >= ctx.run.gates.min_choice_prob
-    ):
+    if not isinstance(answer, ChoiceAnswer):
+        return "items"  # no answer: the field keeps its low-confidence rejection
+    if answer.probabilities.get("statements", 0.0) >= ctx.run.gates.min_choice_prob:
         return "statements"
-    return "items"
+    if answer.probabilities.get("items", 0.0) >= ITEMS_VETO:
+        return "items"
+    return "statements"
 
 
 async def list_kind(ctx: "Ctx", spec: "FieldSpec") -> str:
@@ -578,7 +591,10 @@ async def list_kind(ctx: "Ctx", spec: "FieldSpec") -> str:
     class, not its name): the answer is kept on the run (concurrent askers share one
     request). Only statements are worth reading by
     sentences; a list of names or languages that Clairic is unsure of is not turned
-    into sentences. An unclear or missing answer is ``"items"``.
+    into sentences. ``"statements"`` needs ``statements >= gates.min_choice_prob``
+    OR ``items`` below ``ITEMS_VETO`` (0.75): only a clear ``items`` keeps the list
+    out of the sentence path (a hedging reader's 0.65 for ``items`` is not clear).
+    A missing answer is ``"items"``.
 
     Args:
         ctx: The entity context.

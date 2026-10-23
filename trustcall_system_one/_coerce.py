@@ -2,6 +2,7 @@
 
 import math
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -388,7 +389,33 @@ def _clairic_value(spec: FieldSpec, answer: ClairicAnswer) -> tuple[Any, str | N
     return value, None
 
 
-def _clairic(spec: FieldSpec, answer: ClairicAnswer) -> Coerced:
+_PLACEHOLDER_EDGE = " \t\r\n*_`|."
+
+
+def _folded(text: str) -> str:
+    return " ".join(text.casefold().split()).strip(_PLACEHOLDER_EDGE)
+
+
+def is_placeholder(value: str, placeholders: Sequence[str]) -> bool:
+    """Whether a text says "no value yet" (``TBA``, ``N/A``, a dash) and is no value.
+
+    Args:
+        value: The text of a field.
+        placeholders: The texts that are placeholders (``GateConfig.placeholders``).
+
+    Returns:
+        True when ``value`` is one of them, ignoring case, markdown emphasis, white
+        space and a closing full stop (``"**N/A.**"`` is ``"n/a"``).
+    """
+    folded = _folded(value)
+    return bool(folded) and any(folded == _folded(p) for p in placeholders)
+
+
+def _clairic(
+    spec: FieldSpec,
+    answer: ClairicAnswer,
+    gates: GateConfig = GateConfig(),  # noqa: B008 - frozen dataclass
+) -> Coerced:
     spans = _spans(answer.spans)
     meta: dict[str, Any] = {
         "span": _pair(answer.span),
@@ -414,6 +441,13 @@ def _clairic(spec: FieldSpec, answer: ClairicAnswer) -> Coerced:
                 meta["spans"] = None
         else:
             value, note = _clairic_value(spec, answer)
+            if (
+                spec.clairic.type == "text"
+                and isinstance(value, str)
+                and is_placeholder(value, gates.placeholders)
+            ):
+                # "TBA" in a serial number cell says there is none yet
+                return Coerced(None, True, "placeholder", **meta)
     except ValueError as exc:
         return Coerced(None, False, str(exc), **meta)
     return Coerced(value, True, note, **meta)
@@ -543,7 +577,7 @@ def coerce_union(
     """
     if spec.post != "union" or spec.clairic is None or spec.clef is None:
         return Coerced(None, False, "spec is not a union of primitives")
-    base = _clairic(spec, text_answer)
+    base = _clairic(spec, text_answer, gates)
     if not base.ok or base.value is None:
         return base
     chosen = _choice(spec, type_answer)
@@ -612,7 +646,7 @@ def coerce(
             None, False, "a union of primitives needs two answers: use coerce_union"
         )
     if isinstance(answer, ClairicAnswer):
-        return _clairic(spec, answer)
+        return _clairic(spec, answer, gates)
     if isinstance(answer, NoulAnswer):
         return _noul(spec, answer, gates)
     if isinstance(answer, ChoiceAnswer):
