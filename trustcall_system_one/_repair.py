@@ -920,7 +920,8 @@ class RepairState:
             but not yet known to be needed (see ``repair_loop``).
         bad: ``(wire name, value)`` pairs that an error implicated by name and
             that a repair then replaced: never put back.
-        settle: The record is an insert and ``repair.keep_uncertain`` is on: a
+        settle: The record is an insert and the run keeps uncertain values
+            (``Run.keeps_uncertain``): a
             text value for a field that was null may stand on an uncertain
             attribution (see ``FieldState.settle``).
     """

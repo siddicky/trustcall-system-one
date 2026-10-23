@@ -1083,6 +1083,7 @@ of it is on by default, and every number is a knob.
 | Change gate, one Clef request per operation | add 0.55, replace 0.6, remove 0.85 | `GateConfig(add_threshold, replace_threshold, remove_threshold)` |
 | Presence gate | absent below 0.2 | `PresenceConfig(threshold_absent, threshold_present)` |
 | Repair loop | on, at most 5 rounds | `RepairConfig(enabled, max_attempts, ...)` |
+| An uncertain attribution after the repair keeps a required text value | auto: on when the text extraction is TypeSafe (Jev), off for every other provider | `RepairConfig(keep_uncertain=None \| True \| False)` |
 
 ```python
 from trustcall_system_one import (
@@ -1099,6 +1100,14 @@ extractor = create_extractor(  # Contact: the model from the first example
     repair=RepairConfig(max_attempts=2),
 )
 ```
+
+`keep_uncertain` is `None` ("auto") unless you set it: on when the transport that reads the text
+(`TypeSafeTransport`, or the one a `RoutingTransport`, `KindRoutingTransport` or
+`FieldTypeRoutingTransport` sends the text extraction to) is TypeSafe, off on Cloudflare, Experiential
+Labs and the Decisions API. Jev's attribution of a name or an id is uncalibrated and can land between the
+two bars on a value the input does state; with it on, such a repaired text value stands (noted
+`attribution_uncertain`) instead of the record being lost, and a value the check refutes never does.
+`True` or `False` always wins.
 
 **These numbers are starting points, not tuned values.** They have been exercised on two small
 live runs of the examples, not measured on a data set; see [Limitations](#limitations).

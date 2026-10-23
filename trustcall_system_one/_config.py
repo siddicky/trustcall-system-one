@@ -622,23 +622,30 @@ class RepairConfig:
             instead of the record being lost with every other field it holds. A
             value the check refutes (below ``attribution_drop``) never stands. No
             threshold changes; off, the repair is as strict as the first pass.
+            ``None`` (the default, "auto") follows the extraction transport: on
+            when it is TypeSafe (Jev's attribution of a name or an id is
+            uncalibrated and doubts stated values), off for every other provider
+            (``transport.prefers_keep_uncertain``; a router answers for the
+            transport that does the text extraction). ``True`` or ``False``
+            always wins, whatever the transport.
     """
 
     enabled: bool = True
     max_attempts: int = 5
     stop_on_repeat: bool = True
     allow_pattern_reask: bool = True
-    keep_uncertain: bool = True
+    keep_uncertain: bool | None = None
 
     def __post_init__(self) -> None:
         """Validate every setting."""
-        for name in (
-            "enabled",
-            "stop_on_repeat",
-            "allow_pattern_reask",
-            "keep_uncertain",
-        ):
+        for name in ("enabled", "stop_on_repeat", "allow_pattern_reask"):
             _check_flag(name, getattr(self, name))
+        if self.keep_uncertain is not None and not isinstance(
+            self.keep_uncertain, bool
+        ):
+            raise ValueError(
+                f"keep_uncertain must be a bool or None, got {self.keep_uncertain!r}"
+            )
         if isinstance(self.max_attempts, bool) or not isinstance(
             self.max_attempts, int
         ):

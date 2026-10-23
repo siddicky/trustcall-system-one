@@ -52,8 +52,12 @@ from trustcall_system_one.transport import (
     _can_serve,
     classify_failure,
     max_questions,
+    prefers_keep_uncertain,
     state_token_budget,
 )
+
+_TYPESAFE = "typesafe"
+"""``TypeSafeTransport.provider``: the label a cassette of Jev's answers carries."""
 
 __all__ = [
     "CassetteMissError",
@@ -2344,6 +2348,10 @@ class RecordingTransport:
         """The state budget of the wrapped transport (``None``: it says none)."""
         return state_token_budget(self._inner, model)
 
+    def prefers_keep_uncertain(self, model: str) -> bool:
+        """The wrapped transport's preference (the ``keep_uncertain`` default)."""
+        return prefers_keep_uncertain(self._inner, model)
+
     def serves(self, model: str, payload: Mapping[str, Any] | None = None) -> bool:
         """Whether the wrapped transport can serve the request (a router asks)."""
         return _can_serve(self._inner, model, payload)
@@ -2612,6 +2620,22 @@ class CassetteTransport:
             if inner is not None:
                 found.append(inner)
         return min(found) if found else None
+
+    def prefers_keep_uncertain(self, model: str) -> bool:
+        """Whether what is replayed was answered by a provider that prefers it.
+
+        A replay must settle ``RepairConfig.keep_uncertain`` as the live run did:
+        by the provider this cassette stands for, else by who answered the recorded
+        extraction calls (all of them), else by the ``inner`` transport that serves a
+        miss. A cassette that knows none of them says no.
+        """
+        label = self._provider
+        if label is None:
+            recorded = self.providers()["clairic"]
+            if recorded:
+                return all(name == _TYPESAFE for name in recorded)
+            return prefers_keep_uncertain(self._inner, model) if self._inner else False
+        return label == _TYPESAFE
 
     @property
     def provider(self) -> str | None:

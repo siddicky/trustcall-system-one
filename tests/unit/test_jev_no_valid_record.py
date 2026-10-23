@@ -404,7 +404,12 @@ def _appointment_world(attribution: list[float]) -> Script:
 
 async def test_an_uncertain_attribution_does_not_lose_the_whole_record() -> None:
     world = _appointment_world([0.44, 0.46])
-    result = await make_extractor([Appointment], world).ainvoke(REMINDER)
+    # a scripted transport is no Jev: the default would be off (see
+    # test_keep_uncertain_policy), so the setting is explicit here
+    extractor = make_extractor(
+        [Appointment], world, repair=RepairConfig(keep_uncertain=True)
+    )
+    result = await extractor.ainvoke(REMINDER)
     (record,) = result.records
     assert record.valid and record.after is not None
     assert record.after["patient_name"] == "Tomas Greer"
@@ -427,13 +432,19 @@ async def test_the_knob_turns_it_back_off() -> None:
 
 async def test_a_value_the_attribution_refutes_never_stands() -> None:
     world = _appointment_world([0.30, 0.30])  # below `attribution_drop` (0.4)
-    (record,) = (await make_extractor([Appointment], world).ainvoke(REMINDER)).records
+    extractor = make_extractor(
+        [Appointment], world, repair=RepairConfig(keep_uncertain=True)
+    )
+    (record,) = (await extractor.ainvoke(REMINDER)).records
     assert not record.valid
 
 
 async def test_a_confirmed_value_is_not_noted_as_uncertain() -> None:
     world = _appointment_world([0.95])
-    (record,) = (await make_extractor([Appointment], world).ainvoke(REMINDER)).records
+    extractor = make_extractor(
+        [Appointment], world, repair=RepairConfig(keep_uncertain=True)
+    )
+    (record,) = (await extractor.ainvoke(REMINDER)).records
     assert record.valid
     assert not [w for w in record.fields["patient_name"].warnings if "uncertain" in w]
 

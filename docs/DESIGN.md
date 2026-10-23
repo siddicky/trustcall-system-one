@@ -1189,7 +1189,7 @@ update, see "Collection engine" step 8). Paths are JSON Pointers of the document
 
 Replaces trustcall's `PatchFunctionErrors`. It runs for inserts and updates of `One` schemas (the
 multi-entity engine reuses it per entity) and is configured by `RepairConfig(enabled=True,
-max_attempts=5, stop_on_repeat=True, allow_pattern_reask=True, keep_uncertain=True)`.
+max_attempts=5, stop_on_repeat=True, allow_pattern_reask=True, keep_uncertain=None)`.
 
 **Loop.** After assembly the candidate (insert) or the patched record (update) is validated with
 `model_validate`. On success the record is done. On a `ValidationError`:
@@ -1285,7 +1285,25 @@ other field it held. So, for an INSERT, a TEXT value for a field that was null s
 attribution, after the second look, is neither confirmed (`>= verify.attribution_keep`) nor refuted
 (`< verify.attribution_drop`): it is kept with the field warning `attribution_uncertain: p=0.46 (kept: the
 field is required)`. Nothing is retuned (both bars are as they were); a refuted value (below the drop bar)
-never stands, and `RepairConfig(keep_uncertain=False)` restores the strict repair. Text only: a quoted
+never stands. **The default depends on the provider (`keep_uncertain=None`, "auto").** It was on for every
+provider at first; the policy (decided by the coordinator) is that it is a TypeSafe/Jev behaviour: the
+doubt it answers is Jev's uncalibrated attribution of a name or an id, and on Cloudflare or the other
+providers the strict repair is the measured behaviour. So the engine reads the provider of the extraction:
+`Run.keeps_uncertain` (`_run.py`) is `repair.keep_uncertain` when it is a bool (an explicit `True` or
+`False` always wins) and else `transport.prefers_keep_uncertain(clairic_model)`, a bool attribute or a
+method read defensively like `max_questions` (`transport.prefers_keep_uncertain(transport, model)`):
+`TypeSafeTransport` has it `True`, every other transport says nothing (`False`). The transports that
+hold others answer for the one that does the TEXT extraction: `RoutingTransport` for the transport
+serving the Clairic model, `KindRoutingTransport` for the route of kind `extract` on that model,
+`FieldTypeRoutingTransport` for the `text` route (else its default), `FallbackTransport` for its primary
+(the fallback only stands in when the primary could not answer), and `CalibratedTransport`, the combos
+label and `RecordingTransport` for the transport they wrap. `CassetteTransport` answers as the live
+run did: by the provider it stands for, else by who answered the recorded Clairic calls (all
+`typesafe`), else by the `inner` transport that serves a miss, so a replay settles it like the recording.
+`combos` and `system_one_transport` need nothing: they build `TypeSafeTransport` itself. Only the TEXT
+extraction counts, not the provider of the attribution questions: Jev answering the decisions behind a
+Cloudflare extraction leaves it off. `RepairConfig(keep_uncertain=False)` restores the strict repair on
+Jev. Text only: a quoted
 span is certainly in the input, what is uncertain is whose it is; a number, a date or a time is derived
 (a sum, "two more", a relative date, `09:30` read as `09:30:00`) and its attribution is the guard of
 relative edits and table rows, so it is never kept this way. Updates are never kept this way either (the
@@ -2629,8 +2647,9 @@ Each milestone landed as one commit that left `make lint` and `make test` green.
 | M9 | nested `list[Model]` / `dict[str, prim]` through the engine |
 | M10a | cassette/recording transports, live smoke, evals harness |
 | M10b | README, CI workflow, Makefile polish |
-| M12 | live-run fixes (Decisions as the primary, the aircraft sheets): `list_kind` veto, refusal answers, `clef_hard_picks`, entities without mentions for Decisions, dotted-identity discovery and qualification, markup in mentions, screening of tables for collections with an identity (`discovery.screen_above`), placeholder text is null (`gates.placeholders`) |
 | M11 | aircraft-run fixes: Clef request budget (calibrated estimate, central guard, coreference to the budget), containment of a refused request, dotted identity paths, class docstrings of nested models, screening of identity-less items |
+| M12 | live-run fixes (Decisions as the primary, the aircraft sheets): `list_kind` veto, refusal answers, `clef_hard_picks`, entities without mentions for Decisions, dotted-identity discovery and qualification, markup in mentions, screening of tables for collections with an identity (`discovery.screen_above`), placeholder text is null (`gates.placeholders`) |
+| M13 | integration of the TypeSafe-path fixes (pooled equivalent options, date offsets, table cells, initials, `_own_span`, `keep_uncertain`) with the Decisions-primary fixes; `keep_uncertain` is "auto" (on for a TypeSafe text extraction only) |
 
 ### README
 

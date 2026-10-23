@@ -1901,7 +1901,7 @@ async def _finish_insert(
         ExtractionValidationError: In strict mode, if the record stays invalid.
     """
     run, plan = ctx.run, ctx.plan
-    state = RepairState(settle=run.repair.keep_uncertain)
+    state = RepairState(settle=run.keeps_uncertain)
     built = _build(ctx, root)
     chosen = _chosen_of(root, ())
     leaves = {

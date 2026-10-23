@@ -300,6 +300,10 @@ class _Replaying:
         """The state budget the cassette was recorded with."""
         return self._cassette.state_token_budget(model)
 
+    def prefers_keep_uncertain(self, model: str) -> bool:
+        """The preference of what the cassette replays (see the cassette)."""
+        return self._cassette.prefers_keep_uncertain(model)
+
     def serves(self, model: str, payload: Mapping[str, Any] | None = None) -> bool:
         """Whether the member can serve the request."""
         serves = getattr(self._inner, "serves", None)

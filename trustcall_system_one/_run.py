@@ -60,6 +60,7 @@ from trustcall_system_one.transport import (
     Transport,
     TransportResponse,
     max_questions,
+    prefers_keep_uncertain,
     state_token_budget,
 )
 
@@ -851,6 +852,20 @@ class Run:
         )
         found = [state_token_budget(self.transport, m) for m in models]
         return min([knob, *(b for b in found if b is not None)])
+
+    @property
+    def keeps_uncertain(self) -> bool:
+        """Whether an uncertain attribution may stand after the repair (an insert).
+
+        ``repair.keep_uncertain`` when it was set (``True`` or ``False`` always
+        wins); otherwise on exactly when the transport that does the extraction
+        says it prefers it (``transport.prefers_keep_uncertain(clairic_model)``:
+        TypeSafe does, Cloudflare and the rest do not).
+        """
+        chosen = self.repair.keep_uncertain
+        if chosen is not None:
+            return chosen
+        return prefers_keep_uncertain(self.transport, self.clairic_model)
 
     def clef_batch(self, model: str | None = None) -> int:
         """Most questions one Clef request to ``model`` may carry on this transport.
