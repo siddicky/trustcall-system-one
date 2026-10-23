@@ -67,6 +67,7 @@ from trustcall_system_one._match import (
     identity_keys,
     identity_values,
     match_entities,
+    record_value,
 )
 from trustcall_system_one._render import (
     Parent,
@@ -1098,7 +1099,10 @@ async def _discover(
     noun = scope.noun
     of = f" belonging to {scope.parent.label}" if scope.parent is not None else ""
     rows = _nested_without_identity(scope, phrase)
-    by_words = bool(phrase) and _dotted(scope.plan, scope.cardinality)
+    # a nested identity (an msn) is asked by how the input names the entity, except in
+    # the broader second pass: when that found too few, the identity itself is the
+    # fallback ("by their msn": the table cells that hold one)
+    by_words = bool(phrase) and not broaden and _dotted(scope.plan, scope.cardinality)
     if (rows or by_words) and scope.cardinality.label is None:
         noun = scope.kind  # "engine", not the class name "EngineInfo"
     if by_words:
@@ -1132,8 +1136,10 @@ async def _discover(
             f"mention: the exact words the input uses to name or describe the "
             f"{noun} (its model, type, name or heading), not the "
             f"{_identifier(scope.plan, scope.cardinality)} or another number or code "
-            "on its own. Include repeated and shortened mentions. Do not list "
-            "pronouns, headings or table cells."
+            "on its own. A table cell is a mention when it names or describes the "
+            f"{noun}: its model or type, such as the cell next to a label like "
+            f"'{noun}', 'model' or 'type'. Include repeated and shortened mentions. "
+            "Do not list pronouns, headings, labels, dates or figures."
         )
     else:
         instructions = (
@@ -1242,6 +1248,37 @@ class _Screen:
     generic: frozenset[str]
     numbers: bool
     options: frozenset[str]
+    identity: "re.Pattern[str] | None" = None
+
+
+_PATTERN_HINT = "Must match the pattern "
+
+
+def _identity_shape(scope: "Scope") -> "re.Pattern[str] | None":
+    """The ``pattern`` of the identity field, when it has one (else ``None``).
+
+    The compiler keeps a text field's regex only as the sentence "Must match the
+    pattern ..." of its hints; a figure that does not match it (an MTOW of 78000 for
+    an ``msn`` of four or five digits) is not an identity, so it is not
+    offered to qualification as one. Only for a dotted identity (an identifier nested
+    in a sub-model): that is where a table's figures are proposed as entities.
+    """
+    try:
+        names = identity_fields(scope.plan, scope.cardinality)
+    except ValueError:
+        return None
+    for name in names:
+        if IDENTITY_SEP not in name:
+            continue
+        path = tuple(name.split(IDENTITY_SEP))
+        spec = next((s for s in scope.plan.specs if s.path == path), None)
+        for hint in spec.hints if spec is not None else ():
+            if hint.startswith(_PATTERN_HINT):
+                try:
+                    return re.compile(hint[len(_PATTERN_HINT) :].removesuffix("."))
+                except re.error:
+                    return None
+    return None
 
 
 def _screens(scope: "Scope") -> _Screen:
@@ -1275,7 +1312,12 @@ def _screens(scope: "Scope") -> _Screen:
     )
     names.discard("")
     options.discard("")
-    return _Screen(frozenset(names), numbers, frozenset(options - names))
+    return _Screen(
+        frozenset(names),
+        numbers,
+        frozenset(options - names),
+        _identity_shape(scope),
+    )
 
 
 _CONFIDENT_ITEM = 0.8
@@ -1301,7 +1343,10 @@ def _rank(text: str, screen: _Screen) -> int:
     if not any(ch.isalpha() for ch in bare):  # figures, dates, money amounts
         if screen.numbers and _NUMERIC.fullmatch(text.strip()):
             return 3
-        return 3 if _SERIAL.fullmatch(bare.replace(" ", "")) else 1
+        figure = bare.replace(" ", "")
+        if screen.identity is not None and not screen.identity.fullmatch(figure):
+            return 1  # the identity has a shape and this figure is not it
+        return 3 if _SERIAL.fullmatch(figure) else 1
     if bare in screen.generic:
         return 0
     if len(bare.split()) > 1 or len(bare) > 2 or any(ch.isdigit() for ch in bare):
@@ -2127,6 +2172,8 @@ async def _adopt_records(
     keys = identity_keys(scope.plan, names)
     asked: list[tuple[str, dict[str, Any], str]] = []
     wanted: dict[str, list[str]] = {}
+    dotted = _dotted(scope.plan, scope.cardinality)
+    groups = list(groups)
     for record in scope.existing:
         data = normalise_record(scope.plan, record.data)
         values = [v for v in identity_values(data, keys) if v.strip()]
@@ -2137,6 +2184,8 @@ async def _adopt_records(
             for v in values
         ):
             continue
+        if dotted and _adopt_by_identifier(scope, values, groups, live):
+            continue  # its identifier is in the input: no request
         if not any(
             _mentioned(v, scope.source, nested=scope.parent is not None) for v in values
         ):
@@ -2196,6 +2245,75 @@ async def _adopt_records(
         groups.append(group)
         live.append(group)
     return groups
+
+
+_SEGMENT_END = re.compile(r"\n|[.!?](?=\s)")
+
+
+def _segment(source: str, span: Span) -> Span:
+    """The line or sentence around a span: where a row or a clause begins and ends."""
+    start = 0
+    for found in _SEGMENT_END.finditer(source, 0, span[0]):
+        start = found.end()
+    end = _SEGMENT_END.search(source, span[1])
+    return start, end.start() if end else len(source)
+
+
+def _distinctive(value: str) -> bool:
+    """An identifier that cannot be an everyday word: four characters, one a digit."""
+    flat = "".join(value.split())
+    return len(flat) >= 4 and any(ch.isdigit() for ch in flat)
+
+
+def _adopt_by_identifier(
+    scope: Scope, values: Sequence[str], groups: list[_Group], live: list[_Group]
+) -> bool:
+    """An existing record whose identifier is in the input needs no presence request.
+
+    For a dotted identity (a serial number nested in a sub-model) the discovered
+    mentions are the words that name the entity (``A320``, ``fuel pump``), never the
+    identifier, so ``identity_compatible`` cannot say that the record is covered and a
+    ``record_presence`` request was made for every record. An identifier that is
+    distinctive (``_distinctive``) and written verbatim in the input is the evidence:
+    when a qualified entity has a mention in the same line or sentence the record is
+    covered; else the group qualification refused there is brought back (as for a
+    presence answer, only from ``REVIVE_MIN``), else the identifier's own words
+    become the entity's mention. Matching still decides which record each entity is.
+
+    Returns:
+        Whether the record was settled here (the caller asks nothing about it).
+    """
+    found: tuple[str, Span] | None = None
+    for value in sorted(values, key=len, reverse=True):
+        text = value.strip()
+        if not _distinctive(text):
+            continue
+        hit = re.search(_word_pattern(text, flat=True), scope.source)
+        if hit is not None:
+            found = (hit.group(0), hit.span())
+            break
+    if found is None:
+        return False
+    text, span = found
+    around = _segment(scope.source, span)
+
+    def inside(group: _Group) -> bool:
+        return any(
+            m.span is not None and _overlap(m.span, around) for m in group.mentions
+        )
+
+    if any(inside(g) for g in live):
+        return True
+    refused = next((g for g in groups if g not in live and inside(g)), None)
+    if refused is not None:
+        if refused.qualify_p is None or refused.qualify_p >= REVIVE_MIN:
+            refused.adopted = True
+            live.append(refused)
+        return True
+    group = _Group((Mention(text, span),), None, adopted=True)
+    groups.append(group)
+    live.append(group)
+    return True
 
 
 async def collect(
@@ -2481,9 +2599,58 @@ def _focuses(scope: Scope, info: EntityInfo) -> tuple[Any, Any]:
     return focus, plain
 
 
+_FIGURE = re.compile(r"[\d\s.,'`/\-]+")
+
+
+def _is_bare_number(label: str) -> bool:
+    """Whether a label is only a number: ``78000``, ``12,345``, ``2024``."""
+    text = _bare(label)
+    return (
+        bool(text)
+        and any(ch.isdigit() for ch in text)
+        and bool(_FIGURE.fullmatch(text))
+    )
+
+
+def _digits(text: str) -> str:
+    return "".join(ch for ch in text if ch.isalnum()).casefold()
+
+
+def _not_its_identifier(run: Run, scope: Scope, info: EntityInfo, record: Any) -> str:
+    """Why an entity called by a bare number is not one, or ``""``.
+
+    An entity of a collection whose identity is a path through a sub-model, called by
+    a bare number (live: a table's MTOW, an hours figure, a year), is only an
+    aircraft when the number IS its identity. The identity the extraction found for
+    it must equal the number; a
+    different or missing one means a figure of the table was taken for an entity,
+    however the qualification judged it. The message names the kind, never a value.
+    """
+    if not _is_bare_number(info.label) or record is None or record.after is None:
+        return ""
+    if not _dotted(scope.plan, scope.cardinality):
+        return ""  # items of a plain identity are legitimately called by a number
+    names = identity_fields(scope.plan, scope.cardinality)
+    data = normalise_record(scope.plan, record.after)
+    found: list[str] = []
+    for key in identity_keys(scope.plan, names):
+        value = record_value(data, key)
+        if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+            found.append(str(value))
+        elif isinstance(value, (list, tuple)):
+            found.extend(str(v) for v in value if isinstance(v, (str, int, float)))
+    wanted = _digits(info.label)
+    if any(_digits(v) == wanted for v in found):
+        return ""
+    return (
+        f"the entity of {article(scope.kind)} {scope.kind} was called by a bare "
+        "number that is not its identity"
+    )
+
+
 async def _insert_entity(run: Run, scope: Scope, info: EntityInfo) -> InsertOutcome:
     focus, plain = _focuses(scope, info)
-    return await insert_one(
+    done = await insert_one(
         run,
         scope.plan,
         scope.source,
@@ -2492,6 +2659,15 @@ async def _insert_entity(run: Run, scope: Scope, info: EntityInfo) -> InsertOutc
         focus=focus,
         focus_plain=plain,
         placement=scope.placement(),
+    )
+    why = _not_its_identifier(run, scope, info, done.record)
+    if not why:
+        return done
+    run.warn(scope.scoped(f"bare_number_entity_dropped: {why}"))
+    return dataclasses.replace(
+        done,
+        record=None,
+        skipped=SkippedEntity(scope.plan.name, info, "not_qualified", why),
     )
 
 

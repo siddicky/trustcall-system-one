@@ -335,7 +335,7 @@ async def test_a_recorder_writes_the_decision_a_cassette_replays(
             return TransportResponse(body={"ok": True}, provider="typesafe")
 
     path = tmp_path / "rec.jsonl"
-    recorder = RecordingTransport(Echo(), path)  # type: ignore[arg-type]
+    recorder = RecordingTransport(Echo(), path)
     await recorder.run(
         "@cf/cloudflare/clef",
         {"model": "clef", "questions": {}},

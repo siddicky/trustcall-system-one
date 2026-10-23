@@ -159,12 +159,27 @@ def sheet_world() -> FakeWorld:
     return world
 
 
-def like_the_live_model(world: FakeWorld) -> FakeTransport:
-    """The world, with two things the live model did.
+def _in_a_cell(source: str, span: Any) -> bool:
+    """Whether a mention sits in a table cell (a pipe before it on its line)."""
+    line_start = source.rfind("\n", 0, span[0]) + 1
+    return "|" in source[line_start : span[0]]
+
+
+def like_the_live_model(
+    world: FakeWorld, *, obeys_the_hint: bool = True, literal: bool = True
+) -> FakeTransport:
+    """The world, with what the live model did.
 
     * Discovery follows its instruction: asked for mentions "by their msn" it lists the
       table cells that hold one (``8547 |``, with the pipe); asked for how the input
       names the aircraft it lists those words.
+    * ``obeys_the_hint=False``: discovery IGNORES the wording and lists the cells of the
+      msn whatever it was asked (the recall risk of asking for words: the model that
+      does not read "name or describe").
+    * ``literal=True``: a reader that takes the instruction at its word: told "do not
+      list table cells" it lists none, so a sheet that names its aircraft in a table
+      cell only (``| Aircraft | Airbus A320-214 |``) loses them, unless the wording
+      allows the cells that name or describe the aircraft.
     * Qualification refuses a bare ``12345`` (live: 0.14) unless the question says an
       identifier counts ("or the msn of an aircraft").
     """
@@ -174,12 +189,24 @@ def like_the_live_model(world: FakeWorld) -> FakeTransport:
         body = cast("dict[str, Any]", base(model, payload, meta))
         if meta.kind == "discover":
             asked = str(payload["fields"]["mentions"]["instructions"])
-            cells = "by their msn" in asked
+            cells = "by their msn" in asked or not obeys_the_hint
             answer = body["answers"]["mentions"]
+            source = str(payload.get("state_text") or world.text)
+            forbids_cells = (
+                "Do not list" in asked
+                and "table cells" in asked
+                and "table cell is a mention" not in asked
+            )
             keep = [
                 i
                 for i, text in enumerate(answer["value"])
                 if text.rstrip(" |").isdigit() == cells
+                and not (
+                    literal
+                    and forbids_cells
+                    and not cells
+                    and _in_a_cell(source, answer["spans"][i])
+                )
             ]
             answer["value"] = [answer["value"][i] for i in keep]
             answer["spans"] = [answer["spans"][i] for i in keep]
@@ -553,3 +580,328 @@ def test_a_screen_setting_is_validated() -> None:
         DiscoveryConfig(screen_above=-1)
     assert DiscoveryConfig().screen_above == 12
     assert DiscoveryConfig(screen_above=0).screen_above == 0
+
+
+# --------------------------------------------------------------------------- #
+# The review: recall of the words, figures that are no aircraft, cheap matching
+# --------------------------------------------------------------------------- #
+
+TABLE_ONLY = """\
+| Aircraft | Airbus A320-214 |
+| MSN | 8547 |
+| Registration | AP-ABC |
+| MTOW | 78000 kg |
+Remarks: leased
+
+| Aircraft | Boeing 737-800 |
+| MSN | 12345 |
+| Registration | AP-XYZ |
+| MTOW | 79016 kg |
+"""
+
+
+def table_only_world() -> FakeWorld:
+    """Both aircraft are named only by a table cell (``| Aircraft | Airbus A320 |``)."""
+    world = FakeWorld(TABLE_ONLY)
+    world.entity(
+        "Airbus A320-214",
+        schema=Aircraft,
+        mentions=["Airbus A320-214", "8547"],
+        fields={
+            "identification.msn": "8547",
+            "identification.registration": "AP-ABC",
+            "weights.mtow_kg": 78000,
+            "remarks": "leased",
+        },
+    )
+    world.entity(
+        "Boeing 737-800",
+        schema=Aircraft,
+        mentions=["Boeing 737-800", "12345"],
+        fields={
+            "identification.msn": "12345",
+            "identification.registration": "AP-XYZ",
+            "weights.mtow_kg": 79016,
+        },
+    )
+    return world
+
+
+def _msns(result: Any) -> list[str]:
+    return sorted(
+        str(r.value.identification.msn)
+        for r in result.records
+        if r.valid and isinstance(r.value, Aircraft)
+    )
+
+
+async def test_a_table_only_sheet_still_finds_its_aircraft() -> None:
+    # a reader that takes "do not list table cells" literally would find nothing: the
+    # wording allows the cells that name or describe the aircraft
+    transport = like_the_live_model(table_only_world())
+    result = await create_extractor(
+        [Many(Aircraft, identity="identification.msn")], transport=transport
+    ).ainvoke(TABLE_ONLY)
+    assert _msns(result) == ["12345", "8547"]
+    asked = [
+        field["instructions"]
+        for _, body, meta in transport.calls
+        if meta.kind == "discover"
+        for field in body["fields"].values()
+    ]
+    assert asked and not any(
+        "Do not list pronouns, headings or table cells" in a for a in asked
+    )
+    assert all(
+        "A table cell is a mention when it names or describes" in a for a in asked
+    )
+
+
+async def test_a_model_that_ignores_the_wording_still_finds_them_by_msn() -> None:
+    # the recall risk the other way: discovery lists the msn cells whatever it is asked
+    transport = like_the_live_model(sheet_world(), obeys_the_hint=False)
+    result = await create_extractor(
+        [Many(Aircraft, identity="identification.msn")], transport=transport
+    ).ainvoke(MULTI)
+    assert _msns(result) == ["12345", "8547"]
+    assert not [s for s in result.skipped if s.reason == "not_qualified"]
+
+
+async def test_the_broader_second_pass_asks_by_the_identity() -> None:
+    world = sheet_world()
+    base = like_the_live_model(world)
+
+    def only_the_first(model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
+        body = cast("dict[str, Any]", base._handler(model, payload, meta))
+        if meta.kind == "discover":
+            asked = str(payload["fields"]["mentions"]["instructions"])
+            if "by their msn" not in asked:  # the words find one aircraft only
+                answer = body["answers"]["mentions"]
+                keep = [i for i, t in enumerate(answer["value"]) if "Airbus" in t]
+                answer["value"] = [answer["value"][i] for i in keep]
+                answer["spans"] = [answer["spans"][i] for i in keep]
+        return body
+
+    transport = FakeTransport(only_the_first)
+    result = await create_extractor(
+        [Many(Aircraft, identity="identification.msn")], transport=transport
+    ).ainvoke(MULTI)
+    asked = [
+        field["instructions"]
+        for _, body, meta in transport.calls
+        if meta.kind == "discover"
+        for field in body["fields"].values()
+    ]
+    assert any("by their msn" in a for a in asked), "the fallback never asked by msn"
+    assert _msns(result) == ["12345", "8547"]
+
+
+FLEET = """\
+| Model | MSN | Registration |
+| --- | --- | --- |
+| A320 | 8547 | AP-BLD |
+| A320 | 8601 | AP-BMX |
+"""
+
+
+async def test_two_a320_rows_are_two_records_told_apart_by_msn() -> None:
+    world = FakeWorld(FLEET)
+    for index, (msn, reg) in enumerate((("8547", "AP-BLD"), ("8601", "AP-BMX"))):
+        world.entity(
+            f"A320 {msn}",
+            schema=Aircraft,
+            mentions=[("A320", index)],
+            fields={
+                "identification.msn": msn,
+                "identification.registration": reg,
+            },
+        )
+    result = await create_extractor(
+        [Many(Aircraft, identity="identification.msn")],
+        transport=like_the_live_model(world),
+    ).ainvoke(FLEET)
+    planes = {
+        r.value.identification.msn: r.value.identification.registration
+        for r in result.records
+        if r.valid and isinstance(r.value, Aircraft)
+    }
+    assert planes == {"8547": "AP-BLD", "8601": "AP-BMX"}
+
+
+async def test_a_figure_of_the_table_is_not_an_aircraft() -> None:
+    # discovery lists the MTOW 78000, a gullible qualification says yes, and the
+    # extraction finds no msn equal to it: the post-check drops the entity, and the
+    # warning names the kind, not the figure
+    text = TABLE_ONLY
+    world = table_only_world()
+    world.non_entity("78000", schema=Aircraft, mentions=["78000"])
+    inner = like_the_live_model(world, obeys_the_hint=True)
+
+    def gullible(model: str, payload: dict[str, Any], meta: CallMeta) -> Any:
+        body = cast("dict[str, Any]", inner._handler(model, payload, meta))
+        if meta.kind == "discover":
+            answer = body["answers"]["mentions"]
+            start = text.index("78000")
+            answer["value"].append("78000")
+            answer["spans"].append([start, start + 5])
+        if meta.kind == "qualify":
+            for qid in payload["questions"]:
+                entry = payload["state"]["entities"][qid.removeprefix("qualify.")]
+                if entry["label"] == "78000":
+                    body["answers"][qid] = noul(0.95)
+        return body
+
+    result = await create_extractor(
+        [Many(Aircraft, identity="identification.msn")],
+        transport=FakeTransport(gullible),
+    ).ainvoke(text)
+    assert _msns(result) == ["12345", "8547"]
+    dropped = [w for w in result.warnings if "bare_number_entity_dropped" in w]
+    assert dropped and "78000" not in " ".join(dropped)
+    assert "aircraft" in dropped[0]
+    assert any(s.reason == "not_qualified" for s in result.skipped)
+
+
+class Shaped(BaseModel):
+    """An aircraft whose msn has a shape."""
+
+    identification: "ShapedIdent"
+    remarks: Optional[str] = None
+
+
+class ShapedIdent(BaseModel):
+    """Who the aircraft is."""
+
+    msn: Optional[str] = Field(None, pattern=r"^\d{4,5}$")
+
+
+Shaped.model_rebuild()
+
+
+def test_a_figure_that_is_not_the_shape_of_the_identity_is_not_offered() -> None:
+    from types import SimpleNamespace
+
+    from trustcall_system_one._collection import _identity_shape, _rank, _Screen
+    from trustcall_system_one._compile import compile_schema
+
+    scope: Any = SimpleNamespace(
+        plan=compile_schema(Shaped),
+        cardinality=Many(Shaped, identity="identification.msn"),
+    )
+    shape = _identity_shape(scope)
+    assert shape is not None and shape.fullmatch("8547")
+    screen = _Screen(frozenset(), False, frozenset(), shape)
+    assert _rank("8547", screen) >= 3  # the shape of an msn
+    assert _rank("178000", screen) == 1  # a weight, not an msn
+    assert _rank("2024", screen) >= 3  # still a candidate: the post-check decides
+    plain = _Screen(frozenset(), False, frozenset(), None)
+    assert _rank("178000", plain) >= 3  # no shape known: as before
+
+
+PARTS = (
+    "Inspection update: the fuel pump S/N FP-0193 is now unserviceable, seal leak "
+    "found. Starter generator SG-5521 is unchanged."
+)
+
+
+async def test_a_stated_identifier_needs_no_presence_request() -> None:
+    from evals.holdout_cases import Component
+
+    world = FakeWorld(PARTS)
+    world.entity(
+        "fuel pump",
+        schema=Component,
+        mentions=["fuel pump"],
+        fields={
+            "identification": {"serial": "FP-0193"},
+            "condition": "unserviceable",
+            "remarks": "seal leak found",
+        },
+        matches="FP-0193",
+    )
+    world.entity(
+        "Starter generator",
+        schema=Component,
+        mentions=["Starter generator"],
+        fields={"identification": {"serial": "SG-5521"}},
+        matches="SG-5521",
+    )
+    existing: list[tuple[str, str, dict[str, Any]]] = [
+        (
+            "part-1",
+            "Component",
+            {
+                "identification": {"serial": "SG-5521", "part_number": "23080-14"},
+                "condition": "serviceable",
+                "remarks": None,
+            },
+        ),
+        (
+            "part-2",
+            "Component",
+            {
+                "identification": {"serial": "FP-0193", "part_number": "FP-770"},
+                "condition": "serviceable",
+                "remarks": None,
+            },
+        ),
+    ]
+    transport = world.transport()
+    result = await create_extractor(
+        [Many(Component, identity="identification.serial")],
+        transport=transport,
+        enable_inserts=True,
+    ).ainvoke(PARTS, existing=existing)
+    kinds = [meta.kind for _, _, meta in transport.calls]
+    assert "record_presence" not in kinds
+    updated = {r.json_doc_id: r for r in result.records if r.valid}
+    assert set(updated) == {"part-1", "part-2"}
+    assert len(result.records) == 2  # no entity made twice
+    pump = updated["part-2"].value
+    assert pump is not None and pump.condition == "unserviceable"  # type: ignore[attr-defined]
+
+
+def test_an_identifier_no_entity_covers_adopts_its_own_words() -> None:
+    from types import SimpleNamespace
+
+    from trustcall_system_one._collection import (
+        _adopt_by_identifier,
+        _distinctive,
+        _Group,
+    )
+    from trustcall_system_one._types import Mention
+
+    text = "Fuel pump overhauled.\nSG-5521 | unserviceable\nStarter noted."
+    scope: Any = SimpleNamespace(source=text)
+    pump = _Group((Mention("Fuel pump", (0, 9)),), 0.9)
+    starter = _Group(
+        (Mention("Starter", (text.index("Starter"), text.index("Starter") + 7)),), 0.2
+    )
+    groups, live = [pump, starter], [pump]
+    assert _adopt_by_identifier(scope, ["SG-5521"], groups, live)
+    # no live entity in its row: its own words become the entity
+    assert len(groups) == 3 and live[-1].mentions[0].text == "SG-5521"
+    assert live[-1].adopted
+    # one in the row covers it: nothing is added
+    row = _Group(
+        (
+            Mention(
+                "unserviceable",
+                (text.index("unserviceable"), text.index("unserviceable") + 13),
+            ),
+        ),
+        0.9,
+    )
+    groups, live = [row], [row]
+    assert _adopt_by_identifier(scope, ["SG-5521"], groups, live)
+    assert len(groups) == 1 and live == [row]
+    # a refused group in the row comes back (from REVIVE_MIN)
+    refused = _Group(row.mentions, 0.5)
+    groups, live = [refused], []
+    assert _adopt_by_identifier(scope, ["SG-5521"], groups, live)
+    assert live == [refused] and refused.adopted
+    # a word that is not an identifier is left to the presence question
+    assert not _adopt_by_identifier(scope, ["Fuel pump"], [pump], [pump])
+    assert not _adopt_by_identifier(scope, ["ZZ-9999"], [pump], [pump])
+    assert _distinctive("8547") and _distinctive("FP-0193")
+    assert not _distinctive("Pump") and not _distinctive("A32")

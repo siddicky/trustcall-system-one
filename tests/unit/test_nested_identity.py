@@ -177,7 +177,9 @@ async def test_two_aircraft_are_found_by_their_serial_numbers() -> None:
     assert not any("no_identity_field" in w for w in result.warnings)
 
 
-async def test_discovery_is_asked_by_the_nested_identity() -> None:
+async def test_discovery_asks_for_what_names_the_entity_not_its_nested_identity() -> (
+    None
+):
     sheet = world()
     transport = sheet.transport()
     extractor = create_extractor(
