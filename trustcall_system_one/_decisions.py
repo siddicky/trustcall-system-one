@@ -11,10 +11,11 @@ one:
 * ``score``: one choice per level, named ``"0"``, ``"1"``, ...; ``score`` is the
   probability-weighted level and ``legend`` maps the levels to their descriptions.
 
-The Decisions API returns a probability per choice. If an answer ever comes
-without them it is *hard*: all of the probability goes to the chosen option, the
-answer is tagged ``"hard": true`` and the confidence is 1.0, which is what the
-probabilities say.
+The Decisions API returns a probability per choice. An answer without them, or with
+only (nearly) 0 and 1, is *hard*: it says nothing about how sure it is, so the chosen
+option gets ``hard_cap`` (0.8) of the probability and the confidence is that cap, the
+answer is tagged ``"hard": true``. An answer the model refused (``type`` ``"refusal"``,
+no ``choice``) is no answer at all: the question stays unanswered.
 """
 
 import hashlib
@@ -48,6 +49,7 @@ __all__ = [
     "DecisionsResponse",
     "Plan",
     "from_decisions_response",
+    "readable_state",
     "render_state",
     "to_decisions_request",
 ]
@@ -65,6 +67,8 @@ user who lowers it below 0.8 loses the protection."""
 
 YES = "yes"
 NO = "no"
+REFUSAL = "refusal"
+"""The ``type`` of an answer the model declined to give (it has no ``choice``)."""
 _MAX_QUESTIONS = 64
 
 
@@ -117,11 +121,16 @@ class DecisionsProbability(_Response):
 
 
 class DecisionsAnswer(_Response):
-    """The answer to one question."""
+    """The answer to one question.
+
+    ``choice`` is missing from a ``refusal``: ``{"type": "refusal", "name": "plan"}``
+    is what the live API sent when the model declined to answer a question (the
+    question is unanswered, see ``from_decisions_response``).
+    """
 
     type: str
     name: str
-    choice: str
+    choice: str | None = None
     probabilities: list[DecisionsProbability] | None = None
     confidence: float | None = None
 
@@ -217,6 +226,34 @@ def render_state(state: Any) -> str:
         )
         return f"{head}\n\n{body}"
     return render_value(state)
+
+
+_NO_MENTIONS_NOTE = (
+    "The input is about this one entity and `label` only describes it: the input "
+    "need not contain those words."
+)
+
+
+def readable_state(state: Any) -> Any:
+    """The state as a reader that has only the text sees it.
+
+    The state of a single record (``One(Bill)``) names its entity by a description
+    ("the Bill") that the input never uses, with ``"mentions": []`` where the
+    mentions would anchor the label to the text. Clef takes that in stride; a general
+    reader, asked whether the input states a value "of `entity.label`", has nothing
+    to read the label against and hedges (live, Decisions: 0.27 to 0.4 for an invoice
+    total and number that the one-line input states outright, where Clef said 0.95).
+    The empty ``mentions`` is therefore replaced by a note that says what the label
+    is. A state whose entity has mentions is left as it is.
+    """
+    if not isinstance(state, Mapping):
+        return state
+    entity = state.get("entity")
+    if not isinstance(entity, Mapping) or entity.get("mentions") != []:
+        return state
+    described = {k: v for k, v in entity.items() if k != "mentions"}
+    described["note"] = _NO_MENTIONS_NOTE
+    return {**state, "entity": described}
 
 
 @dataclass(frozen=True)
@@ -319,7 +356,9 @@ def to_decisions_request(
         plans.append(plan)
     try:
         body = DecisionsRequest(
-            model=model, input=render_state(request.state), questions=questions
+            model=model,
+            input=render_state(readable_state(request.state)),
+            questions=questions,
         )
     except ValidationError as exc:  # pragma: no cover - the Clef limits are tighter
         raise BadRequestError(f"not a valid Decisions request: {exc}") from exc
@@ -349,6 +388,8 @@ def _answer(
     hard_cap: float,
     notes: list[str],
 ) -> dict[str, Any]:
+    if given.choice is None:
+        raise _bad(f"{plan.qid!r}: a {given.type!r} answer has no choice", body)
     if given.choice not in plan.values:
         raise _bad(
             f"{plan.qid!r}: {given.choice!r} is not an option {plan.values}", body
@@ -463,6 +504,11 @@ def from_decisions_response(
             has a ``choice`` that is not its most probable option or probabilities
             that cannot be used, or does not become a valid Clef response. The error
             carries the ``reported_cost`` of a response that was charged.
+
+    An answer of ``type`` ``"refusal"`` (the model declined; it has no ``choice``) is
+    NOT an error: the question is left out of ``answers`` (unanswered, which every
+    gate reads as "no", never as a pass) and ``decisions_notes`` names it
+    (``decisions_refusal``, which the engine turns into a run warning).
     """
     try:
         return _translate(body, plans, clef_model, hard_cap)
@@ -495,8 +541,18 @@ def _translate(
         )
     notes: list[str] = []
     answers: dict[str, Any] = {}
+    refused: list[str] = []
     for plan in plans:
+        if given[plan.qid].type == REFUSAL:
+            refused.append(plan.qid)  # no answer: never a pass, never an error
+            continue
         answers[plan.qid] = _answer(plan, given[plan.qid], body, hard_cap, notes)
+    if refused:
+        notes.append(
+            f"decisions_refusal: the model refused {len(refused)} question(s), which "
+            f"stay unanswered: {', '.join(refused[:8])}"
+            + (f", +{len(refused) - 8} more" if len(refused) > 8 else "")
+        )
     usage: dict[str, Any] = {
         "input_tokens": parsed.usage.input_tokens,
         "output_tokens": parsed.usage.output_tokens,

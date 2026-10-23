@@ -699,6 +699,11 @@ With Clef on Cloudflare the default falls back only for a 429 or a failed connec
 when any earlier attempt may have run. The Decisions API sends bare picks (probabilities of 0
 and 1): they are capped at `DecisionsTransport(decisions_hard_cap=0.8)`, below the removal
 gate (0.85), so a fallback answer can add or replace a value but cannot remove one by itself.
+Hard picks of a PRIMARY Decisions Clef are reported as `clef_hard_picks: N Clef answer(s) from
+decisions were hard picks ...; by call kind: ...` (never as `clef_fallback_used`, which is only
+for requests a fallback answered). An answer the model refuses (`{"type": "refusal"}`, no
+`choice`) leaves its question unanswered, with a `decisions_refusal` warning: no gate reads it as
+a pass, and the run goes on.
 
 ### Clef from the Decisions API
 
@@ -706,7 +711,10 @@ gate (0.85), so a fallback answer can add or replace a value but cannot remove o
 decisions` in the evals) makes Experiential's Decisions API (`gpt-6-luna-decisions`, served by OpenAI)
 answer **every** Clef request, not only after a failure, while Clairic stays on Cloudflare. It is an
 opt-in like the others (an `EXPERIENTIAL_API_KEY` alone changes nothing), takes at most 32 questions
-per request, and a bare pick is capped at 0.8 so it cannot authorise a removal by itself.
+per request, and a bare pick is capped at 0.8 so it cannot authorise a removal by itself. That
+guarantee has a price: a delete needs `match.delete_threshold` (0.85) and a saturated "yes" is 0.8,
+so a record is deleted only when Decisions sends a graded answer at 0.85 or more (see
+Limitations).
 
 ### TypeSafe-only: Jev for extraction and decisions
 
@@ -1023,9 +1031,21 @@ want a normalised vocabulary, make the field a `Literal` (a Clef choice), not fr
 - Nested lists use a marker: `pets: Annotated[list[Pet], Many(identity="name")]`.
 - The identity may be a dotted path to a scalar inside a sub-model:
   `Many(AircraftSpec, identity="identification.msn")` (also in a compound identity or a nested
-  list marker). It is used for discovery, for matching against existing records and to protect the
-  identity from being replaced by a short form of itself. A path that does not exist or does not end
-  at a plain field is a `ValueError`.
+  list marker). It is used for matching against existing records and to protect the identity from
+  being replaced by a short form of itself. Discovery does **not** ask for the identifier itself
+  (a serial number is not what a sheet calls an aircraft: asked for "mentions by their msn" the
+  model listed table cells, and a bare `12345` was refused as an aircraft): it asks for the words
+  that name or describe each entity (its model, type, name or heading), and the qualify question
+  reads "is X an aircraft, or the msn of one?". Table and emphasis markup around a mention
+  (`8547 |`, `**Airbus**`) is stripped. A path that does not exist or does not end at a plain field
+  is a `ValueError`.
+- With a table of cells (more than `discovery.screen_above` = 12 mentions found), the mentions of
+  a nested list that has an identity (`checks: list[Check]` named by `check_type`) or of a
+  top-level `Many` with a dotted identity are screened like identity-less items: bare figures, one
+  or two letters, markup, headings and the names of the item's own fields are dropped in code,
+  and each remaining mention is qualified on its own before they are clustered (warnings
+  `junk_mentions_dropped`, `mentions_screened_out`). Never below the count the model gave; 0
+  switches it off; a top-level `Many` with a plain identity (a name) is never screened.
 - Items with no identity (`engines: list[EngineInfo]`, rows with a position and serial numbers) are
   found by what an item is, the mentions are screened in code and one by one before clustering
   (warnings `junk_mentions_dropped`, `mentions_screened_out`) and the result is cut to the count.
@@ -1260,6 +1280,24 @@ Read these before relying on it.
   the mentions to stay under `clef_state_token_budget`, contains a refusal as a warning, and
   warns past 97% of the limit. On a table-heavy sheet with hundreds of table cells the
   entities of identity-less lists are still the weak part (see DESIGN, Risks 10).
+- **Decisions as the primary Clef is much weaker than Clef on Cloudflare** (live, same thresholds:
+  13/29 dev and 6/30 holdout against 26/29 and 16/30; precision stays 100%, recall does not).
+  Fixed on our side: the notes classification (a hedged `items` 0.65 no longer keeps notes out,
+  `ITEMS_VETO`), a refusal answer, the warning name, and the context of an entity without mentions.
+  What remains is the model: it hedges on identifiers and numbers (0.4 to 0.65 where Clef says
+  0.97: a normalised value like `09:00:00` against the input's `09:00`, serial numbers, e-mail
+  addresses), a delete needs a graded 0.85 (a saturated yes is capped at 0.8 by design), and an
+  input that both removes a record and changes it was read as a plain change (0.1 for the delete,
+  so no `conflict_update_delete`). Compare with the default run before relying on it.
+- **Placeholder text is null.** A plain text field whose answer is `TBA`, `TBD`, `N/A`, `n.a.` or
+  a dash is null (`GateConfig.placeholders`; `GateConfig(placeholders=())` keeps them as values).
+  List elements and Clef-typed fields are not touched. What a schema makes of the *kind* of a value
+  (check types that are interval strings) is the schema's business.
+- **Duplicates across spellings.** Two names for one entity that no identity value ties together
+  (`AIRBUS A320-251 NEO` and `A320-200 NEO` of one aircraft whose MSN is `TBA`) can stay two
+  records: the merge check needs every pair across two clusters to pass (live: 0.59 and 0.26,
+  the second with junk mentions inside the cluster, which the screening now keeps out). Two
+  mentions with the same words are asked about, not assumed to be one (two people called Emma).
 - **Alpha.** Public names are in `trustcall_system_one/__init__.py`; anything with a leading
   underscore is internal and may change.
 

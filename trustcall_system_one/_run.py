@@ -66,6 +66,7 @@ from trustcall_system_one.transport import (
 __all__ = [
     "CANCELLED_AFTER_SEND",
     "FALLBACK_WARNING",
+    "HARD_PICKS_WARNING",
     "Answer",
     "Question",
     "Run",
@@ -75,6 +76,11 @@ __all__ = [
 _FALLBACK_FIELDS_SHOWN = 8
 FALLBACK_WARNING = "clef_fallback_used"
 """Start of the warning that says a fallback answered."""
+HARD_PICKS_WARNING = "clef_hard_picks"
+"""Start of the warning of a run whose PRIMARY Clef provider (Decisions, say) gave hard
+picks: answers without probabilities, or with only 0 and 1, whose probability and
+confidence are capped (``DecisionsTransport(decisions_hard_cap=...)``). Not a
+fallback."""
 
 CANCELLED_AFTER_SEND = "cancelled after send; outcome unknown"
 """``CallRecord.error`` of a call cancelled while it may have been on the wire."""
@@ -364,6 +370,10 @@ class Run:
         fallback_used: How many requests a fallback transport answered after
             its primary failed (also reported as the ``clef_fallback_used`` warning).
         fallback_hard: How many of those answers had no probabilities.
+        hard_picks: How many answers of the PRIMARY Clef provider were hard picks
+            (also reported as the ``clef_hard_picks`` warning, which a run with a
+            fallback never mixes up with ``clef_fallback_used``).
+        hard_kinds: Those hard picks by call kind.
         fallback_fields: What the fallback's answers were used for (the call
             kind, schema and field), also when an answer is replayed from
             ``clef_memo``.
@@ -400,6 +410,8 @@ class Run:
     largest_sent: float = 0.0
     fallback_used: int = 0
     fallback_hard: int = 0
+    hard_picks: int = 0
+    hard_kinds: dict[str, int] = field(default_factory=dict)
     fallback_fields: dict[str, None] = field(default_factory=dict)
     fallback_route: tuple[str, str] | None = None
 
@@ -648,6 +660,23 @@ class Run:
             message += f"; used for: {shown}" + (f", +{more} more" if more > 0 else "")
         self.warnings[:] = [
             w for w in self.warnings if not w.startswith(FALLBACK_WARNING)
+        ]
+        self.warnings.append(message)
+
+    def _refresh_hard_warning(self, provider: str) -> None:
+        kinds = ", ".join(
+            f"{kind} {count}"
+            for kind, count in sorted(
+                self.hard_kinds.items(), key=lambda i: (-i[1], i[0])
+            )[:_FALLBACK_FIELDS_SHOWN]
+        )
+        message = (
+            f"{HARD_PICKS_WARNING}: {self.hard_picks} Clef answer(s) from {provider} "
+            "were hard picks (no or saturated probabilities, confidence capped below "
+            f"the removal gate); by call kind: {kinds}"
+        )
+        self.warnings[:] = [
+            w for w in self.warnings if not w.startswith(HARD_PICKS_WARNING)
         ]
         self.warnings.append(message)
 
@@ -1044,8 +1073,12 @@ class Run:
         key = memo_key(model, payload)
         known = self.clef_memo.get(key)
         if known is not None:
-            # an answer keeps where it came from (its ``provider``), also here
-            if any(_fallback_provider(a) for a in known.values()):
+            # an answer keeps where it came from (its ``provider``), also here; it is
+            # a FALLBACK's use only when a fallback answered something in this run
+            # (a primary Decisions run has providers on its answers but no fallback)
+            if self.fallback_used and any(
+                _fallback_provider(a) for a in known.values()
+            ):
                 self._note_fallback_use(meta)
             return dict(known)
         if key in self.rejected:  # refused once: it would be refused again
@@ -1156,9 +1189,13 @@ class Run:
             self.warn(str(note))
         wanted = [qid for qid, _ in chunk if qid in response.answers]
         hard = sum(1 for qid in wanted if _is_hard(response.answers[qid]))
-        if hard:
+        if hard and sent.fallback_from is not None:
             self.fallback_hard += hard
             self._refresh_fallback_warning()
+        elif hard:  # the primary's own hard picks: not a fallback, so not that warning
+            self.hard_picks += hard
+            self.hard_kinds[meta.kind] = self.hard_kinds.get(meta.kind, 0) + hard
+            self._refresh_hard_warning(sent.provider or accounted)
         if sent.served_model is not None:
             pass  # another model's tokens say nothing about Clef's context
         elif response.usage.input_tokens >= _TRUNCATION_RATIO * _CLEF_CONTEXT_TOKENS:

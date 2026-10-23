@@ -190,7 +190,11 @@ async def test_discovery_is_asked_by_the_nested_identity() -> None:
         if meta.kind == "discover"
         for field in body["fields"].values()
     ]
-    assert asks and all("by their msn (manufacturer serial number)" in a for a in asks)
+    # an identifier nested in a sub-model is not what the input calls the aircraft:
+    # discovery asks for the words that name or describe it (live: asked "by their
+    # msn" it listed the table cells, and a bare 12345 was refused as an aircraft)
+    assert asks and all("name or describe the aircraft" in a for a in asks)
+    assert not any("by their msn" in a for a in asks)
 
 
 async def test_existing_records_are_matched_by_the_nested_identity() -> None:

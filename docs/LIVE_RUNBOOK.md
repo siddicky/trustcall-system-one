@@ -311,6 +311,21 @@ trusting it. It is a different model from Clef: a case that only passes with it 
 (gpt-6-luna-decisions, hard cap 0.8)", and `results.json` has the same as `extraction` and
 `decisions`.
 
+Reading a Decisions-primary run:
+
+- The warning is `clef_hard_picks: N Clef answer(s) from decisions were hard picks ...; by call
+  kind: ...` (saturated or missing probabilities, capped at 0.8). It is not `clef_fallback_used`,
+  which is only for a request a fallback answered and is absent here.
+- A `decisions_refusal` warning names the questions the model refused (`{"type": "refusal"}`):
+  they are unanswered, never a pass, and the case goes on.
+- A delete needs a graded 0.85 or more (a saturated yes is 0.8 by design), so expect fewer
+  deletes than with Clef: `visit_cancel_one`, `listing_no_longer_pets` and
+  `order_remove_item` were such cases. An input that removes AND changes a record may be read as
+  a plain change (no `conflict_update_delete`): that expectation is provider-specific.
+- Notes: a notes field is classified (call kind `list_kind`); a hedged `items` below 0.75 no
+  longer keeps notes out, so a Decisions run has `sentences` and `novelty` calls where the first
+  live run had none.
+
 ## 4e. TypeSafe-only: Jev for Clairic and Clef
 
 ```bash

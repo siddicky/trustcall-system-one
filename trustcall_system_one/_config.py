@@ -200,6 +200,31 @@ def _check_probability(name: str, value: float) -> None:
         raise ValueError(f"{name} must be in (0, 1], got {value!r}")
 
 
+DEFAULT_PLACEHOLDERS: tuple[str, ...] = (
+    "tba",
+    "tbd",
+    "tbc",
+    "n/a",
+    "n.a.",
+    "n/d",
+    "-",
+    "--",
+    "\u2013",
+    "\u2014",
+    "?",
+    "to be advised",
+    "to be announced",
+    "to be confirmed",
+    "to be determined",
+    "not available",
+    "not applicable",
+)
+"""Text values that say "no value yet", not a value (compared without case, markup or
+a closing full stop). ``GateConfig(placeholders=())`` keeps them as values.
+Deliberately short: ``none``, ``unknown`` and ``na`` can be real values (a status, a
+country code)."""
+
+
 @dataclass(frozen=True)
 class GateConfig:
     """Thresholds that decide whether a model answer is accepted.
@@ -220,6 +245,13 @@ class GateConfig:
         replace_threshold: Change-gate probability needed to replace a value.
         remove_threshold: Change-gate probability needed to remove a value.
         allow_null_removals: Whether a null answer may remove an existing value.
+        placeholders: Text values that are no value (``DEFAULT_PLACEHOLDERS``: TBA,
+            TBD, N/A, a dash ...). A plain text field whose answer is one of these
+            is null (``"placeholder"`` in the field's warnings), so ``"TBA"`` is
+            neither kept as a serial number nor put in a record that is updated;
+            matching ignores case, markup and a closing full stop. List elements and
+            Clef-typed fields are not touched. Pass ``()`` to keep such text as a
+            value.
     """
 
     required_null_threshold: float = 0.7
@@ -232,6 +264,7 @@ class GateConfig:
     replace_threshold: float = 0.6
     remove_threshold: float = 0.85
     allow_null_removals: bool = False
+    placeholders: tuple[str, ...] = DEFAULT_PLACEHOLDERS
 
     def __post_init__(self) -> None:
         """Validate every threshold."""
@@ -253,6 +286,10 @@ class GateConfig:
             raise ValueError(f"noul_margin must be in [0, 0.5), got {margin!r}")
         if not isinstance(self.allow_null_removals, bool):
             raise ValueError("allow_null_removals must be a bool")
+        if not isinstance(self.placeholders, tuple) or not all(
+            isinstance(p, str) and p.strip() for p in self.placeholders
+        ):
+            raise ValueError("placeholders must be a tuple of non-empty strings")
 
 
 @dataclass(frozen=True)
@@ -657,6 +694,15 @@ class DiscoveryConfig:
             check off.
         record_presence_max: Records asked about at most; above it the check is
             skipped for the collection (one request per record).
+        screen_above: With more than this many mentions found, the mentions of a
+            collection that has an identity are screened in code (bare figures, one
+            or two letters, markup, headings, the names of the item's own fields) and
+            qualified one by one before they are clustered, as the items of a list
+            without an identity always are. It applies to a nested list and to a
+            top-level ``Many`` whose identity is a dotted path (``"a.b"``) only, and
+            never takes the candidates below Clairic's count. A table of
+            cells is what that many mentions are (live: 1,663 refused maintenance
+            checks in one sheet); prose has a handful. 0 switches it off.
     """
 
     presence_absent: float = 0.2
@@ -666,6 +712,7 @@ class DiscoveryConfig:
     qualify_min: float = 0.4
     record_presence: float = 0.5
     record_presence_max: int = 20
+    screen_above: int = 12
 
     def __post_init__(self) -> None:
         """Validate every setting."""
@@ -678,6 +725,7 @@ class DiscoveryConfig:
         _check_unit("qualify_min", self.qualify_min)
         _check_unit("record_presence", self.record_presence, allow_zero=True)
         _check_int("record_presence_max", self.record_presence_max, 0, 500)
+        _check_int("screen_above", self.screen_above, 0, 1000)
 
 
 @dataclass(frozen=True)

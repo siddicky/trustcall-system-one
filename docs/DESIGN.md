@@ -302,6 +302,27 @@ schema title: "Person").
    required `str`) → none: discovery then follows the schema docstring ("Every mention of a
    Reading (A temperature reading…)") and the run warns `no_identity_field`. The identity reads
    in the discovery question as `by their name (full name)`, compound fields joined with "and".
+   **A dotted identity is not asked for by value**: a serial number nested in a sub-model is not
+   what a sheet calls the entity (live, `identification.msn` on a two-aircraft sheet: discovery
+   by msn listed the table cells `8547 |` and `12345 |`, and "is `12345 |` an aircraft?" got 0.14,
+   so the B737 was lost; the A320's own msn, asked "of `8547 |`", scored 0.485 and was dropped).
+   With a dotted identity discovery asks for "every mention of an aircraft: the exact words the
+   input uses to name or describe it (its model, type, name or heading), not the msn or another
+   number or code on its own", the entity is labelled by those words (`Airbus A320-200`), and
+   qualification reads "is `entities.e0.label` an aircraft, or the msn of an aircraft?" (true:
+   "...or the msn that identifies one"). A plain identity (a name) is asked as before. A mention
+   loses the table and emphasis markup at its edges (`clean_mention`: `|`, `*`, `_`, `~`, `\`,
+   en and em dashes), so `8547 |` is `8547`.
+   **Screening a table's worth of mentions** (`discovery.screen_above`, default 12; 0 switches it
+   off): the code screen (`_prefilter`) and the one-by-one qualification before coreference
+   (`_group(screen=True)`) of identity-less items also run, when discovery returned more than
+   that many mentions, for a NESTED list that has an identity (live: 1,663 of the 1,705 refused
+   entities of a 591-line sheet were `MaintenanceCheck`, named by `check_type`; 513 coreference
+   requests) and for a top-level `Many` with a dotted identity (38 refused aircraft: `Qu`, `A`,
+   `77`, `CF`, `ATA`, `CN21.61`, `\*`; their junk mentions also sat inside the real aircraft's
+   clusters and spans). It never takes the candidates below Clairic's count; a top-level
+   collection with a plain identity is never screened; the cap-to-count of identity-less items
+   stays theirs alone.
 2. **Discovery, three requests in parallel** (a forced `schema=` skips the presence question
    only):
    * presence, Clef `noul` (kind `presence`, id `presence`): "Does `input` mention any {Person}
@@ -881,7 +902,7 @@ every field with `limits.list_strategy`:
 | --- | --- |
 | `"list"` | Clairic's `list` type only (the behaviour before M10a) |
 | `"sentences"` | Clairic is not asked about the field at all. The input is split into sentences in code; Clef is asked one `noul` per candidate sentence (call kind `sentences`, `CallMeta.field` the wire name): "Is this sentence one of the <field description>, about `entity.label`: "<sentence>"?", with criteria. A sentence at or above `verify.sentence_keep` (0.6) is an element, verbatim, with its span |
-| `"auto"` (default) | Clairic's list first (the request and the cross-check are the same as `"list"`). If its answer holds elements but its confidence is below `limits.list_auto_below` (0.5; a null or empty answer is the model saying there is nothing, not distrust), or the answer is missing, the existing low-confidence re-ask runs first (one isolated Clairic question over the input alone, kind `reask`). A re-ask that is trusted replaces the answer and the field stays a Clairic list. Otherwise Clef is asked once per schema and field and run (kind `list_kind`, memoised; entities that run at the same time share the one request) a `choice` between `items` ("short named values: names, languages, tags, ids") and `statements` ("free-form statements or facts"). `statements` → the field is read by sentences; `items` → the old low-confidence rejection stands, so a list of languages Clairic is merely unsure of is never turned into sentences. An unclear or missing classification is `items` |
+| `"auto"` (default) | Clairic's list first (the request and the cross-check are the same as `"list"`). If its answer holds elements but its confidence is below `limits.list_auto_below` (0.5; a null or empty answer is the model saying there is nothing, not distrust), or the answer is missing, the existing low-confidence re-ask runs first (one isolated Clairic question over the input alone, kind `reask`). A re-ask that is trusted replaces the answer and the field stays a Clairic list. Otherwise Clef is asked once per schema and field and run (kind `list_kind`, memoised; entities that run at the same time share the one request) a `choice` between `items` ("short named values: names, languages, tags, ids") and `statements` ("free-form statements or facts"). `statements` → the field is read by sentences; `items` → the old low-confidence rejection stands, so a list of languages Clairic is merely unsure of is never turned into sentences. `statements` needs `p(statements) >= gates.min_choice_prob` OR `p(items) < ITEMS_VETO` (0.75): only a CLEAR `items` keeps a list out of the sentence path, because a wrong `items` drops the field while a wrong `statements` still faces the per-sentence question, attribution, novelty and the change gate. (Live, Decisions as the primary gave `items` 0.65 to 0.67, graded, 15 times out of 15 for a notes field, where Cloudflare's Clef gave `statements` 0.95 to 0.97; under the old rule no note was ever added: notes recall 0%.) A missing answer (no Clef answer, a refusal) is `items` |
 
 An explicit `s1_field(list_strategy="sentences")` (or `limits.list_strategy="sentences"`) skips Clairic and the classification altogether and starts together with the field's other requests; the `auto` fallback needs Clairic's answer first, so it cannot.
 
@@ -1407,7 +1428,11 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
     `## record` header could be forged by that text (a note that contains `\n## record\n...`
     would pass for the record); the fence token is a hash of the whole state, so it is
     reproducible, no text of the state contains it and its author cannot know it. Structured
-    `instructions` are fenced the same way.
+    `instructions` are fenced the same way. An `entity` whose `mentions` is `[]` (the one record of
+    a `One(Bill)`, labelled "the Bill", a description the input never uses) is shown with a note
+    instead (`readable_state`): "the input is about this one entity and `label` only describes
+    it", because a reader with only the text has nothing to read the label against (live: 0.4 and
+    0.27 for an invoice number and total that the line states, Clef said 0.95).
   - `questions` become a list in the same order with `name` = the question id; `choice` criteria
     become `choices` (id kept, description a string or rendered JSON, none when null);
     **`noul`** becomes two choices `yes`/`no` and `noul = P(yes)`; **`score`** becomes one choice
@@ -1427,7 +1452,19 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
     itself, but it still passes an add or a replace**, and a bare no is 0.2 (below the 0.4
     attribution drop). The cap protects removals only while `gates.remove_threshold` stays above it: a user
     who lowers `remove_threshold` below `decisions_hard_cap` (0.8) loses that protection. The warning counts
-    hard picks. Graded probabilities (0.1/0.9, say) are
+    hard picks. The same cap bounds every other gate above 0.8: `match.delete_threshold` (0.85) means
+    a record is deleted only on a GRADED answer of 0.85 or more (live, Decisions primary: a graded
+    0.98 deleted, saturated and graded 0.8 yes answers did not), by design. The hard picks of a
+    PRIMARY Decisions Clef are the warning `clef_hard_picks: N Clef answer(s) from decisions were
+    hard picks ...; by call kind: attribution 25, presence 12 ...` (`Run.hard_picks`,
+    `Run.hard_kinds`), not `clef_fallback_used`, which says that a fallback answered a request
+    and counts only those; a memoised answer is a fallback's "use" only when a fallback answered
+    something in the run. **A `refusal` answer** (`{"type": "refusal", "name": "plan"}`, no
+    `choice`; live on a `clef_fields` question) is no answer: the question is left out of the Clef
+    response (every gate reads a missing answer as "no", never as a pass), `decisions_notes` carries
+    `decisions_refusal: the model refused N question(s)...`, which becomes a run warning, and the
+    request is memoised like any other. A refusal of a question that was not asked, or a choice-less
+    answer that is not a refusal, is still a `ModelResponseError`. Graded probabilities (0.1/0.9, say) are
     the API's own numbers and are left alone; thresholds written for graded Clef answers (a
     re-ask band between 0.4 and 0.75) behave like yes/no on a fallback that mostly sends picks.
   - `images` are refused (`BadRequestError`) before sending, and `serves(model, payload)` is
@@ -2592,6 +2629,7 @@ Each milestone landed as one commit that left `make lint` and `make test` green.
 | M9 | nested `list[Model]` / `dict[str, prim]` through the engine |
 | M10a | cassette/recording transports, live smoke, evals harness |
 | M10b | README, CI workflow, Makefile polish |
+| M12 | live-run fixes (Decisions as the primary, the aircraft sheets): `list_kind` veto, refusal answers, `clef_hard_picks`, entities without mentions for Decisions, dotted-identity discovery and qualification, markup in mentions, screening of tables for collections with an identity (`discovery.screen_above`), placeholder text is null (`gates.placeholders`) |
 | M11 | aircraft-run fixes: Clef request budget (calibrated estimate, central guard, coreference to the budget), containment of a refused request, dotted identity paths, class docstrings of nested models, screening of identity-less items |
 
 ### README
@@ -2668,6 +2706,28 @@ green. The examples were the acceptance tests for M5 to M9.
 11. A nested `s1_field(identity=True)` identifies the sub-model, not the record above it (per-level
     identity is documented and tested), so an identity inside a sub-model of a `Many` item is
     named with `Many(identity="a.b")`, not marked on the field.
+12. Decisions as the PRIMARY Clef (live, same thresholds as Cloudflare's: 13/29 dev, 6/30 holdout
+    against 26/29 and 16/30; precision 100%, recall 61% and 76%). Our part is fixed (notes: the
+    `list_kind` veto; a `refusal` answer; the warning name; an entity without mentions). The rest is
+    the model, measured on identical requests: attribution of text and identifier values 0.4 to
+    0.65 where Clef says 0.97 (a normalised `09:00:00` against the input's `09:00`, serial numbers,
+    e-mail, addresses), a graded 0.8 for a clear delete (below the 0.85 delete gate), and an
+    input that both removes and changes a record answered "no" for the delete (0.1), so the
+    update proceeds instead of the documented `conflict_update_delete`: with an unconfirmed delete
+    the update is the right outcome, and that gold expectation is provider-specific. The
+    chance-normalised `confidence` it reports (0.3 for 0.65) is lower than Clef's for the same
+    probability and is used as reported. Not re-measured after these fixes (no live access).
+13. Placeholder text (`TBA`, `TBD`, `N/A`, a dash) is null in a plain text field
+    (`GateConfig.placeholders`, the opt-out is `()`): the live sheet's `apu.status = "TBA"` and
+    its three MSNs `TBA` (which also made three identical, different "identity values"). List
+    elements and Clef-typed fields are untouched; `none`, `unknown` and `na` are deliberately not
+    on the list. What the schema calls a check type (an interval string) is the schema's.
+14. Two names for one entity that no identity value joins can stay two records (live, real sheet:
+    `AIRBUS A320-251 NEO` and `A320-200 NEO`, one 2024 aircraft; count 3, four found): the count
+    driven merge joins two clusters only if EVERY pair across them passes the merge check (0.5):
+    0.87 for `Airbus A320-251N` with the first, then 0.59 and 0.26 against the second (a cluster
+    that held `CF` and `NEO) -` junk). The screening removes the junk from clusters; the rule
+    stays, and two mentions with the same words are asked about, not assumed to be one.
 
 ## Verification
 
