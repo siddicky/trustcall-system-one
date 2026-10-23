@@ -1,19 +1,31 @@
 """Turn an uploaded file into plain text for the extraction form."""
 
-import io
 import pathlib
 from typing import Any, Literal
 
 from fastapi import HTTPException
-from pypdf import PdfReader
 
-__all__ = ["MAX_BYTES", "MAX_CHARS", "read_document"]
+from app._sandbox import (
+    Limits,
+    SandboxCrash,
+    SandboxTimeout,
+    SandboxUnavailable,
+    run_worker,
+)
+
+__all__ = ["MAX_BYTES", "MAX_CHARS", "MAX_PAGES", "PDF_LIMITS", "read_document"]
 
 MAX_BYTES = 10 * 1024 * 1024
 """Largest accepted upload, in bytes."""
 
 MAX_CHARS = 200_000
 """Largest accepted text, in characters (also the cap of ``/api/extract``)."""
+
+MAX_PAGES = 300
+"""Most pages of a PDF that are read."""
+
+PDF_LIMITS = Limits(timeout=20.0, cpu_seconds=15, memory_bytes=1024 * 1024 * 1024)
+"""Limits of the PDF worker: 20 s wall clock, 15 s CPU, 1 GB of address space."""
 
 Kind = Literal["markdown", "pdf", "text"]
 
@@ -31,7 +43,12 @@ def _error(status: int, code: str, message: str) -> HTTPException:
 
 
 def _pdf_text(data: bytes) -> tuple[str, int]:
-    """Extract the text of a PDF.
+    """Extract the text of a PDF in a sandboxed worker process.
+
+    pypdf runs in ``app._pdf_worker`` (isolated interpreter, no credentials, CPU,
+    memory and wall-clock limits), so that a crafted file cannot hang or exhaust
+    the server. It stops once the text passes ``MAX_CHARS`` and refuses more than
+    ``MAX_PAGES`` pages.
 
     Args:
         data: The bytes of the file.
@@ -40,28 +57,51 @@ def _pdf_text(data: bytes) -> tuple[str, int]:
         The page texts joined with a blank line, and the number of pages.
 
     Raises:
-        HTTPException: 422 ``pdf_parse_error`` if the file cannot be parsed and
-            422 ``pdf_no_text`` if it has no text layer (a scan).
+        HTTPException: 413 ``too_large`` over ``MAX_PAGES`` pages or ``MAX_CHARS``
+            characters; 422 ``pdf_parse_error`` if the file cannot be parsed, is
+            password protected or takes too long; 422 ``pdf_no_text`` if it has
+            no text layer (a scan); 503 ``sandbox_unavailable`` if the worker
+            cannot be started.
     """
     try:
-        reader = PdfReader(io.BytesIO(data))
-        if reader.is_encrypted and not reader.decrypt(""):
-            raise _error(422, "pdf_parse_error", "The PDF is password protected.")
-        pages = [(page.extract_text() or "").strip() for page in reader.pages]
-    except HTTPException:
-        raise
-    except Exception as exc:  # pypdf raises many types on damaged files
+        answer = run_worker(
+            "app._pdf_worker",
+            data,
+            PDF_LIMITS,
+            (f"--max-pages={MAX_PAGES}", f"--max-chars={MAX_CHARS}"),
+        )
+    except SandboxTimeout as exc:
         raise _error(
-            422, "pdf_parse_error", f"The PDF could not be read: {exc}"
+            422,
+            "pdf_parse_error",
+            f"The PDF took too long to read ({PDF_LIMITS.timeout:g} s limit).",
         ) from exc
-    text = "\n\n".join(pages).strip()
-    if not text:
+    except SandboxCrash as exc:
+        raise _error(
+            422, "pdf_parse_error", f"The PDF could not be read ({exc})."
+        ) from exc
+    except SandboxUnavailable as exc:
+        raise _error(503, "sandbox_unavailable", str(exc)) from exc
+    if not isinstance(answer, dict):
+        raise _error(422, "pdf_parse_error", "The PDF could not be read.")
+    if answer.get("ok") is True:
+        return str(answer["text"]), int(answer["pages"])
+    error = answer.get("error")
+    if error == "too_many_pages":
+        raise _error(413, "too_large", f"The PDF has more than {MAX_PAGES} pages.")
+    if error == "too_large":
+        raise _error(413, "too_large", f"The text is over {MAX_CHARS:,} characters.")
+    if error == "encrypted":
+        raise _error(422, "pdf_parse_error", "The PDF is password protected.")
+    if error == "no_text":
         raise _error(
             422,
             "pdf_no_text",
             "The PDF has no text layer (it may be a scan); paste the text instead.",
         )
-    return text, len(pages)
+    raise _error(
+        422, "pdf_parse_error", f"The PDF could not be read: {answer.get('message')}"
+    )
 
 
 def read_document(filename: str, data: bytes) -> dict[str, Any]:

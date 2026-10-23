@@ -9,7 +9,11 @@ interface Piece {
   covering: Mark[]
 }
 
-/** Split `text` at every mark boundary. */
+/**
+ * Split `text` at every mark boundary. The marks' offsets are UTF-16 indices
+ * (`buildMarks` converts the backend's code point offsets), so they slice the
+ * string directly.
+ */
 function split(text: string, marks: Mark[]): Piece[] {
   const cuts = new Set<number>([0, text.length])
   for (const m of marks) {

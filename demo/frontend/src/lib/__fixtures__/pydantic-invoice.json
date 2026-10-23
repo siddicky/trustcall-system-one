@@ -1,0 +1,158 @@
+{
+  "$defs": {
+    "Address": {
+      "description": "Postal address.",
+      "properties": {
+        "street": {
+          "title": "Street",
+          "type": "string"
+        },
+        "city": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "City"
+        }
+      },
+      "required": [
+        "street"
+      ],
+      "title": "Address",
+      "type": "object"
+    },
+    "LineItem": {
+      "properties": {
+        "description": {
+          "description": "What was billed",
+          "title": "Description",
+          "type": "string"
+        },
+        "quantity": {
+          "title": "Quantity",
+          "type": "integer"
+        },
+        "unit_price": {
+          "title": "Unit Price",
+          "type": "number"
+        }
+      },
+      "required": [
+        "description",
+        "quantity",
+        "unit_price"
+      ],
+      "title": "LineItem",
+      "type": "object"
+    },
+    "Priority": {
+      "enum": [
+        "low",
+        "high"
+      ],
+      "title": "Priority",
+      "type": "string"
+    }
+  },
+  "description": "A supplier invoice.",
+  "properties": {
+    "invoice_number": {
+      "description": "Vendor-assigned id",
+      "title": "Invoice Number",
+      "type": "string"
+    },
+    "issue_date": {
+      "format": "date",
+      "title": "Issue Date",
+      "type": "string"
+    },
+    "sent_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Sent At"
+    },
+    "vendor": {
+      "$ref": "#/$defs/Address"
+    },
+    "ship_to": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Address"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "line_items": {
+      "items": {
+        "$ref": "#/$defs/LineItem"
+      },
+      "title": "Line Items",
+      "type": "array"
+    },
+    "notes": {
+      "description": "free notes",
+      "items": {
+        "type": "string"
+      },
+      "title": "Notes",
+      "type": "array"
+    },
+    "currency": {
+      "enum": [
+        "USD",
+        "EUR"
+      ],
+      "title": "Currency",
+      "type": "string"
+    },
+    "priority": {
+      "$ref": "#/$defs/Priority",
+      "default": "low"
+    },
+    "paid": {
+      "default": false,
+      "title": "Paid",
+      "type": "boolean"
+    },
+    "tags": {
+      "anyOf": [
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Tags"
+    }
+  },
+  "required": [
+    "invoice_number",
+    "issue_date",
+    "vendor",
+    "line_items",
+    "currency"
+  ],
+  "title": "Invoice",
+  "type": "object"
+}

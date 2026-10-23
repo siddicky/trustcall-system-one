@@ -10,7 +10,8 @@ from trustcall_system_one import Transport, __version__
 
 from app.documents import MAX_BYTES, read_document
 from app.extract import ExtractRequest, detect_provider, get_transport, run_extraction
-from app.schemas import SourceError, parse_models
+from app.limits import BodyLimitMiddleware, default_limits
+from app.schemas import SourceError, parse_models, to_http
 
 __all__ = ["app", "get_transport"]
 
@@ -29,6 +30,8 @@ def allowed_origins() -> list[str]:
     return [origin.strip() for origin in raw.split(",") if origin.strip()]
 
 
+# Added first, so that CORS wraps it and a 413 still carries the CORS headers.
+app.add_middleware(BodyLimitMiddleware, limits=default_limits())
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins(),
@@ -54,9 +57,13 @@ async def health() -> dict[str, Any]:
 
 
 @app.post("/api/document")
-async def document(file: Annotated[UploadFile, File()]) -> dict[str, Any]:
-    """Read an uploaded .md, .markdown, .txt or .pdf file into text."""
-    data = await file.read(MAX_BYTES + 1)
+def document(file: Annotated[UploadFile, File()]) -> dict[str, Any]:
+    """Read an uploaded .md, .markdown, .txt or .pdf file into text.
+
+    A plain ``def``, so that it runs in the thread pool: PDF parsing waits on a
+    worker process and must not block the event loop.
+    """
+    data = file.file.read(MAX_BYTES + 1)
     return read_document(file.filename or "", data)
 
 
@@ -64,13 +71,14 @@ async def document(file: Annotated[UploadFile, File()]) -> dict[str, Any]:
 def schema_parse(body: SchemaParseRequest) -> dict[str, Any]:
     """Turn the source of pydantic models into JSON Schemas.
 
-    The source is checked against an allowlist before it runs; see
-    ``app.schemas``. This is a plain ``def`` so that it runs in the thread pool.
+    The source is checked against an allowlist, then built in a sandboxed worker
+    process; see ``app.schemas``. This is a plain ``def`` so that it runs in the
+    thread pool while it waits for the worker.
     """
     try:
         return {"schemas": parse_models(body.source)}
     except SourceError as exc:
-        raise exc.to_http() from exc
+        raise to_http(exc) from exc
 
 
 @app.post("/api/extract")

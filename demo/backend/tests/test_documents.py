@@ -1,7 +1,13 @@
 """Tests of POST /api/document."""
 
+import inspect
+
+import pytest
 from fastapi.testclient import TestClient
 
+from app import documents
+from app import main as app_main
+from app._sandbox import Limits
 from tests.pdf import make_pdf
 
 
@@ -77,3 +83,65 @@ def test_too_many_bytes_is_413(client: TestClient) -> None:
 
 def test_missing_file_is_422(client: TestClient) -> None:
     assert client.post("/api/document").status_code == 422
+
+
+def test_more_than_300_pages_is_413(client: TestClient) -> None:
+    pdf = make_pdf(["page"] * (documents.MAX_PAGES + 1))
+    response = upload(client, "long.pdf", pdf, "application/pdf")
+    assert response.status_code == 413
+    detail = response.json()["detail"]
+    assert detail["code"] == "too_large" and "300 pages" in detail["message"]
+
+
+def test_300_pages_are_read(client: TestClient) -> None:
+    pdf = make_pdf(["page"] * documents.MAX_PAGES)
+    response = upload(client, "long.pdf", pdf, "application/pdf")
+    assert response.status_code == 200
+    assert response.json()["pages"] == documents.MAX_PAGES
+
+
+def test_a_pdf_with_too_much_text_is_413(client: TestClient) -> None:
+    pdf = make_pdf(["a" * 50_000] * 5)  # 250,000 characters
+    response = upload(client, "wall.pdf", pdf, "application/pdf")
+    assert response.status_code == 413
+    detail = response.json()["detail"]
+    assert detail["code"] == "too_large" and "200,000" in detail["message"]
+
+
+def test_a_pdf_that_takes_too_long_is_422(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(documents, "PDF_LIMITS", Limits(timeout=0.01))
+    pdf = make_pdf(["Dana moved to Berlin."])
+    response = upload(client, "slow.pdf", pdf, "application/pdf")
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail["code"] == "pdf_parse_error" and "too long" in detail["message"]
+
+
+def test_a_worker_that_runs_out_of_memory_is_a_422(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The worker dies on its own memory limit; the server answers and lives on."""
+    monkeypatch.setattr(
+        documents, "PDF_LIMITS", Limits(timeout=20.0, memory_bytes=16 * 1024 * 1024)
+    )
+    pdf = make_pdf(["Dana moved to Berlin."])
+    response = upload(client, "small.pdf", pdf, "application/pdf")
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "pdf_parse_error"
+
+
+def test_the_pdf_worker_has_no_credentials(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app._sandbox import child_env
+
+    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "secret")
+    assert "CLOUDFLARE_API_TOKEN" not in child_env()
+    pdf = make_pdf(["Dana moved to Berlin."])
+    assert upload(client, "a.pdf", pdf, "application/pdf").status_code == 200
+
+
+def test_the_document_endpoint_does_not_block_the_event_loop() -> None:
+    assert not inspect.iscoroutinefunction(app_main.document)
