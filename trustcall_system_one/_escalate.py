@@ -49,6 +49,7 @@ __all__ = [
     "escalate_discovery",
     "escalate_states",
     "locate",
+    "route_discovery",
     "tiebreak",
 ]
 
@@ -213,7 +214,11 @@ def _failed(st: "FieldState") -> bool:
 async def _relative_date(ctx: "Ctx", st: "FieldState", today: date) -> None:
     run, spec = ctx.run, st.spec
     kind = _date_kind(spec)
-    if kind is None or not _failed(st) or not run.escalation_budget("relative_dates"):
+    # routed: asked whatever Clairic read, and its date is replaced when they differ
+    routed = run.escalation.routes("relative_dates")
+    if kind is None or st.escalated or not (routed or _failed(st)):
+        return
+    if not run.escalation_budget("relative_dates"):
         return
     windows = _windows(ctx)
     phrases = find_phrases(ctx.text, windows)
@@ -262,7 +267,13 @@ async def _relative_date(ctx: "Ctx", st: "FieldState", today: date) -> None:
         run.warn(f"escalation:relative_dates: {where}: rejected ({verdict})")
         return
     value, span, quote = verdict
-    run.warn(f"escalation:relative_dates: {where}: proposed {value.isoformat()}")
+    if routed and st.has_value() and st.resolved.value == value:
+        run.warn(f"escalation:relative_dates: {where}: routed, Clairic agrees")
+        return
+    run.warn(
+        f"escalation:relative_dates: {where}: "
+        f"{'routed, ' if routed else ''}proposed {value.isoformat()}"
+    )
     _install(
         st, value, "relative_dates", span=None, raw={"phrase": quote, "span": span}
     )
@@ -547,7 +558,8 @@ async def _fill_row(ctx: "Ctx", states: "Sequence[FieldState]") -> None:
     run = ctx.run
     if ctx.parent is None or not run.escalation.runs("list_rows"):
         return
-    if not _incomplete(ctx, states):
+    routed = run.escalation.routes("list_rows")
+    if not routed and not _incomplete(ctx, states):
         return
     row = _row_of(ctx, await rows_for(ctx))
     if row is None:
@@ -555,16 +567,21 @@ async def _fill_row(ctx: "Ctx", states: "Sequence[FieldState]") -> None:
     filled = []
     for st in states:
         got = row.values.get(st.spec.pretty)
-        if got is None or st.has_value() or st.escalated:
+        if got is None or st.escalated:
             continue
-        if st.reject not in (None, *_FILLABLE):
+        if routed:
+            # the tier's reading of the row stands in for Clairic's where they differ
+            if st.has_value() and st.resolved.value == got[0]:
+                continue
+        elif st.has_value() or st.reject not in (None, *_FILLABLE):
             continue
         value, span = got
         _install(st, value, "list_rows", span=span, raw=row.identity)
         filled.append(st.spec.pretty)
     if filled:
         run.warn(
-            f"escalation:list_rows: {ctx.plan.name}: filled {', '.join(filled)} from "
+            f"escalation:list_rows: {ctx.plan.name}: "
+            f"{'routed, ' if routed else ''}filled {', '.join(filled)} from "
             "the proposed row; the verification ladder judges them"
         )
 
@@ -644,6 +661,42 @@ async def escalate_discovery(
         return []
     short = (found == 0 and present) or (count is not None and count > found)
     if not short:
+        return []
+    rows = await run.once(
+        ("rows", scope_key, plan.name, lineage),
+        lambda: _ask_rows(run, plan, parent, source, meta_like, noun),
+    )
+    return [Mention(row.identity, row.span) for row in rows]
+
+
+async def route_discovery(
+    run: Run,
+    *,
+    plan: "SchemaPlan",
+    source: str,
+    parent: "EntityInfo | None",
+    scope_key: str,
+    noun: str,
+    identifier: str,
+    dotted: bool,
+    meta_like: Any,
+    lineage: tuple[str, ...] = (),
+) -> list[Mention]:
+    """Mentions asked of the tier BEFORE Clairic's discovery (``mode="route"``).
+
+    A nested list (its rows) or a top-level ``Many`` with a dotted identity (its
+    entities). Empty when the mode, the kind or the budget says no, when the call
+    failed or when none of its quotes is in the input: the normal discovery then runs
+    as it would without the tier.
+    """
+    if parent is None:
+        if not (dotted and run.escalation.routes("dotted_discovery")):
+            return []
+        return await run.once(
+            ("dotted", plan.name),
+            lambda: _ask_entities(run, plan, source, noun, identifier, meta_like),
+        )
+    if not run.escalation.routes("list_rows"):
         return []
     rows = await run.once(
         ("rows", scope_key, plan.name, lineage),

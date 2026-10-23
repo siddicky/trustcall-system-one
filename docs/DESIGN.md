@@ -2616,6 +2616,20 @@ is one too); for the default transport only, `TRUSTCALL_S1_ESCALATE=openai` (and
 OpenAI, `only` refuses it, `by_kind` and `calibration` refuse the `escalate` kind); evals `--escalate
 openai --escalate-effort EFFORT`.
 
+**Mode.** `EscalationConfig.mode` is `"on_failure"` (default: everything above) or `"route"`: the three
+classes in `ROUTED_KINDS` go to the tier FIRST, whatever the default setup would have answered. (1) A date or
+datetime field whose mention window holds a relative phrase (needs a `reference_date`) is asked of the tier; its
+verified date replaces Clairic's when they differ (`_escalate._relative_date`). (2) Every nested `list[Model]`:
+`collect` asks the rows before Clairic's discovery and count (`route_discovery`; the quotes become the mentions
+and are not code-screened, since a row code such as `A1` is a verified quote), and `_fill_row` puts the tier's
+reading of a row's fields in place of Clairic's where they differ. (3) The discovery of a top-level `Many` with a
+dotted identity. Unchanged: every quote occurs verbatim, the value is coerced, the ladder and the change gates
+judge it (Clef has to agree), an answer stands for at most `prob_cap`, nothing is deleted or removed on its word.
+An answer that is off, over a limit, unverifiable or failed leaves the normal path exactly as `on_failure` would
+run it (Clairic discovers and counts). A routed value the ladder then refuses is null, as any refused value.
+The tie-break is asked in both modes. Spec: `{"escalate": {"mode": "route"}}`; evals `--escalate-mode route`;
+`TRUSTCALL_S1_ESCALATE_MODE`. Tests: `test_escalation_route.py`.
+
 Every call is a `CallRecord` of the new `CallKind` `"escalate"` (never routed through the Clairic/Clef
 stack: `ESCALATE_KINDS`, outside `CLEF_KINDS`), `CallRecord.field` starts with the sub-kind
 (`relative_dates:done_on`, `list_rows`, `attribution_tiebreak:phone`, `dotted_discovery`), `provider`

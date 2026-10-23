@@ -36,6 +36,7 @@ from evals.search import (
     write_search,
 )
 from evals.suites import DEFAULT_SUITE, SUITES, load_suite
+from trustcall_system_one._config import ESCALATION_MODES
 from trustcall_system_one.combos import PROVIDERS, ComboSpec, companies, load_combo
 from trustcall_system_one.openai_transport import REASONING_EFFORTS
 
@@ -190,6 +191,17 @@ def _common(parser: argparse.ArgumentParser) -> None:
         help="reasoning.effort of the escalation tier (default: "
         "TRUSTCALL_S1_ESCALATE_EFFORT, else none); higher is slower and dearer, "
         "recorded in results.json. Only with --escalate (or the variable)",
+    )
+    parser.add_argument(
+        "--escalate-mode",
+        choices=ESCALATION_MODES,
+        default=None,
+        help="when the escalation tier is asked (default: "
+        "TRUSTCALL_S1_ESCALATE_MODE, else on_failure): on_failure asks it where the "
+        "default setup failed; route sends the relative dates, the rows of nested "
+        "lists and the discovery of a dotted identity to it FIRST (what it says is "
+        "verified and judged like any answer; a failed call or an unverifiable answer "
+        "leaves the default path). Only with --escalate (or the variable)",
     )
     _output_args(parser)
 
@@ -398,6 +410,13 @@ def _settings(args: argparse.Namespace, overrides: dict[str, Any]) -> Settings:
             "--escalate-effort needs --escalate openai (or TRUSTCALL_S1_ESCALATE): "
             "the effort belongs to the escalation tier"
         )
+    if args.escalate_mode and not (
+        args.escalate or os.environ.get("TRUSTCALL_S1_ESCALATE")
+    ):
+        raise ValueError(
+            "--escalate-mode needs --escalate openai (or TRUSTCALL_S1_ESCALATE): "
+            "the mode belongs to the escalation tier"
+        )
     if args.escalate and not args.live:
         print(
             "note: --escalate without --live answers the escalation tier with a "
@@ -425,6 +444,7 @@ def _settings(args: argparse.Namespace, overrides: dict[str, Any]) -> Settings:
         clef_fallback_on=args.clef_fallback_on,
         escalate=args.escalate,
         escalate_effort=args.escalate_effort,
+        escalate_mode=args.escalate_mode,
         suite=args.suite,
     )
 

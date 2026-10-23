@@ -3891,9 +3891,10 @@ def escalation_from_env(
 
     ``TRUSTCALL_S1_ESCALATE=openai`` turns the tier on (``none`` or unset: off);
     ``TRUSTCALL_S1_ESCALATE_EFFORT`` sets ``reasoning.effort`` (``none``, ``low``,
-    ``medium``, ``high``, ``xhigh``, ``max``). **An ``OPENAI_API_KEY`` alone never
-    does**: it would send a user's text to OpenAI because of a variable they set for
-    something else.
+    ``medium``, ``high``, ``xhigh``, ``max``); ``TRUSTCALL_S1_ESCALATE_MODE`` is
+    ``on_failure`` (default) or ``route`` (``EscalationConfig.mode``). **An
+    ``OPENAI_API_KEY`` alone never does**: it would send a user's text to OpenAI
+    because of a variable they set for something else.
 
     Args:
         environ: The environment to read (default ``os.environ``).
@@ -3912,7 +3913,8 @@ def escalation_from_env(
     if raw != "openai":
         raise ValueError(f"TRUSTCALL_S1_ESCALATE={raw!r}: expected 'openai' or 'none'")
     effort = (env.get("TRUSTCALL_S1_ESCALATE_EFFORT") or "").strip().lower() or None
-    return EscalationConfig(enabled=True, reasoning_effort=effort)
+    mode = (env.get("TRUSTCALL_S1_ESCALATE_MODE") or "").strip().lower() or "on_failure"
+    return EscalationConfig(enabled=True, reasoning_effort=effort, mode=mode)
 
 
 def system_one_transport(

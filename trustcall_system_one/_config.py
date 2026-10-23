@@ -904,6 +904,11 @@ ESCALATION_KINDS: tuple[str, ...] = (
     "dotted_discovery",
 )
 """What the escalation tier can be asked to do (``EscalationConfig.kinds``)."""
+ESCALATION_MODES: tuple[str, ...] = ("on_failure", "route")
+"""``EscalationConfig.mode``: ask the tier where the default setup failed, or route the
+classes in ``ROUTED_KINDS`` to it first."""
+ROUTED_KINDS: tuple[str, ...] = ("relative_dates", "list_rows", "dotted_discovery")
+"""The kinds ``mode="route"`` sends to the tier before the default setup answers."""
 REASONING_EFFORTS: tuple[str, ...] = ("none", "low", "medium", "high", "xhigh", "max")
 """The values of ``reasoning.effort`` that the escalation tier accepts."""
 
@@ -945,6 +950,17 @@ class EscalationConfig:
       entity although presence says there are some is asked for each entity's
       descriptive label and identity value.
 
+    ``mode="route"`` changes WHEN three of them are asked (``ROUTED_KINDS``): the date
+    and datetime fields whose mention window holds a relative phrase, every nested
+    ``list[Model]`` (its rows, instead of Clairic's discovery and its values) and the
+    discovery of a top-level ``Many`` with a dotted identity go to the tier first. What
+    it answers is verified, coerced and judged exactly as in ``on_failure``: quotes
+    must occur verbatim in the input, the attribution check (Clef) has to agree, the
+    probability stays under ``prob_cap``, nothing is deleted on its word and a
+    confident Clef "no" is final. An answer that fails verification, or a call that
+    fails, leaves the normal Clairic path as it was. The tie-break is asked in both
+    modes, after the second look.
+
     Attributes:
         enabled: Whether the tier runs at all.
         transport: Where its requests go (an ``OpenAIResponsesTransport``); ``None``
@@ -957,6 +973,8 @@ class EscalationConfig:
         limits: Most calls per invoke of each kind (a kind not listed has no limit of
             its own); defaults: 8 dates, 4 row sets, 12 tie-breaks, 2 discoveries.
         max_calls_per_invoke: Most escalation calls of all kinds in one invoke.
+        mode: ``"on_failure"`` (default: ask only where the default setup failed) or
+            ``"route"`` (the classes in ``ROUTED_KINDS`` go to the tier first).
         prob_cap: The most probability an escalation answer can stand for. It stays
             under ``gates.remove_threshold`` and ``match.delete_threshold`` (0.85), so
             an answer of this tier can authorise an add or a replace but never a
@@ -972,10 +990,15 @@ class EscalationConfig:
     )
     max_calls_per_invoke: int = 20
     prob_cap: float = 0.8
+    mode: str = "on_failure"
 
     def __post_init__(self) -> None:
         """Validate the settings and freeze the collections."""
         _check_flag("enabled", self.enabled)
+        if self.mode not in ESCALATION_MODES:
+            raise ValueError(
+                f"mode must be one of {list(ESCALATION_MODES)}, got {self.mode!r}"
+            )
         kinds = frozenset(self.kinds)
         unknown = sorted(kinds - set(ESCALATION_KINDS))
         if unknown:
@@ -1014,3 +1037,7 @@ class EscalationConfig:
     def runs(self, kind: str) -> bool:
         """Whether the tier is on and ``kind`` may run."""
         return self.enabled and kind in self.kinds
+
+    def routes(self, kind: str) -> bool:
+        """Whether ``kind`` goes to the tier first (``mode="route"``) and may run."""
+        return self.runs(kind) and self.mode == "route" and kind in ROUTED_KINDS

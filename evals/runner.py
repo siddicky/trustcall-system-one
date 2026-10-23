@@ -101,6 +101,8 @@ class Settings:
             combination, whose spec has its own ``escalate``.
         escalate_effort: ``reasoning.effort`` of the tier (``none``... ``max``);
             ``None`` reads ``TRUSTCALL_S1_ESCALATE_EFFORT``, else ``none``.
+        escalate_mode: ``on_failure`` or ``route`` (``EscalationConfig.mode``);
+            ``None`` reads ``TRUSTCALL_S1_ESCALATE_MODE``, else ``on_failure``.
         escalation: Offline: builds the escalation model of a case (default: one
             that never answers). Lets a test script what the model says.
         suite: The name of the case suite, recorded in the results.
@@ -120,6 +122,7 @@ class Settings:
     members: Callable[[Case], Mapping[str, Transport]] | None = None
     escalate: Literal["openai"] | None = None
     escalate_effort: str | None = None
+    escalate_mode: str | None = None
     escalation: Callable[[Case], Transport] | None = None
     suite: str = "default"
     tag: str = ""
@@ -315,7 +318,12 @@ def escalation_plan(settings: Settings, spec: ComboSpec | None) -> EscalateSpec 
         or (from_env.reasoning_effort if from_env is not None else None)
         or "none"
     )
-    return EscalateSpec(reasoning_effort=effort)
+    mode = (
+        settings.escalate_mode
+        or (from_env.mode if from_env is not None else None)
+        or "on_failure"
+    )
+    return EscalateSpec(reasoning_effort=effort, mode=mode)
 
 
 def _escalation_config(

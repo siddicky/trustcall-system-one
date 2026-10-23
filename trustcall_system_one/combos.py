@@ -54,6 +54,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from trustcall_system_one._config import (
     ESCALATION_KINDS,
+    ESCALATION_MODES,
     REASONING_EFFORTS,
     ConcurrencyConfig,
     CorefConfig,
@@ -270,6 +271,8 @@ class EscalateSpec(BaseModel):
         limits: Most calls per invoke by kind (``EscalationConfig.limits``).
         max_calls_per_invoke: Most escalation calls in one invoke.
         prob_cap: The most probability an escalation answer stands for.
+        mode: ``on_failure`` (default) or ``route`` (``EscalationConfig.mode``: the
+            relative dates, nested rows and dotted discovery go to the tier first).
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -281,6 +284,7 @@ class EscalateSpec(BaseModel):
     limits: dict[str, int] | None = None
     max_calls_per_invoke: int | None = None
     prob_cap: float | None = None
+    mode: str = "on_failure"
 
     @model_validator(mode="before")
     @classmethod
@@ -295,6 +299,11 @@ class EscalateSpec(BaseModel):
             raise ValueError(
                 f"escalate.reasoning_effort must be one of {list(REASONING_EFFORTS)}, "
                 f"got {self.reasoning_effort!r}"
+            )
+        if self.mode not in ESCALATION_MODES:
+            raise ValueError(
+                f"escalate.mode must be one of {list(ESCALATION_MODES)}, "
+                f"got {self.mode!r}"
             )
         unknown = sorted(set(self.kinds or ()) - set(ESCALATION_KINDS))
         if unknown:
@@ -320,12 +329,14 @@ class EscalateSpec(BaseModel):
             enabled=True,
             transport=transport,
             reasoning_effort=self.reasoning_effort,
+            mode=self.mode,
             **extra,
         )
 
     def describe(self) -> str:
         """A short label: ``openai gpt-6-luna effort=low``."""
-        return f"{self.provider} {self.model} effort={self.reasoning_effort}"
+        route = " route" if self.mode == "route" else ""
+        return f"{self.provider} {self.model} effort={self.reasoning_effort}{route}"
 
 
 class ComboSpec(BaseModel):

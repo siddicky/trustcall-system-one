@@ -58,7 +58,7 @@ from trustcall_system_one._entity import (
     insert_one,
     update_one,
 )
-from trustcall_system_one._escalate import escalate_discovery
+from trustcall_system_one._escalate import escalate_discovery, route_discovery
 from trustcall_system_one._existing import ExistingRecord, normalise_record
 from trustcall_system_one._match import (
     Candidate,
@@ -2405,7 +2405,35 @@ async def collect(
             f"{scope.kind!r}; give it with Many(kind=...)"
         )
 
-    jobs: list[Any] = [_discover(run, scope, phrase), _count(run, scope)]
+    # escalation mode "route": the rows of a nested list and the entities of a dotted
+    # identity are asked of the tier first; when it gives none (off, failed, nothing
+    # verifiable) Clairic discovers and counts as usual
+    routed = await route_discovery(
+        run,
+        plan=plan,
+        source=scope.source,
+        parent=scope.parent,
+        scope_key=scope.call_scope,
+        noun=scope.kind if (rows or _dotted(plan, scope.cardinality)) else scope.noun,
+        identifier=_identifier(plan, scope.cardinality),
+        dotted=_dotted(plan, scope.cardinality),
+        meta_like=SimpleNamespace(plan=plan, key=None, scope=scope.call_scope),
+        lineage=scope.lineage,
+    )
+
+    async def given(value: Any) -> Any:
+        return value
+
+    if routed:
+        warn(
+            f"escalation_routed: {plan.name}: {len(routed)} mention(s) came from the "
+            "escalation tier; Clairic's discovery and count were not asked"
+        )
+    jobs: list[Any] = (
+        [given(routed), given(None)]
+        if routed
+        else [_discover(run, scope, phrase), _count(run, scope)]
+    )
     if not skip_presence:
         jobs.append(_presence(run, scope))
     results = await gather(*jobs)
@@ -2414,7 +2442,7 @@ async def collect(
     # items nothing names are always screened; so are the mentions of a collection
     # with an identity when discovery returned a table's worth of them
     screen = rows or _table_of_mentions(run, scope, names, mentions)
-    if screen:
+    if screen and not routed:  # the tier's quotes are verified rows, not stray figures
         mentions = _prefilter(run, scope, mentions, count)
     presence: float | None = None
     cut = False

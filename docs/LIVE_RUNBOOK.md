@@ -422,6 +422,10 @@ uv run python -m evals run --suite holdout --live --replay evals/cassettes/esc-b
 uv run python -m evals run --suite holdout --cases CASE_ID --live --escalate openai --out /tmp/one
 ```
 
+`--escalate-mode route` (or `"mode": "route"` in the spec's `escalate`) sends the relative dates, the rows
+of nested lists and the discovery of dotted identities to the tier first instead of after a failure; run the
+two modes (and no tier) on the same suite to compare.
+
 Compare the efforts on the dev suite (never on the holdout: a search chooses by score), with the cost
 and latency of each in the leaderboard (`esc calls`, `esc reasoning tok`, `esc ms/call`; reasoning
 tokens are output tokens, so give the output price):
