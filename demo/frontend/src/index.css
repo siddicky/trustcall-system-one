@@ -11,6 +11,11 @@
     --font-mono: 'Geist Mono', ui-monospace, monospace;
     --font-code: 'Fira Code', ui-monospace, monospace;
     --color-success: var(--success);
+    --color-warning: var(--warning);
+    --color-info: var(--info);
+    --color-sunken: var(--sunken);
+    --color-line: var(--line);
+    --color-faint: var(--faint);
     --color-sidebar-ring: var(--sidebar-ring);
     --color-sidebar-border: var(--sidebar-border);
     --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
@@ -64,6 +69,11 @@
     --accent-foreground: #f3f4f6;
     --destructive: #ff5c8a;           /* status-danger (signal) */
     --success: #3ddc97;               /* mint */
+    --warning: #f5c542;               /* amber */
+    --info: #7ab8ff;
+    --sunken: #0c0e11;                /* code and terminal wells */
+    --line: #2c313b;                  /* border-default (ink-300) */
+    --faint: #7d8491;                 /* text-meta (gray-400) */
     --border: #363b46;                /* border-strong (ink-200) */
     --input: #a3a9b61a;               /* steel at ~10% */
     --ring: #ff7a1a4d;                /* accent at 30% */
@@ -102,4 +112,48 @@
   letter-spacing: 0.14em;
   text-transform: uppercase;
   color: var(--muted-foreground);
+}
+
+/* Code-like text: JSON, patch ops and JSON pointer paths never use ligatures. */
+@utility no-ligatures {
+  font-variant-ligatures: none;
+}
+
+/* Uppercase mono caption (the mockup's .m-code). */
+@utility code-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1.4;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted-foreground);
+}
+
+@layer base {
+  mark[data-hl] {
+    background: #a3a9b633;
+    color: var(--foreground);
+    border-bottom: 1px solid var(--foreground);
+    border-radius: 3px;
+    padding: 1px 1px;
+    scroll-margin: 48px;
+  }
+  mark[data-hl][data-active="true"] {
+    background: #f3f4f63d;
+    border-bottom: 2px solid var(--foreground);
+  }
+  mark[data-hl="mention"] {
+    background: transparent;
+    border-bottom: 1px dashed var(--muted-foreground);
+  }
+  mark[data-hl] sup {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    letter-spacing: 0;
+    margin-left: 3px;
+    vertical-align: top;
+    position: relative;
+    top: -2px;
+    color: var(--foreground);
+  }
 }
