@@ -3022,8 +3022,9 @@ green. The examples were the acceptance tests for M5 to M9.
 11. A nested `s1_field(identity=True)` identifies the sub-model, not the record above it (per-level
     identity is documented and tested), so an identity inside a sub-model of a `Many` item is
     named with `Many(identity="a.b")`, not marked on the field.
-12. Decisions as the PRIMARY Clef (live, same thresholds as Cloudflare's: 13/29 dev, 6/30 holdout
-    against 26/29 and 16/30; precision 100%, recall 61% and 76%). Our part is fixed (notes: the
+12. Decisions as the PRIMARY Clef (live on commit `353b33b`, same thresholds as Cloudflare's: 20/29 dev, 12/30
+    holdout2 against 28/29 and 16/30; precision 90% and 97%, recall 79% and 80%; see the README's Performance
+    section; the earlier 13/29 and 6/30 were measured before the fixes below). Our part is fixed (notes: the
     `list_kind` veto; a `refusal` answer; the warning name; an entity without mentions). The rest is
     the model, measured on identical requests: attribution of text and identifier values 0.4 to
     0.65 where Clef says 0.97 (a normalised `09:00:00` against the input's `09:00`, serial numbers,
@@ -3032,7 +3033,7 @@ green. The examples were the acceptance tests for M5 to M9.
     update proceeds instead of the documented `conflict_update_delete`: with an unconfirmed delete
     the update is the right outcome, and that gold expectation is provider-specific. The
     chance-normalised `confidence` it reports (0.3 for 0.65) is lower than Clef's for the same
-    probability and is used as reported. Not re-measured after these fixes (no live access).
+    probability and is used as reported. Re-measured after these fixes (the figures above).
 13. Placeholder text (`TBA`, `TBD`, `N/A`, a double or long dash) is null in a plain text field
     (`GateConfig.placeholders`; the opt-outs are `()` for the run and `s1_field(placeholders=False)`
     for one field; `TBC`, a lone `-` and a lone `?` are not defaults: ambiguous, and a result or

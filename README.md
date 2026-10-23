@@ -21,7 +21,7 @@ On this page: [quickstart](#quickstart) · [raw calls vs the library](#without-t
 [install](#install) · [insert](#extract-one-record) · [many people](#extract-and-update-many-records) ·
 [never clobbered](#fields-the-text-does-not-mention-are-never-touched) ·
 [types](#type-mapping) · [cardinality](#cardinality) · [verification](#verification-and-thresholds) ·
-[cost](#requests-latency-and-cost) · [`existing`](#the-five-existing-shapes) ·
+[cost](#requests-latency-and-cost) · [performance](#performance) · [`existing`](#the-five-existing-shapes) ·
 [testing](#testing-your-code) · [examples](#examples) · [limitations](#limitations)
 
 ## Quickstart
@@ -1184,8 +1184,9 @@ live runs of the examples, not measured on a data set; see [Limitations](#limita
 ## Requests, latency and cost
 
 The library asks more than a hand-rolled call, on purpose: accuracy first, one request per
-distinct piece of state, run in parallel. Measured on the real models on 2026-10-22
-(commit `05207aa`; no rate limits, no retries, no HTTP errors in the run):
+distinct piece of state, run in parallel. The per-example figures below were measured on the real models on
+2026-10-22 (commit `05207aa`, an early one; no rate limits, no retries, no HTTP errors in the run) and have not been
+repeated; the figures for the whole eval suites on the current commit are in [Performance](#performance):
 
 | Example | Requests | Input tokens | Wall time |
 | --- | --- | --- | --- |
@@ -1223,6 +1224,119 @@ size refusal too.
 `result.usage`, `result.calls` (one entry per request, with kind, status and duration)
 and `result.warnings` tell you what happened; `passes=PassesConfig(split="entity" |
 "submodel" | "field")` trades request count for narrower questions.
+
+## Performance
+
+What the library does on the real models, measured with the eval harness (`python -m evals`; the
+commands are in [`docs/LIVE_RUNBOOK.md`](https://github.com/siddicky/trustcall-system-one/blob/main/docs/LIVE_RUNBOOK.md)).
+
+### Method
+
+- **Suites.** *dev* is the 29 cases of `evals/cases.py`. The library, its thresholds and the routing
+  below were tuned on it. *holdout2* is the 30 blind cases of `evals/holdout2_cases.py`, written after the
+  dev fixes and never used to tune the library; it is the generalisation number. A case passes when every
+  expected operation is produced and no `must_not` is violated.
+- **Runs.** One live run per setup and suite (live, not replayed), on commit `353b33b`, on 2026-10-23, with the
+  default thresholds (`--config default`) and `--concurrency 2` (two cases at a time, so a per-case latency
+  includes the other case's load). No request was retried after an uncertain outcome, and none was uncertain
+  (0 `unknown_outcomes`, 0 errors in all six runs).
+- **Setups.** A: Clairic and Clef on Cloudflare, no escalation
+  (`python -m evals run --live`). B: the same, with `match` and `match_confirm` answered by Clef on Experiential
+  Labs and the opt-in `gpt-6-luna` tier with the recommended routing, effort `none` (`python -m evals combo
+  --spec ... --live`; the spec is `{"by_kind": {"match": "experiential-clef", "match_confirm":
+  "experiential-clef"}, "escalate": {"provider": "openai", "reasoning_effort": "none", "mode": "recommended"}}`,
+  the same as `--escalate openai --escalate-mode recommended --escalate-effort none`). C: Clairic on Cloudflare, every
+  Clef request on the Decisions API (`--clef-provider decisions`), no escalation.
+- **Columns.** Op precision and recall: operations produced against expected, one to one. Value accuracy: the
+  expected inserted values that are right. Bleed: a fact written to the wrong record. Wrong deletes: a record
+  deleted that should not be. Requests: model requests of the run (the OpenAI calls of B included). Median
+  latency: the median over cases of the wall time of a case.
+- **Cost basis.** Clairic at $0.10 per million input tokens, counted from the recorded requests. Cloudflare's Clef
+  has no published price, so it is not in the figure (its input tokens are given). Experiential Labs' cost is the
+  one it reports per call. OpenAI reports tokens and no price; the `gpt-6-luna` cost is an **estimate** at an
+  assumed $2.50 per million input and $10 per million output tokens, which is not a published price. A cost
+  is "Clairic + Clef (unpriced)" unless it says otherwise.
+- **Thresholds are the defaults.** Nothing was changed for these runs.
+
+### Results on commit 353b33b
+
+| Setup | dev passed | holdout2 passed |
+| --- | --- | --- |
+| A. Clairic + Clef | 28/29 | 16/30 |
+| B. Clairic + Clef + gpt-6-luna (recommended routing) | **29/29** | **20/30** |
+| C. Clairic + OpenAI Decisions | 20/29 | 12/30 |
+
+dev (29 cases, used for tuning):
+
+| Setup | passed | op precision / recall | value accuracy | bleed | wrong deletes | requests | median s per case | cost |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| A. Clairic + Clef | 28/29 | 100% / 97% | 100% | 0 | 0 | 408 | 3.1 | $0.0080 Clairic (80,307 in) + Clef (102,684 in, unpriced) |
+| B. Clairic + Clef + gpt-6-luna (recommended routing) | 29/29 | 100% / 100% | 100% | 0 | 0 | 421 (6 OpenAI) | 3.4 | $0.0081 Clairic + $0.0009 Experiential (reported) + about $0.005 OpenAI (estimate: 1,388 in / 179 out) + Clef (unpriced) |
+| C. Clairic + OpenAI Decisions | 20/29 | 90% / 79% | 92% | 0 | 0 | 368 | 11.0 | $0.0077 Clairic + $0.0002 Decisions (reported) |
+
+holdout2 (30 blind cases, the generalisation number):
+
+| Setup | passed | op precision / recall | value accuracy | bleed | wrong deletes | requests | median s per case | cost |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| A. Clairic + Clef | 16/30 | 97% / 82% | 69% | 0 | 0 | 383 | 2.0 | $0.0076 Clairic (76,153 in) + Clef (99,411 in, unpriced) |
+| B. Clairic + Clef + gpt-6-luna (recommended routing) | 20/30 | 97% / 82% | 86% | 0 | 0 | 374 (8 OpenAI) | 2.2 | $0.0067 Clairic + $0.0003 Experiential (reported) + about $0.012 OpenAI (estimate: 2,570 in / 524 out) + Clef (unpriced) |
+| C. Clairic + OpenAI Decisions | 12/30 | 97% / 80% | 68% | 0 | 0 | 401 | 9.4 | $0.0080 Clairic + $0 Decisions (reported) |
+
+The live smoke test (4 scenarios) passes on setup B, 4/4.
+
+TypeSafe's Jev could not be run again (no key). These rows are **old**: measured on commit `78c647b`, with
+concurrency 4, and the holdout column is the **first** holdout set (`evals/holdout_cases.py`), **not holdout2**, so
+they are not comparable with the table above. Jev answers both Clairic and Clef; priced at $0.042 per million
+input tokens, output free. "Calibrated" is the search winner (logit shifts of presence, qualify, match_confirm and
+attribution), tuned on dev only.
+
+| Setup (commit 78c647b) | dev passed | dev op P / R | dev value acc. | dev requests / median s / cost | first holdout passed | holdout op P / R | holdout value acc. | holdout requests / median s / cost |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| TypeSafe Jev | 14/29 | 78% / 64% | 56% | 436 / 1.8 / $0.028 | 8/30 | 84% / 76% | 52% | 629 / 2.4 / $0.031 |
+| TypeSafe Jev, calibrated | 18/29 | 69% / 82% | 88% | 468 / 1.9 / $0.033 | 9/30 | 85% / 81% | 56% | 643 / 1.9 / $0.031 |
+
+(Bleed and wrong deletes were 0 in all four. Requests are Jev requests.)
+
+### Caveats
+
+- **dev is a tuning score.** The library was fixed and tuned until dev passed, so A's 28/29 and B's 29/29 say it
+  was fitted, not that it generalises. holdout2 is the number to read: 16/30 for the plain setup.
+- **The recommended routing was chosen on holdout2.** `mode="recommended"` (relative dates and nested rows asked of
+  the tier first, dotted discovery only on failure) was picked from holdout2 results, so holdout2 is no longer a
+  clean measurement for B: its 20/30 is a selected number, and a fresh blind suite is needed to say how much of
+  the gain holds. B also differs from A in two ways (Clef on Experiential for `match` and `match_confirm`, and the
+  tier); these runs do not separate them.
+- **Single runs.** One run per setup and suite. Models are not deterministic: a difference of one or two cases is
+  within what a rerun can move.
+- **The TypeSafe rows are from an older commit and the first holdout** (see above).
+- **Prices.** Cloudflare's Clef has no published price and is missing from every cost; OpenAI's price is unpublished
+  and the `gpt-6-luna` cost is an estimate at assumed rates; Experiential reports a cost per call and its figure
+  here is tiny and not independently checked.
+- **B sends text to OpenAI and Experiential Labs.** The escalation tier is opt-in, off by default, and a key in the
+  environment never turns it on.
+
+### Recommended setup
+
+Use A (Clairic and Clef on Cloudflare, the default) when the text may only go to Cloudflare: it passes
+16/30 of the blind cases at about $0.008 of Clairic per 30 cases. Use B (the same, plus the opt-in `gpt-6-luna` tier with
+`escalate={"provider": "openai", "mode": "recommended"}`, and Clef on Experiential Labs for `match` and
+`match_confirm`) when sending the text of the cases the default fails to OpenAI is acceptable: it passed 20/30
+of the blind cases against 16/30, with the same precision and recall and 0 bleed, for about one cent more per run (at the
+assumed OpenAI rates) and about 0.2 s more per case. Do not use the Decisions API as the primary Clef (C): it is 4 to 8 cases worse and three to five
+times slower per case. Jev is not recommended on the old numbers above.
+
+### What still fails on holdout2 (setup B, 10 of 30)
+
+- **Entities not discovered when the schema names no kind.** `service_shorthand`, `speaker_no_longer` and
+  `speaker_update_bleed` describe their entity without naming what kind of thing it is (warning `kind_fallback`),
+  discovery finds none and nothing is inserted or updated (give a `Many(kind=...)`); `charter_fleet_similar` (two
+  near-identical boat names) also finds no entity.
+- **Coercion failures.** A required field comes back null or invalid, so the record is dropped: `trip_form_dates`
+  (a date), `claimants_bleed` (a name), and a value that never arrives (`meter_ocr_card`'s address on an OCR'd
+  card, `asset_dotted_insert`'s model).
+- **Update and delete conflicts.** `patron_remove_and_change`: an input that both removes and changes a record is
+  applied as a change (the expected `conflict_update_delete` is not raised).
+- **Relative edits.** `charter_guests_relative`: "N more" is not refused as `relative_edit_unsupported`.
 
 ## The five `existing` shapes
 
@@ -1339,7 +1453,8 @@ Read these before relying on it.
   back right at confidence 0.999. A narrower field definition or a Clef yes/no per candidate is the
   likely fix, untested.
 - **Multi-entity extraction is not yet reliable live** (example 05 above): matching
-  confidence, qualification and the notes problem combine.
+  confidence, qualification and the notes problem combine. On the 30 blind holdout2 cases 16 pass with the default
+  setup (see [Performance](#performance)).
 - **`list[A | B]`, a list of a union of models, is not extracted** (warning `unsupported_list_item`).
   `dict[int, X]` mappings, `Any` and `dict[str, Any]` are skipped.
 - **Thresholds are not tuned.** They are hypotheses with documented defaults. Two live margins are
@@ -1349,7 +1464,7 @@ Read these before relying on it.
   relationship can come back in the speaker's voice, "my cousin"); use `Literal` for a
   vocabulary.
 - **Cost and speed.** Verification costs requests: expect 3 to 10 per record and 2 to 5 seconds
-  live. Clef's price is unpublished and Clairic/Clef rate limits are undocumented; the
+  live (median 2 to 3 seconds and 10 to 13 requests per eval case, with two cases at a time). Clef's price is unpublished and Clairic/Clef rate limits are undocumented; the
   transport adapts to 429s but you may meet them in large batches.
 - **Long inputs.** Clef truncates long state silently and refuses a request over its maximum, so
   the library estimates every request (state and questions, calibrated on recorded table-heavy
@@ -1358,8 +1473,9 @@ Read these before relying on it.
   the mentions to stay under `clef_state_token_budget`, contains a refusal as a warning, and
   warns past 97% of the limit. On a table-heavy sheet with hundreds of table cells the
   entities of identity-less lists are still the weak part (see DESIGN, Risks 10).
-- **Decisions as the primary Clef is much weaker than Clef on Cloudflare** (live, same thresholds:
-  13/29 dev and 6/30 holdout against 26/29 and 16/30; precision stays 100%, recall does not).
+- **Decisions as the primary Clef is weaker than Clef on Cloudflare** (live, same thresholds, commit
+  `353b33b`: 20/29 dev and 12/30 holdout2 against 28/29 and 16/30, see [Performance](#performance);
+  precision stays high, recall does not).
   Fixed on our side: the notes classification (a hedged `items` 0.65 no longer keeps notes out,
   `ITEMS_VETO`), a refusal answer, the warning name, and the context of an entity without mentions.
   What remains is the model: it hedges on identifiers and numbers (0.4 to 0.65 where Clef says
