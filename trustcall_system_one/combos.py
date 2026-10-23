@@ -54,7 +54,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from trustcall_system_one._config import (
     ESCALATION_KINDS,
-    ESCALATION_MODES,
     REASONING_EFFORTS,
     ConcurrencyConfig,
     CorefConfig,
@@ -67,6 +66,8 @@ from trustcall_system_one._config import (
     PresenceConfig,
     RepairConfig,
     VerifyConfig,
+    describe_escalation_mode,
+    resolve_escalation_mode,
 )
 from trustcall_system_one._partition import route_keys
 from trustcall_system_one._wire import body_model
@@ -271,8 +272,13 @@ class EscalateSpec(BaseModel):
         limits: Most calls per invoke by kind (``EscalationConfig.limits``).
         max_calls_per_invoke: Most escalation calls in one invoke.
         prob_cap: The most probability an escalation answer stands for.
-        mode: ``on_failure`` (default) or ``route`` (``EscalationConfig.mode``: the
-            relative dates, nested rows and dotted discovery go to the tier first).
+        mode: When each kind is asked (``EscalationConfig.mode``): ``on_failure``
+            (default), ``route`` (the relative dates, nested rows and dotted discovery
+            go to the tier first), the preset ``recommended`` (dates and rows first,
+            dotted discovery on failure; chosen from holdout2 results) or a mapping of
+            kind to ``on_failure`` / ``route`` (``{"list_rows": "route"}``; a kind it
+            omits is ``on_failure``; ``attribution_tiebreak`` can only be
+            ``on_failure``).
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -284,7 +290,7 @@ class EscalateSpec(BaseModel):
     limits: dict[str, int] | None = None
     max_calls_per_invoke: int | None = None
     prob_cap: float | None = None
-    mode: str = "on_failure"
+    mode: str | dict[str, str] = "on_failure"
 
     @model_validator(mode="before")
     @classmethod
@@ -300,11 +306,10 @@ class EscalateSpec(BaseModel):
                 f"escalate.reasoning_effort must be one of {list(REASONING_EFFORTS)}, "
                 f"got {self.reasoning_effort!r}"
             )
-        if self.mode not in ESCALATION_MODES:
-            raise ValueError(
-                f"escalate.mode must be one of {list(ESCALATION_MODES)}, "
-                f"got {self.mode!r}"
-            )
+        try:
+            resolve_escalation_mode(self.mode)
+        except ValueError as exc:
+            raise ValueError(f"escalate.mode: {exc}") from exc
         unknown = sorted(set(self.kinds or ()) - set(ESCALATION_KINDS))
         if unknown:
             raise ValueError(
@@ -334,8 +339,9 @@ class EscalateSpec(BaseModel):
         )
 
     def describe(self) -> str:
-        """A short label: ``openai gpt-6-luna effort=low``."""
-        route = " route" if self.mode == "route" else ""
+        """A short label: ``openai gpt-6-luna effort=low recommended``."""
+        label = describe_escalation_mode(self.mode)
+        route = "" if label == "on_failure" else f" {label}"
         return f"{self.provider} {self.model} effort={self.reasoning_effort}{route}"
 
 

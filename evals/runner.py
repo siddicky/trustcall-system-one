@@ -26,6 +26,7 @@ from trustcall_system_one import (
     provider_from_env,
     system_one_transport,
 )
+from trustcall_system_one._config import compact_escalation_mode
 from trustcall_system_one.combos import (
     ComboSpec,
     EscalateSpec,
@@ -101,8 +102,9 @@ class Settings:
             combination, whose spec has its own ``escalate``.
         escalate_effort: ``reasoning.effort`` of the tier (``none``... ``max``);
             ``None`` reads ``TRUSTCALL_S1_ESCALATE_EFFORT``, else ``none``.
-        escalate_mode: ``on_failure`` or ``route`` (``EscalationConfig.mode``);
-            ``None`` reads ``TRUSTCALL_S1_ESCALATE_MODE``, else ``on_failure``.
+        escalate_mode: ``on_failure``, ``route``, ``recommended`` or a mapping of
+            kind to mode (``EscalationConfig.mode``); ``None`` reads
+            ``TRUSTCALL_S1_ESCALATE_MODE``, else ``on_failure``.
         escalation: Offline: builds the escalation model of a case (default: one
             that never answers). Lets a test script what the model says.
         suite: The name of the case suite, recorded in the results.
@@ -122,7 +124,7 @@ class Settings:
     members: Callable[[Case], Mapping[str, Transport]] | None = None
     escalate: Literal["openai"] | None = None
     escalate_effort: str | None = None
-    escalate_mode: str | None = None
+    escalate_mode: str | Mapping[str, str] | None = None
     escalation: Callable[[Case], Transport] | None = None
     suite: str = "default"
     tag: str = ""
@@ -313,6 +315,10 @@ def escalation_plan(settings: Settings, spec: ComboSpec | None) -> EscalateSpec 
     from_env = escalation_from_env()
     if settings.escalate is None and from_env is None:
         return None
+    if from_env is None:  # --escalate openai: the variables still set effort and mode
+        from_env = escalation_from_env(
+            {**os.environ, "TRUSTCALL_S1_ESCALATE": "openai"}
+        )
     effort = (
         settings.escalate_effort
         or (from_env.reasoning_effort if from_env is not None else None)
@@ -323,7 +329,7 @@ def escalation_plan(settings: Settings, spec: ComboSpec | None) -> EscalateSpec 
         or (from_env.mode if from_env is not None else None)
         or "on_failure"
     )
-    return EscalateSpec(reasoning_effort=effort, mode=mode)
+    return EscalateSpec(reasoning_effort=effort, mode=compact_escalation_mode(mode))
 
 
 def _escalation_config(

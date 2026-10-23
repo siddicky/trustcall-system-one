@@ -422,9 +422,15 @@ uv run python -m evals run --suite holdout --live --replay evals/cassettes/esc-b
 uv run python -m evals run --suite holdout --cases CASE_ID --live --escalate openai --out /tmp/one
 ```
 
-`--escalate-mode route` (or `"mode": "route"` in the spec's `escalate`) sends the relative dates, the rows
-of nested lists and the discovery of dotted identities to the tier first instead of after a failure; run the
-two modes (and no tier) on the same suite to compare.
+`--escalate-mode` (or `"mode"` in the spec's `escalate`, or `TRUSTCALL_S1_ESCALATE_MODE`) decides when each
+kind is asked: `on_failure` (default), `route` (the relative dates, the rows of nested lists and the discovery of
+dotted identities go to the tier first), `recommended`, or `kind=mode` pairs, comma separated
+(`relative_dates=route,list_rows=route,dotted_discovery=on_failure`; a kind left out is `on_failure`;
+`attribution_tiebreak` can only be `on_failure`). `recommended` is exactly the pairs
+`relative_dates=route,list_rows=route,dotted_discovery=on_failure,attribution_tiebreak=on_failure`. **That
+mapping was chosen from the holdout2 results, so holdout2 is no longer fully clean for that choice:** compare
+modes on the dev suite, and read a holdout2 score under `recommended` as a selected number, not a blind one.
+Run the modes (and no tier) on the same suite to compare; a mode alone enables nothing, it needs `--escalate openai`.
 
 Compare the efforts on the dev suite (never on the holdout: a search chooses by score), with the cost
 and latency of each in the leaderboard (`esc calls`, `esc reasoning tok`, `esc ms/call`; reasoning

@@ -36,7 +36,7 @@ from evals.search import (
     write_search,
 )
 from evals.suites import DEFAULT_SUITE, SUITES, load_suite
-from trustcall_system_one._config import ESCALATION_MODES
+from trustcall_system_one._config import parse_escalation_mode
 from trustcall_system_one.combos import PROVIDERS, ComboSpec, companies, load_combo
 from trustcall_system_one.openai_transport import REASONING_EFFORTS
 
@@ -194,16 +194,29 @@ def _common(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--escalate-mode",
-        choices=ESCALATION_MODES,
+        type=_escalate_mode,
         default=None,
+        metavar="MODE",
         help="when the escalation tier is asked (default: "
         "TRUSTCALL_S1_ESCALATE_MODE, else on_failure): on_failure asks it where the "
         "default setup failed; route sends the relative dates, the rows of nested "
         "lists and the discovery of a dotted identity to it FIRST (what it says is "
         "verified and judged like any answer; a failed call or an unverifiable answer "
-        "leaves the default path). Only with --escalate (or the variable)",
+        "leaves the default path); recommended = relative_dates=route,list_rows=route,"
+        "dotted_discovery=on_failure (chosen from holdout2 results); or kind=mode "
+        "pairs, comma separated, e.g. relative_dates=route,list_rows=route (a kind "
+        "left out is on_failure; attribution_tiebreak can only be on_failure). "
+        "Only with --escalate (or the variable)",
     )
     _output_args(parser)
+
+
+def _escalate_mode(text: str) -> str | dict[str, str]:
+    """Parse ``--escalate-mode``: a mode, a preset or ``kind=mode`` pairs."""
+    try:
+        return parse_escalation_mode(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _combo_common(parser: argparse.ArgumentParser) -> None:

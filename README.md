@@ -849,6 +849,18 @@ is no default price: pass `Prices(per_million_input=..., per_million_output=...)
 tier, relative phrases that name one date (`yesterday`, `3 days ago`, `in two weeks`) are still read in
 code against `reference_date`; `last Tuesday` is not (it can mean two dates), and is the tier's.
 
+**When it is asked.** By default (`mode="on_failure"`) each kind is asked only where the default setup
+failed. `EscalationConfig(mode=...)` can send kinds to the tier *first* ("route"), per kind: a mapping such as
+`mode={"relative_dates": "route", "list_rows": "route", "dotted_discovery": "on_failure",
+"attribution_tiebreak": "on_failure"}` (a kind you leave out is `on_failure`), a plain string for the same
+mode everywhere (`"route"` routes every kind that can be routed), or the preset `mode="recommended"`, which is
+exactly that mapping: relative dates and table rows are asked of the tier first, dotted discovery only on failure.
+`attribution_tiebreak` is always asked after the second look and refuses `route`. The same setting is
+`{"escalate": {"mode": ...}}` in a combination spec, `--escalate-mode on_failure|route|recommended|kind=mode,kind=mode`
+on the evals CLI and `TRUSTCALL_S1_ESCALATE_MODE` (same syntax). **The recommended mapping was chosen from
+the holdout2 results, so holdout2 is no longer fully clean for that choice** (see [Performance](#performance)).
+A mode on its own never turns the tier on, and what it sends is still only the text of the cases it asks about.
+
 `python -m evals run --escalate openai [--escalate-effort low]` and `evals search --order escalate.effort`
 compare the tier's efforts (cost and latency per effort in the leaderboard); see
 [`docs/LIVE_RUNBOOK.md`](https://github.com/siddicky/trustcall-system-one/blob/main/docs/LIVE_RUNBOOK.md)

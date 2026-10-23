@@ -2600,7 +2600,7 @@ The key sits in the httpx request that an `UncertainOutcomeError` chains (`__cau
 ### Configuration and wiring
 
 `EscalationConfig(enabled=False, transport=None, kinds=<all four>, reasoning_effort=None, limits={...},
-max_calls_per_invoke=20, prob_cap=0.8)` (`_config.py`): `limits` are per kind and invoke (defaults 8
+max_calls_per_invoke=20, prob_cap=0.8, mode="on_failure")` (`_config.py`): `limits` are per kind and invoke (defaults 8
 dates, 4 row sets, 12 tie-breaks, 2 discoveries; 0 switches a kind off), `max_calls_per_invoke` counts
 all kinds, a limit that is reached warns once (`escalation_limit`) and the call is not made. An enabled
 config without a transport gets an `OpenAIResponsesTransport` from `OPENAI_API_KEY` on first use (owned,
@@ -2616,19 +2616,41 @@ is one too); for the default transport only, `TRUSTCALL_S1_ESCALATE=openai` (and
 OpenAI, `only` refuses it, `by_kind` and `calibration` refuse the `escalate` kind); evals `--escalate
 openai --escalate-effort EFFORT`.
 
-**Mode.** `EscalationConfig.mode` is `"on_failure"` (default: everything above) or `"route"`: the three
-classes in `ROUTED_KINDS` go to the tier FIRST, whatever the default setup would have answered. (1) A date or
-datetime field whose mention window holds a relative phrase (needs a `reference_date`) is asked of the tier; its
-verified date replaces Clairic's when they differ (`_escalate._relative_date`). (2) Every nested `list[Model]`:
-`collect` asks the rows before Clairic's discovery and count (`route_discovery`; the quotes become the mentions
-and are not code-screened, since a row code such as `A1` is a verified quote), and `_fill_row` puts the tier's
-reading of a row's fields in place of Clairic's where they differ. (3) The discovery of a top-level `Many` with a
-dotted identity. Unchanged: every quote occurs verbatim, the value is coerced, the ladder and the change gates
-judge it (Clef has to agree), an answer stands for at most `prob_cap`, nothing is deleted or removed on its word.
-An answer that is off, over a limit, unverifiable or failed leaves the normal path exactly as `on_failure` would
-run it (Clairic discovers and counts). A routed value the ladder then refuses is null, as any refused value.
-The tie-break is asked in both modes. Spec: `{"escalate": {"mode": "route"}}`; evals `--escalate-mode route`;
-`TRUSTCALL_S1_ESCALATE_MODE`. Tests: `test_escalation_route.py`.
+**Mode.** `EscalationConfig.mode` says WHEN each kind is asked. For one kind it is `"on_failure"` (default:
+everything above) or `"route"`: the three classes in `ROUTED_KINDS` go to the tier FIRST, whatever the default
+setup would have answered. (1) A date or datetime field whose mention window holds a relative phrase (needs a
+`reference_date`) is asked of the tier; its verified date replaces Clairic's when they differ
+(`_escalate._relative_date`). (2) Every nested `list[Model]`: `collect` asks the rows before Clairic's discovery
+and count (`route_discovery`; the quotes become the mentions and are not code-screened, since a row code such as
+`A1` is a verified quote), and `_fill_row` puts the tier's reading of a row's fields in place of Clairic's where
+they differ. (3) The discovery of a top-level `Many` with a dotted identity. Unchanged: every quote occurs
+verbatim, the value is coerced, the ladder and the change gates judge it (Clef has to agree), an answer stands
+for at most `prob_cap`, nothing is deleted or removed on its word. An answer that is off, over a limit,
+unverifiable or failed leaves the normal path exactly as `on_failure` would run it (Clairic discovers and
+counts). A routed value the ladder then refuses is null, as any refused value.
+
+*Mode by kind.* `mode` is a string or a mapping (`_config.resolve_escalation_mode`; stored on the config as a
+frozen mapping of all four kinds, read with `EscalationConfig.mode_for(kind)`, `routes(kind)` is `runs(kind)`
+and `mode_for(kind) == "route"`). A plain string means the same mode for every kind: `"on_failure"` is all
+`on_failure`, `"route"` routes every kind in `ROUTED_KINDS`. A mapping names kinds
+(`{"relative_dates": "route", "list_rows": "route", "dotted_discovery": "on_failure"}`); a kind it leaves out is
+`on_failure`, an unknown kind or mode is a `ValueError`. `attribution_tiebreak` is asked after the second look by
+nature and can only be `on_failure`: `route` for it is refused, in the mapping, the spec, the text forms and the
+CLI. The preset `"recommended"` (`ESCALATION_MODE_PRESETS`) is exactly
+`{relative_dates: route, list_rows: route, dotted_discovery: on_failure, attribution_tiebreak: on_failure}`: dates
+and table rows are asked of the tier first, dotted discovery only where Clairic finds nothing.
+**The recommended mapping was chosen from the holdout2 results**, so holdout2 is no longer a clean
+measurement for that choice: its score under `recommended` is a selected number, and a fresh blind suite is
+needed to say how well the choice generalises. The tie-break is asked in every mode.
+
+Spelling: `EscalateSpec.mode` (the combo spec's `escalate`) takes the string or the mapping
+(`{"escalate": {"mode": "recommended"}}`, `{"escalate": {"mode": {"list_rows": "route"}}}`; `describe()` names it,
+and an equal mapping is labelled as the preset); evals `--escalate-mode on_failure|route|recommended|kind=mode,kind=mode`
+and `TRUSTCALL_S1_ESCALATE_MODE` take the same text (`_config.parse_escalation_mode`: case and blanks do not
+matter, a kind left out is `on_failure`, a malformed pair, a repeated kind or `attribution_tiebreak=route` is an
+error naming the variable or flag). The default stays `"on_failure"`, and the tier itself stays opt-in: a mode
+alone (the variable, the flag, the spec) enables nothing and nothing goes to OpenAI unless the tier is turned on.
+Tests: `test_escalation_route.py`.
 
 Every call is a `CallRecord` of the new `CallKind` `"escalate"` (never routed through the Clairic/Clef
 stack: `ESCALATE_KINDS`, outside `CLEF_KINDS`), `CallRecord.field` starts with the sub-kind

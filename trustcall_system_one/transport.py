@@ -39,7 +39,11 @@ from typing import (
 import httpx
 
 from trustcall_system_one._calibrate import calibrate_body
-from trustcall_system_one._config import ConcurrencyConfig, EscalationConfig
+from trustcall_system_one._config import (
+    ConcurrencyConfig,
+    EscalationConfig,
+    parse_escalation_mode,
+)
 from trustcall_system_one._decisions import (
     DECISIONS_MODEL,
     DEFAULT_HARD_CAP,
@@ -3892,7 +3896,9 @@ def escalation_from_env(
     ``TRUSTCALL_S1_ESCALATE=openai`` turns the tier on (``none`` or unset: off);
     ``TRUSTCALL_S1_ESCALATE_EFFORT`` sets ``reasoning.effort`` (``none``, ``low``,
     ``medium``, ``high``, ``xhigh``, ``max``); ``TRUSTCALL_S1_ESCALATE_MODE`` is
-    ``on_failure`` (default) or ``route`` (``EscalationConfig.mode``). **An
+    ``on_failure`` (default), ``route``, ``recommended`` or ``kind=mode`` pairs
+    separated by commas, e.g. ``relative_dates=route,list_rows=route``
+    (``EscalationConfig.mode``). **An
     ``OPENAI_API_KEY`` alone never does**: it would send a user's text to OpenAI
     because of a variable they set for something else.
 
@@ -3904,7 +3910,7 @@ def escalation_from_env(
         ``OPENAI_API_KEY`` on first use), or ``None``.
 
     Raises:
-        ValueError: For a value that names no provider or effort.
+        ValueError: For a value that names no provider, effort or mode.
     """
     env = os.environ if environ is None else environ
     raw = (env.get("TRUSTCALL_S1_ESCALATE") or "").strip().lower()
@@ -3913,7 +3919,11 @@ def escalation_from_env(
     if raw != "openai":
         raise ValueError(f"TRUSTCALL_S1_ESCALATE={raw!r}: expected 'openai' or 'none'")
     effort = (env.get("TRUSTCALL_S1_ESCALATE_EFFORT") or "").strip().lower() or None
-    mode = (env.get("TRUSTCALL_S1_ESCALATE_MODE") or "").strip().lower() or "on_failure"
+    raw_mode = (env.get("TRUSTCALL_S1_ESCALATE_MODE") or "").strip()
+    try:
+        mode = parse_escalation_mode(raw_mode) if raw_mode else "on_failure"
+    except ValueError as exc:
+        raise ValueError(f"TRUSTCALL_S1_ESCALATE_MODE={raw_mode!r}: {exc}") from exc
     return EscalationConfig(enabled=True, reasoning_effort=effort, mode=mode)
 
 

@@ -38,7 +38,14 @@ from trustcall_system_one import (
     TransportError,
     create_extractor,
 )
-from trustcall_system_one._config import ESCALATION_MODES, ROUTED_KINDS
+from trustcall_system_one._config import (
+    ESCALATION_KINDS,
+    ESCALATION_MODE_PRESETS,
+    ESCALATION_MODES,
+    ROUTED_KINDS,
+    describe_escalation_mode,
+    parse_escalation_mode,
+)
 from trustcall_system_one.combos import ComboSpec, EscalateSpec
 from trustcall_system_one.testing import FakeEscalation, FakeTransport, FakeWorld
 
@@ -59,7 +66,7 @@ def three_days(*_: Any) -> dict[str, Any]:
 
 
 def test_the_mode_defaults_to_on_failure_and_is_validated() -> None:
-    assert EscalationConfig().mode == "on_failure"
+    assert EscalationConfig().mode_for("list_rows") == "on_failure"
     assert ESCALATION_MODES == ("on_failure", "route")
     with pytest.raises(ValueError, match="mode must be one of"):
         EscalationConfig(mode="always")
@@ -85,10 +92,10 @@ def test_a_combo_spec_names_the_mode() -> None:
         {"name": "x", "escalate": {"provider": "openai", "mode": "route"}}
     )
     assert spec.escalate is not None and spec.escalate.mode == "route"
-    assert spec.escalate.config().mode == "route"
+    assert spec.escalate.config().mode_for("list_rows") == "route"
     assert spec.escalate.describe().endswith("route")
     assert "route" not in EscalateSpec().describe()
-    assert EscalateSpec().config().mode == "on_failure"
+    assert EscalateSpec().config().mode_for("list_rows") == "on_failure"
     with pytest.raises(ValueError, match=r"escalate\.mode"):
         EscalateSpec(mode="sometimes")
 
@@ -99,16 +106,16 @@ def test_the_environment_names_the_mode() -> None:
     config = escalation_from_env(
         {"TRUSTCALL_S1_ESCALATE": "openai", "TRUSTCALL_S1_ESCALATE_MODE": "route"}
     )
-    assert config is not None and config.mode == "route"
+    assert config is not None and config.mode_for("list_rows") == "route"
     plain = escalation_from_env({"TRUSTCALL_S1_ESCALATE": "openai"})
-    assert plain is not None and plain.mode == "on_failure"
+    assert plain is not None and plain.mode_for("list_rows") == "on_failure"
     with pytest.raises(ValueError, match="mode"):
         escalation_from_env(
             {"TRUSTCALL_S1_ESCALATE": "openai", "TRUSTCALL_S1_ESCALATE_MODE": "x"}
         )
 
 
-def test_the_cli_takes_the_mode() -> None:
+def test_the_cli_takes_a_plain_mode() -> None:
     from evals.cli import _parser as build_parser
 
     args = build_parser().parse_args(
@@ -116,6 +123,266 @@ def test_the_cli_takes_the_mode() -> None:
     )
     assert args.escalate_mode == "route"
     assert build_parser().parse_args(["run"]).escalate_mode is None
+
+
+# --------------------------------------------------------------------------- #
+# The mode by kind
+# --------------------------------------------------------------------------- #
+
+RECOMMENDED = {
+    "relative_dates": "route",
+    "list_rows": "route",
+    "dotted_discovery": "on_failure",
+    "attribution_tiebreak": "on_failure",
+}
+
+
+def modes(config: EscalationConfig) -> dict[str, str]:
+    return {kind: config.mode_for(kind) for kind in ESCALATION_KINDS}
+
+
+def test_a_mapping_sets_the_mode_of_each_kind() -> None:
+    config = EscalationConfig(
+        enabled=True,
+        mode={
+            "relative_dates": "route",
+            "list_rows": "route",
+            "dotted_discovery": "on_failure",
+            "attribution_tiebreak": "on_failure",
+        },
+    )
+    assert modes(config) == RECOMMENDED
+    assert config.routes("relative_dates") and config.routes("list_rows")
+    assert not config.routes("dotted_discovery")
+    assert not config.routes("attribution_tiebreak")
+    # a kind the mapping omits is on_failure; the mapping is frozen and hashable
+    only = EscalationConfig(mode={"dotted_discovery": "route"})
+    assert modes(only) == {
+        **dict.fromkeys(ESCALATION_KINDS, "on_failure"),
+        **{"dotted_discovery": "route"},
+    }
+    assert hash(only) == hash(EscalationConfig(mode={"dotted_discovery": "route"}))
+    with pytest.raises(TypeError):
+        only.mode["list_rows"] = "route"  # type: ignore[index]
+
+
+def test_a_plain_string_means_the_same_mode_for_every_kind() -> None:
+    off = EscalationConfig(mode="on_failure")
+    assert set(modes(off).values()) == {"on_failure"}
+    route_all = EscalationConfig(mode="route")
+    assert modes(route_all) == {
+        **dict.fromkeys(ROUTED_KINDS, "route"),
+        "attribution_tiebreak": "on_failure",  # never routed
+    }
+    # the string and the equal mapping are the same configuration
+    assert route_all == EscalationConfig(mode=modes(route_all))
+
+
+def test_the_recommended_preset_is_exactly_the_mapping() -> None:
+    preset = EscalationConfig(mode="recommended")
+    assert modes(preset) == RECOMMENDED
+    assert dict(ESCALATION_MODE_PRESETS["recommended"]) == RECOMMENDED
+    assert preset == EscalationConfig(mode=RECOMMENDED)
+    assert describe_escalation_mode("recommended") == "recommended"
+    assert describe_escalation_mode({"list_rows": "route"}) == "route(list_rows)"
+
+
+def test_route_is_refused_for_the_attribution_tie_break() -> None:
+    with pytest.raises(ValueError, match=r"attribution_tiebreak.*on_failure"):
+        EscalationConfig(mode={"attribution_tiebreak": "route"})
+    with pytest.raises(ValueError, match="attribution_tiebreak"):
+        EscalateSpec(mode={"attribution_tiebreak": "route"})
+    with pytest.raises(ValueError, match="attribution_tiebreak"):
+        parse_escalation_mode("attribution_tiebreak=route")
+    # on_failure for it is the only (and the default) value
+    assert (
+        EscalationConfig(mode={"attribution_tiebreak": "on_failure"}).enabled is False
+    )
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        {"nope": "route"},
+        {"list_rows": "sometimes"},
+        {"list_rows": "recommended"},
+        "recommended,route",
+        42,
+    ],
+)
+def test_a_bad_mode_is_refused(mode: Any) -> None:
+    with pytest.raises(ValueError):
+        EscalationConfig(mode=mode)
+
+
+def test_a_combo_spec_takes_the_mode_as_a_string_or_a_mapping() -> None:
+    by_name = ComboSpec.model_validate(
+        {"name": "x", "escalate": {"provider": "openai", "mode": "recommended"}}
+    )
+    assert by_name.escalate is not None and by_name.escalate.mode == "recommended"
+    assert modes(by_name.escalate.config()) == RECOMMENDED
+    assert by_name.escalate.describe().endswith("recommended")
+    by_map = ComboSpec.model_validate(
+        {
+            "name": "x",
+            "escalate": {"mode": {"relative_dates": "route", "list_rows": "route"}},
+        }
+    )
+    assert by_map.escalate is not None
+    assert modes(by_map.escalate.config()) == RECOMMENDED
+    # the same mapping as the preset is labelled as the preset
+    assert by_map.escalate.describe().endswith("recommended")
+    partial = EscalateSpec(mode={"list_rows": "route", "dotted_discovery": "route"})
+    assert partial.describe().endswith("route(list_rows+dotted_discovery)")
+    # the spec round-trips through JSON
+    again = ComboSpec.model_validate_json(by_map.model_dump_json())
+    assert again == by_map
+    with pytest.raises(ValueError, match=r"escalate\.mode"):
+        ComboSpec.model_validate({"name": "x", "escalate": {"mode": {"zzz": "route"}}})
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("on_failure", "on_failure"),
+        ("route", "route"),
+        (" Recommended ", "recommended"),
+        (
+            "relative_dates=route,list_rows=route",
+            {"relative_dates": "route", "list_rows": "route"},
+        ),
+        (
+            " Relative_Dates = ROUTE , dotted_discovery=on_failure ",
+            {"relative_dates": "route", "dotted_discovery": "on_failure"},
+        ),
+    ],
+)
+def test_the_text_syntax_is_parsed(text: str, expected: Any) -> None:
+    assert parse_escalation_mode(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        "always",
+        "list_rows",
+        "list_rows=",
+        "=route",
+        "list_rows=route,list_rows=route",
+    ],
+)
+def test_a_malformed_text_is_refused(text: str) -> None:
+    with pytest.raises(ValueError):
+        parse_escalation_mode(text)
+
+
+def test_the_cli_parses_every_form_of_the_mode() -> None:
+    from evals.cli import _parser as build_parser
+
+    def parse(*mode: str) -> Any:
+        return build_parser().parse_args(
+            [
+                "run",
+                "--escalate",
+                "openai",
+                *(["--escalate-mode", *mode] if mode else []),
+            ]
+        )
+
+    assert parse().escalate_mode is None
+    assert parse("recommended").escalate_mode == "recommended"
+    assert parse("on_failure").escalate_mode == "on_failure"
+    assert parse("relative_dates=route,list_rows=route").escalate_mode == {
+        "relative_dates": "route",
+        "list_rows": "route",
+    }
+    for bad in ("attribution_tiebreak=route", "sometimes", "list_rows=maybe"):
+        with pytest.raises(SystemExit):
+            parse(bad)
+
+
+def test_the_environment_parses_every_form_of_the_mode() -> None:
+    from trustcall_system_one import escalation_from_env
+
+    def env(mode: str) -> EscalationConfig:
+        config = escalation_from_env(
+            {"TRUSTCALL_S1_ESCALATE": "openai", "TRUSTCALL_S1_ESCALATE_MODE": mode}
+        )
+        assert config is not None
+        return config
+
+    assert modes(env("recommended")) == RECOMMENDED
+    assert modes(env("relative_dates=route, list_rows=route")) == RECOMMENDED
+    assert set(modes(env("on_failure")).values()) == {"on_failure"}
+    with pytest.raises(ValueError, match="TRUSTCALL_S1_ESCALATE_MODE"):
+        env("attribution_tiebreak=route")
+    with pytest.raises(ValueError, match="TRUSTCALL_S1_ESCALATE_MODE"):
+        env("list_rows=maybe")
+    # the mode alone never turns the tier on
+    assert escalation_from_env({"TRUSTCALL_S1_ESCALATE_MODE": "recommended"}) is None
+
+
+def test_the_eval_runner_carries_the_mode_into_the_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from evals.runner import Settings, escalation_plan
+
+    monkeypatch.delenv("TRUSTCALL_S1_ESCALATE", raising=False)
+    monkeypatch.delenv("TRUSTCALL_S1_ESCALATE_MODE", raising=False)
+    assert escalation_plan(Settings(), None) is None
+    plan = escalation_plan(
+        Settings(escalate="openai", escalate_mode="recommended"), None
+    )
+    assert plan is not None and plan.mode == "recommended"
+    mapped = escalation_plan(
+        Settings(escalate="openai", escalate_mode={"list_rows": "route"}), None
+    )
+    assert mapped is not None and mapped.mode == {"list_rows": "route"}
+    default = escalation_plan(Settings(escalate="openai"), None)
+    assert default is not None and default.mode == "on_failure"
+    # --escalate openai with the mode in the environment
+    monkeypatch.setenv("TRUSTCALL_S1_ESCALATE_MODE", "recommended")
+    from_env = escalation_plan(Settings(escalate="openai"), None)
+    assert from_env is not None and from_env.mode == "recommended"
+
+
+async def test_recommended_asks_dates_and_rows_first_and_discovery_on_failure() -> None:
+    # dates: asked although Clairic is confident
+    dates = FakeEscalation(three_days)
+    await run_task(
+        THREE_DAYS, DAY, answer="2026-01-01", escalation=tier(dates, mode="recommended")
+    )
+    assert len(dates.calls) == 1
+    # rows: asked first, Clairic does not discover them
+    rows = FakeEscalation(all_rows)
+    result = await insert_aircraft(
+        engine_world().handler, tier(rows, mode="recommended")
+    )
+    assert len(rows.calls) == 1
+    kinds = Counter(c.kind for c in result.calls if c.schema == "Engine")
+    assert kinds["discover"] == 0 and kinds["count"] == 0
+    # dotted discovery: Clairic works, so the tier is never asked
+    discovery = FakeEscalation(GOOD)
+    found = await run_sheet(sheet_world().handler, tier(discovery, mode="recommended"))
+    assert not discovery.calls
+    assert len(found.records) == 2
+    assert Counter(c.kind for c in found.calls)["discover"] >= 1
+    # ... and it is asked where Clairic finds nothing
+    rescue = FakeEscalation(GOOD)
+    rescued = await run_sheet(
+        blind_discovery(sheet_world().handler), tier(rescue, mode="recommended")
+    )
+    assert len(rescue.calls) == 1 and len(rescued.records) == 2
+
+
+async def test_a_mapping_routes_only_the_kinds_it_names() -> None:
+    fake = FakeEscalation(all_rows)
+    mode = {"relative_dates": "route"}  # rows stay on_failure
+    result = await insert_aircraft(engine_world().handler, tier(fake, mode=mode))
+    assert not fake.calls  # nothing failed, rows were not routed
+    kinds = Counter(c.kind for c in result.calls if c.schema == "Engine")
+    assert kinds["discover"] >= 1
 
 
 # --------------------------------------------------------------------------- #

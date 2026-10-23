@@ -905,12 +905,167 @@ ESCALATION_KINDS: tuple[str, ...] = (
 )
 """What the escalation tier can be asked to do (``EscalationConfig.kinds``)."""
 ESCALATION_MODES: tuple[str, ...] = ("on_failure", "route")
-"""``EscalationConfig.mode``: ask the tier where the default setup failed, or route the
-classes in ``ROUTED_KINDS`` to it first."""
+"""What ``EscalationConfig.mode`` says of one kind: ask the tier where the default
+setup failed, or send the kind to it first (only the kinds in ``ROUTED_KINDS``)."""
 ROUTED_KINDS: tuple[str, ...] = ("relative_dates", "list_rows", "dotted_discovery")
-"""The kinds ``mode="route"`` sends to the tier before the default setup answers."""
+"""The kinds that may be routed: sent to the tier before the default setup answers.
+``attribution_tiebreak`` is asked after the second look by nature and can only be
+``on_failure``."""
+ESCALATION_MODE_PRESETS: Mapping[str, Mapping[str, str]] = {
+    "recommended": {
+        "relative_dates": "route",
+        "list_rows": "route",
+        "dotted_discovery": "on_failure",
+        "attribution_tiebreak": "on_failure",
+    },
+}
+"""Named per-kind mappings (``EscalationConfig.mode="recommended"``).
+
+``recommended`` was chosen from the holdout2 results (dates and table rows asked of the
+tier first, dotted discovery only on failure), so holdout2 is no longer a clean
+measurement for that choice (see "Escalation tier" in the design doc)."""
 REASONING_EFFORTS: tuple[str, ...] = ("none", "low", "medium", "high", "xhigh", "max")
 """The values of ``reasoning.effort`` that the escalation tier accepts."""
+
+
+class _KindModes(Mapping[str, str]):
+    """An immutable, hashable mapping of every escalation kind to its mode."""
+
+    def __init__(self, items: Mapping[str, str]) -> None:
+        self._data: dict[str, str] = dict(items)
+        self._hash = hash(frozenset(self._data.items()))
+
+    def __getitem__(self, key: str) -> str:
+        return self._data[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __hash__(self) -> int:
+        return self._hash
+
+    def __repr__(self) -> str:
+        return f"{self._data!r}"
+
+
+def resolve_escalation_mode(mode: str | Mapping[str, str]) -> dict[str, str]:
+    """The mode of every escalation kind that ``mode`` stands for.
+
+    Args:
+        mode: ``"on_failure"`` or ``"route"`` (every kind that can be routed, the others
+            stay ``on_failure``), a preset name (``"recommended"``), or a mapping of
+            kind to ``"on_failure"`` / ``"route"`` (a kind it omits is ``on_failure``).
+
+    Returns:
+        A mapping with all of ``ESCALATION_KINDS``.
+
+    Raises:
+        ValueError: For an unknown mode, preset or kind, or ``route`` for a kind that
+            cannot be routed (``attribution_tiebreak``).
+    """
+    if isinstance(mode, str):
+        if mode in ESCALATION_MODE_PRESETS:
+            return dict(ESCALATION_MODE_PRESETS[mode])
+        if mode not in ESCALATION_MODES:
+            raise ValueError(
+                f"mode must be one of {list(ESCALATION_MODES)}, a preset "
+                f"{list(ESCALATION_MODE_PRESETS)} or a mapping of kind to mode, "
+                f"got {mode!r}"
+            )
+        return {
+            kind: mode if kind in ROUTED_KINDS else "on_failure"
+            for kind in ESCALATION_KINDS
+        }
+    if not isinstance(mode, Mapping):
+        raise ValueError(
+            f"mode must be a string or a mapping of kind to mode, got {mode!r}"
+        )
+    unknown = sorted(str(k) for k in set(mode) - set(ESCALATION_KINDS))
+    if unknown:
+        raise ValueError(
+            f"mode names unknown escalation kind(s) {unknown}; expected a subset of "
+            f"{list(ESCALATION_KINDS)}"
+        )
+    out = dict.fromkeys(ESCALATION_KINDS, "on_failure")
+    for kind, value in mode.items():
+        if value not in ESCALATION_MODES:
+            raise ValueError(
+                f"mode[{kind!r}] must be one of {list(ESCALATION_MODES)}, got {value!r}"
+            )
+        if value == "route" and kind not in ROUTED_KINDS:
+            raise ValueError(
+                f"mode[{kind!r}] cannot be 'route': it is asked after the second look "
+                f"and can only be 'on_failure' (routable: {list(ROUTED_KINDS)})"
+            )
+        out[kind] = value
+    return out
+
+
+def parse_escalation_mode(text: str) -> str | dict[str, str]:
+    """Parse the text of ``--escalate-mode`` or ``TRUSTCALL_S1_ESCALATE_MODE``.
+
+    The syntax is ``on_failure``, ``route``, ``recommended`` or a comma-separated list
+    of ``kind=mode`` pairs (``relative_dates=route,list_rows=route``; a kind it omits is
+    ``on_failure``). Case and surrounding blanks do not matter.
+
+    Args:
+        text: The text to parse.
+
+    Returns:
+        A mode string, or a mapping of kind to mode; both are valid for
+        ``EscalationConfig.mode`` and ``EscalateSpec.mode``.
+
+    Raises:
+        ValueError: For a malformed pair, a repeated kind, or anything
+            ``resolve_escalation_mode`` refuses.
+    """
+    raw = text.strip().lower()
+    if "=" not in raw:
+        resolve_escalation_mode(raw)
+        return raw
+    mapping: dict[str, str] = {}
+    for part in raw.split(","):
+        kind, sep, value = (piece.strip() for piece in part.partition("="))
+        if not sep or not kind or not value:
+            raise ValueError(
+                f"escalation mode {text!r}: expected kind=mode pairs, got {part!r}"
+            )
+        if kind in mapping:
+            raise ValueError(f"escalation mode {text!r}: {kind!r} is given twice")
+        mapping[kind] = value
+    resolve_escalation_mode(mapping)
+    return mapping
+
+
+def compact_escalation_mode(mode: str | Mapping[str, str]) -> str | dict[str, str]:
+    """The shortest spelling of ``mode``.
+
+    Returns:
+        ``on_failure``, ``route`` or a preset name when ``mode`` stands for one of
+        them, else a mapping of the routed kinds to ``route``.
+    """
+    resolved = resolve_escalation_mode(mode)
+    for name in ("on_failure", "route", *ESCALATION_MODE_PRESETS):
+        if resolved == resolve_escalation_mode(name):
+            return name
+    return {k: "route" for k in ESCALATION_KINDS if resolved[k] == "route"}
+
+
+def describe_escalation_mode(mode: str | Mapping[str, str]) -> str:
+    """A short label of ``mode``.
+
+    Returns:
+        ``on_failure``, ``route``, ``recommended`` or the routed kinds, as in
+        ``route(relative_dates+list_rows)``.
+    """
+    compact = compact_escalation_mode(mode)
+    if isinstance(compact, str):
+        return compact
+    return "route(" + "+".join(compact) + ")"
+
 
 _DEFAULT_KIND_LIMITS: Mapping[str, int] = {
     "relative_dates": 8,
@@ -950,16 +1105,24 @@ class EscalationConfig:
       entity although presence says there are some is asked for each entity's
       descriptive label and identity value.
 
-    ``mode="route"`` changes WHEN three of them are asked (``ROUTED_KINDS``): the date
-    and datetime fields whose mention window holds a relative phrase, every nested
-    ``list[Model]`` (its rows, instead of Clairic's discovery and its values) and the
-    discovery of a top-level ``Many`` with a dotted identity go to the tier first. What
-    it answers is verified, coerced and judged exactly as in ``on_failure``: quotes
-    must occur verbatim in the input, the attribution check (Clef) has to agree, the
-    probability stays under ``prob_cap``, nothing is deleted on its word and a
-    confident Clef "no" is final. An answer that fails verification, or a call that
-    fails, leaves the normal Clairic path as it was. The tie-break is asked in both
-    modes, after the second look.
+    ``mode`` decides WHEN each kind is asked. ``"route"`` changes it for three of them
+    (``ROUTED_KINDS``): the date and datetime fields whose mention window holds a
+    relative phrase, every nested ``list[Model]`` (its rows, instead of Clairic's
+    discovery and its values) and the discovery of a top-level ``Many`` with a dotted
+    identity go to the tier first. What it answers is verified, coerced and judged
+    exactly as in ``on_failure``: quotes must occur verbatim in the input, the
+    attribution check (Clef) has to agree, the probability stays under ``prob_cap``,
+    nothing is deleted on its word and a confident Clef "no" is final. An answer that
+    fails verification, or a call that fails, leaves the normal Clairic path as it
+    was. The tie-break is asked after the second look, always (``on_failure``).
+
+    The mode can differ by kind: a mapping such as ``{"relative_dates": "route",
+    "list_rows": "route", "dotted_discovery": "on_failure"}`` (a kind it does not name
+    is ``on_failure``); a plain string means the same mode for every kind that can be
+    routed; ``"recommended"`` is the preset in ``ESCALATION_MODE_PRESETS`` (dates and
+    table rows first, dotted discovery on failure), **chosen from the holdout2
+    results**, so holdout2 is no longer clean for that choice. ``"route"`` for
+    ``attribution_tiebreak`` is refused.
 
     Attributes:
         enabled: Whether the tier runs at all.
@@ -973,8 +1136,11 @@ class EscalationConfig:
         limits: Most calls per invoke of each kind (a kind not listed has no limit of
             its own); defaults: 8 dates, 4 row sets, 12 tie-breaks, 2 discoveries.
         max_calls_per_invoke: Most escalation calls of all kinds in one invoke.
-        mode: ``"on_failure"`` (default: ask only where the default setup failed) or
-            ``"route"`` (the classes in ``ROUTED_KINDS`` go to the tier first).
+        mode: ``"on_failure"`` (default: ask only where the default setup failed),
+            ``"route"`` (the classes in ``ROUTED_KINDS`` go to the tier first),
+            ``"recommended"`` (a preset) or a mapping of kind to one of the two modes.
+            It is stored as a frozen mapping of every kind to its mode; ask it with
+            ``mode_for(kind)``.
         prob_cap: The most probability an escalation answer can stand for. It stays
             under ``gates.remove_threshold`` and ``match.delete_threshold`` (0.85), so
             an answer of this tier can authorise an add or a replace but never a
@@ -990,15 +1156,12 @@ class EscalationConfig:
     )
     max_calls_per_invoke: int = 20
     prob_cap: float = 0.8
-    mode: str = "on_failure"
+    mode: str | Mapping[str, str] = "on_failure"
 
     def __post_init__(self) -> None:
         """Validate the settings and freeze the collections."""
         _check_flag("enabled", self.enabled)
-        if self.mode not in ESCALATION_MODES:
-            raise ValueError(
-                f"mode must be one of {list(ESCALATION_MODES)}, got {self.mode!r}"
-            )
+        object.__setattr__(self, "mode", _KindModes(resolve_escalation_mode(self.mode)))
         kinds = frozenset(self.kinds)
         unknown = sorted(kinds - set(ESCALATION_KINDS))
         if unknown:
@@ -1038,6 +1201,14 @@ class EscalationConfig:
         """Whether the tier is on and ``kind`` may run."""
         return self.enabled and kind in self.kinds
 
+    def mode_for(self, kind: str) -> str:
+        """The mode of ``kind``: ``"on_failure"`` or ``"route"``."""
+        modes = self.mode
+        assert isinstance(modes, Mapping)  # normalised in __post_init__
+        return modes[kind]
+
     def routes(self, kind: str) -> bool:
-        """Whether ``kind`` goes to the tier first (``mode="route"``) and may run."""
-        return self.runs(kind) and self.mode == "route" and kind in ROUTED_KINDS
+        """Whether ``kind`` goes to the tier first (mode ``route``) and may run."""
+        return (
+            self.runs(kind) and self.mode_for(kind) == "route" and kind in ROUTED_KINDS
+        )
