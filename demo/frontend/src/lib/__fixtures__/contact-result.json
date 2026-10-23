@@ -1,0 +1,1040 @@
+{
+ "text": "Quick note after catching up with Dana: she moved to Berlin last month and started as Head of Ops at Northwind. Her mobile is now +49 30 5555 0198. She also asked to be introduced to our logistics team.",
+ "result": {
+  "records": [
+   {
+    "schema_name": "Contact",
+    "json_doc_id": "crm-4711",
+    "kind": "update",
+    "value": {
+     "name": "Dana Whitfield",
+     "email": "dana.whitfield@fabrikam.example",
+     "phone": "+49 30 5555 0198",
+     "city": "Berlin",
+     "company": "Northwind",
+     "title": "Head of Ops",
+     "notes": [
+      "Prefers email over phone",
+      "Met at the 2023 logistics summit",
+      "She also asked to be introduced to our logistics team."
+     ]
+    },
+    "before": {
+     "name": "Dana Whitfield",
+     "email": "dana.whitfield@fabrikam.example",
+     "phone": "+1 415 555 0134",
+     "city": "Austin",
+     "company": "Fabrikam",
+     "title": "Operations Manager",
+     "notes": [
+      "Prefers email over phone",
+      "Met at the 2023 logistics summit"
+     ]
+    },
+    "after": {
+     "name": "Dana Whitfield",
+     "email": "dana.whitfield@fabrikam.example",
+     "phone": "+49 30 5555 0198",
+     "city": "Berlin",
+     "company": "Northwind",
+     "title": "Head of Ops",
+     "notes": [
+      "Prefers email over phone",
+      "Met at the 2023 logistics summit",
+      "She also asked to be introduced to our logistics team."
+     ]
+    },
+    "patches": [
+     {
+      "op": "replace",
+      "path": "/phone",
+      "value": "+49 30 5555 0198",
+      "repaired_from": null
+     },
+     {
+      "op": "replace",
+      "path": "/city",
+      "value": "Berlin",
+      "repaired_from": null
+     },
+     {
+      "op": "replace",
+      "path": "/company",
+      "value": "Northwind",
+      "repaired_from": null
+     },
+     {
+      "op": "replace",
+      "path": "/title",
+      "value": "Head of Ops",
+      "repaired_from": null
+     },
+     {
+      "op": "add",
+      "path": "/notes/-",
+      "value": "She also asked to be introduced to our logistics team.",
+      "repaired_from": null
+     }
+    ],
+    "rejected": [
+     {
+      "op": null,
+      "path": "/email",
+      "reason": "echo_span",
+      "detail": "the answer's span lies in the existing record, not the input",
+      "p": null
+     },
+     {
+      "op": "replace",
+      "path": "/name",
+      "reason": "identity_subset",
+      "detail": "'Dana' is only a short form of the record's 'Dana Whitfield'",
+      "p": null
+     },
+     {
+      "op": "add",
+      "path": "/notes/-",
+      "reason": "not_novel",
+      "detail": "the sentence adds nothing the record does not hold (p=0.16 < 0.5)",
+      "p": 0.1644
+     },
+     {
+      "op": "add",
+      "path": "/notes/-",
+      "reason": "not_novel",
+      "detail": "the sentence adds nothing the record does not hold (p=0.02 < 0.5)",
+      "p": 0.0216
+     }
+    ],
+    "fields": {
+     "name": {
+      "path": [
+       "name"
+      ],
+      "pretty": "name",
+      "wire_name": "name",
+      "engine": "clairic",
+      "value": "Dana Whitfield",
+      "raw": "Dana",
+      "p_null": 0.0012319437228143215,
+      "confidence": 0.9999885559082031,
+      "guess": "Dana",
+      "span": [
+       34,
+       38
+      ],
+      "spans": null,
+      "source": "clairic",
+      "attribution_p": 0.8756,
+      "gate_p": null,
+      "crosscheck_agree": false,
+      "provider": null,
+      "reask": false,
+      "repaired": false,
+      "rejected_reason": null,
+      "warnings": [
+       "echo_span: replaced by the input-only reading",
+       "adopted_from_crosscheck"
+      ]
+     },
+     "email": {
+      "path": [
+       "email"
+      ],
+      "pretty": "email",
+      "wire_name": "email",
+      "engine": "clairic",
+      "value": null,
+      "raw": "dana.whitfield@fabrikam.example",
+      "p_null": 0.019196754321455956,
+      "confidence": 0.9981195330619812,
+      "guess": "dana.whitfield@fabrikam.example",
+      "span": null,
+      "spans": null,
+      "source": "clairic",
+      "attribution_p": null,
+      "gate_p": null,
+      "crosscheck_agree": null,
+      "provider": null,
+      "reask": false,
+      "repaired": false,
+      "rejected_reason": "echo_span",
+      "warnings": []
+     },
+     "phone": {
+      "path": [
+       "phone"
+      ],
+      "pretty": "phone",
+      "wire_name": "phone",
+      "engine": "clairic",
+      "value": "+49 30 5555 0198",
+      "raw": "+49 30 5555 0198",
+      "p_null": 3.4659529774216935e-05,
+      "confidence": 0.9999884366989136,
+      "guess": "+49 30 5555 0198",
+      "span": [
+       130,
+       146
+      ],
+      "spans": null,
+      "source": "clairic",
+      "attribution_p": 0.9752,
+      "gate_p": 0.9818,
+      "crosscheck_agree": false,
+      "provider": null,
+      "reask": false,
+      "repaired": false,
+      "rejected_reason": null,
+      "warnings": [
+       "echo_span: replaced by the input-only reading",
+       "adopted_from_crosscheck"
+      ]
+     },
+     "city": {
+      "path": [
+       "city"
+      ],
+      "pretty": "city",
+      "wire_name": "city",
+      "engine": "clairic",
+      "value": "Berlin",
+      "raw": "Berlin",
+      "p_null": 0.00026231707306578755,
+      "confidence": 0.9998186230659485,
+      "guess": "Berlin",
+      "span": [
+       53,
+       59
+      ],
+      "spans": null,
+      "source": "clairic",
+      "attribution_p": 0.9785,
+      "gate_p": 0.9847,
+      "crosscheck_agree": true,
+      "provider": null,
+      "reask": true,
+      "repaired": false,
+      "rejected_reason": null,
+      "warnings": []
+     },
+     "company": {
+      "path": [
+       "company"
+      ],
+      "pretty": "company",
+      "wire_name": "company",
+      "engine": "clairic",
+      "value": "Northwind",
+      "raw": "Northwind",
+      "p_null": 0.013622269965708256,
+      "confidence": 0.9998990297317505,
+      "guess": "Northwind",
+      "span": [
+       101,
+       110
+      ],
+      "spans": null,
+      "source": "clairic",
+      "attribution_p": 0.9652,
+      "gate_p": 0.9829,
+      "crosscheck_agree": false,
+      "provider": null,
+      "reask": false,
+      "repaired": false,
+      "rejected_reason": null,
+      "warnings": [
+       "echo_span: replaced by the input-only reading",
+       "adopted_from_crosscheck"
+      ]
+     },
+     "title": {
+      "path": [
+       "title"
+      ],
+      "pretty": "title",
+      "wire_name": "title",
+      "engine": "clairic",
+      "value": "Head of Ops",
+      "raw": "Head of Ops",
+      "p_null": 0.0015616711461916566,
+      "confidence": 0.987583577632904,
+      "guess": "Head of Ops",
+      "span": [
+       86,
+       97
+      ],
+      "spans": null,
+      "source": "clairic",
+      "attribution_p": 0.9774,
+      "gate_p": 0.9808,
+      "crosscheck_agree": false,
+      "provider": null,
+      "reask": false,
+      "repaired": false,
+      "rejected_reason": null,
+      "warnings": [
+       "echo_span: replaced by the input-only reading",
+       "adopted_from_crosscheck"
+      ]
+     },
+     "notes": {
+      "path": [
+       "notes"
+      ],
+      "pretty": "notes",
+      "wire_name": "notes",
+      "engine": "clairic",
+      "value": null,
+      "raw": [
+       {
+        "sentence": "Quick note after catching up with Dana: she moved to Berlin last month and started as Head of Ops at Northwind.",
+        "p": 0.9309
+       },
+       {
+        "sentence": "Her mobile is now +49 30 5555 0198.",
+        "p": 0.9593
+       },
+       {
+        "sentence": "She also asked to be introduced to our logistics team.",
+        "p": 0.7937
+       }
+      ],
+      "p_null": null,
+      "confidence": 0.7937,
+      "guess": null,
+      "span": null,
+      "spans": [
+       [
+        0,
+        111
+       ],
+       [
+        112,
+        147
+       ],
+       [
+        148,
+        202
+       ]
+      ],
+      "source": "clairic",
+      "attribution_p": [
+       0.9668,
+       0.9776,
+       0.9844
+      ],
+      "gate_p": 0.9781,
+      "crosscheck_agree": true,
+      "provider": null,
+      "reask": false,
+      "repaired": false,
+      "rejected_reason": "not_novel",
+      "warnings": [
+       "list_strategy:sentences",
+       "sentences:3/3",
+       "list_strategy:auto->sentences (the list answer had confidence 3.2e-11)"
+      ]
+     }
+    },
+    "entity": {
+     "key": "e0",
+     "label": "the Contact",
+     "mentions": [],
+     "first_mention": null,
+     "qualify_p": 0.9351,
+     "match_probs": {},
+     "parent": null
+    },
+    "valid": true,
+    "errors": [],
+    "delete_p": null
+   }
+  ],
+  "skipped": [],
+  "untouched": [],
+  "deleted": [],
+  "attempts": 1,
+  "usage": {
+   "state_tokens": 457,
+   "image_tokens": 0,
+   "schema_tokens": 1948,
+   "input_tokens": 10127,
+   "output_tokens": 0,
+   "reasoning_tokens": 0,
+   "passes": 16,
+   "requests": 23,
+   "reported_requests": 0,
+   "reported_cost_usd": 0.0,
+   "by_model": {
+    "@cf/cloudflare/clef": {
+     "state_tokens": 0,
+     "image_tokens": 0,
+     "schema_tokens": 0,
+     "input_tokens": 5964,
+     "output_tokens": 0,
+     "reasoning_tokens": 0,
+     "passes": 0,
+     "requests": 19,
+     "reported_requests": 0,
+     "reported_cost_usd": 0.0,
+     "by_model": {},
+     "by_kind": {}
+    },
+    "@cf/cloudflare/clairic": {
+     "state_tokens": 457,
+     "image_tokens": 0,
+     "schema_tokens": 1948,
+     "input_tokens": 4163,
+     "output_tokens": 0,
+     "reasoning_tokens": 0,
+     "passes": 16,
+     "requests": 4,
+     "reported_requests": 0,
+     "reported_cost_usd": 0.0,
+     "by_model": {},
+     "by_kind": {}
+    }
+   },
+   "by_kind": {
+    "presence": {
+     "state_tokens": 0,
+     "image_tokens": 0,
+     "schema_tokens": 0,
+     "input_tokens": 204,
+     "output_tokens": 0,
+     "reasoning_tokens": 0,
+     "passes": 0,
+     "requests": 1,
+     "reported_requests": 0,
+     "reported_cost_usd": 0.0,
+     "by_model": {},
+     "by_kind": {}
+    },
+    "extract": {
+     "state_tokens": 211,
+     "image_tokens": 0,
+     "schema_tokens": 834,
+     "input_tokens": 2311,
+     "output_tokens": 0,
+     "reasoning_tokens": 0,
+     "passes": 7,
+     "requests": 1,
+     "reported_requests": 0,
+     "reported_cost_usd": 0.0,
+     "by_model": {},
+     "by_kind": {}
+    },
+    "crosscheck": {
+     "state_tokens": 82,
+     "image_tokens": 0,
+     "schema_tokens": 834,
+     "input_tokens": 1408,
+     "output_tokens": 0,
+     "reasoning_tokens": 0,
+     "passes": 7,
+     "requests": 1,
+     "reported_requests": 0,
+     "reported_cost_usd": 0.0,
+     "by_model": {},
+     "by_kind": {}
+    },
+    "reask": {
+     "state_tokens": 164,
+     "image_tokens": 0,
+     "schema_tokens": 280,
+     "input_tokens": 444,
+     "output_tokens": 0,
+     "reasoning_tokens": 0,
+     "passes": 2,
+     "requests": 2,
+     "reported_requests": 0,
+     "reported_cost_usd": 0.0,
+     "by_model": {},
+     "by_kind": {}
+    },
+    "list_kind": {
+     "state_tokens": 0,
+     "image_tokens": 0,
+     "schema_tokens": 0,
+     "input_tokens": 187,
+     "output_tokens": 0,
+     "reasoning_tokens": 0,
+     "passes": 0,
+     "requests": 1,
+     "reported_requests": 0,
+     "reported_cost_usd": 0.0,
+     "by_model": {},
+     "by_kind": {}
+    },
+    "sentences": {
+     "state_tokens": 0,
+     "image_tokens": 0,
+     "schema_tokens": 0,
+     "input_tokens": 527,
+     "output_tokens": 0,
+     "reasoning_tokens": 0,
+     "passes": 0,
+     "requests": 1,
+     "reported_requests": 0,
+     "reported_cost_usd": 0.0,
+     "by_model": {},
+     "by_kind": {}
+    },
+    "attribution": {
+     "state_tokens": 0,
+     "image_tokens": 0,
+     "schema_tokens": 0,
+     "input_tokens": 2126,
+     "output_tokens": 0,
+     "reasoning_tokens": 0,
+     "passes": 0,
+     "requests": 8,
+     "reported_requests": 0,
+     "reported_cost_usd": 0.0,
+     "by_model": {},
+     "by_kind": {}
+    },
+    "gate": {
+     "state_tokens": 0,
+     "image_tokens": 0,
+     "schema_tokens": 0,
+     "input_tokens": 1940,
+     "output_tokens": 0,
+     "reasoning_tokens": 0,
+     "passes": 0,
+     "requests": 5,
+     "reported_requests": 0,
+     "reported_cost_usd": 0.0,
+     "by_model": {},
+     "by_kind": {}
+    },
+    "novelty": {
+     "state_tokens": 0,
+     "image_tokens": 0,
+     "schema_tokens": 0,
+     "input_tokens": 980,
+     "output_tokens": 0,
+     "reasoning_tokens": 0,
+     "passes": 0,
+     "requests": 3,
+     "reported_requests": 0,
+     "reported_cost_usd": 0.0,
+     "by_model": {},
+     "by_kind": {}
+    }
+   }
+  },
+  "cost": {
+   "usd": 0.00041630000000000004,
+   "unpriced_models": [
+    "@cf/cloudflare/clef"
+   ],
+   "complete": false,
+   "reported_usd": 0.0
+  },
+  "calls": [
+   {
+    "model": "@cf/cloudflare/clef",
+    "kind": "presence",
+    "schema": "Contact",
+    "entity": "e0",
+    "field": null,
+    "scope": "",
+    "n_items": 1,
+    "usage": {
+     "input_tokens": 204,
+     "output_tokens": 0
+    },
+    "duration_ms": 609.4628959999682,
+    "retries": 0,
+    "error": null,
+    "status_code": 200,
+    "request_id": null,
+    "cost_usd": null,
+    "provider": "cloudflare",
+    "fallback_from": null
+   },
+   {
+    "model": "@cf/cloudflare/clairic",
+    "kind": "extract",
+    "schema": "Contact",
+    "entity": "e0",
+    "field": null,
+    "scope": "",
+    "n_items": 7,
+    "usage": {
+     "state_tokens": 211,
+     "image_tokens": 0,
+     "schema_tokens": 834,
+     "input_tokens": 2311,
+     "output_tokens": 0,
+     "passes": 7
+    },
+    "duration_ms": 349.1558430000623,
+    "retries": 0,
+    "error": null,
+    "status_code": 200,
+    "request_id": null,
+    "cost_usd": null,
+    "provider": "cloudflare",
+    "fallback_from": null
+   },
+   {
+    "model": "@cf/cloudflare/clairic",
+    "kind": "crosscheck",
+    "schema": "Contact",
+    "entity": "e0",
+    "field": null,
+    "scope": "",
+    "n_items": 7,
+    "usage": {
+     "state_tokens": 82,
+     "image_tokens": 0,
+     "schema_tokens": 834,
+     "input_tokens": 1408,
+     "output_tokens": 0,
+     "passes": 7
+    },
+    "duration_ms": 727.0107679996727,
+    "retries": 0,
+    "error": null,
+    "status_code": 200,
+    "request_id": null,
+    "cost_usd": null,
+    "provider": "cloudflare",
+    "fallback_from": null
+   },
+   {
+    "model": "@cf/cloudflare/clairic",
+    "kind": "reask",
+    "schema": "Contact",
+    "entity": "e0",
+    "field": "notes",
+    "scope": "",
+    "n_items": 1,
+    "usage": {
+     "state_tokens": 82,
+     "image_tokens": 0,
+     "schema_tokens": 144,
+     "input_tokens": 226,
+     "output_tokens": 0,
+     "passes": 1
+    },
+    "duration_ms": 313.7976719999642,
+    "retries": 0,
+    "error": null,
+    "status_code": 200,
+    "request_id": null,
+    "cost_usd": null,
+    "provider": "cloudflare",
+    "fallback_from": null
+   },
+   {
+    "model": "@cf/cloudflare/clef",
+    "kind": "list_kind",
+    "schema": "Contact",
+    "entity": "e0",
+    "field": "notes",
+    "scope": "",
+    "n_items": 1,
+    "usage": {
+     "input_tokens": 187,
+     "output_tokens": 0
+    },
+    "duration_ms": 419.860546000109,
+    "retries": 0,
+    "error": null,
+    "status_code": 200,
+    "request_id": null,
+    "cost_usd": null,
+    "provider": "cloudflare",
+    "fallback_from": null
+   },
+   {
+    "model": "@cf/cloudflare/clef",
+    "kind": "sentences",
+    "schema": "Contact",
+    "entity": "e0",
+    "field": "notes",
+    "scope": "",
+    "n_items": 3,
+    "usage": {
+     "input_tokens": 527,
+     "output_tokens": 0
+    },
+    "duration_ms": 505.7245719999628,
+    "retries": 0,
+    "error": null,
+    "status_code": 200,
+    "request_id": null,
+    "cost_usd": null,
+    "provider": "cloudflare",
+    "fallback_from": null
+   },
+   {
+    "model": "@cf/cloudflare/clairic",
+    "kind": "reask",
+    "schema": "Contact",
+    "entity": "e0",
+    "field": "city",
+    "scope": "",
+    "n_items": 1,
+    "usage": {
+     "state_tokens": 82,
+     "image_tokens": 0,
+     "schema_tokens": 136,
+     "input_tokens": 218,
+     "output_tokens": 0,
+     "passes": 1
+    },
+    "duration_ms": 338.2343270000092,
+    "retries": 0,
+    "error": null,
+    "status_code": 200,
+    "request_id": null,
+    "cost_usd": null,
+    "provider": "cloudflare",
+    "fallback_from": null
+   },
+   {
+    "model": "@cf/cloudflare/clef",
+    "kind": "attribution",
+    "schema": "Contact",
+    "entity": "e0",
+    "field": null,
+    "scope": "",
+    "n_items": 1,
+    "usage": {
+     "input_tokens": 277,
+     "output_tokens": 0
+    },
+    "duration_ms": 292.5955430000613,
+    "retries": 0,
+    "error": null,
+    "status_code": 200,
+    "request_id": null,
+    "cost_usd": null,
+    "provider": "cloudflare",
+    "fallback_from": null
+   },
+   {
+    "model": "@cf/cloudflare/clef",
+    "kind": "attribution",
+    "schema": "Contact",
+    "entity": "e0",
+    "field": null,
+    "scope": "",
+    "n_items": 1,
+    "usage": {
+     "input_tokens": 290,
+     "output_tokens": 0
+    },
+    "duration_ms": 485.3872659996341,
+    "retries": 0,
+    "error": null,
+    "status_code": 200,
+    "request_id": null,
+    "cost_usd": null,
+    "provider": "cloudflare",
+    "fallback_from": null
+   },
+   {
+    "model": "@cf/cloudflare/clef",
+    "kind": "attribution",
+    "schema": "Contact",
+    "entity": "e0",
+    "field": null,
+    "scope": "",
+    "n_items": 1,
+    "usage": {
+     "input_tokens": 277,
+     "output_tokens": 0
+    },
+    "duration_ms": 565.3517139999167,
+    "retries": 0,
+    "error": null,
+    "status_code": 200,
+    "request_id": null,
+    "cost_usd": null,
+    "provider": "cloudflare",
+    "fallback_from": null
+   },
+   {
+    "model": "@cf/cloudflare/clef",
+    "kind": "attribution",
+    "schema": "Contact",
+    "entity": "e0",
+    "field": null,
+    "scope": "",
+    "n_items": 1,
+    "usage": {
+     "input_tokens": 245,
+     "output_tokens": 0
+    },
+    "duration_ms": 574.5769810000638,
+    "retries": 0,
+    "error": null,
+    "status_code": 200,
+    "request_id": null,
+    "cost_usd": null,
+    "provider": "cloudflare",
+    "fallback_from": null
+   },
+   {
+    "model": "@cf/cloudflare/clef",
+    "kind": "attribution",
+    "schema": "Contact",
+    "entity": "e0",
+    "field": null,
+    "scope": "",
+    "n_items": 1,
+    "usage": {
+     "input_tokens": 248,
+     "output_tokens": 0
+    },
+    "duration_ms": 592.6399400000264,
+    "retries": 0,
+    "error": null,
+    "status_code": 200,
+    "request_id": null,
+    "cost_usd": null,
+    "provider": "cloudflare",
+    "fallback_from": null
+   },
+   {
+    "model": "@cf/cloudflare/clef",
+    "kind": "attribution",
+    "schema": "Contact",
+    "entity": "e0",
+    "field": null,
+    "scope": "",
+    "n_items": 1,
+    "usage": {
+     "input_tokens": 278,
+     "output_tokens": 0
+    },
+    "duration_ms": 678.238782000335,
+    "retries": 0,
+    "error": null,
+    "status_code": 200,
+    "request_id": null,
+    "cost_usd": null,
+    "provider": "cloudflare",
+    "fallback_from": null
+   },
+   {
+    "model": "@cf/cloudflare/clef",
+    "kind": "attribution",
+    "schema": "Contact",
+    "entity": "e0",
+    "field": null,
+    "scope": "",
+    "n_items": 1,
+    "usage": {
+     "input_tokens": 235,
+     "output_tokens": 0
+    },
+    "duration_ms": 726.3167529999919,
+    "retries": 0,
+    "error": null,
+    "status_code": 200,
+    "request_id": null,
+    "cost_usd": null,
+    "provider": "cloudflare",
+    "fallback_from": null
+   },
+   {
+    "model": "@cf/cloudflare/clef",
+    "kind": "attribution",
+    "schema": "Contact",
+    "entity": "e0",
+    "field": null,
+    "scope": "",
+    "n_items": 1,
+    "usage": {
+     "input_tokens": 276,
+     "output_tokens": 0
+    },
+    "duration_ms": 866.018687000178,
+    "retries": 0,
+    "error": null,
+    "status_code": 200,
+    "request_id": null,
+    "cost_usd": null,
+    "provider": "cloudflare",
+    "fallback_from": null
+   },
+   {
+    "model": "@cf/cloudflare/clef",
+    "kind": "gate",
+    "schema": "Contact",
+    "entity": "e0",
+    "field": "company",
+    "scope": "",
+    "n_items": 1,
+    "usage": {
+     "input_tokens": 382,
+     "output_tokens": 0
+    },
+    "duration_ms": 247.2956649999105,
+    "retries": 0,
+    "error": null,
+    "status_code": 200,
+    "request_id": null,
+    "cost_usd": null,
+    "provider": "cloudflare",
+    "fallback_from": null
+   },
+   {
+    "model": "@cf/cloudflare/clef",
+    "kind": "gate",
+    "schema": "Contact",
+    "entity": "e0",
+    "field": "city",
+    "scope": "",
+    "n_items": 1,
+    "usage": {
+     "input_tokens": 379,
+     "output_tokens": 0
+    },
+    "duration_ms": 438.93349000018134,
+    "retries": 0,
+    "error": null,
+    "status_code": 200,
+    "request_id": null,
+    "cost_usd": null,
+    "provider": "cloudflare",
+    "fallback_from": null
+   },
+   {
+    "model": "@cf/cloudflare/clef",
+    "kind": "gate",
+    "schema": "Contact",
+    "entity": "e0",
+    "field": "phone",
+    "scope": "",
+    "n_items": 1,
+    "usage": {
+     "input_tokens": 406,
+     "output_tokens": 0
+    },
+    "duration_ms": 535.8218530000158,
+    "retries": 0,
+    "error": null,
+    "status_code": 200,
+    "request_id": null,
+    "cost_usd": null,
+    "provider": "cloudflare",
+    "fallback_from": null
+   },
+   {
+    "model": "@cf/cloudflare/clef",
+    "kind": "gate",
+    "schema": "Contact",
+    "entity": "e0",
+    "field": "title",
+    "scope": "",
+    "n_items": 1,
+    "usage": {
+     "input_tokens": 382,
+     "output_tokens": 0
+    },
+    "duration_ms": 559.160552999856,
+    "retries": 0,
+    "error": null,
+    "status_code": 200,
+    "request_id": null,
+    "cost_usd": null,
+    "provider": "cloudflare",
+    "fallback_from": null
+   },
+   {
+    "model": "@cf/cloudflare/clef",
+    "kind": "novelty",
+    "schema": "Contact",
+    "entity": "e0",
+    "field": "notes",
+    "scope": "",
+    "n_items": 1,
+    "usage": {
+     "input_tokens": 329,
+     "output_tokens": 0
+    },
+    "duration_ms": 324.3627599999854,
+    "retries": 0,
+    "error": null,
+    "status_code": 200,
+    "request_id": null,
+    "cost_usd": null,
+    "provider": "cloudflare",
+    "fallback_from": null
+   },
+   {
+    "model": "@cf/cloudflare/clef",
+    "kind": "novelty",
+    "schema": "Contact",
+    "entity": "e0",
+    "field": "notes",
+    "scope": "",
+    "n_items": 1,
+    "usage": {
+     "input_tokens": 332,
+     "output_tokens": 0
+    },
+    "duration_ms": 343.8150520000818,
+    "retries": 0,
+    "error": null,
+    "status_code": 200,
+    "request_id": null,
+    "cost_usd": null,
+    "provider": "cloudflare",
+    "fallback_from": null
+   },
+   {
+    "model": "@cf/cloudflare/clef",
+    "kind": "novelty",
+    "schema": "Contact",
+    "entity": "e0",
+    "field": "notes",
+    "scope": "",
+    "n_items": 1,
+    "usage": {
+     "input_tokens": 319,
+     "output_tokens": 0
+    },
+    "duration_ms": 520.4896949999238,
+    "retries": 0,
+    "error": null,
+    "status_code": 200,
+    "request_id": null,
+    "cost_usd": null,
+    "provider": "cloudflare",
+    "fallback_from": null
+   },
+   {
+    "model": "@cf/cloudflare/clef",
+    "kind": "gate",
+    "schema": "Contact",
+    "entity": "e0",
+    "field": "notes",
+    "scope": "",
+    "n_items": 1,
+    "usage": {
+     "input_tokens": 391,
+     "output_tokens": 0
+    },
+    "duration_ms": 551.0528150002756,
+    "retries": 0,
+    "error": null,
+    "status_code": 200,
+    "request_id": null,
+    "cost_usd": null,
+    "provider": "cloudflare",
+    "fallback_from": null
+   }
+  ],
+  "warnings": [],
+  "elapsed_ms": 5465.0
+ }
+}
