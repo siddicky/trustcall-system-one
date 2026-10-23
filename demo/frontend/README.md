@@ -1,21 +1,51 @@
-# React + TypeScript + Vite + shadcn/ui
+# Trustcall System One demo: frontend
 
-This is a template for a new Vite project with React, TypeScript, and shadcn/ui.
-
-## Adding components
-
-To add components to your app, run the following command:
+Vite, React, TypeScript and shadcn/ui. Deployed to Vercel (project
+`trustcall-system-one-frontend`, root directory `demo/frontend`). It calls the
+FastAPI backend in `demo/backend` at `VITE_API_URL`.
 
 ```bash
-npx shadcn@latest add button
+npm install
+npm run dev        # http://localhost:5173, no sign-in
+npm test
+npm run build
 ```
 
-This will place the ui components in the `src/components` directory.
+## Google sign-in
 
-## Using components
+On Vercel, every page sits behind Google sign-in, the same scheme as the
+Siddicky client portal:
 
-To use the components in your app, import them as follows:
+- `middleware.ts` (Vercel Routing Middleware) checks a signed `tc_session`
+  cookie on every request. Signed-out page views go to `/signin`. Other
+  requests get a 401. Public paths: `/signin`, `/api/auth/*` and the hashed
+  build assets under `/assets/`.
+- `api/auth/google/start.ts` and `api/auth/google/callback.ts` (Vercel
+  Functions) run the OAuth code flow, check the ID token's issuer, audience
+  and verified email against `ALLOWED_EMAILS`, and set a 7-day session.
+- `api/auth/signout.ts` clears the session; `api/auth/me.ts` returns the
+  signed-in account for the header.
+- `server/session.ts` holds the HMAC session, allowlist and cookie helpers.
 
-```tsx
-import { Button } from "@/components/ui/button"
-```
+`npm run dev` (plain Vite) does not run the middleware or the functions, so
+local development has no gate. Run `vercel dev` to try the gate locally.
+
+### Environment variables (Vercel project settings)
+
+| Name | Value |
+| --- | --- |
+| `GOOGLE_CLIENT_ID` | OAuth client ID (type "Web application") |
+| `GOOGLE_CLIENT_SECRET` | Its secret |
+| `AUTH_SECRET` | Random string that signs sessions: `openssl rand -hex 32`. Changing it signs everyone out. |
+| `ALLOWED_EMAILS` | Comma-separated addresses (`me@example.com`) or domains (`@example.com`). Empty admits nobody. |
+
+A deployment without `AUTH_SECRET` answers 503 instead of opening up.
+Removing an address from `ALLOWED_EMAILS` locks it out on its next request.
+
+In Google Cloud Console, add each origin's callback to the client's
+authorised redirect URIs, for example
+`https://trustcall.siddicky.ca/api/auth/google/callback`. Preview deployments
+use other hostnames, so Google sign-in only works on origins you register.
+
+The gate covers this site only. The backend at `VITE_API_URL` is not gated:
+anyone with its URL can call it directly (CORS limits browsers, not scripts).
