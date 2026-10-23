@@ -16,12 +16,13 @@ ENV_VARS = (
     "TYPESAFE_API_KEY",
     "TRUSTCALL_S1_CLEF_PROVIDER",
     "TRUSTCALL_S1_ESCALATE",
+    "DEMO_TOKEN_SECRET",
 )
 
 
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Start every test without provider credentials."""
+    """Start every test without provider credentials or an API token secret."""
     for name in ENV_VARS:
         monkeypatch.delenv(name, raising=False)
 

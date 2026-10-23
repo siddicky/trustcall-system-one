@@ -205,3 +205,21 @@ export function isHttps(request: Request): boolean {
     new URL(request.url).protocol === "https:"
   )
 }
+
+export const API_TOKEN_AUDIENCE = "trustcall-demo-api"
+export const API_TOKEN_MAX_AGE = 600 // 10 minutes
+
+/**
+ * A short-lived bearer token for the FastAPI backend, signed with
+ * DEMO_TOKEN_SECRET (shared with the backend, never with the browser).
+ */
+export async function createApiToken(
+  email: string,
+  secret: string
+): Promise<{ token: string; exp: number }> {
+  const exp = nowSeconds() + API_TOKEN_MAX_AGE
+  const payload = toBase64Url(
+    JSON.stringify({ email, aud: API_TOKEN_AUDIENCE, exp })
+  )
+  return { token: `${payload}.${await sign(payload, secret)}`, exp }
+}

@@ -68,9 +68,14 @@ as secrets):
 | `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN` | Cloudflare credentials for Clairic and Clef; **or** |
 | `TRUSTCALL_S1_PROVIDER=typesafe`, `TYPESAFE_API_KEY` | TypeSafe's Jev answers both models (a key alone never switches provider) |
 | `DEMO_ALLOWED_ORIGINS` | Comma-separated origins of the frontend, for CORS. Default `http://localhost:5173,http://127.0.0.1:5173` |
+| `DEMO_TOKEN_SECRET` | Shared with the Vercel frontend (secret). Every route but `GET /api/health` then needs `Authorization: Bearer <token>`, minted by the frontend's `/api/auth/token` for signed-in users |
 
-Whoever can reach the API spends your model credits: put the demo behind something
-(rate limits, an access gate) if the URL is public.
+Whoever can reach the API spends your model credits, so deployments set
+`DEMO_TOKEN_SECRET`. Without it the API is open, which suits local development, and
+it logs a warning at start-up. A token is `base64url(json).hex(hmac-sha256)` with
+payload `{"email", "aud": "trustcall-demo-api", "exp"}` and lives 10 minutes; see
+`app/auth.py`. A missing, forged, expired or wrong-audience token answers 401
+`unauthorized`.
 
 ## API
 
