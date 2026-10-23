@@ -985,7 +985,12 @@ at 0.33 on the first pass and the repair, or refused by the null check or the at
 doubted that the input states Emma's "full name" (null check 0.02, attribution 0.45), which left the
 new person invalid and dropped), the field takes a proper-noun mention (label and span), with
 the warning `identity_from_mention: <the reason>` on the field and in `result.warnings`; never for an
-update. Only a name-like identity field qualifies (named `name`, `full_name`, `title`, `label` or
+update. The field's span is the value's own words in the input (`_own_span`): the entity's label can be shorter
+than the mention that was found for it (discovery on Jev listed the clause `Her name is Olivia Davis`, the
+longer mention replaced `Olivia Davis`, and the label `Olivia Davis` was stored with the CLAUSE's span, so
+the smoke's `spans_quote_the_input` failed intermittently), so the span is the occurrence of the value
+inside the mention, else the closest one, and none when the input does not hold the words. Only a
+name-like identity field qualifies (named `name`, `full_name`, `title`, `label` or
 `display_name`, or marked `s1_field(identity=True)` with a description about a name, title or label), so a
 Subscriber's `email` or a Ticket's `id` is never made up from "Dana Ruiz" or "printer ticket"; and only a
 capitalised mention that is not a descriptive reference ("my cousin", "the client", "The printer ticket")
@@ -1163,7 +1168,7 @@ update, see "Collection engine" step 8). Paths are JSON Pointers of the document
 
 Replaces trustcall's `PatchFunctionErrors`. It runs for inserts and updates of `One` schemas (the
 multi-entity engine reuses it per entity) and is configured by `RepairConfig(enabled=True,
-max_attempts=5, stop_on_repeat=True, allow_pattern_reask=True)`.
+max_attempts=5, stop_on_repeat=True, allow_pattern_reask=True, keep_uncertain=True)`.
 
 **Loop.** After assembly the candidate (insert) or the patched record (update) is validated with
 `model_validate`. On success the record is done. On a `ValidationError`:
@@ -1249,6 +1254,23 @@ that the field's own validation accepts. The answer is accepted only if its span
 and it meets the format. Otherwise the field fails fast: no request is made (or no second one),
 the reason is in the field's warnings, and the other failing fields go on without it. Vocabularies
 belong in a `Literal`, where Clef chooses among the allowed values and no error arises.
+
+**An uncertain attribution does not lose the record (`keep_uncertain`).** A repaired answer goes
+through the whole ladder, and the attribution check that threw the first answer away judges the second
+one by the same question about the same value: a model that answers the same pick twice (Jev does: it is
+deterministic over one request) gets the same 0.44, and the repair can never change the outcome. The
+cost of that veto is not one field: a required field that is null leaves the record invalid, with every
+other field it held. So, for an INSERT, a TEXT value for a field that was null stands when its
+attribution, after the second look, is neither confirmed (`>= verify.attribution_keep`) nor refuted
+(`< verify.attribution_drop`): it is kept with the field warning `attribution_uncertain: p=0.46 (kept: the
+field is required)`. Nothing is retuned (both bars are as they were); a refuted value (below the drop bar)
+never stands, and `RepairConfig(keep_uncertain=False)` restores the strict repair. Text only: a quoted
+span is certainly in the input, what is uncertain is whose it is; a number, a date or a time is derived
+(a sum, "two more", a relative date, `09:30` read as `09:30:00`) and its attribution is the guard of
+relative edits and table rows, so it is never kept this way. Updates are never kept this way either (the
+old value stands there, nothing is lost). Live (78c647b, uncalibrated Jev): the patient name (0.44, then 0.46),
+the product name (0.41), an invoice number (0.59, 0.57) and a contact name (0.65, 0.60) were values of exactly
+this kind; an event name (0.38) and a lead's name (0.16) were refuted and are not kept.
 
 **Terminal failure.** Updates: the operations on the paths that still fail are dropped
 (`RejectedOp(reason="validation")`) and the record is validated once more (the M5 rule); a
@@ -2005,8 +2027,18 @@ document order (Jev leans toward the first option, `none` is last):
 
 The answer maps back as `value` (the span's text, or the number), `span` (the candidate's exact
 offsets in the state that was sent: `state_text[s:e] == text` for a pattern candidate), `p_null` =
-P(`none`), `confidence` = Jev's and `guess` = the best non-`none` candidate. **When Jev's choice is
-`none` the value is null, whatever the other probabilities are** (`none` 0.45 over a phone number at
+P(`none`), `confidence` = Jev's and `guess` = the best non-`none` candidate. **Options that say the
+same thing share their odds**: the input offers `Hearthside Maple Granola` as a span, as the sentence
+`S000` and as the block `B000`, and Jev spreads its probability over the three, so the best single option
+holds a third of what the VALUE holds and Jev's `confidence` (the lead of the chosen option over the next
+one, which is the same value) is low although nothing else was in doubt (live: 0.42 for a product name,
+0.39 for a surname: under `min_confidence`, so a stated value was rejected and its record invalid). The
+value is chosen among values: the odds of the options with the same value (spaces and case aside) are
+added up, the best value's likeliest option gives the span, and `confidence` is the larger of Jev's own
+and the value's pooled odds over the best DIFFERENT answer (`none` included); it is never lowered. When
+the pooled odds of the best value exceed those of `none`, the value was chosen even though `none` is the
+single likeliest option. **When Jev's choice is `none` the value is null, whatever the other
+probabilities are** (unless the shapes of one value outweigh it, as above) (`none` 0.45 over a phone number at
 0.40 is "not stated", and `p_null` is 0.45, so the ladder sees a doubt, not a decision), and the
 best candidate is only the `guess` (so a null `value` whose `p_null` is *below* the
 field's threshold means Jev chose `none` narrowly; `p_null` stays P(`none`) and is not raised to hide it).
@@ -2086,9 +2118,11 @@ is offered too (its span runs from the first amount to the last).
 
 **Date extraction** (cookbook: "TypeSafe answers `Choice` questions about the date in one call,
 code turns those answers into a `date`. The model reads what the text says and never does the
-calendar math"). For each date field, seven choices go in the same request: `mode` (`absolute`,
+calendar math"). For each date field, nine choices go in the same request: the cookbook's seven, `mode` (`absolute`,
 `relative`, `none`), `month`, `day`, `year` (1900 to 2050 plus `none` and `out_of_range`),
-`day_anchor`, `weekday`, `week_offset`, in the cookbook's wording. Code reads only the parts `mode`
+`day_anchor`, `weekday`, `week_offset`, in the cookbook's wording, and two of this library's for a date given as a
+distance from today, `offset_count` (1 to 60) and `offset_unit` (`days_ago`, `days_ahead`, `weeks_ago`, ... `years_ahead`, `none`),
+read when `day_anchor` is `offset`. Code reads only the parts `mode`
 calls for: a year-less date takes the reference year, or the next one when it is more than 31 days
 past; "next Thursday" is the following calendar week, "this Thursday" this week, **"last Thursday" the
 previous one (`week_offset` has `previous`), "yesterday" the day before (`day_anchor` has
@@ -2097,7 +2131,8 @@ previous one (`week_offset` has `previous`), "yesterday" the day before (`day_an
 that code, and the answer says so: `needs_review` is true, `note` says "inferred year, not stated" (or
 week) and the confidence is capped at 0.8 (`INFERRED_CONFIDENCE`), which is under the library's
 low-confidence bar (0.85), so the ladder re-asks and cross-checks it instead of accepting it. A
-count of days ago ("3 days ago") is not a part, so such a date is not resolved (flagged). **The confidence of the answer is the weakest confidence among the parts used**, `p_null`
+distance from today ("3 days ago", "in two weeks") is resolved by code from the count and the unit; "last week"
+and "next month" (no count) are not parts, so such a date is not resolved (flagged). **The confidence of the answer is the weakest confidence among the parts used**, `p_null`
 is P(`mode` = `none`) when a date was resolved (for a `datetime` the larger of the date's and the
 time's, since it is not stated if either part is not) and `max(P(none), 1 - confidence)` when it was not,
 and the cookbook's review flag (no date, or confidence under **0.60**) is returned as `needs_review`
@@ -2163,9 +2198,39 @@ reasoning model if a signal fires). The stages map onto the library's ladder lik
   with no offset. The year-less date is biased to the future (the reference year, or the next if the
   date is more than 31 days past); that and a bare weekday are flagged as inferred
   (`needs_review`, confidence at most 0.8), but "August 14" in a document about last year still resolves
-  to the coming one. "Last Thursday" and "yesterday" are read; "3 days ago" is not.
+  to the coming one. "Last Thursday", "yesterday", "three days ago", "in two weeks" and "a month from
+  now" are read (`day_anchor` `offset` with `offset_count` 1 to 60 and `offset_unit` `days_ago`,
+  `weeks_ahead`, ... : the unit and the direction are one choice; a month or a year that lands past
+  the end of a month stops on its last day); "last week", "next month", "a couple of days ago", "the end
+  of the month" and "a week from Tuesday" are not. The attribution of a date field says what day it is
+  (`Today is Monday, 2026-03-23.`) when the invoke has a `reference_date`; without one it does not (the
+  adapter then resolves against the current date, and the attribution cannot check a relative date).
+  Live (78c647b): a date that was right and had been resolved from "yesterday" or "last Tuesday" scored
+  0.03 to 0.13 on "does the input state this date?" because the question never said what day it was.
 * Two entities whose names are the same text share candidates (dedup by text; the span is the first
   occurrence), and the focus can quote the entity's mentions but cannot tell which occurrence it means.
+* **Tables.** A row of a table (`| PT-1042 | 09:30 | Room 3 | vaccination |`) and a tab-separated line
+  are sentences whose cells are clauses (`S004.3`), so a cell is an option; before, only the whole row
+  was (live: the room of a visit was `| PT-1041 | 09:00 | Room 2 | checkup |`). A cell of one character
+  is not an option (a number cell is a numeric candidate anyway), a sentence offers at most 12 pieces
+  (a table of more than 12 columns loses the last), and columns aligned with spaces only are not cells.
+* **Initials.** `J. Okafor` is one name: the period that the mention cleaning takes off the initial is
+  not what separates two mentions, and the period of an initial or a title (`J.`, `Dr.`) does not end a
+  sentence (so `Okafor` after `J.` does not "only start a sentence"). A clause that continues a name
+  after a spaced dash, a colon or a semicolon (`J. Okafor - buyer`) is an apposition of the name, like one
+  after a comma, and is not a mention of its own. Before, discovery of `J. Okafor - buyer` left four
+  fragments (`J`, `Okafor`, `M`, `Brandt`), the entity was labelled `J`, and no fallback could name it.
+* **What this does not fix.** (a) Jev answers the library's attribution question about the NAME or id
+  that identifies a record (the patient's full name, the event's name, an invoice number, the lead's
+  name) at 0.16 to 0.65, against 0.9 for a stated amount or id of the same sentence; a name that is
+  rejected below `attribution_drop` (0.4: an event name at 0.38) is lost, whatever the repair does. The
+  question's wording was not changed, because it cannot be tested without calls; a different wording,
+  or Jev's own verification (`p_wrong`) standing in for the attribution of a quoted text, is the
+  experiment to run live. (b) A number, a date or a time of a table row whose attribution is in the
+  middle band is still rejected (the row's identity is what that question guards). (c) A field whose
+  description asks for more than the input states (`Amount due including shipping` for an invoice that
+  says `totals $500.00`) is Jev's `none` at 0.46: a model choice. (d) A relative date that Jev reads but
+  the attribution still doubts with the day given (not measured: there is no live run of this change).
 * `count` fields ("how many Persons does the input mention?") find a numeral only if one is written:
   a count nobody states is a null (the count reconciliation of `Many` is then simply off). Lists of
   more than `max_list_candidates` (400) candidates drop the structural candidates first.

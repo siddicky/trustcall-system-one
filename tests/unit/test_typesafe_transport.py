@@ -934,6 +934,8 @@ def test_a_date_is_read_as_parts_and_resolved_in_code() -> None:
         "due::day_anchor",
         "due::weekday",
         "due::week_offset",
+        "due::offset_count",
+        "due::offset_unit",
     ]
     assert (
         "How is the deadline to return the form written?"

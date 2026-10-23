@@ -1146,9 +1146,19 @@ def _name_like(spec: FieldSpec) -> bool:
     return spec.identity and bool(_NAME_WORDS.search(spec.description))
 
 
+_ABBREVIATION = re.compile(r"(?<![A-Za-z])(?:[A-Z]|Mr|Mrs|Ms|Mx|Dr|Prof|Sr|Jr|St)\.$")
+"""An initial ("J.") or a title ("Dr."): its period does not end a sentence."""
+
+
 def _sentence_initial(source: str, at: int) -> bool:
-    """Whether the text at ``at`` starts the input or a sentence."""
+    """Whether the text at ``at`` starts the input or a sentence.
+
+    The period of an initial or a title ("J. Okafor", "Dr. Wu") does not end a
+    sentence, so the word after it does not start one.
+    """
     before = source[:at].rstrip(" \t\"'(\N{LEFT DOUBLE QUOTATION MARK}")
+    if before.endswith(".") and _ABBREVIATION.search(before):
+        return False
     return not before or before[-1] in _SENTENCE_END
 
 
@@ -1273,6 +1283,50 @@ def _identity_bleed(
     return refused, [reject]
 
 
+def _own_span(source: str, value: str, near: Span | None) -> Span | None:
+    """Where ``value`` is written in ``source``: exactly its own words, or ``None``.
+
+    The name of an entity is the entity's label, which can be shorter than the
+    mention that was found for it (a mention of ``Her name is Olivia Davis`` for the
+    entity labelled ``Olivia Davis``): its span must be the words of the value, not
+    the words around them. The occurrence inside ``near`` (the mention's span) wins,
+    else the one closest to it, else the first.
+
+    Args:
+        source: The input.
+        value: The value (words, whitespace and case aside).
+        near: Where the mention that supplied the value lies, if known.
+
+    Returns:
+        The span of the value's words, or ``None`` when the input does not hold them.
+    """
+    words = value.split()
+    if not words:
+        return None
+    wanted = " ".join(words).casefold()
+    if (
+        near is not None
+        and 0 <= near[0] < near[1] <= len(source)
+        and " ".join(source[near[0] : near[1]].split()).casefold() == wanted
+    ):
+        return near
+    lead = r"(?<!\w)" if words[0][0].isalnum() else ""
+    tail = r"(?!\w)" if words[-1][-1].isalnum() else ""
+    body = r"\s+".join(re.escape(word) for word in words)
+    found = [
+        (m.start(), m.end())
+        for m in re.finditer(f"{lead}{body}{tail}", source, re.IGNORECASE)
+    ]
+    if not found:
+        return None
+    if near is None:
+        return found[0]
+    inside = [f for f in found if near[0] <= f[0] and f[1] <= near[1]]
+    if inside:
+        return inside[0]
+    return min(found, key=lambda f: min(abs(f[0] - near[1]), abs(f[1] - near[0])))
+
+
 def _from_mention(ctx: Ctx, spec: FieldSpec, answer: FieldAnswer) -> FieldAnswer:
     """The mention's own words for the name of a new entity, if extraction gave none.
 
@@ -1315,6 +1369,7 @@ def _from_mention(ctx: Ctx, spec: FieldSpec, answer: FieldAnswer) -> FieldAnswer
     if chosen is None:
         return answer
     value, span = chosen
+    span = _own_span(ctx.text, value, span)
     was = answer.rejected_reason or "no value"
     ctx.warn(f"{ctx.plan.name}.{spec.pretty}: identity_from_mention: {was}")
     return dataclasses.replace(
@@ -1846,7 +1901,7 @@ async def _finish_insert(
         ExtractionValidationError: In strict mode, if the record stays invalid.
     """
     run, plan = ctx.run, ctx.plan
-    state = RepairState()
+    state = RepairState(settle=run.repair.keep_uncertain)
     built = _build(ctx, root)
     chosen = _chosen_of(root, ())
     leaves = {
