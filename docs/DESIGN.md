@@ -308,11 +308,27 @@ schema title: "Person").
    so the B737 was lost; the A320's own msn, asked "of `8547 |`", scored 0.485 and was dropped).
    With a dotted identity discovery asks for "every mention of an aircraft: the exact words the
    input uses to name or describe it (its model, type, name or heading), not the msn or another
-   number or code on its own", the entity is labelled by those words (`Airbus A320-200`), and
+   number or code on its own. A table cell is a mention when it names or describes the aircraft: its
+   model or type, such as the cell next to a label like 'aircraft', 'model' or 'type'" (a sheet
+   that names its aircraft only in a table, `| Aircraft | Airbus A320-214 |`, would lose them under
+   "do not list table cells"), the entity is labelled by those words (`Airbus A320-200`), and
    qualification reads "is `entities.e0.label` an aircraft, or the msn of an aircraft?" (true:
    "...or the msn that identifies one"). A plain identity (a name) is asked as before. A mention
    loses the table and emphasis markup at its edges (`clean_mention`: `|`, `*`, `_`, `~`, `\`,
-   en and em dashes), so `8547 |` is `8547`.
+   en and em dashes), so `8547 |` is `8547`. **The words can fail, so there are three nets.** (1) The
+   broader second pass (`count` above the entities found) asks by the identity, `by their msn`: the
+   cells that hold one, which qualification accepts in context ("or the msn of an aircraft"). (2) An
+   insert entity called by a bare number (an MTOW `78000`, an hours figure, a year) is dropped when
+   its extracted identity is not that number (`not_qualified`, warning `bare_number_entity_dropped`,
+   which names the kind and never a value), however qualification judged it; and `_rank` does not
+   offer a figure that does not match the identity field's regex `pattern` (read from the field's
+   hints) to qualification when it has one. (3) An existing record whose identifier (four
+   characters or more, one a digit) is written verbatim in the input needs no `record_presence`
+   request: a qualified entity with a mention in the same line or sentence covers it, else the group
+   qualification refused there is brought back (from `REVIVE_MIN`), else the identifier's own words
+   become the entity's mention (`_adopt_by_identifier`); matching still decides which record each
+   entity is. Before, discovery by identifier gave that for free and the words made a request per
+   record.
    **Screening a table's worth of mentions** (`discovery.screen_above`, default 12; 0 switches it
    off): the code screen (`_prefilter`) and the one-by-one qualification before coreference
    (`_group(screen=True)`) of identity-less items also run, when discovery returned more than
@@ -320,9 +336,13 @@ schema title: "Person").
    entities of a 591-line sheet were `MaintenanceCheck`, named by `check_type`; 513 coreference
    requests) and for a top-level `Many` with a dotted identity (38 refused aircraft: `Qu`, `A`,
    `77`, `CF`, `ATA`, `CN21.61`, `\*`; their junk mentions also sat inside the real aircraft's
-   clusters and spans). It never takes the candidates below Clairic's count; a top-level
-   collection with a plain identity is never screened; the cap-to-count of identity-less items
-   stays theirs alone.
+   clusters and spans). It never takes the candidates below Clairic's count, which is a count of
+   ENTITIES: for a collection with an identity the survivors are counted by distinct (normalised)
+   mention, not one per mention (three mentions of one pet are one entity), and without a count at
+   least one entity is expected, so a screen that leaves nothing gives back the best of what it
+   dropped (up to ten per expected entity). A two-letter name (`Jo`, `Al`) is a name, not a code, in
+   a NESTED list that has a plain identity. A top-level collection with a plain identity is never
+   screened; the cap-to-count of identity-less items stays theirs alone.
 2. **Discovery, three requests in parallel** (a forced `schema=` skips the presence question
    only):
    * presence, Clef `noul` (kind `presence`, id `presence`): "Does `input` mention any {Person}
@@ -902,7 +922,7 @@ every field with `limits.list_strategy`:
 | --- | --- |
 | `"list"` | Clairic's `list` type only (the behaviour before M10a) |
 | `"sentences"` | Clairic is not asked about the field at all. The input is split into sentences in code; Clef is asked one `noul` per candidate sentence (call kind `sentences`, `CallMeta.field` the wire name): "Is this sentence one of the <field description>, about `entity.label`: "<sentence>"?", with criteria. A sentence at or above `verify.sentence_keep` (0.6) is an element, verbatim, with its span |
-| `"auto"` (default) | Clairic's list first (the request and the cross-check are the same as `"list"`). If its answer holds elements but its confidence is below `limits.list_auto_below` (0.5; a null or empty answer is the model saying there is nothing, not distrust), or the answer is missing, the existing low-confidence re-ask runs first (one isolated Clairic question over the input alone, kind `reask`). A re-ask that is trusted replaces the answer and the field stays a Clairic list. Otherwise Clef is asked once per schema and field and run (kind `list_kind`, memoised; entities that run at the same time share the one request) a `choice` between `items` ("short named values: names, languages, tags, ids") and `statements` ("free-form statements or facts"). `statements` → the field is read by sentences; `items` → the old low-confidence rejection stands, so a list of languages Clairic is merely unsure of is never turned into sentences. `statements` needs `p(statements) >= gates.min_choice_prob` OR `p(items) < ITEMS_VETO` (0.75): only a CLEAR `items` keeps a list out of the sentence path, because a wrong `items` drops the field while a wrong `statements` still faces the per-sentence question, attribution, novelty and the change gate. (Live, Decisions as the primary gave `items` 0.65 to 0.67, graded, 15 times out of 15 for a notes field, where Cloudflare's Clef gave `statements` 0.95 to 0.97; under the old rule no note was ever added: notes recall 0%.) A missing answer (no Clef answer, a refusal) is `items` |
+| `"auto"` (default) | Clairic's list first (the request and the cross-check are the same as `"list"`). If its answer holds elements but its confidence is below `limits.list_auto_below` (0.5; a null or empty answer is the model saying there is nothing, not distrust), or the answer is missing, the existing low-confidence re-ask runs first (one isolated Clairic question over the input alone, kind `reask`). A re-ask that is trusted replaces the answer and the field stays a Clairic list. Otherwise Clef is asked once per schema and field and run (kind `list_kind`, memoised; entities that run at the same time share the one request) a `choice` between `items` ("short named values: names, languages, tags, ids") and `statements` ("free-form statements or facts"). `statements` → the field is read by sentences; `items` → the old low-confidence rejection stands, so a list of languages Clairic is merely unsure of is never turned into sentences. `statements` needs `statements` CHOSEN with `p(statements) >= gates.min_choice_prob`; for a HEDGING reader only (the Decisions API, or a hard pick: `_hedged_veto`) `p(items) < ITEMS_VETO` (0.75, at most the hard cap, so a hard `items` always vetoes) is enough: only a CLEAR `items` keeps a list out of the sentence path, because a wrong `items` drops the field while a wrong `statements` still faces the per-sentence question, attribution, novelty and the change gate. A graded answer of any other provider keeps the plain rule: a list of phone numbers that Cloudflare's Clef calls `items` at 0.70 must not become the sentence that holds them. (Live, Decisions as the primary gave `items` 0.65 to 0.67, graded, 15 times out of 15 for a notes field, where Cloudflare's Clef gave `statements` 0.95 to 0.97; under the old rule no note was ever added: notes recall 0%.) A missing answer (no Clef answer, a refusal) is `items` |
 
 An explicit `s1_field(list_strategy="sentences")` (or `limits.list_strategy="sentences"`) skips Clairic and the classification altogether and starts together with the field's other requests; the `auto` fallback needs Clairic's answer first, so it cannot.
 
@@ -1283,26 +1303,34 @@ deterministic over one request) gets the same 0.44, and the repair can never cha
 cost of that veto is not one field: a required field that is null leaves the record invalid, with every
 other field it held. So, for an INSERT, a TEXT value for a field that was null stands when its
 attribution, after the second look, is neither confirmed (`>= verify.attribution_keep`) nor refuted
-(`< verify.attribution_drop`): it is kept with the field warning `attribution_uncertain: p=0.46 (kept: the
-field is required)`. Nothing is retuned (both bars are as they were); a refuted value (below the drop bar)
-never stands. **The default depends on the provider (`keep_uncertain=None`, "auto").** It was on for every
-provider at first; the policy (decided by the coordinator) is that it is a TypeSafe/Jev behaviour: the
-doubt it answers is Jev's uncalibrated attribution of a name or an id, and on Cloudflare or the other
-providers the strict repair is the measured behaviour. So the engine reads the provider of the extraction:
-`Run.keeps_uncertain` (`_run.py`) is `repair.keep_uncertain` when it is a bool (an explicit `True` or
-`False` always wins) and else `transport.prefers_keep_uncertain(clairic_model)`, a bool attribute or a
-method read defensively like `max_questions` (`transport.prefers_keep_uncertain(transport, model)`):
-`TypeSafeTransport` has it `True`, every other transport says nothing (`False`). The transports that
-hold others answer for the one that does the TEXT extraction: `RoutingTransport` for the transport
-serving the Clairic model, `KindRoutingTransport` for the route of kind `extract` on that model,
-`FieldTypeRoutingTransport` for the `text` route (else its default), `FallbackTransport` for its primary
-(the fallback only stands in when the primary could not answer), and `CalibratedTransport`, the combos
-label and `RecordingTransport` for the transport they wrap. `CassetteTransport` answers as the live
-run did: by the provider it stands for, else by who answered the recorded Clairic calls (all
-`typesafe`), else by the `inner` transport that serves a miss, so a replay settles it like the recording.
-`combos` and `system_one_transport` need nothing: they build `TypeSafeTransport` itself. Only the TEXT
-extraction counts, not the provider of the attribution questions: Jev answering the decisions behind a
-Cloudflare extraction leaves it off. `RepairConfig(keep_uncertain=False)` restores the strict repair on
+(`< verify.attribution_drop`): it is kept with the field warning `attribution_uncertain: p=0.46 (kept: a
+required field, the same value twice)`. Nothing is retuned (both bars are as they were); a refuted value
+(below the drop bar) never stands. **Only a value that is the field's own** (`_may_settle` in
+`_repair.py`): (1) the field is REQUIRED and not nullable (`spec.required`): an optional field that a
+model validator implicated ("email or phone is required") is not a lost record, and the value found for
+it is whoever's it happens to be (probe: "Dana Ruiz joined the call with Mark Lee. Mark's email is
+mark@lee.example." gave Dana Mark's address); (2) the re-ask gave the SAME value as the first answer
+(`Target.first`), not a new guess that nobody judged twice; (3) in a collection, the value's span is not
+inside, or nearer to, a mention of another entity (`Ctx.others`) than to the entity's own mentions, and
+a value without a span cannot be told. **The default depends on the provider (`keep_uncertain=None`,
+"auto").** The setting is a TypeSafe/Jev behaviour: the doubt it answers is Jev's uncalibrated
+attribution of a name or an id, which the other providers do not show, and the repair needs Jev to read
+the same value again. So `Run.keeps_uncertain` (`_run.py`) is `repair.keep_uncertain` when it is a bool
+(an explicit `True` or `False` always wins) and otherwise ON only when the provider that answers the
+ATTRIBUTION (`clef_model`, kind `attribution`) AND the one that answers the repair and the isolated
+re-ask (`clairic_model`, kinds `repair` and `reask`) all say yes: `prefers_keep_uncertain(transport,
+model, kind)` (`transport.py`), a bool attribute or a `(model, kind)` method read defensively like
+`max_questions`. `TypeSafeTransport` has it `True`, every other transport says nothing (`False`). The
+transports that hold others answer for the call: `RoutingTransport` for the transport serving the model,
+`KindRoutingTransport` for the route of `(kind, model)`, `FieldTypeRoutingTransport` for its `text` route
+when the model is Clairic and for its default for Clef (a Clef request is never split),
+`FallbackTransport` for its primary, and `CalibratedTransport`, the combos label and `RecordingTransport`
+for what they wrap. So Jev reading the text while Cloudflare answers the attribution (or the other way
+round) leaves it OFF, and so does a `by_kind` route that sends only the re-ask or only the attribution
+elsewhere. A recording writes the decision itself on every call line (`keep_uncertain`, what the wrapped
+transport said of that model and kind) and `CassetteTransport` replays it per model family and kind (the
+provider it stands for, else the `inner` transport of a miss, else off, when nothing was recorded: never
+a guess over every recorded provider). `RepairConfig(keep_uncertain=False)` restores the strict repair on
 Jev. Text only: a quoted
 span is certainly in the input, what is uncertain is whose it is; a number, a date or a time is derived
 (a sum, "two more", a relative date, `09:30` read as `09:30:00`) and its attribution is the guard of
@@ -1481,7 +1509,9 @@ is noted there too. A repaired field that was a Clairic field and became a Clef 
     `choice`; live on a `clef_fields` question) is no answer: the question is left out of the Clef
     response (every gate reads a missing answer as "no", never as a pass), `decisions_notes` carries
     `decisions_refusal: the model refused N question(s)...`, which becomes a run warning, and the
-    request is memoised like any other. A refusal of a question that was not asked, or a choice-less
+    request is memoised like any other. `decisions_refused` lists the ids, and a refused ATTRIBUTION is
+    final (`Run.was_refused`): no isolated re-check and no second request, the value is rejected as
+    `attribution_missing`. A refusal of a question that was not asked, or a choice-less
     answer that is not a refusal, is still a `ModelResponseError`. Graded probabilities (0.1/0.9, say) are
     the API's own numbers and are left alone; thresholds written for graded Clef answers (a
     re-ask band between 0.4 and 0.75) behave like yes/no on a fallback that mostly sends picks.
@@ -2089,10 +2119,13 @@ holds a third of what the VALUE holds and Jev's `confidence` (the lead of the ch
 one, which is the same value) is low although nothing else was in doubt (live: 0.42 for a product name,
 0.39 for a surname: under `min_confidence`, so a stated value was rejected and its record invalid). The
 value is chosen among values: the odds of the options with the same value (spaces and case aside) are
-added up, the best value's likeliest option gives the span, and `confidence` is the larger of Jev's own
-and the value's pooled odds over the best DIFFERENT answer (`none` included); it is never lowered. When
-the pooled odds of the best value exceed those of `none`, the value was chosen even though `none` is the
-single likeliest option. **When Jev's choice is `none` the value is null, whatever the other
+added up, the best value's likeliest option gives the span, and `confidence` is the value's lead (its
+pooled odds over the best DIFFERENT answer, `none` included, never below 0); Jev's own confidence is
+about ITS choice, so it is a floor (`max(Jev's, the lead)`) only when the pooled value IS the value of
+Jev's choice. A value Jev did not choose (a rival option, or `none`, was the single likeliest) has its
+lead only: a number chosen at 0.35 with confidence 0.7 and a product name pooling 0.42 give the name
+0.07, not 0.7. When the pooled odds of the best value exceed those of `none`, the value was chosen even
+though `none` is the single likeliest option. **When Jev's choice is `none` the value is null, whatever the other
 probabilities are** (unless the shapes of one value outweigh it, as above) (`none` 0.45 over a phone number at
 0.40 is "not stated", and `p_null` is 0.45, so the ladder sees a doubt, not a decision), and the
 best candidate is only the `guess` (so a null `value` whose `p_null` is *below* the
@@ -2176,7 +2209,7 @@ code turns those answers into a `date`. The model reads what the text says and n
 calendar math"). For each date field, nine choices go in the same request: the cookbook's seven, `mode` (`absolute`,
 `relative`, `none`), `month`, `day`, `year` (1900 to 2050 plus `none` and `out_of_range`),
 `day_anchor`, `weekday`, `week_offset`, in the cookbook's wording, and two of this library's for a date given as a
-distance from today, `offset_count` (1 to 60) and `offset_unit` (`days_ago`, `days_ahead`, `weeks_ago`, ... `years_ahead`, `none`),
+distance from today, `offset_count` (1 to 60, `none`, or `out_of_range` for a number above 60 or one that is not whole: flagged, never guessed) and `offset_unit` (`days_ago`, `days_ahead`, `weeks_ago`, ... `years_ahead`, `none`; "last week" and "next month" have no number and are `none`, not "ago, 1"),
 read when `day_anchor` is `offset`. Code reads only the parts `mode`
 calls for: a year-less date takes the reference year, or the next one when it is more than 31 days
 past; "next Thursday" is the following calendar week, "this Thursday" this week, **"last Thursday" the
@@ -2258,8 +2291,13 @@ reasoning model if a signal fires). The stages map onto the library's ladder lik
   `weeks_ahead`, ... : the unit and the direction are one choice; a month or a year that lands past
   the end of a month stops on its last day); "last week", "next month", "a couple of days ago", "the end
   of the month" and "a week from Tuesday" are not. The attribution of a date field says what day it is
-  (`Today is Monday, 2026-03-23.`) when the invoke has a `reference_date`; without one it does not (the
-  adapter then resolves against the current date, and the attribution cannot check a relative date).
+  (`Today is Monday, 2026-03-23.`): the day is `Run.today`, the `reference_date` or, without one, the UTC
+  date pinned when the invoke began, and that one day is also what TypeSafe resolves a relative date
+  against (`CallMeta.today`, never put in the Clairic request: that would change every Clairic request
+  and cassette key). **Compatibility:** the attribution requests of date fields on EVERY provider now
+  carry the note, so their request keys changed: a cassette recorded before this does not replay those
+  requests strictly, and an invoke without a `reference_date` asks a different question each day, so a
+  strict replay needs a `reference_date` (or a new recording).
   Live (78c647b): a date that was right and had been resolved from "yesterday" or "last Tuesday" scored
   0.03 to 0.13 on "does the input state this date?" because the question never said what day it was.
 * Two entities whose names are the same text share candidates (dedup by text; the span is the first
@@ -2649,7 +2687,7 @@ Each milestone landed as one commit that left `make lint` and `make test` green.
 | M10b | README, CI workflow, Makefile polish |
 | M11 | aircraft-run fixes: Clef request budget (calibrated estimate, central guard, coreference to the budget), containment of a refused request, dotted identity paths, class docstrings of nested models, screening of identity-less items |
 | M12 | live-run fixes (Decisions as the primary, the aircraft sheets): `list_kind` veto, refusal answers, `clef_hard_picks`, entities without mentions for Decisions, dotted-identity discovery and qualification, markup in mentions, screening of tables for collections with an identity (`discovery.screen_above`), placeholder text is null (`gates.placeholders`) |
-| M13 | integration of the TypeSafe-path fixes (pooled equivalent options, date offsets, table cells, initials, `_own_span`, `keep_uncertain`) with the Decisions-primary fixes; `keep_uncertain` is "auto" (on for a TypeSafe text extraction only) |
+| M13 | integration of the TypeSafe-path fixes (pooled equivalent options, date offsets, table cells, initials, `_own_span`, `keep_uncertain`) with the Decisions-primary fixes; `keep_uncertain` is "auto" (on only where Jev answers the attribution and the re-ask) |
 
 ### README
 
@@ -2736,8 +2774,10 @@ green. The examples were the acceptance tests for M5 to M9.
     the update is the right outcome, and that gold expectation is provider-specific. The
     chance-normalised `confidence` it reports (0.3 for 0.65) is lower than Clef's for the same
     probability and is used as reported. Not re-measured after these fixes (no live access).
-13. Placeholder text (`TBA`, `TBD`, `N/A`, a dash) is null in a plain text field
-    (`GateConfig.placeholders`, the opt-out is `()`): the live sheet's `apu.status = "TBA"` and
+13. Placeholder text (`TBA`, `TBD`, `N/A`, a double or long dash) is null in a plain text field
+    (`GateConfig.placeholders`; the opt-outs are `()` for the run and `s1_field(placeholders=False)`
+    for one field; `TBC`, a lone `-` and a lone `?` are not defaults: ambiguous, and a result or
+    status can read `-`): the live sheet's `apu.status = "TBA"` and
     its three MSNs `TBA` (which also made three identical, different "identity values"). List
     elements and Clef-typed fields are untouched; `none`, `unknown` and `na` are deliberately not
     on the list. What the schema calls a check type (an interval string) is the schema's.
@@ -2747,6 +2787,15 @@ green. The examples were the acceptance tests for M5 to M9.
     0.87 for `Airbus A320-251N` with the first, then 0.59 and 0.26 against the second (a cluster
     that held `CF` and `NEO) -` junk). The screening removes the junk from clusters; the rule
     stays, and two mentions with the same words are asked about, not assumed to be one.
+
+15. The holdout is contaminated for TypeSafe. Commit `7decebc` (pooled equivalent
+    options, date offsets and the "today" note, `keep_uncertain`, table cells, initials, the
+    identity span) fixed failures that were read from live TypeSafe runs of the holdout suite, and
+    the cases they fixed then passed. **Every TypeSafe holdout result from `7decebc` on is
+    diagnosed-on-holdout** (`evals/README.md`): it is a dev number, not a blind one, and it does
+    not support choosing a combination. The same holds for any live holdout number that was read
+    while a fix was written. A fresh blind suite (`holdout2`) is written separately; the offline
+    holdout (scripted worlds) measures the engine, not a provider.
 
 ## Verification
 

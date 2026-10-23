@@ -568,5 +568,7 @@ def _translate(
     }
     if notes:
         clef["decisions_notes"] = notes
+    if refused:
+        clef["decisions_refused"] = refused  # the engine does not ask these again
     parse_clef(clef)  # the result is a valid Clef response, or this raises
     return clef

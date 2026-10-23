@@ -21,6 +21,7 @@ from trustcall_system_one import (
     Many,
     One,
     create_extractor,
+    s1_field,
 )
 from trustcall_system_one._coerce import is_placeholder
 from trustcall_system_one._collection import clean_mention
@@ -501,7 +502,7 @@ async def test_a_top_level_plain_identity_is_never_screened() -> None:
 @pytest.mark.parametrize(
     "text",
     ["TBA", "tba", " TBA ", "**TBA**", "N/A", "n/a.", "n.a.",
-     "TBD", "—", "-", "To be confirmed", "Not available"],
+     "TBD", "—", "--", "To be confirmed", "Not available"],
 )  # fmt: skip
 def test_placeholders_are_recognised(text: str) -> None:
     assert is_placeholder(text, GateConfig().placeholders)
@@ -509,7 +510,20 @@ def test_placeholders_are_recognised(text: str) -> None:
 
 @pytest.mark.parametrize(
     "text",
-    ["Honeywell", "GTCP 131-9A", "None", "Unknown", "NA", "TBA-1", "", "0", "A-"],
+    [
+        "Honeywell",
+        "GTCP 131-9A",
+        "None",
+        "Unknown",
+        "NA",
+        "TBA-1",
+        "",
+        "0",
+        "A-",
+        "-",
+        "?",
+        "TBC",
+    ],
 )
 def test_real_values_are_not_placeholders(text: str) -> None:
     assert not is_placeholder(text, GateConfig().placeholders)
@@ -564,6 +578,34 @@ async def test_placeholders_can_be_kept_as_values() -> None:
     (record,) = result.records
     assert isinstance(record.value, Apu)
     assert (record.value.status, record.value.serial_number) == ("TBA", "N/A")
+
+
+class Inspection(BaseModel):
+    """An inspection."""
+
+    result: Optional[str] = Field(None, json_schema_extra=s1_field(placeholders=False))
+    status: Optional[str] = None
+
+
+async def test_one_field_can_keep_its_placeholder() -> None:
+    text = "Check: result N/A, status TBA."
+    world = FakeWorld(text)
+    world.entity(
+        "the Check",
+        schema=Inspection,
+        mentions=["Check"],
+        fields={"result": "N/A", "status": "TBA"},
+    )
+    (record,) = (
+        await create_extractor([One(Inspection)], transport=world.transport()).ainvoke(
+            text
+        )
+    ).records
+    assert isinstance(record.value, Inspection)
+    assert record.value.result == "N/A"  # this field keeps it
+    assert record.value.status is None  # the run's setting applies elsewhere
+    with pytest.raises(ValueError, match="placeholders must be a bool"):
+        s1_field(placeholders="no")  # type: ignore[arg-type]
 
 
 def test_the_placeholders_setting_is_validated() -> None:

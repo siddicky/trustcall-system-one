@@ -7,6 +7,11 @@ for tuning. Do not change a case, a threshold or a prompt
 after looking at how a provider scores on it; a case is only fixed when its gold is
 wrong from the text alone (and then the change is a new commit that says so).
 
+NOTE: TypeSafe (Jev) results on this suite from commit 7decebc on are
+diagnosed-on-holdout (see ``evals/README.md``): the fixes of that commit were found
+from TypeSafe's live failures here, so those numbers are not blind. A fresh suite
+(``holdout2``) is the one for claims about TypeSafe.
+
 The format is the dev suite's (``evals.model.Case``): the same scoring, the same
 offline scripted ``FakeWorld`` per case. The schemas, domains and texts are new:
 logistics, healthcare scheduling (fictional, non-sensitive), real estate listings,

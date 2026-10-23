@@ -444,6 +444,7 @@ def _clairic(
             if (
                 spec.clairic.type == "text"
                 and isinstance(value, str)
+                and spec.extra.get("placeholders") is not False
                 and is_placeholder(value, gates.placeholders)
             ):
                 # "TBA" in a serial number cell says there is none yet

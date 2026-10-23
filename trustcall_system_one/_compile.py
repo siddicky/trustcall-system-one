@@ -129,6 +129,7 @@ _S1_KEYS = frozenset(
         "clef",
         "criteria",
         "list_strategy",
+        "placeholders",
     }
 )
 _IDENTITY_NAMES = (
@@ -269,6 +270,7 @@ def s1_field(
     clef: str | None = None,
     criteria: Mapping[str, Any] | list[Any] | None = None,
     list_strategy: str | None = None,
+    placeholders: bool | None = None,
 ) -> dict[str, Any]:
     """Build ``json_schema_extra`` carrying per-field extraction options.
 
@@ -298,6 +300,10 @@ def s1_field(
             such as "things worth remembering") or ``"auto"`` (ask Clairic first,
             use sentences when its confidence is low). Unset follows
             ``Limits.list_strategy``.
+        placeholders: ``False`` keeps a placeholder text (``TBA``, ``N/A``, see
+            ``GateConfig.placeholders``) as the value of this plain text field,
+            whatever the run's setting: a field whose value may legitimately be
+            ``N/A``. ``None`` or ``True`` follow ``GateConfig.placeholders``.
 
     Returns:
         ``{"trustcall_system_one": {...}}``.
@@ -358,6 +364,10 @@ def s1_field(
                 f"got {list_strategy!r}"
             )
         options["list_strategy"] = list_strategy
+    if placeholders is not None:
+        if not isinstance(placeholders, bool):
+            raise ValueError("placeholders must be a bool")
+        options["placeholders"] = placeholders
     return {S1_KEY: options}
 
 

@@ -1249,6 +1249,9 @@ class _Screen:
     numbers: bool
     options: frozenset[str]
     identity: "re.Pattern[str] | None" = None
+    named: bool = False
+    """Items of a nested list that has a plain identity (names): a name of two letters
+    (``Jo``, ``Al``) is a name, not a code."""
 
 
 _PATTERN_HINT = "Must match the pattern "
@@ -1279,6 +1282,23 @@ def _identity_shape(scope: "Scope") -> "re.Pattern[str] | None":
                 except re.error:
                     return None
     return None
+
+
+def _identity_names(scope: "Scope") -> tuple[str, ...]:
+    try:
+        return identity_fields(scope.plan, scope.cardinality)
+    except ValueError:
+        return ()
+
+
+def _named(scope: "Scope") -> bool:
+    """Whether the collection is a nested list of items that are told apart by name."""
+    names = _identity_names(scope)
+    return (
+        scope.parent is not None
+        and bool(names)
+        and not any(IDENTITY_SEP in name for name in names)
+    )
 
 
 def _screens(scope: "Scope") -> _Screen:
@@ -1317,6 +1337,7 @@ def _screens(scope: "Scope") -> _Screen:
         numbers,
         frozenset(options - names),
         _identity_shape(scope),
+        _named(scope),
     )
 
 
@@ -1351,7 +1372,10 @@ def _rank(text: str, screen: _Screen) -> int:
         return 0
     if len(bare.split()) > 1 or len(bare) > 2 or any(ch.isdigit() for ch in bare):
         return 3
-    return 2 if text.strip(" *_|`.:").isupper() else 1
+    shown = text.strip(" *_|`.:")
+    if screen.named and len(bare) == 2 and bare.isalpha() and shown.istitle():
+        return 3  # "Jo", "Al": a name in a list of named items
+    return 2 if shown.isupper() else 1
 
 
 def _table_of_mentions(
@@ -1400,12 +1424,20 @@ def _prefilter(
     kept = [m for rank, m in ranked if rank >= 3]
     dropped = len(mentions) - len(kept)
     back: list[Mention] = []
-    if count is not None and len(kept) < count:
+    # the count is of ENTITIES: with an identity an entity has several mentions, so
+    # the survivors are counted by distinct (normalised) mention, not one per mention;
+    # without a count at least one is expected, so a screen that leaves nothing gives
+    # back the best of what it dropped
+    expected = count if count is not None else 1
+    survivors = (
+        len({_bare(m.text) for m in kept}) if _identity_names(scope) else len(kept)
+    )
+    if survivors < expected:
         pool = sorted(
             ((rank, m) for rank, m in ranked if 1 <= rank < 3),
             key=lambda item: (-item[0], item[1].span or (0, 0)),
         )
-        back = [m for _, m in pool[: max(count * 10, 10)]]
+        back = [m for _, m in pool[: max(expected * 10, 10)]]
         kept = sorted([*kept, *back], key=lambda m: (m.span or (0, 0), m.text))
     if dropped:
         run.warn(
@@ -1416,8 +1448,12 @@ def _prefilter(
                 "(bare figures, one or two letters, markup, headings and the names "
                 f"of the {scope.kind}'s own fields)"
                 + (
-                    f"; {len(back)} of them came back because Clairic counted "
-                    f"{count} and fewer survived"
+                    f"; {len(back)} of them came back because "
+                    + (
+                        f"Clairic counted {count} and fewer survived"
+                        if count is not None
+                        else "nothing else survived"
+                    )
                     if back
                     else ""
                 )

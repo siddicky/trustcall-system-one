@@ -225,13 +225,20 @@ def date_questions(role: str) -> dict[str, dict[str, Any]]:
         "offset_count": _choice(
             f"If {role} is a number of days, weeks, months or years from today ('three "
             "days ago', 'in two weeks', 'a month from now'), what is the number ('a' "
-            "and 'an' are 1)?",
-            {str(n): None for n in range(1, 61)} | {"none": _ABSENT},
+            "and 'an' are 1)? 'none' if no number is stated ('last week', 'next "
+            "month'), 'out_of_range' if the number is above 60 or is not a whole "
+            "number.",
+            {str(n): None for n in range(1, 61)}
+            | {
+                "out_of_range": "A number is stated and is not one of 1 to 60.",
+                "none": _ABSENT,
+            },
         ),
         "offset_unit": _choice(
             f"If {role} is a number of days, weeks, months or years from today, which "
-            "unit is it in, and is it before today ('ago', 'earlier', 'last') or after "
-            "it ('in two weeks', 'a month from now')?",
+            "unit is it in, and is it before today ('ago', 'earlier') or after it "
+            "('in two weeks', 'a month from now')? A phrase without a number ('last "
+            "week', 'next month') is 'none'.",
             {u: None for u in OFFSET_UNITS} | {"none": _ABSENT},
         ),
     }
@@ -407,6 +414,8 @@ def _date_of(
             used += ["offset_count", "offset_unit"]
             count = parts["offset_count"].choice if "offset_count" in parts else ""
             unit = parts["offset_unit"].choice if "offset_unit" in parts else ""
+            if count == "out_of_range":
+                return None, used, "relative offset out of range", ()
             if not count.isdigit() or unit not in OFFSET_UNITS:
                 return None, used, "relative offset not read", ()
             shifted = _shift(today, int(count), unit)

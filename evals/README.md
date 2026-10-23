@@ -57,6 +57,22 @@ it. So:
 - Never record cassettes of the holdout into a directory that the dev suite or the
   tests replay from.
 
+### Results that were diagnosed on the holdout
+
+The rule above was broken once, in the open, and the numbers it touched are marked:
+**every TypeSafe (Jev) result on this holdout from commit `7decebc` on is
+diagnosed-on-holdout.** The fixes of that commit (pooled equivalent options, date
+offsets and the "today" note, `keep_uncertain`, table-cell candidates, initials, the
+identity span) were found by reading TypeSafe's live failures on holdout cases, and
+the cases they fixed were then passing. A TypeSafe holdout number measured after that
+commit is a dev number: do not quote it as blind, do not use it to choose a
+combination, and do not compare it with a number measured before it. The offline
+suite (scripted worlds) is unaffected by this, but is no evidence about a provider.
+
+A fresh, blind holdout (`holdout2`) is written by someone who has not seen those
+failures; use that one for any claim about TypeSafe, and apply the rule above to it
+from its first run.
+
 Where the library documents a limit, the gold follows the documented behaviour (and
 the case's `note` says so): a relative edit ("two more seats") is refused with
 `relative_edit_unsupported`, text values are verbatim spans, and an input that both

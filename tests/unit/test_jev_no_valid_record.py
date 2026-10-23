@@ -18,6 +18,7 @@ selection") by case and cause.
 
 # ruff: noqa: UP045 - tests deliberately spell Optional and Union
 
+import asyncio
 from datetime import date
 from typing import Any, Optional
 
@@ -48,7 +49,7 @@ from trustcall_system_one._repair import _may_settle
 from trustcall_system_one._structure import build_structure, to_lines
 from trustcall_system_one._typesafe import _apposition
 from trustcall_system_one._wire import ClairicAnswer
-from trustcall_system_one.testing import FakeWorld
+from trustcall_system_one.testing import FakeTransport, FakeWorld
 
 __all__: list[str] = []
 
@@ -334,6 +335,21 @@ def test_the_date_questions_name_the_offset() -> None:
     assert units[:2] == ["days_ago", "days_ahead"] and units[-1] == "none"
 
 
+def test_a_count_beyond_the_list_is_out_of_range_not_a_guess() -> None:
+    questions = date_questions("the date of the report")
+    assert "out_of_range" in questions["offset_count"]["criteria"]
+    result = assemble_date(_offset("out_of_range", "days_ago"), TODAY)
+    assert result.value is None and result.note == "relative offset out of range"
+    assert result.needs_review
+
+
+def test_last_week_is_not_an_offset_of_one() -> None:
+    wording = date_questions("the date")["offset_unit"]["instructions"]
+    assert "'last'" not in wording  # "last week" has no count
+    assert "'last week', 'next month') is 'none'" in wording
+    assert "'none'" in date_questions("the date")["offset_count"]["instructions"]
+
+
 def test_jev_reads_three_days_ago_through_the_whole_adapter() -> None:
     parts = {
         "mode": "relative",
@@ -402,15 +418,79 @@ async def test_the_attribution_of_a_date_says_what_day_it_is() -> None:
     assert asked["attr.wo_number"].startswith("Does `input` state that")
 
 
-async def test_without_a_reference_date_the_attribution_is_as_it_was() -> None:
+async def test_without_a_reference_date_the_pinned_utc_day_is_named() -> None:
+    from datetime import datetime, timezone
+
     world = _work_order_world()
     await make_extractor([WorkOrder], world).ainvoke(WORK_ORDER)
-    asked = [
-        q["instructions"]
+    today = datetime.now(timezone.utc).date()
+    asked = {
+        qid: q["instructions"]
         for _, payload, _ in world.calls("attribution")
-        for q in payload["questions"].values()
-    ]
-    assert asked and not [a for a in asked if "Today is" in a]
+        for qid, q in payload["questions"].items()
+    }
+    assert asked["attr.completed_on"].startswith(
+        f"Today is {today:%A}, {today.isoformat()}. "
+    )
+    assert asked["attr.wo_number"].startswith("Does `input` state that")
+    # the same day goes to the transport with every Clairic call (TypeSafe resolves
+    # "three days ago" against it), though no reference_date is put in the request
+    clairic_calls = world.calls("extract")
+    assert clairic_calls
+    for _, payload, meta in clairic_calls:
+        assert meta.today == today.isoformat()
+        assert payload.get("reference_date") is None
+
+
+async def test_a_given_reference_date_is_the_day_everywhere() -> None:
+    world = _work_order_world()
+    extractor = make_extractor([WorkOrder], world, reference_date="2026-03-23")
+    await extractor.ainvoke(WORK_ORDER)
+    assert {meta.today for _, _, meta in world.calls("extract")} == {"2026-03-23"}
+    assert {p["reference_date"] for _, p, _ in world.calls("extract")} == {"2026-03-23"}
+
+
+def test_one_run_has_one_day_and_the_meta_day_is_not_the_calls_identity() -> None:
+    from trustcall_system_one import CallMeta as Meta
+    from trustcall_system_one._run import Run
+
+    run = Run(transport=FakeTransport(lambda *a: None), pinned="2026-01-02")
+    assert run.today == "2026-01-02"
+    run.reference_date = "2026-03-23"
+    assert run.today == "2026-03-23"
+    run.reference_date = "not a date"
+    assert run.today == "2026-01-02"
+    assert Meta(kind="extract") == Meta(kind="extract", today="2026-01-02")
+
+
+def test_a_relative_date_resolves_against_the_pinned_day_of_the_meta() -> None:
+    from trustcall_system_one import CallMeta as Meta
+
+    parts = {
+        "mode": "relative",
+        "day_anchor": "offset",
+        "offset_count": "3",
+        "offset_unit": "days_ago",
+    }
+
+    def script(qid: str, question: dict[str, Any], body: dict[str, Any]) -> Any:
+        _, _, part = qid.partition("::")
+        return choice(question, parts[part], 0.97) if part in parts else None
+
+    fields = {"reported_on": {"type": "date", "instructions": "the report date"}}
+    payload = clairic_payload(
+        fields, "Customers cannot sign in. Reported three days ago."
+    )
+    assert "reference_date" not in payload or payload["reference_date"] is None
+    transport = make(Jev(script))
+    sent = asyncio.run(
+        transport.run(
+            "@cf/cloudflare/clairic",
+            payload,
+            meta=Meta(kind="extract", today="2026-03-23"),
+        )
+    )
+    assert sent.body["answers"]["reported_on"]["value"] == "2026-03-20"
 
 
 # --------------------------------------------------------------------------- #

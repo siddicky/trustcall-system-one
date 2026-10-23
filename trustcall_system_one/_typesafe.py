@@ -940,6 +940,7 @@ async def run_clairic(
     memo: dict[str, "asyncio.Future[dict[str, float]]"],
     escalate: EscalationHook | None = None,
     model_name: str = "jev",
+    pinned: str | None = None,
 ) -> dict[str, Any]:
     """Serve a Clairic request with Jev.
 
@@ -953,6 +954,10 @@ async def run_clairic(
             calls: concurrent calls over one input share one stitch request).
         escalate: Answers a field the verification doubts, or ``None``.
         model_name: The model name for the response before Jev has answered.
+        pinned: The date the invoke treats as today, for a request without a
+            ``reference_date`` (the engine pins one per invoke so that the date
+            resolved here and the date the attribution note names are one); the
+            current UTC date when neither is given.
 
     Returns:
         A Clairic response body.
@@ -983,7 +988,7 @@ async def run_clairic(
         cut = content.rfind(" ", 0, config.max_input_chars)
         content = content[: cut if cut > 0 else config.max_input_chars]
     focus = _focus(parts.head, parts.input)
-    today = _today(request.reference_date)
+    today = _today(request.reference_date or pinned)
 
     structure: Structure | None = None
     if any(_structured(f) for f in request.fields.values()):

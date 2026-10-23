@@ -348,6 +348,22 @@ async def test_a_refused_gate_is_never_a_pass() -> None:
     assert any(w.startswith("decisions_refusal") for w in result.warnings)
 
 
+async def test_a_refused_attribution_is_final_and_never_asked_again_in_isolation() -> (
+    None
+):
+    from collections import Counter
+
+    control = await run_case("contacts_update_add")
+    assert Counter(c.kind for c in control.calls)["reask"] == 0  # it passes at once
+    result = await run_case("contacts_update_add", refuse=frozenset({"attribution"}))
+    kinds = Counter(c.kind for c in result.calls)
+    # one attribution request, refused; no isolated re-ask and no second check
+    assert kinds["attribution"] == 1
+    assert kinds["reask"] == 0
+    assert any(w.startswith("decisions_refusal") for w in result.warnings)
+    assert not [op for op in actual_ops(result) if op.kind in ("add", "replace")]
+
+
 # --------------------------------------------------------------------------- #
 # 4. The warning of a primary provider's hard picks
 # --------------------------------------------------------------------------- #

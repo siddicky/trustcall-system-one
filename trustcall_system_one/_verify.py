@@ -2084,8 +2084,14 @@ def _today_note(ctx: Ctx, spec: FieldSpec) -> str:
 
     The note reads ``Today is Monday, 2026-03-23.``
 
-    Only for a date or datetime field (or a list of them) of an invoke that has a
-    reference date; empty otherwise.
+    Only for a date or datetime field (or a list of them). The day is the invoke's
+    ``Run.today``: its reference date, or the UTC date pinned when it began (so the
+    note is there without a reference date too, and is the date TypeSafe resolved a
+    relative date against). The attribution requests of date fields therefore carry
+    the date in every run, which changes their request keys: a cassette recorded
+    before this note no longer replays those requests strictly, and an invoke without
+    a ``reference_date`` asks a different question each day, so a strict replay needs
+    one (or the cassette has to be recorded again).
 
     A date that the input gives as "yesterday", "three days ago" or "last Tuesday" was
     resolved against the reference date; a question that asks whether the input states
@@ -2096,13 +2102,9 @@ def _today_note(ctx: Ctx, spec: FieldSpec) -> str:
     if clairic is None:
         return ""
     kind = clairic.items if clairic.type == "list" else clairic.type
-    reference = ctx.run.reference_date
-    if kind not in ("date", "datetime") or not reference:
+    if kind not in ("date", "datetime"):
         return ""
-    try:
-        today = date.fromisoformat(reference[:10])
-    except ValueError:
-        return ""
+    today = date.fromisoformat(ctx.run.today)
     return f"Today is {today:%A}, {today.isoformat()}. "
 
 
@@ -2374,6 +2376,16 @@ async def _judge(ctx: Ctx, st: FieldState, answers: dict[str, Answer]) -> None:
     if not _is_list(st):
         p = _p(answers, _attr_id(st, None))
         st.attribution_p = p
+        if p is None and ctx.run.was_refused(
+            ctx.meta("attribution"), _attr_id(st, None)
+        ):
+            # the model declined to answer: that is final, and not asked again
+            st.set_reject(
+                "attribution_missing",
+                "the model refused the attribution question (decisions_refusal)",
+                None,
+            )
+            return
         if p is None:  # no answer is not a pass: check again, in isolation
             await _recheck_scalar(ctx, st)
             return
@@ -2399,6 +2411,11 @@ async def _judge(ctx: Ctx, st: FieldState, answers: dict[str, Answer]) -> None:
         elif answered is not None and answered < verify.attribution_drop:
             keep.append(False)
             _drop(st, index, elements[index], answered, missing=False)
+        elif answered is None and ctx.run.was_refused(
+            ctx.meta("attribution"), _attr_id(st, index)
+        ):  # declined: final, not asked again
+            keep.append(False)
+            _drop(st, index, elements[index], None, missing=True)
         else:  # in the middle band, or unanswered (which is not a pass)
             keep.append(False)
             pending.append(index)

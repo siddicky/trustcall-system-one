@@ -236,6 +236,12 @@ class CallMeta:
     entity: str | None = None
     field: str | None = None
     scope: str = ""
+    today: str | None = dataclasses.field(default=None, compare=False, repr=False)
+    """The ISO date this invoke treats as today (``Run.today``): the reference date, or
+    the UTC date pinned when the invoke started. The engine sets it on Clairic calls;
+    ``TypeSafeTransport`` resolves a date given as "three days ago" against it when the
+    request has no ``reference_date`` (which is never sent just for this: it would
+    change every Clairic request). Not part of the call's identity."""
 
 
 @dataclass(frozen=True)
@@ -2126,7 +2132,8 @@ class TypeSafeTransport(ExperientialTransport):
         Args:
             model: The Clairic or Clef model (full id or bare name).
             payload: The Clairic or Clef request body.
-            meta: Routing context (not sent).
+            meta: Routing context (not sent); ``meta.today`` is the date a relative
+                date is resolved against when the request has no reference date.
             timeout: Per-request timeout in seconds; ``None`` uses the client's.
 
         Returns:
@@ -2145,7 +2152,7 @@ class TypeSafeTransport(ExperientialTransport):
             TransportError: A failure before the request was sent.
             ModelResponseError: A 2xx that is not a valid answer to the questions.
         """
-        del meta  # nothing about the call leaves the process
+        # nothing about the call leaves the process; ``meta.today`` is only read
         try:
             name = body_model(model)
         except ValueError:
@@ -2154,7 +2161,7 @@ class TypeSafeTransport(ExperientialTransport):
             ) from None
         if name != "clairic":
             return await self._clef(payload, timeout)
-        return await self._clairic(payload, timeout)
+        return await self._clairic(payload, timeout, meta.today)
 
     async def _clef(
         self, payload: Mapping[str, Any], timeout: float | None
@@ -2283,7 +2290,10 @@ class TypeSafeTransport(ExperientialTransport):
         return error
 
     async def _clairic(
-        self, payload: Mapping[str, Any], timeout: float | None
+        self,
+        payload: Mapping[str, Any],
+        timeout: float | None,
+        today: str | None = None,
     ) -> TransportResponse:
         started = time.perf_counter()
         stats = RunStats()
@@ -2350,6 +2360,7 @@ class TypeSafeTransport(ExperientialTransport):
                     memo=self._stitch_memo,
                     escalate=self._escalate,
                     model_name=self._model,
+                    pinned=today,
                 ),
                 self._call_deadline,
             )

@@ -1,12 +1,14 @@
 """Per-invoke context: transport calls, usage, call log and warnings."""
 
 import asyncio
+import dataclasses
 import hashlib
 import json
 import re
 import time
 from collections.abc import Awaitable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
 from typing import Any, TypeVar, Union
 
 from trustcall_system_one._config import (
@@ -347,6 +349,8 @@ class Run:
             Each request model validates the documented size limits before it is
             sent.
         reference_date: ISO date Clairic resolves relative dates against.
+        pinned: The UTC date at which the run began: today, for an invoke that gave no
+            reference date (see ``today``).
         strict: Raise instead of returning an invalid record or a truncated state.
         enable_inserts: Whether an item the input mentions that matches none of the
             existing items of a nested list is added to it (a nested list the
@@ -396,6 +400,9 @@ class Run:
     match: MatchConfig = field(default_factory=MatchConfig)
     images: Sequence[Any] | None = None
     reference_date: str | None = None
+    pinned: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).date().isoformat()
+    )
     strict: bool = False
     enable_inserts: bool = False
     enable_item_removals: bool = False
@@ -408,6 +415,7 @@ class Run:
     clef_memo: "dict[str, dict[str, Answer]]" = field(default_factory=dict)
     rejected: set[str] = field(default_factory=set)
     refusals: dict[str, int] = field(default_factory=dict)
+    refused: set[tuple[str, ...]] = field(default_factory=set)
     largest_sent: float = 0.0
     fallback_used: int = 0
     fallback_hard: int = 0
@@ -697,6 +705,43 @@ class Run:
             fallback_from=sent.fallback_from,
         )
 
+    @staticmethod
+    def _refusal_key(meta: CallMeta, qid: str) -> tuple[str, ...]:
+        return (
+            meta.kind,
+            meta.schema,
+            meta.entity or "",
+            meta.scope,
+            meta.field or "",
+            qid,
+        )
+
+    def was_refused(self, meta: CallMeta, qid: str) -> bool:
+        """Whether the model declined this question (a Decisions ``refusal``).
+
+        A refusal is final for the question: it is never asked again in isolation
+        (an unanswered question otherwise gets one more request), and the value it
+        was about is not kept.
+        """
+        return self._refusal_key(meta, qid) in self.refused
+
+    @property
+    def today(self) -> str:
+        """The date this invoke treats as today (ISO).
+
+        The reference date when the invoke gave a valid one, else the UTC date pinned
+        when the run began, so that one invoke uses ONE date: the one TypeSafe
+        resolves "three days ago" against (``CallMeta.today``) and the one the
+        attribution of a date names (``Today is Monday, 2026-03-23.``), even across
+        midnight.
+        """
+        if self.reference_date:
+            try:
+                return date.fromisoformat(self.reference_date[:10]).isoformat()
+            except ValueError:
+                pass
+        return self.pinned
+
     async def call_clairic(
         self,
         fields: Mapping[str, ClairicField],
@@ -732,6 +777,8 @@ class Run:
                 it was logged).
         """
         text = state.text if isinstance(state, RenderedState) else state
+        if meta.today is None:
+            meta = dataclasses.replace(meta, today=self.today)
         request = ClairicRequest(
             model=body_model(self.clairic_model),
             state=text,
@@ -1207,8 +1254,11 @@ class Run:
             provider=sent.provider,
             fallback_from=sent.fallback_from,
         )
-        for note in (response.model_extra or {}).get("decisions_notes", ()):
+        extra = response.model_extra or {}
+        for note in extra.get("decisions_notes", ()):
             self.warn(str(note))
+        for qid in extra.get("decisions_refused", ()):
+            self.refused.add(self._refusal_key(meta, str(qid)))
         wanted = [qid for qid, _ in chunk if qid in response.answers]
         hard = sum(1 for qid in wanted if _is_hard(response.answers[qid]))
         if hard and sent.fallback_from is not None:

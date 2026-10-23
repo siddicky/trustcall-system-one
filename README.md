@@ -1035,8 +1035,11 @@ want a normalised vocabulary, make the field a `Literal` (a Clef choice), not fr
   being replaced by a short form of itself. Discovery does **not** ask for the identifier itself
   (a serial number is not what a sheet calls an aircraft: asked for "mentions by their msn" the
   model listed table cells, and a bare `12345` was refused as an aircraft): it asks for the words
-  that name or describe each entity (its model, type, name or heading), and the qualify question
-  reads "is X an aircraft, or the msn of one?". Table and emphasis markup around a mention
+  that name or describe each entity (its model, type, name or heading; a table cell that does so
+  counts), and the qualify question reads "is X an aircraft, or the msn of one?". If the words find
+  too few, a second pass asks by the msn; an entity called by a bare number that is not its msn (a
+  weight) is dropped (`bare_number_entity_dropped`); an existing record whose msn is written in the
+  input is found without a presence request. Table and emphasis markup around a mention
   (`8547 |`, `**Airbus**`) is stripped. A path that does not exist or does not end at a plain field
   is a `ValueError`.
 - With a table of cells (more than `discovery.screen_above` = 12 mentions found), the mentions of
@@ -1083,7 +1086,7 @@ of it is on by default, and every number is a knob.
 | Change gate, one Clef request per operation | add 0.55, replace 0.6, remove 0.85 | `GateConfig(add_threshold, replace_threshold, remove_threshold)` |
 | Presence gate | absent below 0.2 | `PresenceConfig(threshold_absent, threshold_present)` |
 | Repair loop | on, at most 5 rounds | `RepairConfig(enabled, max_attempts, ...)` |
-| An uncertain attribution after the repair keeps a required text value | auto: on when the text extraction is TypeSafe (Jev), off for every other provider | `RepairConfig(keep_uncertain=None \| True \| False)` |
+| An uncertain attribution after the repair keeps a required text value | auto: on when Jev answers the attribution and the re-ask, off otherwise | `RepairConfig(keep_uncertain=None \| True \| False)` |
 
 ```python
 from trustcall_system_one import (
@@ -1101,13 +1104,15 @@ extractor = create_extractor(  # Contact: the model from the first example
 )
 ```
 
-`keep_uncertain` is `None` ("auto") unless you set it: on when the transport that reads the text
-(`TypeSafeTransport`, or the one a `RoutingTransport`, `KindRoutingTransport` or
-`FieldTypeRoutingTransport` sends the text extraction to) is TypeSafe, off on Cloudflare, Experiential
-Labs and the Decisions API. Jev's attribution of a name or an id is uncalibrated and can land between the
-two bars on a value the input does state; with it on, such a repaired text value stands (noted
-`attribution_uncertain`) instead of the record being lost, and a value the check refutes never does.
-`True` or `False` always wins.
+`keep_uncertain` is `None` ("auto") unless you set it: on only when TypeSafe (Jev) answers the
+attribution question AND the repair re-ask (with a `RoutingTransport`, `KindRoutingTransport` or
+`FieldTypeRoutingTransport`, the transports those calls are routed to), off on Cloudflare,
+Experiential Labs and the Decisions API, and off when Jev reads the text but another provider answers
+the attribution. Jev's attribution of a name or an id is uncalibrated and can land between the two bars
+on a value the input does state; with it on, a repaired text value of a REQUIRED field that the re-ask
+gave again, and that is not nearer to another entity, stands (noted `attribution_uncertain`) instead of
+the record being lost; a value the check refutes never does, and an optional field is never filled
+this way. `True` or `False` always wins.
 
 **These numbers are starting points, not tuned values.** They have been exercised on two small
 live runs of the examples, not measured on a data set; see [Limitations](#limitations).
@@ -1299,7 +1304,10 @@ Read these before relying on it.
   input that both removes a record and changes it was read as a plain change (0.1 for the delete,
   so no `conflict_update_delete`). Compare with the default run before relying on it.
 - **Placeholder text is null.** A plain text field whose answer is `TBA`, `TBD`, `N/A`, `n.a.` or
-  a dash is null (`GateConfig.placeholders`; `GateConfig(placeholders=())` keeps them as values).
+  a double or long dash is null (`GateConfig.placeholders`; `GateConfig(placeholders=())` keeps
+  them as values, `s1_field(placeholders=False)` does for one field). `TBC`, a lone `-` and a
+  lone `?` are not on the list (ambiguous: a result or a status can read `-`); add them to
+  `placeholders` if your data uses them as "no value".
   List elements and Clef-typed fields are not touched. What a schema makes of the *kind* of a value
   (check types that are interval strings) is the schema's business.
 - **Duplicates across spellings.** Two names for one entity that no identity value ties together

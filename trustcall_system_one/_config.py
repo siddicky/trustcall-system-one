@@ -203,15 +203,12 @@ def _check_probability(name: str, value: float) -> None:
 DEFAULT_PLACEHOLDERS: tuple[str, ...] = (
     "tba",
     "tbd",
-    "tbc",
     "n/a",
     "n.a.",
     "n/d",
-    "-",
     "--",
     "\u2013",
     "\u2014",
-    "?",
     "to be advised",
     "to be announced",
     "to be confirmed",
@@ -222,7 +219,11 @@ DEFAULT_PLACEHOLDERS: tuple[str, ...] = (
 """Text values that say "no value yet", not a value (compared without case, markup or
 a closing full stop). ``GateConfig(placeholders=())`` keeps them as values.
 Deliberately short: ``none``, ``unknown`` and ``na`` can be real values (a status, a
-country code)."""
+country code), ``tbc`` is ambiguous (to be confirmed, or "to be continued", or an
+abbreviation) and a lone ``-`` or ``?`` can be a result or a status (a check that
+reads ``-``, a question mark that answers "unknown"), so none of them is listed:
+add them to ``GateConfig(placeholders=...)`` when the data uses them as "no value"
+(``s1_field(placeholders=False)`` keeps ``N/A`` as the value of one field)."""
 
 
 @dataclass(frozen=True)
@@ -246,12 +247,12 @@ class GateConfig:
         remove_threshold: Change-gate probability needed to remove a value.
         allow_null_removals: Whether a null answer may remove an existing value.
         placeholders: Text values that are no value (``DEFAULT_PLACEHOLDERS``: TBA,
-            TBD, N/A, a dash ...). A plain text field whose answer is one of these
-            is null (``"placeholder"`` in the field's warnings), so ``"TBA"`` is
+            TBD, N/A, a double dash ...). A plain text field whose answer is one of
+            these is null (``"placeholder"`` in the field's warnings), so ``"TBA"`` is
             neither kept as a serial number nor put in a record that is updated;
             matching ignores case, markup and a closing full stop. List elements and
             Clef-typed fields are not touched. Pass ``()`` to keep such text as a
-            value.
+            value, or ``s1_field(placeholders=False)`` on one field.
     """
 
     required_null_threshold: float = 0.7
@@ -614,20 +615,24 @@ class RepairConfig:
             ``pattern`` (or another format check) when the input holds text that
             could satisfy it. Clairic only quotes the input, so it cannot
             reformat; without this switch such a field is never asked again.
-        keep_uncertain: A field that is null makes the record invalid; when the
-            repair gets a value for it that the attribution check can neither
-            confirm nor refute (its probability stays between
-            ``verify.attribution_drop`` and ``verify.attribution_keep`` after the
-            second look), the value stands, noted ``attribution_uncertain``,
-            instead of the record being lost with every other field it holds. A
-            value the check refutes (below ``attribution_drop``) never stands. No
-            threshold changes; off, the repair is as strict as the first pass.
-            ``None`` (the default, "auto") follows the extraction transport: on
-            when it is TypeSafe (Jev's attribution of a name or an id is
-            uncalibrated and doubts stated values), off for every other provider
-            (``transport.prefers_keep_uncertain``; a router answers for the
-            transport that does the text extraction). ``True`` or ``False``
-            always wins, whatever the transport.
+        keep_uncertain: A REQUIRED text field (not optional, not nullable) that is
+            null makes the record invalid; when the repair gets the SAME value for
+            it again and the attribution check can neither confirm nor refute it
+            (its probability stays between ``verify.attribution_drop`` and
+            ``verify.attribution_keep`` after the second look), the value stands,
+            noted ``attribution_uncertain``, instead of the record being lost with
+            every other field it holds. A value the check refutes (below
+            ``attribution_drop``), a different value, an optional field (a model
+            validator that implicates it does not make it required) and a value
+            nearer to another entity of the collection than to this one never
+            stand. No threshold changes; off, the repair is as strict as the first
+            pass. ``None`` (the default, "auto") is on only when TypeSafe answers
+            BOTH the attribution question (``clef_model``, kind ``attribution``)
+            and the repair re-ask (``clairic_model``, kinds ``repair`` and
+            ``reask``): Jev's attribution of a name or an id is uncalibrated and
+            doubts stated values, which no other provider does
+            (``transport.prefers_keep_uncertain``; routers answer by model and
+            call kind). ``True`` or ``False`` always wins, whatever the transport.
     """
 
     enabled: bool = True
