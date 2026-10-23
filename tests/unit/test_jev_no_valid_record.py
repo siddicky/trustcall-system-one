@@ -22,7 +22,7 @@ from datetime import date
 from typing import Any, Optional
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 
 from evals.invariants import spans_quote_the_input
 from tests.unit.extract_helpers import Script, ca, make_extractor
@@ -33,11 +33,18 @@ from tests.unit.test_typesafe_transport import (
     clairic_payload,
     make,
 )
-from trustcall_system_one import Many, RepairConfig, TypeSafeConfig, create_extractor
+from trustcall_system_one import (
+    Many,
+    One,
+    RepairConfig,
+    TypeSafeConfig,
+    create_extractor,
+)
 from trustcall_system_one._candidates import structure_pieces
 from trustcall_system_one._collection import parse_mentions
 from trustcall_system_one._dateparts import Part, assemble_date, date_questions
 from trustcall_system_one._entity import _own_span, _proper_noun, _sentence_initial
+from trustcall_system_one._repair import _may_settle
 from trustcall_system_one._structure import build_structure, to_lines
 from trustcall_system_one._typesafe import _apposition
 from trustcall_system_one._wire import ClairicAnswer
@@ -118,7 +125,41 @@ def test_the_pooled_value_beats_a_single_rival_option() -> None:
     answer = sent.body["answers"]["product_name"]
     assert answer["value"] == "Hearthside Maple Granola"
     assert answer["guess"] == "Hearthside Maple Granola"
-    assert answer["confidence"] >= 0.4  # never lower than Jev's own
+    # Jev's 0.4 is its confidence in `190`, the option it chose, not in the product
+    # name: the value that was not chosen has its lead (0.6 against 0.3) only
+    assert answer["confidence"] == pytest.approx(0.3)
+
+
+def _pooled_answer(shares: dict[str, float], p_none: float, conf: float) -> Any:
+    jev = Jev(_spread(shares, p_none=p_none, confidence=conf))
+    sent = clairic(
+        make(jev, config=TypeSafeConfig(verify_selection=False)),
+        clairic_payload(PRODUCT, NUTRITION),
+    )
+    return sent.body["answers"]["product_name"]
+
+
+def test_a_value_jev_did_not_choose_does_not_inherit_its_confidence() -> None:
+    # probe_pool: Jev chose the number (0.35, confidence 0.7); the product name
+    # pools 0.14 x 3 = 0.42 and wins as a value: it must not be certified with 0.7
+    answer = _pooled_answer({"Hearthside Maple Granola": 0.14, "190": 0.35}, 0.02, 0.7)
+    assert answer["value"] == "Hearthside Maple Granola"
+    assert answer["confidence"] < 0.7
+    assert answer["confidence"] == pytest.approx(0.42 - 0.35)
+
+
+def test_a_value_that_overturns_none_does_not_inherit_its_confidence() -> None:
+    # probe_pool: `none` is the likeliest single option (0.3, confidence 0.7); the
+    # product name holds 0.15 x 3 = 0.45 and wins as a value, with its lead only
+    answer = _pooled_answer({"Hearthside Maple Granola": 0.15}, 0.3, 0.7)
+    assert answer["value"] == "Hearthside Maple Granola"
+    assert answer["confidence"] == pytest.approx(0.45 - 0.3)
+
+
+def test_the_pooled_value_that_is_jevs_choice_keeps_its_floor() -> None:
+    # one value in three shapes, chosen: max(Jev's confidence, the lead)
+    answer = _pooled_answer({"Hearthside Maple Granola": 0.3}, 0.02, 0.97)
+    assert answer["confidence"] == pytest.approx(0.97)
 
 
 def test_an_option_that_stands_alone_keeps_jevs_confidence() -> None:
@@ -465,9 +506,118 @@ async def test_a_required_number_is_not_kept_on_an_uncertain_attribution() -> No
     }
     world.reask = {"value": ca("number", 12.5, find="12.5")}
     world.attribution = {"attr.value": [0.5]}
-    result = await make_extractor([Reading], world).ainvoke("Meter M-12 reads 12.5.")
+    # keep_uncertain is explicit: the default is off on a scripted transport, which
+    # would make this test pass without the number exclusion it is about
+    extractor = make_extractor(
+        [Reading], world, repair=RepairConfig(keep_uncertain=True)
+    )
+    result = await extractor.ainvoke("Meter M-12 reads 12.5.")
     (record,) = result.records
     assert not record.valid
+    assert not [w for w in record.fields["value"].warnings if "uncertain" in w]
+
+
+# --------------------------------------------------------------------------- #
+# keep_uncertain stands only for a required field's own value (probe_bleed)
+# --------------------------------------------------------------------------- #
+
+BLEED = "Dana Ruiz joined the call with Mark Lee. Mark's email is mark@lee.example."
+
+
+class ReachableContact(BaseModel):
+    """A contact: Dana."""
+
+    name: str
+    email: Optional[str] = Field(None, description="the contact's email address")
+    phone: Optional[str] = Field(None, description="the contact's phone number")
+
+    @model_validator(mode="after")
+    def reachable(self) -> "ReachableContact":
+        if not (self.email or self.phone):
+            raise ValueError("email or phone is required")
+        return self
+
+
+def _bleed_world(attribution: list[float]) -> Script:
+    world = Script()
+    world.clairic = {
+        "name": ca("text", "Dana Ruiz", find="Dana Ruiz"),
+        "email": ca("text", None, p_null=0.9),
+        "phone": ca("text", None, p_null=0.9),
+    }
+    world.repair = {"email": ca("text", "mark@lee.example", find="mark@lee.example")}
+    world.reask = {"email": ca("text", "mark@lee.example", find="mark@lee.example")}
+    world.attribution = {"attr.email": attribution}
+    return world
+
+
+@pytest.mark.parametrize("keep", [None, False, True])
+async def test_another_persons_email_never_fills_an_optional_field(
+    keep: bool | None,
+) -> None:
+    # Mark's address, attributed 0.5 to Dana, would make Dana "reachable": an
+    # optional field that a model validator implicated is not a lost record
+    world = _bleed_world([0.5])
+    extractor = make_extractor(
+        [One(ReachableContact)], world, repair=RepairConfig(keep_uncertain=keep)
+    )
+    (record,) = (await extractor.ainvoke(BLEED)).records
+    assert record.after is None or record.after.get("email") is None
+    assert not record.valid
+    assert not [w for w in record.fields["email"].warnings if "uncertain" in w]
+
+
+async def test_a_nullable_required_field_is_not_kept() -> None:
+    class Loose(BaseModel):
+        """A note."""
+
+        title: str
+        owner: Optional[str]  # required but nullable: a null is a valid value
+
+    world = Script()
+    world.clairic = {
+        "title": ca("text", "Quarterly plan", find="Quarterly plan"),
+        "owner": ca("text", "Dana Ruiz", find="Dana Ruiz", confidence=0.63),
+    }
+    world.reask = {"owner": ca("text", "Dana Ruiz", find="Dana Ruiz")}
+    world.attribution = {"attr.owner": [0.44, 0.46]}
+    extractor = make_extractor(
+        [One(Loose)], world, repair=RepairConfig(keep_uncertain=True)
+    )
+    (record,) = (await extractor.ainvoke("Quarterly plan, owner Dana Ruiz.")).records
+    assert record.valid
+    assert record.after is not None and record.after["owner"] is None
+
+
+def _settling(
+    own: list[tuple[int, int]],
+    others: list[tuple[int, int]],
+    span: tuple[int, int] | None,
+    *,
+    first: str = "x",
+    value: str = "x",
+) -> bool:
+    from types import SimpleNamespace
+
+    ctx = SimpleNamespace(mention_spans=lambda: own, others=tuple(others + own))
+    spec = SimpleNamespace(
+        required=True, nullable=False, clairic=SimpleNamespace(type="text")
+    )
+    target = SimpleNamespace(previous=None, first=first)
+    resolved = SimpleNamespace(value=value, span=span)
+    return _may_settle(ctx, spec, target, resolved)  # type: ignore[arg-type]
+
+
+def test_a_value_inside_or_nearer_to_another_entity_is_not_kept() -> None:
+    own, other = [(0, 9)], [(40, 49)]
+    assert _settling(own, other, (12, 20))  # nearer to its own mention
+    assert not _settling(own, other, (41, 45))  # inside the other entity's mention
+    assert not _settling(own, other, (30, 38))  # nearer to the other's than its own
+    assert not _settling(own, other, None)  # whose it is cannot be told
+    assert _settling(own, [], None)  # a lone entity: nothing to bleed from
+    assert not _settling(own, other, (12, 20), first="x", value="y")  # a new guess
+    assert not _settling([], other, (41, 45))
+    assert _settling([], other, (0, 5))
 
 
 # --------------------------------------------------------------------------- #

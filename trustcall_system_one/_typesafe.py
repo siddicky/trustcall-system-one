@@ -1361,8 +1361,15 @@ def _finish(
         if pick.shapes > 1:
             # one value offered in several shapes: its odds are the sum of theirs and
             # its confidence is its lead over the best DIFFERENT answer (`none` too)
-            lead = pick.held - pick.rival
-            out["confidence"] = max(answer.confidence, lead)
+            # Jev's own confidence is about ITS choice: it is kept (as a floor) only
+            # when the pooled value is that choice; a value that Jev did not choose
+            # (a rival option, or `none`, was the single likeliest) has its lead only.
+            lead = max(0.0, pick.held - pick.rival)
+            chosen = next((c for c in options if _lookup(c) == answer.choice), None)
+            is_choice = (
+                chosen is not None and top is not None and _same(chosen) == _same(top)
+            )
+            out["confidence"] = max(answer.confidence, lead) if is_choice else lead
         if top is not None:
             out["guess"] = top.value
         # Jev's own choice of `none` is "not stated", whatever the threshold; the

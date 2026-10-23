@@ -2474,7 +2474,8 @@ async def _recheck_scalar(ctx: Ctx, st: FieldState) -> None:
         # neither confirmed nor refuted, and a null here loses the whole record
         _adopt(st, checked)
         st.notes.append(
-            f"attribution_uncertain: p={p:.2f} (kept: the field is required)"
+            f"attribution_uncertain: p={p:.2f} (kept: a required field, the same "
+            "value twice)"
         )
     else:
         st.set_reject(

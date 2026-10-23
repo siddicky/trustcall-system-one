@@ -1916,8 +1916,14 @@ async def _finish_insert(
             if leaf is None:
                 return None
             kind = leaf.state.type_answer if leaf.state is not None else None
+            first = leaf.state.resolved.value if leaf.state is not None else None
             return Target(
-                hit, leaf.spec, leaf.final(), kind, sentences=_by_sentences(leaf)
+                hit,
+                leaf.spec,
+                leaf.final(),
+                type_answer=kind,
+                sentences=_by_sentences(leaf),
+                first=first,
             )
 
         async def apply(outcomes: list[Outcome]) -> None:
