@@ -14,7 +14,7 @@ This library turns those probabilities into validated pydantic objects, and turn
 code and checked one by one**, so a field the text never mentions is never touched.
 
 It is a reimplementation of the ideas of [trustcall](https://github.com/hinthornw/trustcall)
-(see [Credits](#credits)) with no LangChain or LangGraph. Status: alpha (`0.1.0a1`),
+(see [Credits](#credits)) with no LangChain or LangGraph. Status: alpha (`0.1.0a2`),
 the API may still move.
 
 On this page: [quickstart](#quickstart) · [raw calls vs the library](#without-the-library-vs-with-the-library) ·
