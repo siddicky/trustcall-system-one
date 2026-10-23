@@ -30,6 +30,7 @@ from trustcall_system_one._config import (
     ConcurrencyConfig,
     CorefConfig,
     DiscoveryConfig,
+    EscalationConfig,
     GateConfig,
     Limits,
     MatchConfig,
@@ -66,6 +67,7 @@ from trustcall_system_one.transport import (
     clef_fallback_from_env,
     clef_fallback_on_from_env,
     clef_provider_from_env,
+    escalation_from_env,
     provider_from_env,
     system_one_transport,
 )
@@ -108,6 +110,31 @@ def _close_at_exit(ref: "weakref.ReferenceType[_Core]") -> None:
             core.close()
 
 
+class _Closing:
+    """Two owned transports (the main one and the escalation's) closed as one."""
+
+    def __init__(self, *members: Any) -> None:
+        self._members = members
+
+    async def aclose(self) -> None:
+        for member in self._members:
+            with contextlib.suppress(Exception):
+                await member.aclose()
+
+    def close(self) -> None:
+        for member in self._members:
+            with contextlib.suppress(Exception):
+                member.close()
+
+
+def _closing(*members: Any) -> Any:
+    """What to close: nothing, the one transport, or both."""
+    held = [m for m in members if m is not None]
+    if len(held) > 1:
+        return _Closing(*held)
+    return held[0] if held else None
+
+
 class _Core:
     """Shared by an extractor and its ``with_options`` copies.
 
@@ -128,11 +155,13 @@ class _Core:
             clef_provider_from_env()
             clef_fallback_from_env()
             clef_fallback_on_from_env()
+            escalation_from_env()
         self._given = transport
         self._concurrency = concurrency
         self._owned: (
             CloudflareTransport | RoutingTransport | TypeSafeTransport | None
         ) = None
+        self._owned_escalation: Transport | None = None
         self._lock = threading.RLock()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
@@ -162,6 +191,36 @@ class _Core:
                         concurrency=self._concurrency,
                     )
             return self._owned
+
+    def escalation(self, explicit: EscalationConfig | None) -> EscalationConfig | None:
+        """The escalation tier of an invoke, with its transport, or ``None`` (off).
+
+        Chosen explicitly: ``create_extractor(escalation=...)``, else the tier the
+        transport carries (``system_one_transport(escalate="openai")``), else, for the
+        default transport only, ``TRUSTCALL_S1_ESCALATE=openai``. A key in the
+        environment never selects it. An enabled tier without a transport gets an
+        ``OpenAIResponsesTransport`` (owned, closed with this core).
+        """
+        config = explicit
+        if config is None:
+            config = getattr(self._given, "escalation", None)
+        if config is None and self._given is None:
+            config = escalation_from_env()
+        if config is None or not config.enabled:
+            return None
+        if config.transport is not None:
+            return config
+        with self._lock:
+            if self._owned_escalation is None:
+                from trustcall_system_one.openai_transport import (
+                    OpenAIResponsesTransport,
+                )
+
+                self._owned_escalation = OpenAIResponsesTransport(
+                    reasoning_effort=config.reasoning_effort or "none",
+                    concurrency=self._concurrency,
+                )
+            return dataclasses.replace(config, transport=self._owned_escalation)
 
     # -- the bridge loop --------------------------------------------------- #
 
@@ -277,6 +336,8 @@ class _Core:
         loop, thread = self._take_loop()
         with self._lock:
             owned, self._owned = self._owned, None
+            extra, self._owned_escalation = self._owned_escalation, None
+        owned = _closing(owned, extra)
         if loop is not None and thread is not None and not loop.is_closed():
             if threading.current_thread() is thread:
                 if owned is None:
@@ -302,6 +363,8 @@ class _Core:
         loop, thread = self._take_loop()
         with self._lock:
             owned, self._owned = self._owned, None
+            extra, self._owned_escalation = self._owned_escalation, None
+        owned = _closing(owned, extra)
         if owned is not None:
             with contextlib.suppress(Exception):
                 await owned.aclose()
@@ -425,6 +488,7 @@ class Extractor:
         prices: Input-token prices used for ``ExtractionResult.cost``.
         reference_date: Default date relative dates are resolved against.
         strict: Raise on a terminal validation failure.
+        escalation: The opt-in escalation tier (see ``create_extractor``).
     """
 
     schemas: tuple[Any, ...]
@@ -450,6 +514,7 @@ class Extractor:
     prices: Prices = field(default_factory=Prices)
     reference_date: date | str | None = None
     strict: bool = False
+    escalation: EscalationConfig | None = None
     _core: _Core | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -467,6 +532,18 @@ class Extractor:
                 f"{self.existing_schema_policy!r}"
             )
         _iso_date(self.reference_date)
+        if self.escalation is not None and self.escalation.enabled:
+            cap = self.escalation.prob_cap
+            for name, bar in (
+                ("gates.remove_threshold", self.gates.remove_threshold),
+                ("match.delete_threshold", self.match.delete_threshold),
+            ):
+                if cap >= bar:
+                    raise ValueError(
+                        f"escalation.prob_cap ({cap}) must stay below {name} ({bar}): "
+                        "an answer of the escalation tier must never authorise a "
+                        "removal or a delete"
+                    )
         names: list[str] = []
         for item in self.schemas:
             plan = self.plan_for(_inner(item))
@@ -486,6 +563,20 @@ class Extractor:
         """The shared transport and bridge holder."""
         assert self._core is not None
         return self._core
+
+    def _escalation_for_run(self) -> EscalationConfig:
+        """The escalation tier this invoke runs with (a disabled one when off)."""
+        config = self.core.escalation(self.escalation)
+        if config is None:
+            return EscalationConfig()
+        cap = config.prob_cap
+        if cap >= self.gates.remove_threshold or cap >= self.match.delete_threshold:
+            raise ValueError(
+                f"escalation.prob_cap ({cap}) must stay below gates.remove_threshold "
+                f"({self.gates.remove_threshold}) and match.delete_threshold "
+                f"({self.match.delete_threshold})"
+            )
+        return config
 
     def plan_for(self, schema: SchemaLike | One | Many) -> SchemaPlan:
         """Return the compiled plan for a schema (cached).
@@ -653,6 +744,7 @@ class Extractor:
             strict=self.strict,
             enable_inserts=self.enable_inserts,
             enable_item_removals=self.enable_item_removals,
+            escalation=self._escalation_for_run(),
         )
         for warning in records.warnings:
             run.warn(warning)
@@ -1141,6 +1233,7 @@ def create_extractor(
     prices: Prices | None = None,
     reference_date: date | str | None = None,
     strict: bool = False,
+    escalation: EscalationConfig | None = None,
 ) -> Extractor:
     """Create an extractor for one or more schemas.
 
@@ -1182,6 +1275,13 @@ def create_extractor(
         reference_date: Default date relative dates are resolved against.
         strict: Raise ``ExtractionValidationError`` (or ``StateTruncatedError``)
             instead of returning an invalid record (or a warning).
+        escalation: The opt-in escalation tier (``EscalationConfig``): the few cases
+            the default setup fails are asked of ``gpt-6-luna`` through the OpenAI
+            Responses API, **which sends their text to OpenAI**. Off unless it is
+            passed enabled here, carried by the transport
+            (``system_one_transport(escalate="openai")``) or, with the default
+            transport, ``TRUSTCALL_S1_ESCALATE=openai``; an ``OPENAI_API_KEY`` alone
+            never turns it on.
 
     Returns:
         The extractor.
@@ -1216,4 +1316,5 @@ def create_extractor(
         prices=prices or Prices(),
         reference_date=reference_date,
         strict=strict,
+        escalation=escalation,
     )

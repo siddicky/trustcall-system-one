@@ -62,6 +62,8 @@ _TYPESAFE = "typesafe"
 __all__ = [
     "CassetteMissError",
     "CassetteTransport",
+    "EscalationHandler",
+    "FakeEscalation",
     "FakeTransport",
     "FakeWorld",
     "RecordingTransport",
@@ -86,6 +88,9 @@ Handler = Callable[
 
 
 _FULL_IDS = (CLAIRIC, CLEF, CLEF_FLASH)
+
+EscalationHandler = Callable[[dict[str, Any], CallMeta], "dict[str, Any] | None"]
+"""``handler(payload, meta)`` of a ``FakeEscalation``: the JSON the model writes."""
 
 
 def route(*, default: Handler | None = None, **by_kind: Handler) -> Handler:
@@ -283,6 +288,102 @@ class FakeTransport:
             retries=0,
             duration_ms=(time.perf_counter() - started) * 1000,
             status_code=200,
+        )
+
+
+class FakeEscalation:
+    """A scripted stand-in for the escalation model (``OpenAIResponsesTransport``).
+
+    It answers the escalation tier's calls from ``handler(payload, meta)``, which
+    returns the JSON object the model would write (``None``: the model gave no
+    answer). Like the real transport it takes a payload with ``input`` and ``schema``
+    and checks that an answer has exactly the keys of the schema (strict mode). The
+    default handler never answers, so an escalation configured with it changes
+    nothing.
+
+    Attributes:
+        calls: Every ``(model, payload, meta)`` seen, in order.
+        model: The model it stands for (``gpt-6-luna``).
+        provider: ``openai``.
+    """
+
+    provider = "openai"
+    max_questions = 8
+    state_token_budget = 100_000
+
+    def __init__(
+        self,
+        handler: EscalationHandler | None = None,
+        *,
+        model: str = "gpt-6-luna",
+        reasoning_tokens: int | Mapping[str, int] = 0,
+    ) -> None:
+        """Create the stand-in.
+
+        Args:
+            handler: ``handler(payload, meta)``: the JSON the model writes, or
+                ``None`` for no answer (the default: it never answers).
+            model: The model it stands for.
+            reasoning_tokens: The reasoning tokens each call reports (part of its
+                output tokens): a number, or a mapping from the call's
+                ``reasoning_effort`` to one (0 for an effort not listed).
+        """
+        self._handler = handler
+        self.model = model
+        self._reasoning = reasoning_tokens
+        self.calls: list[tuple[str, dict[str, Any], CallMeta]] = []
+
+    def serves(self, model: str, payload: Mapping[str, Any] | None = None) -> bool:
+        """Whether this stands in for ``model``: not Clairic and not Clef."""
+        return model not in ("clairic", "clef", "clef-flash", *_FULL_IDS)
+
+    async def run(
+        self,
+        model: str,
+        payload: Mapping[str, Any],
+        *,
+        meta: CallMeta,
+        timeout: float | None = None,
+    ) -> TransportResponse:
+        """Answer one escalation call (see the class docstring)."""
+        body = json.loads(json.dumps(payload, allow_nan=False))
+        self.calls.append((model, body, meta))
+        if meta.kind != "escalate":
+            raise AssertionError(f"FakeEscalation got a {meta.kind!r} call")
+        schema = body.get("schema")
+        if not isinstance(schema, dict) or not isinstance(body.get("input"), str):
+            raise AssertionError("an escalation payload needs 'input' and 'schema'")
+        answer = self._handler(body, meta) if self._handler is not None else None
+        if answer is not None and set(answer) != set(schema.get("properties", {})):
+            raise AssertionError(
+                f"the answer's keys {sorted(answer)} are not the schema's "
+                f"{sorted(schema.get('properties', {}))} (strict mode)"
+            )
+        reasoning = (
+            self._reasoning
+            if isinstance(self._reasoning, int)
+            else self._reasoning.get(str(body.get("reasoning_effort") or "none"), 0)
+        )
+        reply = {
+            "model": model,
+            "status": "completed",
+            "parsed": answer,
+            "text": None if answer is None else json.dumps(answer),
+            "refusal": None,
+            "no_answer": None if answer is not None else "scripted: no answer",
+            "logprobs": None,
+            "usage": {
+                "input_tokens": 10 + len(body["input"]) // 4,
+                "output_tokens": 5 + reasoning,
+                "reasoning_tokens": reasoning,
+            },
+        }
+        return TransportResponse(
+            body=reply,
+            status_code=200,
+            duration_ms=1.0,
+            provider="openai",
+            served_model=model,
         )
 
 
@@ -2124,6 +2225,7 @@ _SECRET_ENV = (
     "CLOUDFLARE_AUTH_TOKEN",
     "EXPERIENTIAL_API_KEY",
     "TYPESAFE_API_KEY",
+    "OPENAI_API_KEY",
 )
 _REDACTED = "<redacted>"
 _MIN_SECRET = 16
@@ -2172,6 +2274,7 @@ _GATEWAY_PATH = re.compile(
 )
 _EXPERIENTIAL_KEY = re.compile(r"\bxpl_[A-Za-z0-9_-]{16,}")
 _TYPESAFE_KEY = re.compile(r"\bapikey_[A-Za-z0-9_-]{16,}")
+_OPENAI_KEY = re.compile(r"\bsk-[A-Za-z0-9_-]{16,}")
 _ACCOUNT_ID = re.compile(r"(?<=accounts/)[0-9a-fA-F]{32}(?![0-9A-Za-z])")
 _BEARER_HEADER = re.compile(
     r"(?i)(authorization[\"']?\s*[:=]\s*[\"']?)bearer\s+[^\s\"',}]+"
@@ -2186,10 +2289,12 @@ def scrub(text: str, extra: Iterable[str] = ()) -> str:
 
     For error messages, reports and other text that is not replayed as data: the
     exact values of the Cloudflare environment variables, of
-    ``EXPERIENTIAL_API_KEY``, ``TYPESAFE_API_KEY`` and of ``extra`` (for example
+    ``EXPERIENTIAL_API_KEY``, ``TYPESAFE_API_KEY``, ``OPENAI_API_KEY`` and of
+    ``extra`` (for example
     ``CloudflareTransport.sensitive_values()`` or
     ``ExperientialTransport.sensitive_values()`` or ``TypeSafeTransport``), any
-    ``xpl_`` Experiential Labs key, any ``apikey_`` TypeSafe key, the account id in a
+    ``xpl_`` Experiential Labs key, any ``apikey_`` TypeSafe key, any ``sk-`` OpenAI key
+    (``sk-proj-...`` too), the account id in a
     Cloudflare API URL (``api.cloudflare.com/client/v4/accounts/<id>``), an AI
     Gateway URL (``gateway.ai.cloudflare.com/v1/<id>/``) or an ``accounts/<32 hex
     characters>`` path, and the bearer token of an ``Authorization`` header (or a
@@ -2216,6 +2321,7 @@ def scrub(text: str, extra: Iterable[str] = ()) -> str:
     text = _ACCOUNT_ID.sub(_REDACTED, text)
     text = _EXPERIENTIAL_KEY.sub(_REDACTED, text)
     text = _TYPESAFE_KEY.sub(_REDACTED, text)
+    text = _OPENAI_KEY.sub(_REDACTED, text)
     text = _BEARER_HEADER.sub(rf"\1Bearer {_REDACTED}", text)
     return _BEARER_TOKEN.sub(f"Bearer {_REDACTED}", text)
 

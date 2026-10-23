@@ -806,6 +806,54 @@ on the holdout). The building blocks are public too: `KindRoutingTransport({"att
 `CalibratedTransport(inner, {"attribution": 0.5})`. See [`docs/DESIGN.md`](https://github.com/siddicky/trustcall-system-one/blob/main/docs/DESIGN.md)
 ("Mixing providers per call kind and field type") for the rules.
 
+### Escalation tier: `gpt-6-luna` for the cases the default fails (opt-in, text goes to OpenAI)
+
+Clairic and Clef fail a few kinds of cases that a stronger model gets right: a relative date
+("three days ago", "last Tuesday") that leaves a required date invalid, the rows of a nested list
+(a markdown table whose rows come out empty or with one row filled), an attribution that lands between
+0.4 and 0.75 and drops a correct value, and a `Many` with a dotted identity that finds nothing. The
+escalation tier asks OpenAI's `gpt-6-luna` (Responses API, strict JSON, `reasoning.effort` `none` unless
+you say otherwise) about exactly those cases.
+
+**This sends the text of those cases to OpenAI (`store: false` is set, so OpenAI is asked not to keep
+it). It is off by default and opt-in: an `OPENAI_API_KEY` in the environment never turns it on.** Turn it on
+by naming it:
+
+```python
+from trustcall_system_one import (
+    EscalationConfig,
+    OpenAIResponsesTransport,
+    create_extractor,
+)
+
+extractor = create_extractor(
+    [Contract],
+    reference_date="2026-10-23",
+    escalation=EscalationConfig(
+        enabled=True, reasoning_effort="low"
+    ),  # key: OPENAI_API_KEY
+    # or: transport=system_one_transport(escalate="openai"),
+    # or, with the default transport: TRUSTCALL_S1_ESCALATE=openai
+)
+```
+
+What it can and cannot do: everything it says is a *proposal*. A quoted value must occur verbatim in the
+input, a date must parse and be what its phrase can mean, and the result goes through the usual
+verification ladder and change gates. It never writes, deletes or overrides a confident Clef answer; an
+answer of the tier counts at most `prob_cap` (0.8), below the removal and delete gates (0.85), so it can
+keep a value or pass an add or a replace, never remove or delete. `max_calls_per_invoke` (20) and per-kind
+limits bound the calls; each is a `CallRecord` of kind `escalate` (`CallRecord.field` starts with the
+kind) with its tokens (reasoning tokens included in the output tokens) and latency, and a warning says
+what it did. A call that fails leaves the default result (with a warning); a rejected key raises. There
+is no default price: pass `Prices(per_million_input=..., per_million_output=...)` for a cost. Without the
+tier, relative phrases that name one date (`yesterday`, `3 days ago`, `in two weeks`) are still read in
+code against `reference_date`; `last Tuesday` is not (it can mean two dates), and is the tier's.
+
+`python -m evals run --escalate openai [--escalate-effort low]` and `evals search --order escalate.effort`
+compare the tier's efforts (cost and latency per effort in the leaderboard); see
+[`docs/LIVE_RUNBOOK.md`](https://github.com/siddicky/trustcall-system-one/blob/main/docs/LIVE_RUNBOOK.md)
+section 4g and "Escalation tier (gpt-6-luna)" in [`docs/DESIGN.md`](https://github.com/siddicky/trustcall-system-one/blob/main/docs/DESIGN.md).
+
 ## Extract one record
 
 Schemas are plain pydantic models (also `TypedDict`s, JSON Schemas or annotated
@@ -1006,7 +1054,7 @@ The schema compiler decides which model is asked, and how, from the annotation:
 | --- | --- |
 | `str` | Clairic `text` |
 | `int`, `float`, `Decimal` | Clairic `number` |
-| `date`, `time`, `datetime` | Clairic date, time, datetime (`reference_date=` anchors relative dates) |
+| `date`, `time`, `datetime` | Clairic date, time, datetime (`reference_date=` anchors dates written without a year; "yesterday" and "three days ago" are resolved against it in code, see below) |
 | `timedelta` | Clairic `duration` |
 | `list[str \| int \| float \| date]`, `tuple[X, ...]`, `set`, `frozenset` | Clairic `list`; spans stay aligned to the surviving elements |
 | `bool` | Clef `noul`, abstains within 0.5 +/- 0.15; `Optional[bool]` is a `choice` of yes, no, unstated |

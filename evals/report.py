@@ -81,6 +81,15 @@ def suite_markdown(suite: SuiteResult) -> str:
             if suite.clef_provider
             else []
         ),
+        *(
+            [
+                f"Escalation tier: {suite.escalation} (the text of the cases the "
+                "default setup fails goes to OpenAI)",
+                "",
+            ]
+            if suite.escalation
+            else []
+        ),
         f"Overrides: `{dict(suite.overrides)}`"
         if suite.overrides
         else "Overrides: none",
@@ -128,6 +137,15 @@ def suite_markdown(suite: SuiteResult) -> str:
         ]
     if agg["reported_cost_usd"]:
         lines += ["", f"Cost reported by the provider: ${agg['reported_cost_usd']:.6f}"]
+    if suite.escalation:
+        lines += [
+            "",
+            f"Escalation calls: {agg['escalation_calls']} "
+            f"({agg['escalation_failed']} failed), tokens in/out "
+            f"{agg['escalation_input_tokens']}/{agg['escalation_output_tokens']} "
+            f"(reasoning {agg['escalation_reasoning_tokens']}), mean latency "
+            f"{agg['escalation_mean_latency_ms']:.0f} ms",
+        ]
     if suite.mode == "offline":
         lines += [
             "",
@@ -157,6 +175,7 @@ def combo_record(suite: SuiteResult) -> dict[str, Any] | None:
             **spec.labels,
             "extraction": suite.extraction,
             "decisions": suite.decisions,
+            **({"escalation": suite.escalation} if suite.escalation else {}),
         },
         "companies": list(spec.companies()),
     }
@@ -173,6 +192,8 @@ def write_suite(suite: SuiteResult, out: Path) -> tuple[Path, Path]:
         "decisions": suite.decisions,
         "clef_provider": suite.clef_provider,
         "clef_fallback": suite.clef_fallback,
+        "escalation": suite.escalation,
+        "escalate_effort": suite.escalate_effort,
         "suite": suite.suite,
         "tag": suite.tag,
         "replay": suite.replay,

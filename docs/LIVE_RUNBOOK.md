@@ -400,6 +400,52 @@ leaderboard. An improvement has to beat the incumbent by `--min-margin` (default
 Hand back `leaderboard.md`, `best.json` and the holdout result of the winner (its directory is named
 `...-holdout-...`).
 
+## 4g. Escalation tier (gpt-6-luna): with and without
+
+**Opt-in, and it sends the text of the cases the default setup fails to OpenAI.** Needs
+`OPENAI_API_KEY` in the environment (the error names the variable, never a value); a key alone changes
+nothing. Offline (no flag needed to be safe) the tier is a stand-in that never answers, so offline runs
+are unchanged. Run the same suite twice, with and without, on the same recorded Cloudflare answers:
+
+```bash
+export OPENAI_API_KEY=...   # from the environment only; never in a file or a command line
+
+# 1. the default setup, recorded (Cloudflare Clairic + Clef)
+uv run python -m evals run --suite holdout --live --record evals/cassettes/esc-base \
+    --out evals/results/holdout-no-escalation
+# 2. the same cases with the tier: Cloudflare is replayed, only the tier's calls (and what
+#    the tier changed) go live
+uv run python -m evals run --suite holdout --live --replay evals/cassettes/esc-base \
+    --record evals/cassettes/esc-low --escalate openai --escalate-effort low \
+    --out evals/results/holdout-escalate-low
+# one case, to read what was asked (the call log has the kind "escalate", field "relative_dates:<field>")
+uv run python -m evals run --suite holdout --cases CASE_ID --live --escalate openai --out /tmp/one
+```
+
+Compare the efforts on the dev suite (never on the holdout: a search chooses by score), with the cost
+and latency of each in the leaderboard (`esc calls`, `esc reasoning tok`, `esc ms/call`; reasoning
+tokens are output tokens, so give the output price):
+
+```bash
+cat > escalate.json <<'EOF'
+{"name": "escalate", "escalate": {"provider": "openai", "model": "gpt-6-luna", "reasoning_effort": "none"}}
+EOF
+uv run python -m evals search --base escalate.json --live --order escalate.effort \
+    --price cloudflare=P:P --price openai=IN:OUT --max-runs 8 --budget-usd 10 \
+    --record evals/cassettes --out evals/results/search-effort   # none (base), low, medium, high
+# the winner, once, on the holdout
+uv run python -m evals combo --spec evals/results/search-effort/best.json --suite holdout --live \
+    --out evals/results/holdout-escalate-best
+```
+
+Read, per effort: passed cases (the margin is one case or 0.02 F1, and a rise in bleed or wrong deletes
+is a veto), `escalation_calls`, the calls that failed, `escalation_reasoning_tokens`,
+`escalation_mean_latency_ms` and the estimated cost. A timeout is an uncertain outcome (the call may have
+been charged) and is never sent again; a higher effort has a longer read timeout (60 s at `none` up to
+900 s at `max`). In each run, check the `escalation:` warnings (one per use: kind, schema and field, no
+text), `escalation_failed` / `escalation_no_answer` (what the default result stood in for), and that no
+record lost a value or a row it had without the tier (the tier only adds proposals that pass the ladder).
+
 ## 5. What to hand back
 
 1. The commit hash, the date, and whether the working tree was clean.
@@ -413,6 +459,9 @@ Hand back `leaderboard.md`, `best.json` and the holdout result of the winner (it
    saved example.
 7. The paths of `evals/results/*` and `evals/cassettes/` (not committed) and of
    `tests/recorded/smoke_*.jsonl`.
-8. Anything that surprised you: an HTTP error, a rate limit, a warning that appears in every run,
+8. If the escalation tier ran (section 4g): the effort(s), the `escalation:` warnings, the calls that failed
+   and their messages and request ids, reasoning tokens and mean latency per effort, and the cases
+   that changed against the run without it.
+9. Anything that surprised you: an HTTP error, a rate limit, a warning that appears in every run,
    a request count far from the offline one (offline: `uv run python -m evals run`, 190 requests for
    the 24 cases).

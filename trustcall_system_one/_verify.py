@@ -48,6 +48,7 @@ from trustcall_system_one._compile import (
 )
 from trustcall_system_one._coref import has_context
 from trustcall_system_one._errors import StateTruncatedError
+from trustcall_system_one._escalate import tiebreak
 from trustcall_system_one._render import (
     Focus,
     RenderedState,
@@ -1148,6 +1149,10 @@ class FieldState:
             is invalid without it (``RepairConfig.keep_uncertain``): a value whose
             attribution stays between the drop and the keep bar after the second
             look stands.
+        escalated: The escalation kind that proposed the value (``relative_dates``,
+            ``list_rows``), empty for an answer of the default setup. There is no
+            Clairic reading to cross-check it against, and no tie-break to ask the
+            model that proposed it: the attribution check (Clef) has to agree.
     """
 
     spec: FieldSpec
@@ -1164,6 +1169,7 @@ class FieldState:
     crosscheck_agree: bool | None = None
     sentences: bool = False
     settle: bool = False
+    escalated: str = ""
 
     @property
     def value(self) -> Any:
@@ -1214,6 +1220,16 @@ def _code(reason: str | None) -> str:
     return reason if reason in _SHORT_CODES else "unparseable"
 
 
+def _reference_day(run: Run) -> date | None:
+    """The invoke's reference date as a ``date`` (``None`` without one)."""
+    if not run.reference_date:
+        return None
+    try:
+        return date.fromisoformat(run.reference_date[:10])
+    except ValueError:
+        return None
+
+
 async def resolve(
     ctx: Ctx,
     spec: FieldSpec,
@@ -1254,7 +1270,7 @@ async def resolve(
         coerced = coerce_union(spec, answer, type_answer, gates)
         raw = {"text": answer.value, "type": type_answer.choice}
     else:
-        coerced = coerce(spec, answer, gates)
+        coerced = coerce(spec, answer, gates, today=_reference_day(ctx.run))
     notes: list[str] = []
     echo_lost: list[tuple[int, str, str]] = []
     if coerced.ok and rendered is not None and rendered.existing_span is not None:
@@ -2470,6 +2486,17 @@ async def _recheck_scalar(ctx: Ctx, st: FieldState) -> None:
         )
     elif p >= verify.attribution_keep:
         _adopt(st, checked)
+    elif p >= verify.attribution_drop and (
+        broken := await _tiebreak_scalar(ctx, st, checked, p)
+    ):
+        if broken >= verify.attribution_keep:
+            _adopt(st, checked)
+        else:
+            st.set_reject(
+                "attribution",
+                "the escalation model says the input does not state it either",
+                broken,
+            )
     elif st.settle and p >= verify.attribution_drop:
         # neither confirmed nor refuted, and a null here loses the whole record
         _adopt(st, checked)
@@ -2481,6 +2508,31 @@ async def _recheck_scalar(ctx: Ctx, st: FieldState) -> None:
         st.set_reject(
             "attribution", "still not stated about the entity after a re-ask", p
         )
+
+
+async def _tiebreak_scalar(
+    ctx: Ctx, st: FieldState, checked: Resolved, p: float
+) -> float | None:
+    """The escalation tier's answer to an attribution the second look left in the band.
+
+    ``None`` when the tier is off, out of calls, failed or has nothing to say (the
+    value's fate is then what it was without the tier). Never for a removal: the
+    probability it returns is at most ``prob_cap``, below every removal gate.
+    """
+    if not ctx.run.escalation.runs("attribution_tiebreak"):
+        return None
+    question = _attribution_question(
+        st.spec.scoped,
+        checked.value,
+        element=False,
+        ask_for=requestable(st.spec, ctx.plan),
+        today=_today_note(ctx, st.spec),
+    )
+    q = await tiebreak(ctx, st, str(question.instructions), span=checked.span)
+    if q is not None:
+        st.attribution_p = q
+        st.notes.append(f"attribution_tiebreak: clef {p:.2f} -> escalation {q:.2f}")
+    return q
 
 
 async def _recheck_elements(
@@ -2537,6 +2589,22 @@ async def _recheck_elements(
         p = _p(answers, _attr_id(st, index))
         if p is not None:
             probabilities[index] = p
+        if p is not None and verify.attribution_drop <= p < verify.attribution_keep:
+            asked = await tiebreak(
+                ctx,
+                st,
+                _attribution_question(
+                    st.spec.scoped,
+                    value,
+                    element=True,
+                    today=_today_note(ctx, st.spec),
+                ).instructions,
+                span=candidates[index][1],
+                detail=f"[{index}]",
+            )
+            if asked is not None:
+                st.notes.append(f"attribution_tiebreak: clef {p:.2f} -> {asked:.2f}")
+                p = probabilities[index] = asked
         if p is not None and p >= verify.attribution_keep:
             keep[index] = True
             elements[index] = value
@@ -2727,7 +2795,7 @@ async def crosscheck(
     lookup = new_elements or {}
 
     async def one(st: FieldState) -> None:
-        if st.sentences:  # read from the input alone: nothing to check against
+        if st.sentences or st.escalated:  # no Clairic reading to check against
             st.crosscheck_agree = True
         elif _is_list(st):
             _cross_list(st, lookup.get(st.spec.wire_name))

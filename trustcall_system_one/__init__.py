@@ -16,6 +16,7 @@ from trustcall_system_one._config import (
     CorefConfig,
     CostReport,
     DiscoveryConfig,
+    EscalationConfig,
     GateConfig,
     Limits,
     MatchConfig,
@@ -60,6 +61,7 @@ from trustcall_system_one._types import (
 )
 from trustcall_system_one._version import __version__
 from trustcall_system_one._wire import CLAIRIC, CLEF, CLEF_FLASH
+from trustcall_system_one.openai_transport import OpenAIResponsesTransport
 from trustcall_system_one.transport import (
     CalibratedTransport,
     CallMeta,
@@ -79,6 +81,7 @@ from trustcall_system_one.transport import (
     clef_fallback_from_env,
     clef_fallback_on_from_env,
     clef_provider_from_env,
+    escalation_from_env,
     provider_from_env,
     system_one_transport,
 )
@@ -102,6 +105,7 @@ __all__ = [
     "DecisionsTransport",
     "DiscoveryConfig",
     "EntityInfo",
+    "EscalationConfig",
     "EscalationHook",
     "EscalationRequest",
     "ExperientialTransport",
@@ -122,6 +126,7 @@ __all__ = [
     "Mention",
     "ModelResponseError",
     "One",
+    "OpenAIResponsesTransport",
     "PassesConfig",
     "PatchOp",
     "PresenceConfig",
@@ -154,6 +159,7 @@ __all__ = [
     "clef_provider_from_env",
     "compile_schema",
     "create_extractor",
+    "escalation_from_env",
     "provider_from_env",
     "s1_field",
     "system_one_transport",

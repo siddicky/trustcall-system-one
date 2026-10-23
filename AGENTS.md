@@ -44,6 +44,7 @@ Planned modules, from the "Package layout" table in `docs/DESIGN.md`:
 - `trustcall_system_one/_decisions.py`: translation between Clef bodies and the Decisions API (the fallback for Clef).
 - `trustcall_system_one/_typesafe.py`: Clef to Jev translation and the Clairic stand-in (selection, verification, escalation); `_candidates.py` (pattern candidates), `_structure.py` (lines, stitching, blocks), `_dateparts.py` (date, time and duration parts).
 - `trustcall_system_one/_calibrate.py`: logit shifts of the probabilities of a Clef response (`CalibratedTransport`); `_partition.py`: Clairic requests split by field type and merged back (`FieldTypeRoutingTransport`).
+- `trustcall_system_one/openai_transport.py` (public): `OpenAIResponsesTransport`, the client of the opt-in escalation tier (`gpt-6-luna`, Responses API; never retries an uncertain outcome); `_escalate.py`: the tier's four kinds and their verification; `_relative.py`: relative dates read in code.
 - `trustcall_system_one/combos.py` (public): `ComboSpec`, the declarative combination of providers per call kind and field type, and the transport stack it builds.
 - `trustcall_system_one/_wire.py`: exact Clairic and Clef request and response pydantic models.
 - `trustcall_system_one/_schemas.py`: coerces BaseModel, TypedDict, JSON Schema or callable into a BaseModel.

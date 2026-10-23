@@ -14,23 +14,32 @@ from evals.model import Case, CaseResult
 from evals.scoring import score
 from trustcall_system_one import (
     CallMeta,
+    EscalationConfig,
+    OpenAIResponsesTransport,
     Transport,
     TransportResponse,
     clef_fallback_from_env,
     clef_fallback_on_from_env,
     clef_provider_from_env,
     create_extractor,
+    escalation_from_env,
     provider_from_env,
     system_one_transport,
 )
 from trustcall_system_one.combos import (
     ComboSpec,
+    EscalateSpec,
     build_combo_transport,
     calibrate_transport,
     create_provider_transports,
     provider_label,
 )
-from trustcall_system_one.testing import CassetteTransport, RecordingTransport, scrub
+from trustcall_system_one.testing import (
+    CassetteTransport,
+    FakeEscalation,
+    RecordingTransport,
+    scrub,
+)
 from trustcall_system_one.transport import classify_failure
 
 __all__ = [
@@ -83,6 +92,17 @@ class Settings:
         members: Offline, with ``combo``: builds the transport of each provider the
             combination names for a case (default: the case's scripted world for
             every provider). Lets a test make one provider better at one kind.
+        escalate: ``openai`` turns the opt-in escalation tier on (``gpt-6-luna``
+            through the OpenAI Responses API; live it sends the text of the cases
+            the default setup fails to OpenAI and needs ``OPENAI_API_KEY``).
+            ``None`` reads ``TRUSTCALL_S1_ESCALATE``; a key alone never selects it.
+            Offline the tier is answered by ``escalation`` or, by default, by a
+            stand-in that gives no answer (so nothing changes). Not for a
+            combination, whose spec has its own ``escalate``.
+        escalate_effort: ``reasoning.effort`` of the tier (``none``... ``max``);
+            ``None`` reads ``TRUSTCALL_S1_ESCALATE_EFFORT``, else ``none``.
+        escalation: Offline: builds the escalation model of a case (default: one
+            that never answers). Lets a test script what the model says.
         suite: The name of the case suite, recorded in the results.
         tag: A label of the run, recorded in the results.
     """
@@ -98,6 +118,9 @@ class Settings:
     clef_fallback_on: frozenset[str] | None = None
     combo: ComboSpec | None = None
     members: Callable[[Case], Mapping[str, Transport]] | None = None
+    escalate: Literal["openai"] | None = None
+    escalate_effort: str | None = None
+    escalation: Callable[[Case], Transport] | None = None
     suite: str = "default"
     tag: str = ""
 
@@ -130,6 +153,9 @@ class SuiteResult:
         tag: The label of the run.
         replay: The cassette directory the run replayed from (empty: none). With
             ``mode`` ``replay+live`` the requests that were not recorded went live.
+        escalation: The escalation tier that ran (``openai gpt-6-luna effort=low``),
+            empty when it was off.
+        escalate_effort: Its ``reasoning.effort`` (empty when off).
     """
 
     config: str
@@ -146,6 +172,8 @@ class SuiteResult:
     suite: str = "default"
     tag: str = ""
     replay: str = ""
+    escalation: str = ""
+    escalate_effort: str = ""
 
 
 def combination(
@@ -215,6 +243,11 @@ def missing_credentials(spec: ComboSpec) -> list[str]:
         missing.append("EXPERIENTIAL_API_KEY")
     if "typesafe" in named and not (os.environ.get("TYPESAFE_API_KEY") or "").strip():
         missing.append("TYPESAFE_API_KEY")
+    if (
+        spec.escalate is not None
+        and not (os.environ.get("OPENAI_API_KEY") or "").strip()
+    ):
+        missing.append("OPENAI_API_KEY")
     return missing
 
 
@@ -232,22 +265,127 @@ def usage_by_provider(
     for call in calls:
         row = out.setdefault(
             str(call.provider or "unknown"),
-            {"requests": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
+            {
+                "requests": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cost_usd": 0.0,
+                "latency_ms": 0.0,
+            },
         )
         row["requests"] += 1
         row["input_tokens"] += int(call.usage.get("input_tokens", 0))
         row["output_tokens"] += int(call.usage.get("output_tokens", 0))
         row["cost_usd"] += float(call.cost_usd or 0.0)
+        row["latency_ms"] += float(call.duration_ms or 0.0)
     for label, used in (replayed or {}).items():
         row = out.setdefault(
             label,
-            {"requests": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0},
+            {
+                "requests": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cost_usd": 0.0,
+                "latency_ms": 0.0,
+            },
         )
         row["replayed_requests"] = used["requests"]
         row["replayed_input_tokens"] = used["input_tokens"]
         row["replayed_output_tokens"] = used["output_tokens"]
         row["replayed_cost_usd"] = used["cost"]
     return out
+
+
+def escalation_plan(settings: Settings, spec: ComboSpec | None) -> EscalateSpec | None:
+    """The escalation tier a run uses, or ``None`` (off).
+
+    A combination decides by its own ``escalate``. Otherwise ``Settings.escalate``
+    (``--escalate openai``) or ``TRUSTCALL_S1_ESCALATE=openai`` turns it on, with the
+    effort of ``Settings.escalate_effort`` (``--escalate-effort``), else
+    ``TRUSTCALL_S1_ESCALATE_EFFORT``, else ``none``. A key in the environment alone
+    never does.
+    """
+    if spec is not None:
+        return spec.escalate
+    from_env = escalation_from_env()
+    if settings.escalate is None and from_env is None:
+        return None
+    effort = (
+        settings.escalate_effort
+        or (from_env.reasoning_effort if from_env is not None else None)
+        or "none"
+    )
+    return EscalateSpec(reasoning_effort=effort)
+
+
+def _escalation_config(
+    plan: EscalateSpec | None,
+    case: Case,
+    settings: Settings,
+    openai: Transport | None,
+    snapshot: CassetteTransport | None,
+    cassettes: list[CassetteTransport],
+    name: str,
+) -> EscalationConfig | None:
+    """The escalation tier of one case, recorded and replayed like a provider.
+
+    Live it is the shared OpenAI transport; offline the case's scripted stand-in
+    (``Settings.escalation``) or one that never answers. A recorder writes what it
+    answered and a cassette replays only what ``openai`` recorded.
+    """
+    if plan is None:
+        return None
+    member: Transport
+    if settings.live:
+        assert openai is not None
+        member = openai
+    elif settings.escalation is not None:
+        member = settings.escalation(case)
+    else:
+        member = FakeEscalation(model=plan.model)
+    if settings.record is not None:
+        member = RecordingTransport(member, settings.record / f"{name}.jsonl")
+    if settings.replay is not None:
+        source = snapshot or CassetteTransport(settings.replay)
+        cassette = source.fork(
+            strict=not settings.live,
+            inner=member if settings.live else None,
+            provider="openai",
+        )
+        cassettes.append(cassette)
+        member = cassette
+    setattr(member, "model", plan.model)  # noqa: B010 - what the engine asks for
+    return plan.config(transport=member)
+
+
+def _open_openai(plan: EscalateSpec) -> Transport:
+    """The OpenAI transport the cases of a live run share (the key is read per call)."""
+    return OpenAIResponsesTransport(
+        model=plan.model, reasoning_effort=plan.reasoning_effort
+    )
+
+
+def escalation_usage(calls: Sequence[Any]) -> dict[str, Any]:
+    """What the escalation tier cost in a call log: calls, tokens and latency.
+
+    ``reasoning_tokens`` are part of ``output_tokens``; ``latency_ms`` is the sum of
+    the calls' wall time (failed ones too) and ``by_kind`` counts the calls by
+    sub-kind (``CallRecord.field`` starts with it).
+    """
+    rows = [c for c in calls if c.kind == "escalate"]
+    by_kind: dict[str, int] = {}
+    for row in rows:
+        sub = str(row.field or "").split(":", 1)[0]
+        by_kind[sub] = by_kind.get(sub, 0) + 1
+    return {
+        "calls": len(rows),
+        "failed": sum(1 for r in rows if r.error),
+        "input_tokens": sum(int(r.usage.get("input_tokens", 0)) for r in rows),
+        "output_tokens": sum(int(r.usage.get("output_tokens", 0)) for r in rows),
+        "reasoning_tokens": sum(int(r.usage.get("reasoning_tokens", 0)) for r in rows),
+        "latency_ms": round(sum(float(r.duration_ms or 0.0) for r in rows), 2),
+        "by_kind": by_kind,
+    }
 
 
 def _replayed(cassettes: Sequence[CassetteTransport]) -> dict[str, dict[str, float]]:
@@ -470,6 +608,7 @@ async def _run_case(
     live: Transport | None,
     snapshot: CassetteTransport | None = None,
     shared: Mapping[str, Transport] | None = None,
+    openai: Transport | None = None,
 ) -> CaseResult:
     options = build_options(settings.overrides, case.options)
     spec = settings.combo.canonical() if settings.combo is not None else None
@@ -501,14 +640,25 @@ async def _run_case(
                 )
             )
             transport = cassettes[0]
+    escalation = _escalation_config(
+        escalation_plan(settings, spec),
+        case,
+        settings,
+        openai,
+        snapshot,
+        cassettes,
+        name,
+    )
     started = time.perf_counter()
     secrets: tuple[str, ...] = ()
-    for owner in (live, *(shared or {}).values()):
+    for owner in (live, openai, *(shared or {}).values()):
         sensitive = getattr(owner, "sensitive_values", None)
         if callable(sensitive):
             secrets = tuple(dict.fromkeys([*secrets, *sensitive()]))
     try:
-        extractor = create_extractor(case.schemas(), transport=transport, **options)
+        extractor = create_extractor(
+            case.schemas(), transport=transport, escalation=escalation, **options
+        )
         result = await extractor.ainvoke(case.text, existing=case.existing)
     except Exception as exc:
         failed = CaseResult(case=case.id)
@@ -521,6 +671,7 @@ async def _run_case(
         failed.by_provider = usage_by_provider(
             getattr(exc, "calls", ()), _replayed(cassettes)
         )
+        failed.escalation = escalation_usage(getattr(exc, "calls", ()))
         # an error message can carry the request URL, and with it the account id
         failed.error = scrub(f"{type(exc).__name__}: {str(exc)[:300]}", secrets)
         failed.wall_s = time.perf_counter() - started
@@ -533,6 +684,7 @@ async def _run_case(
     scored.reported_cost_usd = result.usage.reported_cost_usd
     scored.output_tokens = result.usage.output_tokens
     scored.by_provider = usage_by_provider(result.calls, _replayed(cassettes))
+    scored.escalation = escalation_usage(result.calls)
     scored.warnings = [scrub(w, secrets) for w in scored.warnings]
     scored.wall_s = time.perf_counter() - started
     scored.forwarded = sum(c.forwarded for c in cassettes)
@@ -593,6 +745,14 @@ async def run_suite(
                 else ""
             )
         )
+    if (
+        settings.live
+        and escalation_plan(settings, None) is not None
+        and not (os.environ.get("OPENAI_API_KEY") or "").strip()
+    ):
+        raise RuntimeError(
+            "--live with --escalate openai needs OPENAI_API_KEY in the environment"
+        )
     if settings.record is not None:
         settings.record.mkdir(parents=True, exist_ok=True)
     gate = asyncio.Semaphore(max(1, settings.concurrency))
@@ -610,6 +770,8 @@ async def run_suite(
             clef_fallback=fallback,
             clef_fallback_on=_fallback_on(settings),
         )
+    plan = escalation_plan(settings, None)
+    openai = _open_openai(plan) if settings.live and plan is not None else None
     snapshot = CassetteTransport(settings.replay) if settings.replay else None
     if snapshot is not None and not settings.live:  # nothing is sent: what was recorded
         extraction, decisions = recorded_labels(snapshot)
@@ -620,13 +782,15 @@ async def run_suite(
 
     async def one(case: Case) -> CaseResult:
         async with gate:
-            return await _run_case(case, settings, live, snapshot)
+            return await _run_case(case, settings, live, snapshot, None, openai)
 
     try:
         results = list(await asyncio.gather(*(one(c) for c in runnable)))
     finally:
         if live is not None:
             await live.aclose()
+        if openai is not None:
+            await openai.aclose()  # type: ignore[attr-defined]
     return SuiteResult(
         config,
         dict(settings.overrides),
@@ -642,6 +806,8 @@ async def run_suite(
         decisions,
         suite=settings.suite,
         tag=settings.tag,
+        escalation=plan.describe() if plan is not None else "",
+        escalate_effort=plan.reasoning_effort if plan is not None else "",
     )
 
 
@@ -680,6 +846,8 @@ async def _run_combo(
     # one transport per provider, shared by the cases (each case stacks its own
     # recorder and cassette on top of them)
     shared = create_provider_transports(spec) if settings.live else None
+    plan = escalation_plan(settings, spec)
+    openai = _open_openai(plan) if settings.live and plan is not None else None
     snapshot = CassetteTransport(settings.replay) if settings.replay else None
     if snapshot is not None and not settings.live:
         extraction, decisions = recorded_labels(snapshot)
@@ -693,12 +861,12 @@ async def _run_combo(
 
     async def one(case: Case) -> CaseResult:
         async with gate:
-            return await _run_case(case, settings, None, snapshot, shared)
+            return await _run_case(case, settings, None, snapshot, shared, openai)
 
     try:
         results = list(await asyncio.gather(*(one(c) for c in runnable)))
     finally:
-        for member in (shared or {}).values():
+        for member in (*(shared or {}).values(), *([openai] if openai else [])):
             closer = getattr(member, "aclose", None)
             if callable(closer):
                 await closer()
@@ -714,7 +882,25 @@ async def _run_combo(
         suite=settings.suite,
         tag=settings.tag,
         replay=str(settings.replay) if settings.replay is not None else "",
+        escalation=plan.describe() if plan is not None else "",
+        escalate_effort=plan.reasoning_effort if plan is not None else "",
     )
+
+
+def _escalation_totals(results: Sequence[CaseResult]) -> dict[str, Any]:
+    """The escalation tier's calls, tokens and latency over a suite."""
+    rows = [r.escalation for r in results if r.escalation]
+    calls = sum(int(r["calls"]) for r in rows)
+    latency = sum(float(r["latency_ms"]) for r in rows)
+    return {
+        "escalation_calls": calls,
+        "escalation_failed": sum(int(r["failed"]) for r in rows),
+        "escalation_input_tokens": sum(int(r["input_tokens"]) for r in rows),
+        "escalation_output_tokens": sum(int(r["output_tokens"]) for r in rows),
+        "escalation_reasoning_tokens": sum(int(r["reasoning_tokens"]) for r in rows),
+        "escalation_latency_ms": round(latency, 2),
+        "escalation_mean_latency_ms": round(latency / calls, 2) if calls else 0.0,
+    }
 
 
 def aggregate(results: Sequence[CaseResult]) -> dict[str, Any]:
@@ -766,4 +952,5 @@ def aggregate(results: Sequence[CaseResult]) -> dict[str, Any]:
         "forwarded": sum(r.forwarded for r in results),
         "unknown_outcomes": sum(r.unknown_outcomes for r in results),
         "reported_cost_usd": round(sum(r.reported_cost_usd for r in results), 6),
+        **_escalation_totals(results),
     }

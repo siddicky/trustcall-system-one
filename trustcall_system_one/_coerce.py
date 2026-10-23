@@ -12,6 +12,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from trustcall_system_one._compile import FieldSpec
 from trustcall_system_one._config import GateConfig
+from trustcall_system_one._relative import resolve_phrase
 from trustcall_system_one._types import UNSTATED
 from trustcall_system_one._wire import (
     ChoiceAnswer,
@@ -358,7 +359,30 @@ def _list_value(
     return kept, reason, indexes, failed
 
 
-def _clairic_value(spec: FieldSpec, answer: ClairicAnswer) -> tuple[Any, str | None]:
+def _relative(value: Any, kind: str, today: date | None) -> tuple[Any, str] | None:
+    """A date or datetime answer that is a relative phrase, resolved in code.
+
+    Clairic documents ``reference_date`` as the anchor of dates written without a
+    year, not of relative phrases, so an answer that hands "yesterday" or "three days
+    ago" back is not an ISO date. It is read here when the phrase names one date
+    whatever the convention (``_relative.resolve_phrase``) and the invoke has a
+    reference date; a datetime is then that day at midnight, flagged in the note.
+    """
+    if today is None or not isinstance(value, str):
+        return None
+    found = resolve_phrase(" ".join(value.split()), today)
+    if found is None:
+        return None
+    if kind == "datetime":
+        return datetime.combine(
+            found, time()
+        ), "relative_date: resolved in code (midnight)"
+    return found, "relative_date: resolved in code"
+
+
+def _clairic_value(
+    spec: FieldSpec, answer: ClairicAnswer, today: date | None = None
+) -> tuple[Any, str | None]:
     assert spec.clairic is not None
     value = answer.value
     kind = spec.clairic.type
@@ -370,10 +394,14 @@ def _clairic_value(spec: FieldSpec, answer: ClairicAnswer) -> tuple[Any, str | N
         if isinstance(value, str):
             return _duration_text(value, unit), None
         return _timedelta(float(_decimal(value)), unit), None
-    if kind == "date":
-        return _parse_date(value), None
-    if kind == "datetime":
-        return _parse_datetime(value), None
+    if kind in ("date", "datetime"):
+        try:
+            return (_parse_date if kind == "date" else _parse_datetime)(value), None
+        except ValueError:
+            relative = _relative(value, kind, today)
+            if relative is None:
+                raise
+            return relative
     if kind == "time":
         return _parse_time(value), None
     if kind == "text":
@@ -415,6 +443,7 @@ def _clairic(
     spec: FieldSpec,
     answer: ClairicAnswer,
     gates: GateConfig = GateConfig(),  # noqa: B008 - frozen dataclass
+    today: date | None = None,
 ) -> Coerced:
     spans = _spans(answer.spans)
     meta: dict[str, Any] = {
@@ -440,7 +469,7 @@ def _clairic(
             else:
                 meta["spans"] = None
         else:
-            value, note = _clairic_value(spec, answer)
+            value, note = _clairic_value(spec, answer, today)
             if (
                 spec.clairic.type == "text"
                 and isinstance(value, str)
@@ -605,6 +634,7 @@ def coerce(
     spec: FieldSpec,
     answer: ClairicAnswer | NoulAnswer | ChoiceAnswer | ScoreAnswer,
     gates: GateConfig = GateConfig(),  # noqa: B008 - frozen dataclass
+    today: date | None = None,
 ) -> Coerced:
     """Convert a model answer into the Python value for a field.
 
@@ -622,6 +652,9 @@ def coerce(
       for sets, drop duplicates keeping the first occurrence (the value is still
       a list; pydantic builds the set). A ``span`` or ``spans`` is kept only if
       every pair is ``[start, end]`` with ``0 <= start <= end``.
+    * A date or datetime answer that is a relative phrase naming one date ("yesterday",
+      "three days ago", "in two weeks") is resolved against ``today`` (the invoke's
+      reference date) when there is one, instead of failing as "not an ISO date".
     * Clef noul: yes at ``noul >= 0.5 + margin``, no at ``noul <= 0.5 - margin``,
       otherwise ``"abstain"``.
     * Clef choice: ``spec.key_map[choice]``; an unknown option is not ok.
@@ -637,6 +670,7 @@ def coerce(
         spec: The field the answer belongs to.
         answer: The parsed model answer.
         gates: Supplies ``noul_margin``.
+        today: The reference date, for a relative-phrase answer of a date field.
 
     Returns:
         The converted value plus answer metadata.
@@ -646,7 +680,7 @@ def coerce(
             None, False, "a union of primitives needs two answers: use coerce_union"
         )
     if isinstance(answer, ClairicAnswer):
-        return _clairic(spec, answer, gates)
+        return _clairic(spec, answer, gates, today)
     if isinstance(answer, NoulAnswer):
         return _noul(spec, answer, gates)
     if isinstance(answer, ChoiceAnswer):
