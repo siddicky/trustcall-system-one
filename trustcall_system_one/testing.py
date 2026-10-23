@@ -18,6 +18,7 @@ from typing import Any, Literal, cast
 
 from pydantic import BaseModel
 
+from trustcall_system_one._config import EscalationConfig
 from trustcall_system_one._coref import identity_compatible
 from trustcall_system_one._errors import (
     AuthError,
@@ -51,6 +52,7 @@ from trustcall_system_one.transport import (
     TransportResponse,
     _can_serve,
     classify_failure,
+    escalation_of,
     max_questions,
     prefers_keep_uncertain,
     state_token_budget,
@@ -2446,6 +2448,11 @@ class RecordingTransport:
             with open(self.path, "w", encoding="utf-8"):
                 pass
 
+    @property
+    def escalation(self) -> EscalationConfig | None:
+        """The escalation tier the wrapped transport carries (``None``: none)."""
+        return escalation_of(self._inner)
+
     def max_questions(self, model: str) -> int:
         """Questions one Clef request may carry: the wrapped transport's limit.
 
@@ -2733,6 +2740,11 @@ class CassetteTransport:
             if inner is not None:
                 found.append(inner)
         return min(found) if found else None
+
+    @property
+    def escalation(self) -> EscalationConfig | None:
+        """The escalation tier the ``inner`` transport carries (``None``: none)."""
+        return escalation_of(self._inner)
 
     def prefers_keep_uncertain(self, model: str, kind: str | None = None) -> bool:
         """What the recording said of a call of ``kind`` to ``model``, replayed.

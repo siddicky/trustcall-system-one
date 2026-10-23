@@ -234,6 +234,11 @@ class Ctx:
             that holds a record, so there it is False. An amount the input asks to
             ADD to a new entity ("two more of the blue mugs") has nothing to add to,
             so it is the entity's whole amount (see ``_attribution_question``).
+        held: For a NEW item of a list that already holds an item it resembles (the
+            match said ``__new__``, yet the item's words are those of a held one:
+            "mugs" and "blue mug"), that held item's record. ``fresh`` is False
+            then, and a quantity the input asks to ADD ("two more mugs") is refused
+            as a relative edit of the held item's (``_refuse_relative_adds``).
     """
 
     run: Run
@@ -263,6 +268,7 @@ class Ctx:
     identity: tuple[str, ...] = ()
     sentence_fields: set[str] = field(default_factory=set)
     fresh: bool = False
+    held: dict[str, Any] | None = None
 
     def input_only(self) -> "Ctx":
         """The same context without the record: every request is about the input.
@@ -1159,6 +1165,10 @@ class FieldState:
             ``list_rows``), empty for an answer of the default setup. There is no
             Clairic reading to cross-check it against, and no tie-break to ask the
             model that proposed it: the attribution check (Clef) has to agree.
+        backup: What the default setup had read, when a ROUTED escalation proposal
+            (``mode="route"``) took its place: if the ladder refuses the proposal, the
+            backup is restored and judged normally (``run_ladder``), so asking the
+            tier first can never leave a field null that the default setup read.
     """
 
     spec: FieldSpec
@@ -1176,6 +1186,7 @@ class FieldState:
     sentences: bool = False
     settle: bool = False
     escalated: str = ""
+    backup: Resolved | None = None
 
     @property
     def value(self) -> Any:
@@ -2130,10 +2141,26 @@ def _today_note(ctx: Ctx, spec: FieldSpec) -> str:
     return f"Today is {today:%A}, {today.isoformat()}. "
 
 
-_CLAUSE = re.compile(r"^(?:how|whether|when|where|why|what|who|whom|which)\b", re.I)
+_CLAUSE = re.compile(
+    r"^(?:how|whether|when|where|why|what|who|whom|which)[ \t]+\S", re.I
+)
 """A description that is a clause ("how the person relates to the speaker"), not a
 noun phrase: "<description> of the entity" would hang the entity on its last noun
-("the speaker of Olivia Davis")."""
+("the speaker of Olivia Davis"). The clause word has to stand alone and be followed by
+more words: "Which-way sign text" and "Who's Who entry title" are noun phrases."""
+
+
+def _clause_of(description: str) -> str | None:
+    """The description as a clause to put into a sentence (first letter lowercase).
+
+    ``None`` when it is a noun phrase. "How the person relates to the speaker" reads
+    "how the person relates to the speaker" in the middle of a question.
+    """
+    text = " ".join(description.split())
+    if _CLAUSE.match(text) is None:
+        return None
+    return text[:1].lower() + text[1:]
+
 
 _FRESH_NOTE = (
     " `entity.label` is new, nothing of it was held before: an amount the input asks "
@@ -2159,7 +2186,18 @@ def _attribution_question(
     order's "add two more") is asked as "does the input ask for it".
     """
     text = display(value)
+    clause = _clause_of(description)
     if element:
+        if clause is not None:  # "an answer to ...", not "a how the person ..."
+            return NoulQuestion(
+                type="noul",
+                instructions=(
+                    f'{today}According to `input`, is "{text}" an answer, for '
+                    f'`entity.label`, to "{clause}"? Something the input asks to '
+                    "include counts."
+                ),
+                criteria=NoulCriteria(true=_YES, false=_NO),
+            )
         return NoulQuestion(
             type="noul",
             instructions=(
@@ -2173,18 +2211,24 @@ def _attribution_question(
         # "Does the input ask for 2 of the entity (as the number of units ordered)?"
         # is the shape that told 2 (0.78 to 0.86) from 3 (0.02 to 0.04) and kept a
         # stated 1 (0.92 to 0.98); the longer "state or ask for X to be V" did not
-        noun = _ARTICLE.sub("", description.strip(), count=1)
-        instructions = f"Does `input` ask for {text} of `entity.label` (as the {noun})?"
+        if clause is not None:
+            instructions = (
+                f"Does `input` ask for {text} of `entity.label` (as {clause})?"
+            )
+        else:
+            noun = _ARTICLE.sub("", description.strip(), count=1)
+            instructions = (
+                f"Does `input` ask for {text} of `entity.label` (as the {noun})?"
+            )
         if fresh:
             # the engine knows the entity is new; the model reading the input does not
             # (live: "two more of the blue mugs" on an order that holds none, 0.48)
             instructions += _FRESH_NOTE
     else:
-        clause = _CLAUSE.match(description.strip()) is not None
-        about = "for `entity.label`, " if clause else ""
-        of = "" if clause else " of `entity.label`"
+        about = "for `entity.label`, " if clause is not None else ""
+        of = "" if clause is not None else " of `entity.label`"
         instructions = (
-            f"{today}Does `input` state that {about}{description}{of} is "
+            f"{today}Does `input` state that {about}{clause or description}{of} is "
             f'"{text}", or does it follow by simple arithmetic or date math from '
             "figures the input states about `entity.label`?"
         )
@@ -2855,6 +2899,112 @@ async def crosscheck(
 # --------------------------------------------------------------------------- #
 
 
+def _held_value(held: dict[str, Any], spec: Any) -> Any:
+    """What a held item's record holds at a field's path (``None``: nothing)."""
+    current: Any = held
+    for part in spec.path:
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+async def _refuse_relative_adds(ctx: Ctx, states: Sequence[FieldState]) -> None:
+    """Refuse an amount that the input only asks to ADD to an item the list holds.
+
+    "Add two more mugs" against an order that holds "blue mug" (3): the new entity
+    ("mugs") was matched as new, but it is the held item's words, so the 2 is how the
+    held amount changes, not the amount of another item; writing it as a new line
+    would double the item with the wrong quantity. The question that refuses a
+    relative replacement (call kind ``relative_edit``) is asked of this add, with the
+    held item's amount as the current value; at ``verify.relative_edit`` or above the
+    field is rejected as ``relative_edit_unsupported`` (a required one then makes the
+    entity invalid, so nothing is written). Only for an entity with a ``held`` item:
+    a new item that resembles nothing held is the whole amount (``Ctx.fresh``).
+
+    Args:
+        ctx: The insert context of the entity.
+        states: Its Clairic field states, after the ladder.
+    """
+    from trustcall_system_one._diff import Change
+    from trustcall_system_one._gates import relative_edits
+
+    held = ctx.held
+    floor = ctx.run.verify.relative_edit
+    if held is None or floor <= 0:
+        return
+    asked: list[tuple[FieldState, Change]] = []
+    for st in states:
+        value, old = st.resolved.value, _held_value(held, st.spec)
+        if (
+            not st.has_value()
+            or not relative_candidate(st.spec)
+            or any(
+                isinstance(v, bool) or not isinstance(v, (int, float))
+                for v in (value, old)
+            )
+            or not float(value).is_integer()
+            or not float(old).is_integer()
+            or value == old
+        ):
+            continue
+        change = Change(
+            op="replace",
+            path="/" + "/".join(str(p) for p in st.spec.path),
+            value=value,
+            old=old,
+            field_path=st.spec.pretty,
+            spans=tuple(st.spans),
+        )
+        asked.append((st, change))
+    if not asked:
+        return
+    answers = await relative_edits(ctx, held, [change for _, change in asked])
+    for (st, change), p in zip(asked, answers, strict=True):
+        if p is None or p < floor:
+            continue
+        st.set_reject(
+            "relative_edit_unsupported",
+            f"the input states a change relative to the held item's current value "
+            f"{change.old!r} (p={p:.2f}), not a new item's amount; relative edits are "
+            f"not computed, so {change.value!r} was not written",
+            p,
+        )
+        ctx.run.warn(
+            f"relative_edit_unsupported: {ctx.plan.name}.{st.spec.pretty}: the input "
+            "asks to add to an item the list already holds, so no new item was "
+            f"written (p={p:.2f})"
+        )
+
+
+async def _restore_backups(ctx: Ctx, states: Sequence[FieldState]) -> None:
+    """Give a field back what the default setup read when the ladder refused the tier.
+
+    A routed escalation proposal (``mode="route"``) replaces a standing answer of
+    Clairic before the ladder runs. When the ladder (attribution) then refuses the
+    proposal, the field would be null although Clairic had read a value; the answer
+    that was replaced is restored and goes through the ladder as it would have
+    without the tier. A proposal the ladder accepted drops its backup.
+    """
+    redo: list[FieldState] = []
+    for st in states:
+        if st.backup is None:
+            continue
+        if st.reject is None:
+            st.backup = None  # the proposal stands
+            continue
+        st.resolved, st.backup = st.backup, None
+        st.reject, st.reject_detail, st.reject_p = None, "", None
+        st.escalated, st.attribution_p, st.dropped = "", None, []
+        st.notes.append(
+            "escalation_refused: the proposal of the escalation tier was refused; "
+            "the default setup's answer is judged instead"
+        )
+        redo.append(st)
+    if redo:
+        await run_ladder(ctx, redo)
+
+
 async def run_ladder(ctx: Ctx, states: list[FieldState]) -> None:
     """Run the verification ladder for an insert over every Clairic field.
 
@@ -2886,3 +3036,5 @@ async def run_ladder(ctx: Ctx, states: list[FieldState]) -> None:
                 if st.has_value() and not (_is_list(st) and not st.resolved.value)
             ],
         )
+    await _restore_backups(ctx, states)
+    await _refuse_relative_adds(ctx, states)

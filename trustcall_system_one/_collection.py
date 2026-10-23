@@ -77,6 +77,7 @@ from trustcall_system_one._render import (
     discovery_focus,
     entity_focus,
     mention_windows,
+    segment_around,
 )
 from trustcall_system_one._run import Run, gather
 from trustcall_system_one._types import (
@@ -2285,18 +2286,6 @@ async def _adopt_records(
     return groups
 
 
-_SEGMENT_END = re.compile(r"\n|[.!?](?=\s)")
-
-
-def _segment(source: str, span: Span) -> Span:
-    """The line or sentence around a span: where a row or a clause begins and ends."""
-    start = 0
-    for found in _SEGMENT_END.finditer(source, 0, span[0]):
-        start = found.end()
-    end = _SEGMENT_END.search(source, span[1])
-    return start, end.start() if end else len(source)
-
-
 def _distinctive(value: str) -> bool:
     """An identifier that cannot be an everyday word: four characters, one a digit."""
     flat = "".join(value.split())
@@ -2333,7 +2322,7 @@ def _adopt_by_identifier(
     if found is None:
         return False
     text, span = found
-    around = _segment(scope.source, span)
+    around = segment_around(scope.source, span)
 
     def inside(group: _Group) -> bool:
         return any(
@@ -2424,13 +2413,18 @@ async def collect(
     async def given(value: Any) -> Any:
         return value
 
+    if routed and scope.parent is None:
+        # the entities of a dotted identity: a label that is no name (a generic word)
+        # is no entity, as for Clairic's discovery
+        routed = _prefilter(run, scope, routed, None)
     if routed:
         warn(
             f"escalation_routed: {plan.name}: {len(routed)} mention(s) came from the "
-            "escalation tier; Clairic's discovery and count were not asked"
+            "escalation tier; Clairic's discovery was not asked first (its count is, "
+            "and a count above them brings discovery in)"
         )
     jobs: list[Any] = (
-        [given(routed), given(None)]
+        [given(routed), _count(run, scope)]
         if routed
         else [_discover(run, scope, phrase), _count(run, scope)]
     )
@@ -2439,6 +2433,17 @@ async def collect(
     results = await gather(*jobs)
     mentions: list[Mention] = results[0]
     count: int | None = results[1]
+    if routed and count is not None and count > len(routed):
+        # the tier gave fewer than Clairic counts (a partial answer): discovery runs
+        # after all and its mentions join the tier's, as for a broadened discovery
+        wider = await _discover(run, scope, phrase)
+        if rows or _table_of_mentions(run, scope, names, wider):
+            wider = _prefilter(run, scope, wider, count)
+        warn(
+            f"escalation_routed_partial: {plan.name}: the tier gave {len(routed)} of "
+            f"{count} counted; Clairic's discovery added {len(wider)} mention(s)"
+        )
+        mentions = _union(mentions, wider, scope.source)
     # items nothing names are always screened; so are the mentions of a collection
     # with an identity when discovery returned a table's worth of them
     screen = rows or _table_of_mentions(run, scope, names, mentions)
@@ -2756,6 +2761,47 @@ def _not_its_identifier(run: Run, scope: Scope, info: EntityInfo, record: Any) -
     )
 
 
+def _stems(text: str) -> frozenset[str]:
+    """The words of a name with a plural "s" or "es" taken off (``mugs`` is ``mug``)."""
+    words = re.findall(r"[a-z0-9]+", text.casefold())
+    return frozenset(
+        w[:-2]
+        if len(w) > 4 and w.endswith("es")
+        else w[:-1]
+        if len(w) > 3 and w.endswith("s")
+        else w
+        for w in words
+    )
+
+
+def _held_item(scope: Scope, info: EntityInfo) -> dict[str, Any] | None:
+    """The record of the held item that a NEW entity of the list resembles, if any.
+
+    The match said the entity is new, yet its words ("mugs") are all among those of a
+    held item's identity ("blue mug"), or all of the item's are among the entity's:
+    the input may well be about the held item ("add two more mugs"). ``None`` when no
+    held item is that close, so a new item that resembles nothing there is new
+    (``Ctx.fresh``): "two more notebooks" next to a mug line is the whole amount.
+    """
+    if not scope.existing:
+        return None
+    words = _stems(" ".join([info.label, *(m.text for m in info.mentions)]))
+    own = _stems(info.label)
+    if not words:
+        return None
+    names = identity_fields(scope.plan, scope.cardinality)
+    for record in scope.existing:
+        data = getattr(record, "data", None)
+        if not isinstance(data, dict):
+            continue
+        normal = normalise_record(scope.plan, data)
+        for text in identity_values(normal, identity_keys(scope.plan, names)):
+            held = _stems(text)
+            if held and (own <= held or held <= own or held <= words):
+                return dict(normal)
+    return None
+
+
 async def _insert_entity(run: Run, scope: Scope, info: EntityInfo) -> InsertOutcome:
     focus, plain = _focuses(scope, info)
     done = await insert_one(
@@ -2767,6 +2813,7 @@ async def _insert_entity(run: Run, scope: Scope, info: EntityInfo) -> InsertOutc
         focus=focus,
         focus_plain=plain,
         placement=scope.placement(),
+        held=_held_item(scope, info),
     )
     why = _not_its_identifier(run, scope, info, done.record)
     if not why:

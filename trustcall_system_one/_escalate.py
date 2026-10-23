@@ -32,8 +32,8 @@ from datetime import date, datetime, time
 from typing import TYPE_CHECKING, Any
 
 from trustcall_system_one._coerce import coerce
-from trustcall_system_one._relative import find_phrases, plausible
-from trustcall_system_one._render import mention_windows
+from trustcall_system_one._relative import find_phrases, plausible, sentence_around
+from trustcall_system_one._render import mention_windows, segment_around
 from trustcall_system_one._run import Run, gather
 from trustcall_system_one._types import Mention
 from trustcall_system_one._wire import ClairicAnswer
@@ -70,37 +70,111 @@ _PREAMBLE = (
 # --------------------------------------------------------------------------- #
 
 
+def _overlap(first: Span, second: Span) -> bool:
+    return first[0] < second[1] and second[0] < first[1]
+
+
+def _occurrences(source: str, quote: str) -> list[Span]:
+    """Every place ``quote`` occurs in ``source`` as whole words, white space folded.
+
+    A quote that starts (ends) with a letter or digit does not match in the middle of
+    a longer word or code: ``ENG-1`` is not in ``ENG-10``, ``2`` is not in ``B2``.
+    """
+    words = quote.split()
+    if not words:
+        return []
+    pattern = r"\s+".join(re.escape(word) for word in words)
+    if re.match(r"\w", words[0]):
+        pattern = r"(?<!\w)" + pattern
+    if re.search(r"\w$", words[-1]):
+        pattern += r"(?!\w)"
+    return [m.span() for m in re.finditer(pattern, source)]
+
+
 def locate(
     source: str,
     quote: str,
     *,
-    near: Span | None = None,
+    near: Span | Sequence[Span] | None = None,
     taken: Sequence[Span] = (),
+    within: Sequence[Span] | None = None,
+    avoid: Sequence[Span] = (),
 ) -> Span | None:
     """Where ``quote`` occurs in ``source``, verbatim apart from white space.
+
+    The quote has to match as whole words (see ``_occurrences``).
 
     Args:
         source: The input.
         quote: What the model quoted.
-        near: Prefer the occurrence closest to this span.
-        taken: Occurrences already used (not returned again).
+        near: Prefer the occurrence closest to this span (or to the nearest of these
+            spans).
+        taken: Spans already used: an occurrence that overlaps one is not returned.
+        within: Ranges of the input; an occurrence has to lie inside one of them.
+        avoid: Spans an occurrence must not overlap.
 
     Returns:
         The ``(start, end)`` of the occurrence, or ``None`` when the input does not
-        contain the quote (the model made it up).
+        contain the quote there (the model made it up, or it is elsewhere).
     """
-    words = quote.split()
-    if not words:
-        return None
-    pattern = r"\s+".join(re.escape(word) for word in words)
-    found = [m.span() for m in re.finditer(pattern, source)]
-    found = [span for span in found if span not in set(taken)]
+    found = [
+        span
+        for span in _occurrences(source, quote)
+        if not any(_overlap(span, t) for t in (*taken, *avoid))
+        and (within is None or any(w[0] <= span[0] and span[1] <= w[1] for w in within))
+    ]
     if not found:
         return None
     if near is None:
         return found[0]
-    centre = (near[0] + near[1]) / 2
-    return min(found, key=lambda s: abs((s[0] + s[1]) / 2 - centre))
+    anchors: list[Span] = (
+        [(near[0], near[1])] if isinstance(near[0], int) else list(near)  # type: ignore[arg-type,list-item]
+    )
+    if not anchors:
+        return found[0]
+    return min(found, key=lambda s: _distance(s, anchors))
+
+
+def _distance(span: Span, anchors: Sequence[Span]) -> float:
+    """How far ``span`` lies from the nearest of ``anchors`` (centre to centre)."""
+    centre = (span[0] + span[1]) / 2
+    return min(abs(centre - (a[0] + a[1]) / 2) for a in anchors)
+
+
+_BLANK_LINE = re.compile(r"\n[ \t]*\n")
+_MARKUP = re.compile(r"[\s|:;,.*#>_-]+")
+
+
+def _paragraph(source: str, span: Span) -> Span:
+    """The block of lines (no blank line inside) that holds ``span``."""
+    start = max((m.end() for m in _BLANK_LINE.finditer(source, 0, span[0])), default=0)
+    after = _BLANK_LINE.search(source, span[1])
+    return start, after.start() if after else len(source)
+
+
+def _is_label(source: str, span: Span, segment: Span) -> bool:
+    """Whether an identity stands alone on its line: a heading, a bare label.
+
+    Only then can its values be on the lines after it; a table row or a sentence holds
+    its own values, and what is quoted from elsewhere is another row's.
+    """
+    rest = source[segment[0] : span[0]] + " " + source[span[1] : segment[1]]
+    return len(_MARKUP.sub(" ", rest).split()) <= 1
+
+
+def _ring(source: str, span: Span, window: int) -> Span:
+    return max(0, span[0] - window), min(len(source), span[1] + window)
+
+
+def _clip(ring: Span, within: Sequence[Span] | None) -> list[Span]:
+    """``ring`` cut to the ranges of ``within`` (all of it when there are none)."""
+    if within is None:
+        return [ring]
+    return [
+        (max(ring[0], w[0]), min(ring[1], w[1]))
+        for w in within
+        if max(ring[0], w[0]) < min(ring[1], w[1])
+    ]
 
 
 def _windows(ctx: "Ctx") -> list[Span]:
@@ -157,10 +231,15 @@ def _install(
 
     There is no Clairic confidence or ``p_null`` to threshold, and no input-only
     Clairic pass could confirm it (that pass is the model that failed), so the state
-    is marked ``escalated``: the attribution check (Clef) is what has to agree.
+    is marked ``escalated``: the attribution check (Clef) is what has to agree. A
+    standing answer of the default setup that the proposal replaces (routed mode) is
+    kept as ``st.backup``: if the ladder refuses the proposal the answer is restored
+    and judged as it would have been without the tier.
     """
     from trustcall_system_one._verify import Resolved
 
+    if st.has_value():
+        st.backup = st.resolved
     st.resolved = Resolved(
         value=value,
         raw=raw,
@@ -261,7 +340,10 @@ async def _relative_date(ctx: "Ctx", st: "FieldState", today: date) -> None:
     )
     if answer is None:
         return
-    verdict = _check_date(answer, ctx.text, windows, phrases, today, wants_time)
+    anchors = [m.span for m in (ctx.info.mentions if ctx.info else ()) if m.span]
+    verdict = _check_date(
+        answer, ctx.text, windows, phrases, today, wants_time, anchors
+    )
     where = f"{ctx.plan.name}.{spec.pretty}"
     if isinstance(verdict, str):
         run.warn(f"escalation:relative_dates: {where}: rejected ({verdict})")
@@ -286,17 +368,22 @@ def _check_date(
     phrases: Sequence[Any],
     today: date,
     wants_time: bool,
+    anchors: Sequence[Span] = (),
 ) -> "tuple[date | datetime, Span, str] | str":
-    """Verify what the model said: a reason it is refused, or the date and its quote."""
+    """Verify what the model said: a reason it is refused, or the date and its quote.
+
+    The phrase has to occur inside one of the entity's windows; where it occurs more
+    than once the occurrence nearest the entity's mentions (``anchors``) is the one.
+    """
     quote, iso = answer.get("phrase"), answer.get("iso_date")
     if quote is None and iso is None:
         return "the model found no relative date"
     if not isinstance(quote, str) or not isinstance(iso, str):
         return "phrase and iso_date must both be given"
-    span = locate(source, quote)
+    span = locate(source, quote, within=windows, near=anchors or None)
     if span is None:
-        return "the phrase is not in the input"
-    if not any(w[0] <= span[0] and span[1] <= w[1] for w in windows):
+        if locate(source, quote) is None:
+            return "the phrase is not in the input"
         return "the phrase is outside the entity's mention window"
     inside = [p for p in phrases if span[0] <= p.start and p.end <= span[1]]
     if not inside:
@@ -307,7 +394,8 @@ def _check_date(
         found = date.fromisoformat(iso.strip())
     except ValueError:
         return "iso_date is not a real date"
-    if not plausible(inside[0].text, found, today):
+    context = sentence_around(source, inside[0].start, inside[0].end)
+    if not plausible(inside[0].text, found, today, context=context):
         return "the date cannot be what the phrase says"
     if not wants_time:
         return found, span, quote
@@ -353,17 +441,16 @@ async def tiebreak(
     run = ctx.run
     if st.escalated or not run.escalation_budget("attribution_tiebreak"):
         return None
-    anchors = [span] if span else []
+    # around the value and the entity's mentions; with no span, around the mentions
+    # (the whole input only for an entity that has none)
+    mentions = [m.span for m in (ctx.info.mentions if ctx.info else ()) if m.span]
     windows = (
         mention_windows(
             len(ctx.text),
-            [
-                *anchors,
-                *[m.span for m in (ctx.info.mentions if ctx.info else ()) if m.span],
-            ],
+            [*([span] if span else []), *mentions],
             run.verify.window_chars,
         )
-        if anchors
+        if span or mentions
         else [(0, len(ctx.text))]
     )
     text = _joined(ctx.text, windows)
@@ -430,32 +517,89 @@ def _row_specs(plan: "SchemaPlan") -> "list[FieldSpec]":
 
 
 def _verify_rows(
-    answer: dict[str, Any], source: str, specs: "Sequence[FieldSpec]"
+    answer: dict[str, Any],
+    source: str,
+    specs: "Sequence[FieldSpec]",
+    *,
+    within: Sequence[Span] | None = None,
+    window: int = 600,
 ) -> list[RowProposal]:
-    """Keep the rows and values whose quotes occur in the input and coerce."""
+    """Keep the rows and values whose quotes occur in the input and coerce.
+
+    Every quote must occur as whole words (``ENG-1`` is not in ``ENG-10``). A row's
+    identity is the occurrence whose line or sentence holds most of its values (the
+    first when none does), and no two rows share an occurrence. A value has to lie in
+    its identity's line or sentence. Only an identity that stands alone on its line (a
+    heading: ``ENG-1`` above ``serial SN-5001``) may have values on the lines after it,
+    within its own block of lines and ``window`` characters, and never in the line of
+    another row's identity: a value quoted from another row is not this row's.
+
+    Args:
+        answer: The model's ``{rows: [...]}``.
+        source: The input.
+        specs: The item's scalar fields (``_row_specs``).
+        within: Ranges of the input the rows may come from (the parent's part).
+        window: Characters around an identity a value may come from.
+    """
     rows = answer.get("rows")
     out: list[RowProposal] = []
-    taken: list[Span] = []
     if not isinstance(rows, list):
         return out
     by_name = {spec.pretty: spec for spec in specs}
+    chosen: list[tuple[str, Span, dict[str, str]]] = []
+    taken: list[Span] = []
     for row in rows:
         if not isinstance(row, dict) or not isinstance(row.get("identity"), str):
             continue
         quote = row["identity"]
-        span = locate(source, quote, taken=taken)
-        if span is None:  # an identity that is not in the input is made up
-            continue
-        taken.append(span)
-        values: dict[str, tuple[Any, Span | None]] = {}
         fields = row.get("fields")
-        for name, text in fields.items() if isinstance(fields, dict) else ():
-            spec = by_name.get(name)
-            if spec is None or not isinstance(text, str) or not text.strip():
-                continue
-            where = locate(source, text, near=span)
+        texts = {
+            name: text
+            for name, text in (fields.items() if isinstance(fields, dict) else ())
+            if name in by_name and isinstance(text, str) and text.strip()
+        }
+        found = [
+            span
+            for span in _occurrences(source, quote)
+            if not any(_overlap(span, t) for t in taken)
+            and (
+                within is None
+                or any(w[0] <= span[0] and span[1] <= w[1] for w in within)
+            )
+        ]
+        if not found:  # an identity that is not in the input is made up
+            continue
+
+        def score(span: Span, texts: dict[str, str] = texts) -> int:
+            segment = segment_around(source, span)
+            return sum(
+                locate(source, text, within=[segment]) is not None
+                for text in texts.values()
+            )
+
+        best = max(found, key=lambda span: (score(span), -span[0]))
+        taken.append(best)
+        chosen.append((quote, best, texts))
+    segments = [segment_around(source, span) for _, span, _ in chosen]
+    for index, (quote, span, texts) in enumerate(chosen):
+        elsewhere = [seg for k, seg in enumerate(segments) if k != index]
+        values: dict[str, tuple[Any, Span | None]] = {}
+        for name, text in texts.items():
+            where = locate(source, text, near=span, within=[segments[index]])
+            if where is None and _is_label(source, span, segments[index]):
+                # a heading or label: its values follow on the lines after it, in
+                # its own block
+                block = _clip(_ring(source, span, window), [_paragraph(source, span)])
+                where = locate(
+                    source,
+                    text,
+                    near=span,
+                    within=[c for b in block for c in _clip(b, within)],
+                    avoid=elsewhere,
+                )
             if where is None:
                 continue
+            spec = by_name[name]
             assert spec.clairic is not None
             coerced = coerce(spec, ClairicAnswer(type=spec.clairic.type, value=text))
             if coerced.ok and coerced.value is not None:
@@ -473,7 +617,13 @@ async def _ask_rows(
     noun: str,
 ) -> list[RowProposal]:
     specs = _row_specs(plan)
-    if not specs or _too_long(run, source):
+    # a nested list is asked about in its parent's part of the input
+    spans = [m.span for m in (parent.mentions if parent else ()) if m.span]
+    windows = (
+        mention_windows(len(source), spans, run.verify.window_chars) if spans else None
+    )
+    shown = source if windows is None else _joined(source, windows)
+    if not specs or _too_long(run, shown):
         return []
     names = ", ".join(
         f"{spec.pretty} ({spec.description or spec.pretty})" for spec in specs
@@ -484,7 +634,7 @@ async def _ask_rows(
         "instructions": f"{_PREAMBLE} The text lists the rows{of} of a table or list "
         f"(each row is one {noun}). Report every row, once each.",
         "input": (
-            f"Text:\n{source}\n\nFor each {noun}{of}, give `identity`: the exact words "
+            f"Text:\n{shown}\n\nFor each {noun}{of}, give `identity`: the exact words "
             "that label the row (its position code, number, name or model), and "
             "`fields`: for each field below the exact words of the text that give its "
             "value in that row, or null when the row does not state it. Fields: "
@@ -507,7 +657,9 @@ async def _ask_rows(
     )
     if answer is None:
         return []
-    rows = _verify_rows(answer, source, specs)
+    rows = _verify_rows(
+        answer, source, specs, within=windows, window=run.verify.window_chars
+    )
     asked = answer.get("rows")
     dropped = (len(asked) if isinstance(asked, list) else 0) - len(rows)
     run.warn(
@@ -529,12 +681,24 @@ async def rows_for(ctx: "Ctx") -> list[RowProposal]:
 
 
 def _row_of(ctx: "Ctx", rows: Sequence[RowProposal]) -> RowProposal | None:
-    """The proposed row that is this entity: its identity lies on a mention."""
+    """The proposed row that is this entity: its identity IS a mention, else overlaps.
+
+    A row whose identity span equals a mention's wins over one that only overlaps it
+    (``ENG-1`` inside the mention ``ENG-10``); among overlaps the longest overlap wins.
+    """
     spans = [m.span for m in (ctx.info.mentions if ctx.info else ()) if m.span]
     for row in rows:
+        if row.span in spans:
+            return row
+    best: RowProposal | None = None
+    best_overlap = 0
+    for row in rows:
         for a, b in spans:
-            if a < row.span[1] and row.span[0] < b:
-                return row
+            overlap = min(b, row.span[1]) - max(a, row.span[0])
+            if overlap > best_overlap:
+                best, best_overlap = row, overlap
+    if best is not None:
+        return best
     texts = {" ".join(m.text.split()) for m in (ctx.info.mentions if ctx.info else ())}
     return next((r for r in rows if " ".join(r.identity.split()) in texts), None)
 
@@ -744,22 +908,71 @@ async def _ask_entities(
     if answer is None:
         return []
     entities = answer.get("entities")
-    out: list[Mention] = []
-    taken: list[Span] = []
-    for item in entities if isinstance(entities, list) else ():
+    found = _pair_entities(
+        entities if isinstance(entities, list) else [],
+        source,
+        run.verify.window_chars,
+    )
+    out = [Mention(" ".join(label.split()), label_span) for label, label_span in found]
+    asked = len(entities) if isinstance(entities, list) else 0
+    run.warn(
+        f"escalation:dotted_discovery: {plan.name}: {len(out)} of {asked} "
+        "entit(ies) had both quotes in the input, together"
+    )
+    return sorted(out, key=lambda m: m.span or (0, 0))
+
+
+def _pair_entities(
+    items: Sequence[Any], source: str, window: int
+) -> list[tuple[str, Span]]:
+    """The ``(label, span)`` of each entity whose two quotes belong together.
+
+    The identity is located first (whole words, one entity per identity value, no two
+    entities on one occurrence); the label is the free occurrence nearest to its
+    identity, in the identity's line or sentence, else within ``window`` characters of
+    it. Entities appear in the input in one order, so a pair that crosses another
+    (the label of one entity placed before the label of another, its identity after
+    that one's) is a label paired with the wrong identity: both are refused.
+    """
+    placed: list[tuple[str, Span, Span]] = []
+    seen: set[str] = set()
+    identities: list[Span] = []
+    labels: list[Span] = []
+    for item in items:
         if not isinstance(item, dict):
             continue
         label, ident = item.get("label"), item.get("identity")
         if not (isinstance(label, str) and isinstance(ident, str)):
             continue
-        span = locate(source, label, taken=taken)
-        if span is None or locate(source, ident) is None:  # both must be in the input
+        key = " ".join(ident.split()).casefold()
+        if not key or key in seen:  # one entity per identity value
             continue
-        taken.append(span)
-        out.append(Mention(" ".join(label.split()), span))
-    asked = len(entities) if isinstance(entities, list) else 0
-    run.warn(
-        f"escalation:dotted_discovery: {plan.name}: {len(out)} of {asked} "
-        "entit(ies) had both quotes in the input"
-    )
-    return sorted(out, key=lambda m: m.span or (0, 0))
+        ident_span = locate(source, ident, taken=identities)
+        if ident_span is None:
+            continue
+        label_span = None
+        for tier in (
+            [segment_around(source, ident_span)],  # its line or sentence,
+            _clip(_ring(source, ident_span, window), [_paragraph(source, ident_span)]),
+            [_ring(source, ident_span, window)],  # else within the window
+        ):
+            label_span = locate(
+                source, label, near=ident_span, within=tier, taken=labels
+            )
+            if label_span is not None:
+                break
+        if label_span is None:  # both quotes have to be in the input, together
+            continue
+        seen.add(key)
+        identities.append(ident_span)
+        labels.append(label_span)
+        placed.append((label, label_span, ident_span))
+    crossed = {
+        i
+        for i, (_, la, ia) in enumerate(placed)
+        for j, (_, lb, ib) in enumerate(placed)
+        if i != j and (la[0] < lb[0]) != (ia[0] < ib[0])
+    }
+    return [
+        (label, span) for i, (label, span, _) in enumerate(placed) if i not in crossed
+    ]

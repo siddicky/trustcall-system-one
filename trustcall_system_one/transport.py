@@ -103,6 +103,7 @@ __all__ = [
     "CallMeta",
     "CloudflareTransport",
     "DecisionsTransport",
+    "EscalatingTransport",
     "EscalationHook",
     "EscalationRequest",
     "ExperientialTransport",
@@ -118,6 +119,7 @@ __all__ = [
     "clef_fallback_on_from_env",
     "clef_provider_from_env",
     "escalation_from_env",
+    "escalation_of",
     "max_questions",
     "prefers_keep_uncertain",
     "provider_from_env",
@@ -296,6 +298,18 @@ class TransportResponse:
     primary_error: BaseException | None = None
     rerouted_from: str | None = None
     warnings: tuple[str, ...] = ()
+
+
+def escalation_of(transport: object) -> EscalationConfig | None:
+    """The escalation tier a transport carries, or ``None``.
+
+    ``system_one_transport(escalate="openai")`` returns an ``EscalatingTransport``
+    that carries the choice; the wrappers (recorders, cassettes, fallbacks, routers,
+    calibration) forward what the transport they wrap carries, so the opt-in survives
+    wrapping and is never stored on a transport that was passed in.
+    """
+    found = getattr(transport, "escalation", None)
+    return found if isinstance(found, EscalationConfig) else None
 
 
 @runtime_checkable
@@ -778,9 +792,10 @@ class _HttpTransport:
         failure: TransportError | None,
         *,
         reason: str | None = None,
+        limit: float | None = None,
     ) -> TransportError:
-        """Build the error raised when ``call_deadline`` is used up."""
-        message = f"call deadline of {self._call_deadline}s exceeded"
+        """Build the error raised when ``call_deadline`` (or ``limit``) is used up."""
+        message = f"call deadline of {limit or self._call_deadline}s exceeded"
         if retries:
             message += f" after {retries} retr{'y' if retries == 1 else 'ies'}"
         if reason:
@@ -1518,19 +1533,22 @@ class ExperientialTransport(_HttpTransport):
         *,
         timeout: float | None,
         on_send: Callable[[], None] | None = None,
+        call_deadline: float | Literal["default"] | None = "default",
     ) -> TransportResponse:
         """Send one request body with the retry policy of the class.
 
         ``model`` is the key of the adaptive limiter; ``context`` is handed to
         ``_read_success`` to read the answer. ``on_send`` is called the first time the
         request is about to be put on the wire (once it has its limiter slot): from
-        then on it may have been run, and charged.
+        then on it may have been run, and charged. ``call_deadline`` replaces the
+        transport's own deadline for this call (``None``: none).
         """
         token = self._token()
         url = self._base_url
         headers = self._headers(token)
         client = self._get_client()
         started = time.perf_counter()
+        limit = self._call_deadline if call_deadline == "default" else call_deadline
         deadline: float | None = None  # set when the first slot is acquired
         retries = 0
         previous_delay = self._backoff_base
@@ -1540,17 +1558,20 @@ class ExperientialTransport(_HttpTransport):
             failure: TransportError
             try:
                 async with self.limiter.slot(model, self._queue_timeout) as generation:
-                    if deadline is None and self._call_deadline is not None:
-                        deadline = self._clock() + self._call_deadline
+                    if deadline is None and limit is not None:
+                        deadline = self._clock() + limit
                     post_kwargs = self._post_kwargs(client, timeout, deadline)
                     if post_kwargs is None:
-                        raise self._deadline_error(retries, last_failure)
+                        raise self._deadline_error(retries, last_failure, limit=limit)
                     if retries and deadline is not None:
                         left = deadline - self._clock()
                         need = self._attempt_budget(client, timeout)
                         if left < need:
                             raise self._deadline_error(
-                                retries, last_failure, reason=_starved(left, need)
+                                retries,
+                                last_failure,
+                                reason=_starved(left, need),
+                                limit=limit,
                             )
                     # Built outside the try: a payload that cannot be encoded
                     # fails here, before anything is sent, and is not uncertain.
@@ -1638,14 +1659,17 @@ class ExperientialTransport(_HttpTransport):
                     random.uniform(self._backoff_base, previous_delay * 3),
                 )
             if deadline is not None and self._clock() + delay >= deadline:
-                raise self._deadline_error(retries, failure)
+                raise self._deadline_error(retries, failure, limit=limit)
             if deadline is not None:
                 # Do not wait for a send that would be starved of time anyway.
                 left = deadline - self._clock() - delay
                 need = self._attempt_budget(client, timeout)
                 if left < need:
                     raise self._deadline_error(
-                        retries, failure, reason=_starved(left, need, waiting=True)
+                        retries,
+                        failure,
+                        reason=_starved(left, need, waiting=True),
+                        limit=limit,
                     )
             retries += 1
             if retry_after is None:
@@ -2623,6 +2647,11 @@ class FallbackTransport:
         self._primary = primary
         self._fallback = fallback
 
+    @property
+    def escalation(self) -> EscalationConfig | None:
+        """The escalation tier the primary carries (``None``: none)."""
+        return escalation_of(self._primary)
+
     def max_questions(self, model: str) -> int:
         """Questions one request may carry: the smaller limit of the two transports.
 
@@ -2797,6 +2826,11 @@ class RoutingTransport:
             table[name] = transport
         self._routes = table
         self._default = default
+
+    @property
+    def escalation(self) -> EscalationConfig | None:
+        """The escalation tier the default transport carries (``None``: none)."""
+        return escalation_of(self._default)
 
     def transport_for(self, model: str) -> Transport:
         """The transport that serves ``model`` (full id or bare name)."""
@@ -3066,6 +3100,11 @@ class _Wrapping:
     _inner: Transport
 
     @property
+    def escalation(self) -> EscalationConfig | None:
+        """The escalation tier the wrapped transport carries (``None``: none)."""
+        return escalation_of(self._inner)
+
+    @property
     def provider(self) -> str | None:
         """The provider of the wrapped transport, if it names one."""
         found = getattr(self._inner, "provider", None)
@@ -3208,6 +3247,11 @@ class KindRoutingTransport:
             table[slot] = transport
         self._table = table
         self._default = default
+
+    @property
+    def escalation(self) -> EscalationConfig | None:
+        """The escalation tier the default transport carries (``None``: none)."""
+        return escalation_of(self._default)
 
     def transport_for(self, model: str, kind: str | None = None) -> Transport:
         """The transport that serves a call of ``kind`` to ``model``.
@@ -3392,6 +3436,11 @@ class FieldTypeRoutingTransport:
                 raise ValueError(f"cannot route field type {key!r}; expected {known}")
         self._routes = dict(routes)
         self._default = default
+
+    @property
+    def escalation(self) -> EscalationConfig | None:
+        """The escalation tier the default transport carries (``None``: none)."""
+        return escalation_of(self._default)
 
     def _members(self) -> list[Transport]:
         return _unique([*self._routes.values(), self._default])
@@ -3753,6 +3802,46 @@ class CalibratedTransport(_Wrapping):
         )
 
 
+class EscalatingTransport(_Wrapping):
+    """A transport that carries the escalation tier its owner opted in to.
+
+    ``system_one_transport(escalate="openai")`` returns this around the transport it
+    builds (or was given): the choice lives here, never on the wrapped transport, so
+    a transport that was passed in is not changed and a later extractor built on it
+    sends nothing to OpenAI. Every call, limit, failure category and credential list is
+    the wrapped transport's; ``aclose`` and ``close`` close it.
+
+    Attributes:
+        escalation: The enabled ``EscalationConfig`` of the opt-in.
+    """
+
+    def __init__(self, inner: Transport, escalation: EscalationConfig) -> None:
+        """Wrap ``inner`` with an escalation choice.
+
+        Args:
+            inner: The transport that serves Clairic and Clef.
+            escalation: The enabled tier it carries.
+        """
+        self._inner = inner
+        self._config = escalation
+
+    @property
+    def escalation(self) -> EscalationConfig:
+        """The tier this transport carries."""
+        return self._config
+
+    async def run(
+        self,
+        model: str,
+        payload: Mapping[str, Any],
+        *,
+        meta: CallMeta,
+        timeout: float | None = None,
+    ) -> TransportResponse:
+        """Run the call on the wrapped transport."""
+        return await self._inner.run(model, payload, meta=meta, timeout=timeout)
+
+
 ClefProvider = Literal["cloudflare", "experiential", "decisions"]
 Provider = Literal["cloudflare", "typesafe"]
 
@@ -3940,7 +4029,7 @@ def system_one_transport(
     concurrency: ConcurrencyConfig | None = None,
     escalate: EscalateChoice | EscalationConfig | None = None,
     openai: Transport | None = None,
-) -> CloudflareTransport | RoutingTransport | TypeSafeTransport:
+) -> CloudflareTransport | RoutingTransport | TypeSafeTransport | EscalatingTransport:
     """Build the usual transport: Clairic on Cloudflare, Clef where you choose.
 
     Three combinations are selectable (each is an explicit opt-in):
@@ -3979,11 +4068,12 @@ def system_one_transport(
         escalate: ``"openai"`` (or an ``EscalationConfig``) opts in to the escalation
             tier: the few cases the default setup fails are asked of ``gpt-6-luna``
             through the OpenAI Responses API, **which sends their text to OpenAI**.
-            The returned transport then carries the choice (``transport.escalation``),
-            which ``create_extractor`` reads. ``None`` (the default) adds nothing and
-            reads nothing from the environment here: ``TRUSTCALL_S1_ESCALATE`` is for
-            the extractor's default transport. Contradicts ``provider="typesafe"``
-            (TypeSafe only).
+            The returned transport is an ``EscalatingTransport`` that carries the
+            choice (``transport.escalation``), which ``create_extractor`` reads; a
+            transport you passed in is never changed. ``"none"`` and ``None`` (the
+            default) add nothing, and ``None`` reads nothing from the environment
+            here: ``TRUSTCALL_S1_ESCALATE`` is for the extractor's default transport.
+            Contradicts ``provider="typesafe"`` (TypeSafe only).
         openai: The ``OpenAIResponsesTransport`` the tier uses (close it yourself:
             it is yours); by default the extractor creates one from ``OPENAI_API_KEY``
             on first use and closes it with itself.
@@ -3992,7 +4082,8 @@ def system_one_transport(
         A plain ``CloudflareTransport`` when Clef is on Cloudflare without a
         fallback; a ``TypeSafeTransport`` for ``provider="typesafe"``; otherwise a
         ``RoutingTransport`` that sends Clef to the chosen transport (wrapped in the
-        fallback, if any) and everything else to Cloudflare. For
+        fallback, if any) and everything else to Cloudflare; with ``escalate`` an
+        ``EscalatingTransport`` around it. For
         ``create_extractor(..., transport=...)``; close it with ``aclose`` or
         ``close`` when you are done.
 
@@ -4031,8 +4122,8 @@ def system_one_transport(
         escalating=config is not None,
     )
     if config is not None:
-        # the transport carries the choice: ``create_extractor`` reads it from there
-        setattr(inner, "escalation", config)  # noqa: B010
+        # the wrapper carries the choice; the transport given (or built) is untouched
+        return EscalatingTransport(inner, config)
     return inner
 
 

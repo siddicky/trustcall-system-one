@@ -2107,6 +2107,7 @@ async def insert_one(
     focus: Focus | None = None,
     focus_plain: Focus | None = None,
     placement: Placement | None = None,
+    held: dict[str, Any] | None = None,
 ) -> InsertOutcome:
     """Extract one entity of a schema from ``text``.
 
@@ -2132,6 +2133,10 @@ async def insert_one(
         focus_plain: The same without offsets, for requests that carry only
             windows of the input.
         placement: For an item of a nested list, whom it belongs to.
+        held: The record of the item the list already holds that this new entity
+            resembles, if any. The entity is then not "fresh": nothing says that the
+            held item is another thing, so an amount to ADD ("two more") is a
+            relative edit of its amount and is refused (``_verify.run_ladder``).
 
     Returns:
         The outcome: no record when the gate finds no entity, else an insert
@@ -2144,7 +2149,9 @@ async def insert_one(
     """
     placed = placement or Placement()
     if entity is None:
-        ctx = Ctx(run=run, plan=plan, text=text, label=label, fresh=True)
+        ctx = Ctx(
+            run=run, plan=plan, text=text, label=label, fresh=held is None, held=held
+        )
     else:
         ctx = Ctx(
             run=run,
@@ -2156,7 +2163,8 @@ async def insert_one(
             info=entity,
             focus=focus,
             focus_plain=focus_plain,
-            fresh=True,
+            fresh=held is None,
+            held=held,
         )
         skip_presence = True
     ctx = dataclasses.replace(

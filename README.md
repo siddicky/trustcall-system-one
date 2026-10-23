@@ -846,8 +846,12 @@ limits bound the calls; each is a `CallRecord` of kind `escalate` (`CallRecord.f
 kind) with its tokens (reasoning tokens included in the output tokens) and latency, and a warning says
 what it did. A call that fails leaves the default result (with a warning); a rejected key raises. There
 is no default price: pass `Prices(per_million_input=..., per_million_output=...)` for a cost. Without the
-tier, relative phrases that name one date (`yesterday`, `3 days ago`, `in two weeks`) are still read in
-code against `reference_date`; `last Tuesday` is not (it can mean two dates), and is the tier's.
+tier, relative phrases that name one date (`yesterday`, `3 days ago`, `two weeks from now`, and `in two weeks`
+where its sentence is in the future tense) are still read in code against `reference_date`; `last Tuesday` is not
+(it can mean two dates) and neither is `two days later` (it counts from another date the text names): those are
+the tier's, or nobody's. `system_one_transport(escalate="openai")` returns an `EscalatingTransport` that wraps the
+transport it was given and carries the opt-in: a transport you pass in is never changed.
+`TRUSTCALL_S1_PROVIDER=typesafe` with the tier on is an error (TypeSafe only: nothing goes to OpenAI).
 
 **When it is asked.** By default (`mode="on_failure"`) each kind is asked only where the default setup
 failed. `EscalationConfig(mode=...)` can send kinds to the tier *first* ("route"), per kind: a mapping such as

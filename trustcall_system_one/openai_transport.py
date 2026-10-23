@@ -20,7 +20,7 @@ import os
 import re
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 
@@ -236,6 +236,8 @@ class OpenAIResponsesTransport(ExperientialTransport):
             raise ValueError("state_token_budget must be at least 1")
         _check_effort(reasoning_effort)
         read = EFFORT_TIMEOUTS[reasoning_effort]
+        self._follows_effort = timeout is None
+        self._auto_deadline = call_deadline == "auto"
         if timeout is None:
             timeout = httpx.Timeout(read, connect=_DEFAULT_TIMEOUT.connect)
         elif timeout.read is not None:
@@ -343,14 +345,21 @@ class OpenAIResponsesTransport(ExperientialTransport):
         timeout: float | None = None,
     ) -> Any:
         """Run one call (see the class docstring); ``payload["model"]`` is ``model``."""
-        if timeout is None and self._injected_client is None:
+        self._check_model(model)
+        outgoing, context = self._prepare({**payload, "model": model})
+        deadline: float | Literal["default"] | None = "default"
+        if timeout is None and self._injected_client is None and self._follows_effort:
+            # the read timeout, and the "auto" deadline, follow the effort the call
+            # runs at (its own, else the transport's); a ``timeout`` the caller gave
+            # the transport, or this call, is never raised or lowered
             effort = payload.get("reasoning_effort") or self.reasoning_effort
-            if effort in EFFORT_TIMEOUTS and self._timeout.read is not None:
-                # a call at a higher effort than the transport's own gets its longer
-                # read timeout, never a shorter one than the client was built with
-                timeout = max(EFFORT_TIMEOUTS[effort], float(self._timeout.read))
-        return await super().run(
-            model, {**payload, "model": model}, meta=meta, timeout=timeout
+            _check_effort(effort)
+            timeout = EFFORT_TIMEOUTS[effort]
+            if self._auto_deadline:
+                deadline = max(300.0, 2.5 * timeout)
+        del meta  # nothing about the call leaves the process
+        return await self._post(
+            model, outgoing, context, timeout=timeout, call_deadline=deadline
         )
 
     # -- response ---------------------------------------------------------- #
@@ -383,10 +392,11 @@ class OpenAIResponsesTransport(ExperientialTransport):
             },
         }
         status = body.get("status")
-        if status is not None and status != "completed":
+        if status != "completed":  # incomplete, failed, cancelled or not stated
             incomplete = body.get("incomplete_details")
             why = incomplete.get("reason") if isinstance(incomplete, dict) else None
-            out["no_answer"] = f"status {status}" + (
+            shown = _safe(status, _SAFE_WORD) or "missing"
+            out["no_answer"] = f"status {shown}" + (
                 f" ({_safe(why, _SAFE_WORD)})" if _safe(why, _SAFE_WORD) else ""
             )
             return out

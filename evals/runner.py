@@ -733,6 +733,14 @@ async def run_suite(
             "it with --clef-provider or --clef-fallback (or the "
             "TRUSTCALL_S1_CLEF_PROVIDER / TRUSTCALL_S1_CLEF_FALLBACK variables)"
         )
+    if _main_provider(settings) == "typesafe" and (
+        escalation_plan(settings, None) is not None
+    ):  # TypeSafe only: the tier would send the text to OpenAI
+        raise ValueError(
+            "--provider typesafe (or TRUSTCALL_S1_PROVIDER=typesafe) is TypeSafe "
+            "only: --escalate openai (or TRUSTCALL_S1_ESCALATE) would send text to "
+            "OpenAI; use a combination spec, which names every provider"
+        )
     runnable = [c for c in cases if settings.live or c.world is not None]
     skipped = [c.id for c in cases if c not in runnable]
     # Shown in the report whenever a live request is possible: live, or a replay

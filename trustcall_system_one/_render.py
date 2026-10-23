@@ -143,6 +143,18 @@ def mention_windows(
     return [(start, end) for start, end in merged]
 
 
+_SEGMENT_END = re.compile(r"\n|[.!?](?=\s)")
+
+
+def segment_around(source: str, span: Span) -> Span:
+    """The line or sentence around a span: where a row or a clause begins and ends."""
+    start = 0
+    for found in _SEGMENT_END.finditer(source, 0, span[0]):
+        start = found.end()
+    end = _SEGMENT_END.search(source, span[1])
+    return start, end.start() if end else len(source)
+
+
 def narrow_text(text: str, windows: Sequence[Span]) -> str:
     """Join the windows of ``text`` with ``…`` separators (for Clef states)."""
     if not windows:

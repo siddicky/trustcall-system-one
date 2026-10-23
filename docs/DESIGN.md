@@ -525,8 +525,19 @@ schema title: "Person").
    suspects a quantity already there (live: 0.48 for 2, a tiebreak by gpt-6-luna said "no" at every effort).
    With the sentence 0.84 at the first look. It is never added to an update (`Ctx.fresh` is False on the
    input-only copy of a record's context): there "two more" stays a relative edit and is refused as
-   `relative_edit_unsupported`. A description that is a CLAUSE (it starts with how, whether, when, where, why,
-   what, who or which: "how the person relates to the speaker") does not take "of `entity.label`", which hung
+   `relative_edit_unsupported`. **Nor to a new item that resembles a held one**: the match says `__new__` but its
+   words are those of an item the list holds ("mugs" and a held "blue mug": the stems of one's words, plural "s"
+   taken off, include the other's, `_collection._held_item`); `Ctx.held` is that item's record, `fresh` is False,
+   and after the ladder the relative-edit question (kind `relative_edit`, as for a replacement) is asked of the add
+   with the held amount as the current value: at `verify.relative_edit` or above the field is rejected as
+   `relative_edit_unsupported` (warning of that name; the required quantity is then missing, so nothing is
+   written). A new item that matches nothing held ("two more notebooks" next to a mug line, "red mugs" next to
+   "blue mug") is still the whole amount, and so is any new item of an empty list. The rule: refuse "N more X"
+   when a held item matches X; treat it as new when none does and the match said `__new__`. A description that is a CLAUSE (it starts with how, whether, when, where, why,
+   what, who or which as a word of its own followed by more words: "how the person relates to the speaker";
+   "Which-way sign text" and "Who's Who entry title" are noun phrases; the clause is put into the sentence with its
+   first letter lowercase, and the element and "ask for" questions take it too: "an answer, for the entity, to
+   ..." and "(as how many ...)") does not take "of `entity.label`", which hung
    the entity on the clause's last noun ("the speaker of Olivia Davis"; live 0.69 for "cousin", the escalation
    tiebreak answered "no" or "yes" by effort): it reads "state that for `entity.label`, {desc} is '{value}'"
    (0.86). A list element names its field: "According to `input`, is '{value}' one of
@@ -2520,12 +2531,17 @@ fails validation, whatever the repair re-ask says. The README and the docstrings
 `reference_date` "anchors relative dates"; it does not, as far as the API says. **Fixed in code, no
 model involved (`_relative.py`, `_coerce._relative`):** a date or datetime answer that is a phrase
 naming ONE date whatever the convention (`today`, `tomorrow`, `yesterday`, the day after tomorrow
-or before yesterday, `N days|weeks|fortnights|months|years ago|from now|later|earlier`, `in N ...`;
-numbers as digits or words) is resolved against the invoke's `reference_date` (a datetime is that day at
+or before yesterday, `N days|weeks|fortnights|months|years ago|from now`, and `in N ...` where the
+sentence is in the future tense; numbers as digits or words) is resolved against the invoke's `reference_date` (a datetime is that day at
 midnight, noted `relative_date: resolved in code (midnight)`); without a reference date the answer stays
 invalid (the code never uses today's date). A weekday phrase ("last Tuesday", "next Friday") is NOT
 resolved in code: on a Friday "last Tuesday" can mean either of two dates, so the code does not pick.
-What is left (a null answer, a weekday phrase, any other shape) is the tier's.
+`N days later` / `earlier` count from ANOTHER date the text names ("arrived on 1 March and was inspected two days
+later"), not from today, so they are neither found nor resolved (`plausible` does not judge them either); and
+`in N weeks` is a duration as often as a distance from today ("done in two weeks"), so it counts only where its
+sentence says it is ahead (will, due, scheduled, expected, opens, ... or `from now`; `sentence_around`), in
+`find_phrases` and in `resolve_phrase(context=...)`; the coercion has only the phrase, so a bare "in two weeks"
+handed back by Clairic is not read. What is left (a null answer, a weekday phrase, any other shape) is the tier's.
 
 **Never on its own word.** Every escalation result is a *proposal*. It goes through the same
 verification ladder (attribution by Clef, and for updates the input-only pass is skipped for it, since
@@ -2551,15 +2567,17 @@ strict `json_schema`, and `store: false` (the live probe did not send it and the
   payload, so one transport serves several efforts), on `ComboSpec.escalate`, on the evals
   (`--escalate-effort`) and as a search dimension (`escalate.effort`). A higher effort thinks longer
   before the first byte, so the per-attempt read timeout scales with it (`EFFORT_TIMEOUTS`: 60, 120,
-  180, 300, 600, 900 s; overridden by `timeout=` or a call's own; the call deadline is 300 s or 2.5 times
-  the read timeout, whichever is more). **The retry rules do not change with the effort: a timeout after
+  180, 300, 600, 900 s; the effort is the EFFECTIVE one: a call's own, else the transport's; a `timeout=` given
+  to the transport or to the call is never scaled or raised; the "auto" call deadline is 300 s or 2.5 times the
+  read timeout of that effective effort, whichever is more, passed per call to `_post(call_deadline=...)`, so
+  an `xhigh` or `max` call on a transport built at `none` is not cut at 300 s). **The retry rules do not change with the effort: a timeout after
   the request was sent is an uncertain outcome and is never retried.**
 * **Response.** The answer is found by item type: the `message` item's `output_text` content (a
   `reasoning` item before it, present when the effort is above `none`, is ignored and its summary is
   never kept; the live probe showed `output[0]` as the message at effort `none`, `phase:
   "final_answer"`). The reply body is normalised to `{model, status, parsed, text, refusal, no_answer,
   logprobs, usage}`. A `refusal` content item, a `status` other than `completed` (`incomplete`,
-  `failed`) and a response without an `output_text` are **no answer** (`parsed: None`,
+  `failed`, or none stated) and a response without an `output_text` are **no answer** (`parsed: None`,
   `no_answer` says why): the response arrived and was charged, so it is not an uncertain outcome, nothing
   is retried, and the engine only warns (`escalation_no_answer`). Text that is not a JSON object under a
   strict schema is a `ModelResponseError` (its message never holds the text).
@@ -2607,10 +2625,16 @@ config without a transport gets an `OpenAIResponsesTransport` from `OPENAI_API_K
 closed with the extractor).
 
 The opt-in, in order of precedence: `create_extractor(escalation=EscalationConfig(enabled=True))`; the
-tier a transport carries (`system_one_transport(escalate="openai")` sets `transport.escalation`; it is a
-`ValueError` with `provider="typesafe"` (TypeSafe only) and an `openai=` transport without `escalate=`
-is one too); for the default transport only, `TRUSTCALL_S1_ESCALATE=openai` (and
-`TRUSTCALL_S1_ESCALATE_EFFORT`; a bad value fails when the extractor is made); `ComboSpec.escalate`
+tier a transport carries (`system_one_transport(escalate="openai")` returns an `EscalatingTransport`, a thin
+wrapper around the transport it builds or was given that holds `.escalation`; a transport that was passed in is
+NEVER changed, so the opt-in cannot stick on the caller's object and reach a later extractor; `escalate="none"`
+adds nothing; every wrapper (`RecordingTransport`, `CassetteTransport`, `FallbackTransport`, the routers,
+`CalibratedTransport`) forwards `.escalation` of what it wraps, `transport.escalation_of`; it is a `ValueError`
+with `provider="typesafe"` (TypeSafe only) and an `openai=` transport without `escalate=` is one too); for the
+default transport only, `TRUSTCALL_S1_ESCALATE=openai` (and `TRUSTCALL_S1_ESCALATE_EFFORT`; a bad value fails when
+the extractor is made; **with `TRUSTCALL_S1_PROVIDER=typesafe` it is a `ValueError` too**, as is an explicit
+`create_extractor(escalation=...)` on the default transport, and the evals' `run_suite` with provider typesafe and
+the tier on: TypeSafe only means nothing goes to OpenAI); `ComboSpec.escalate`
 (`"openai"` or `{"provider": "openai", "model", "reasoning_effort", "kinds", "limits",
 "max_calls_per_invoke", "prob_cap"}`; part of `spec.key()` and `describe()`, `spec.companies()` adds
 OpenAI, `only` refuses it, `by_kind` and `calibration` refuse the `escalate` kind); evals `--escalate
@@ -2619,15 +2643,37 @@ openai --escalate-effort EFFORT`.
 **Mode.** `EscalationConfig.mode` says WHEN each kind is asked. For one kind it is `"on_failure"` (default:
 everything above) or `"route"`: the three classes in `ROUTED_KINDS` go to the tier FIRST, whatever the default
 setup would have answered. (1) A date or datetime field whose mention window holds a relative phrase (needs a
-`reference_date`) is asked of the tier; its verified date replaces Clairic's when they differ
-(`_escalate._relative_date`). (2) Every nested `list[Model]`: `collect` asks the rows before Clairic's discovery
-and count (`route_discovery`; the quotes become the mentions and are not code-screened, since a row code such as
-`A1` is a verified quote), and `_fill_row` puts the tier's reading of a row's fields in place of Clairic's where
-they differ. (3) The discovery of a top-level `Many` with a dotted identity. Unchanged: every quote occurs
-verbatim, the value is coerced, the ladder and the change gates judge it (Clef has to agree), an answer stands
-for at most `prob_cap`, nothing is deleted or removed on its word. An answer that is off, over a limit,
-unverifiable or failed leaves the normal path exactly as `on_failure` would run it (Clairic discovers and
-counts). A routed value the ladder then refuses is null, as any refused value.
+`reference_date`) is asked of the tier (`_escalate._relative_date`). The phrase must lie in the entity's windows,
+and where it occurs more than once the occurrence nearest the entity's mentions is the one checked (`_check_date`).
+A verified date that differs from Clairic's takes its place **with Clairic's answer kept as a backup**
+(`FieldState.backup`): if the ladder refuses the proposal, `run_ladder` (`_restore_backups`) restores the backup
+and judges it normally, so asking first can never leave null a date Clairic read ("Completed on 2026-03-01; the
+part was ordered three days ago": the tier's date for the part is refused, the 1 March stands). (2) Every nested
+`list[Model]`: `collect` asks the rows before Clairic's discovery (`route_discovery`; the quotes become the mentions
+and are not code-screened, since a row code such as `A1` is a verified quote), in the parent's part of the input
+(windows around the parent's mentions; the whole input for a `One`), and `_fill_row` puts the tier's reading of a
+row's fields in place of Clairic's where they differ (with the same backup). Clairic's COUNT is still asked: if it
+exceeds the rows the tier gave (a partial answer), Clairic's discovery runs too and its mentions join the tier's
+(`escalation_routed_partial`), as a broadened discovery does. (3) The discovery of a top-level `Many` with a dotted
+identity, the same way (count; partial answers completed), with the routed labels put through the junk screen
+(`_prefilter`: a label such as "Aircraft" names nothing and is dropped; if nothing survives Clairic discovers).
+Unchanged: every quote occurs verbatim, the value is coerced, the ladder and the change gates judge it (Clef has to
+agree), an answer stands for at most `prob_cap`, nothing is deleted or removed on its word. An answer that is off,
+over a limit, unverifiable or failed leaves the normal path exactly as `on_failure` would run it (Clairic discovers
+and counts).
+
+**Verification of quotes (`_escalate.locate`, `_verify_rows`, `_pair_entities`).** A quote must occur as WHOLE
+WORDS (white space folded): `ENG-1` is not in `ENG-10`, `2` is not in `B2` or `SN-1002`; no two rows (or entities)
+share an occurrence of their identity. A row's identity is the occurrence whose line or sentence (`segment_around`)
+holds most of its values; a value must lie in that line or sentence. Only an identity that stands alone on its line
+(a heading) may have values on the lines after it, within its block of lines (no blank line) and `window_chars`, and
+never in the line of another row's identity: a value quoted from another row is not this row's. `_row_of` prefers
+the row whose span EQUALS a mention's over one that overlaps it (then the longest overlap). For dotted discovery the
+identity is located first (one entity per identity value), and the label is the free occurrence nearest to it in its
+line, else its block of lines, else within `window_chars`; pairs that cross (entities appear in the input in one
+order, so a label paired with another entity's identity breaks it) are refused. The entity's mention is the label (the
+verified identity pairs it but is not a second mention: coreference and qualification would take a bare serial for
+another entity).
 
 *Mode by kind.* `mode` is a string or a mapping (`_config.resolve_escalation_mode`; stored on the config as a
 frozen mapping of all four kinds, read with `EscalationConfig.mode_for(kind)`, `routes(kind)` is `runs(kind)`

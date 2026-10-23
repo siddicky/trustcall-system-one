@@ -361,7 +361,7 @@ async def test_recommended_asks_dates_and_rows_first_and_discovery_on_failure() 
     )
     assert len(rows.calls) == 1
     kinds = Counter(c.kind for c in result.calls if c.schema == "Engine")
-    assert kinds["discover"] == 0 and kinds["count"] == 0
+    assert kinds["discover"] == 0 and kinds["count"] == 1
     # dotted discovery: Clairic works, so the tier is never asked
     discovery = FakeEscalation(GOOD)
     found = await run_sheet(sheet_world().handler, tier(discovery, mode="recommended"))
@@ -490,7 +490,8 @@ async def test_routed_rows_replace_clairics_discovery_and_values() -> None:
     ]
     assert len(fake.calls) == 1  # discovery and the fields share one call
     kinds = Counter(c.kind for c in result.calls if c.schema == "Engine")
-    assert kinds["discover"] == 0 and kinds["count"] == 0  # Clairic was not asked
+    # Clairic's discovery is not asked first; its count is, and agrees with the rows
+    assert kinds["discover"] == 0 and kinds["count"] == 1
     assert any("escalation_routed: Engine" in w for w in result.warnings)
     assert Counter(c.kind for c in result.calls)["attribution"] >= 3  # judged by Clef
 
@@ -602,7 +603,7 @@ async def test_routed_discovery_asks_the_tier_before_clairic() -> None:
     ]
     assert len(fake.calls) == 1
     kinds = Counter(c.kind for c in result.calls)
-    assert kinds["discover"] == 0 and kinds["count"] == 0
+    assert kinds["discover"] == 0 and kinds["count"] == 1
     assert kinds["qualify"] >= 1 and kinds["extract"] >= 2  # the normal path went on
     (call,) = escalations(result)
     assert call.field == "dotted_discovery"

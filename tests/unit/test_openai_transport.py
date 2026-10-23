@@ -660,3 +660,95 @@ def test_system_one_transport_carries_the_choice_and_refuses_typesafe() -> None:
         system_one_transport(provider="cloudflare", escalate="gemini")  # type: ignore[arg-type]
     plain = system_one_transport(provider="cloudflare", escalate="none")
     assert getattr(plain, "escalation", None) is None
+
+
+# --------------------------------------------------------------------------- #
+# The deadline and the read timeout follow the effort a call runs at
+# --------------------------------------------------------------------------- #
+
+
+class _Post:
+    """Stands in for ``_post``: what timeout and deadline a call was sent with."""
+
+    def __init__(self) -> None:
+        self.seen: list[tuple[float | None, Any]] = []
+
+    async def __call__(self, *args: Any, **kwargs: Any) -> str:
+        self.seen.append((kwargs["timeout"], kwargs["call_deadline"]))
+        return "sent"
+
+
+async def _timing(
+    transport: OpenAIResponsesTransport, payload: dict[str, Any], **kwargs: Any
+) -> tuple[float | None, Any]:
+    post = _Post()
+    transport._post = post  # type: ignore[method-assign,assignment]
+    await transport.run("gpt-6-luna", payload, meta=META, **kwargs)
+    return post.seen[0]
+
+
+async def test_the_deadline_of_a_call_follows_the_effort_it_runs_at() -> None:
+    transport = OpenAIResponsesTransport(api_key=KEY, reasoning_effort="none")
+    assert transport._call_deadline == 300.0
+    timeout, deadline = await _timing(transport, {**PAYLOAD, "reasoning_effort": "max"})
+    assert timeout == EFFORT_TIMEOUTS["max"]
+    assert deadline == 2.5 * EFFORT_TIMEOUTS["max"]  # not cut at 300 s
+    timeout, deadline = await _timing(
+        transport, {**PAYLOAD, "reasoning_effort": "xhigh"}
+    )
+    assert (timeout, deadline) == (600.0, 1500.0)
+    # the transport's own effort, and a lower one on a higher transport
+    assert await _timing(transport, PAYLOAD) == (60.0, 300.0)
+    high = OpenAIResponsesTransport(api_key=KEY, reasoning_effort="high")
+    assert await _timing(high, {**PAYLOAD, "reasoning_effort": "none"}) == (60.0, 300.0)
+
+
+async def test_an_explicit_timeout_is_never_scaled() -> None:
+    own = OpenAIResponsesTransport(
+        api_key=KEY, reasoning_effort="none", timeout=httpx.Timeout(30.0)
+    )
+    assert own._call_deadline == 300.0
+    # the client's own timeout stays (nothing is passed per call), the deadline too
+    assert await _timing(own, {**PAYLOAD, "reasoning_effort": "max"}) == (
+        None,
+        "default",
+    )
+    # a timeout given to the call is passed as it is
+    assert await _timing(own, PAYLOAD, timeout=7.0) == (7.0, "default")
+    follows = OpenAIResponsesTransport(api_key=KEY)
+    assert await _timing(follows, PAYLOAD, timeout=7.0) == (7.0, "default")
+    # a deadline the caller chose is the caller's
+    fixed = OpenAIResponsesTransport(api_key=KEY, call_deadline=90)
+    assert await _timing(fixed, {**PAYLOAD, "reasoning_effort": "max"}) == (
+        EFFORT_TIMEOUTS["max"],
+        "default",
+    )
+    assert fixed._call_deadline == 90.0
+
+
+async def test_a_high_effort_call_gets_the_time_it_needs_on_the_wire() -> None:
+    seen: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(dict(request.extensions["timeout"]))
+        return ok()
+
+    transport = OpenAIResponsesTransport(api_key=KEY, reasoning_effort="none")
+    transport._get_client = lambda: httpx.AsyncClient(  # type: ignore[method-assign]
+        transport=httpx.MockTransport(handler), timeout=transport._timeout
+    )
+    await run(transport, {**PAYLOAD, "reasoning_effort": "max"})
+    assert seen[0]["read"] == EFFORT_TIMEOUTS["max"]  # not capped at 300 s
+
+
+async def test_a_response_without_a_status_is_no_answer() -> None:
+    body = json.loads(json.dumps(JSON_BODY))
+    del body["status"]
+    transport, _ = make(Recorder(ok(body)))
+    reply = await run(transport)
+    assert reply.body["parsed"] is None
+    assert reply.body["no_answer"] == "status missing"
+    done = json.loads(json.dumps(JSON_BODY))
+    done["status"] = "completed"
+    transport, _ = make(Recorder(ok(done)))
+    assert (await run(transport)).body["parsed"] is not None

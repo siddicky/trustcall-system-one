@@ -61,6 +61,7 @@ from trustcall_system_one._types import (
 from trustcall_system_one._wire import CLAIRIC, CLEF
 from trustcall_system_one.transport import (
     CloudflareTransport,
+    EscalatingTransport,
     RoutingTransport,
     Transport,
     TypeSafeTransport,
@@ -68,6 +69,7 @@ from trustcall_system_one.transport import (
     clef_fallback_on_from_env,
     clef_provider_from_env,
     escalation_from_env,
+    escalation_of,
     provider_from_env,
     system_one_transport,
 )
@@ -135,6 +137,21 @@ def _closing(*members: Any) -> Any:
     return held[0] if held else None
 
 
+def _refuse_typesafe_escalation(what: str) -> None:
+    """Raise when the default transport is TypeSafe's and the escalation tier is on.
+
+    ``TRUSTCALL_S1_PROVIDER=typesafe`` is TypeSafe only: ``what`` would send text to
+    OpenAI, as ``system_one_transport(provider="typesafe", escalate="openai")`` refuses
+    to. Name the contradiction instead of choosing one side.
+    """
+    if provider_from_env() == "typesafe":
+        raise ValueError(
+            "TRUSTCALL_S1_PROVIDER=typesafe is TypeSafe only: "
+            f"{what} would send text to OpenAI (unset one of them, or use a "
+            "combination spec, which names every provider)"
+        )
+
+
 class _Core:
     """Shared by an extractor and its ``with_options`` copies.
 
@@ -155,11 +172,16 @@ class _Core:
             clef_provider_from_env()
             clef_fallback_from_env()
             clef_fallback_on_from_env()
-            escalation_from_env()
+            if escalation_from_env() is not None:
+                _refuse_typesafe_escalation("TRUSTCALL_S1_ESCALATE=openai")
         self._given = transport
         self._concurrency = concurrency
         self._owned: (
-            CloudflareTransport | RoutingTransport | TypeSafeTransport | None
+            CloudflareTransport
+            | RoutingTransport
+            | TypeSafeTransport
+            | EscalatingTransport
+            | None
         ) = None
         self._owned_escalation: Transport | None = None
         self._lock = threading.RLock()
@@ -203,11 +225,13 @@ class _Core:
         """
         config = explicit
         if config is None:
-            config = getattr(self._given, "escalation", None)
+            config = escalation_of(self._given)
         if config is None and self._given is None:
             config = escalation_from_env()
         if config is None or not config.enabled:
             return None
+        if self._given is None:
+            _refuse_typesafe_escalation("an enabled escalation tier")
         if config.transport is not None:
             return config
         with self._lock:
@@ -533,6 +557,8 @@ class Extractor:
             )
         _iso_date(self.reference_date)
         if self.escalation is not None and self.escalation.enabled:
+            if self.transport is None:
+                _refuse_typesafe_escalation("create_extractor(escalation=...)")
             cap = self.escalation.prob_cap
             for name, bar in (
                 ("gates.remove_threshold", self.gates.remove_threshold),

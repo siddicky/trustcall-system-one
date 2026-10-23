@@ -8,6 +8,7 @@ import pytest
 
 from trustcall_system_one import (
     CloudflareTransport,
+    EscalatingTransport,
     RoutingTransport,
     Transport,
     TypeSafeTransport,
@@ -72,7 +73,9 @@ def live_transport() -> Iterator[Callable[[str], Transport]]:
     ``TRUSTCALL_S1_RECORD=<dir>`` writes each scenario's requests and responses to
     ``<dir>/smoke_<name>.jsonl`` (never headers or credentials).
     """
-    opened: list[CloudflareTransport | RoutingTransport | TypeSafeTransport] = []
+    opened: list[
+        CloudflareTransport | RoutingTransport | TypeSafeTransport | EscalatingTransport
+    ] = []
 
     def make(name: str) -> Transport:
         live = system_one_transport()

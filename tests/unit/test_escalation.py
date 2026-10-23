@@ -145,8 +145,8 @@ LAST_TUESDAY = "Task: Replace the pump. It was completed last Tuesday."
         (THREE_DAYS, "three days ago", dt.date(2026, 10, 20)),
         ("Task: Replace the pump. Done yesterday.", "yesterday", dt.date(2026, 10, 22)),
         (
-            "Task: Replace the pump. Done in two weeks.",
-            "in two weeks",
+            "Task: Replace the pump. Done two weeks from now.",
+            "two weeks from now",
             dt.date(2026, 11, 6),
         ),
         (
@@ -361,13 +361,18 @@ def test_the_relative_phrases_the_code_knows() -> None:
     assert resolve_phrase("yesterday", today) == dt.date(2026, 10, 22)
     assert resolve_phrase("the day after tomorrow", today) == dt.date(2026, 10, 25)
     assert resolve_phrase("Three days ago", today) == dt.date(2026, 10, 20)
-    assert resolve_phrase("in 2 weeks", today) == dt.date(2026, 11, 6)
+    ahead = "It is due in 2 weeks"
+    assert resolve_phrase("in 2 weeks", today, context=ahead) == dt.date(2026, 11, 6)
+    assert resolve_phrase("in 2 weeks", today) is None  # a duration as often as a date
+    assert resolve_phrase("in 2 weeks", today, context="Done in 2 weeks") is None
+    assert resolve_phrase("two days later", today) is None  # counts from another date
+    assert resolve_phrase("a week earlier", today) is None
     assert resolve_phrase("a fortnight ago", today) == dt.date(2026, 10, 9)
     assert resolve_phrase("2 fortnights ago", today) == dt.date(2026, 9, 25)
     assert resolve_phrase("a month from now", today) == dt.date(2026, 11, 23)
     assert resolve_phrase("last Tuesday", today) is None  # a convention, not a fact
     assert resolve_phrase("whenever", today) is None
-    text = "Seen yesterday, again in two weeks, and last Tuesday; nothing else."
+    text = "Seen yesterday, will be seen again in two weeks, and last Tuesday; no more."
     assert [p.text for p in find_phrases(text)] == [
         "yesterday",
         "in two weeks",
@@ -610,7 +615,7 @@ async def test_the_tier_never_deletes_a_row_on_the_models_word() -> None:
     assert ops == []  # the rows list stays as it was
 
 
-async def test_a_value_quoted_from_another_row_is_not_taken() -> None:
+async def test_a_value_that_is_not_in_the_text_is_not_taken() -> None:
     fake = FakeEscalation(
         lambda p, m: {
             "rows": [
@@ -964,7 +969,8 @@ class Trip(BaseModel):
 
 
 TRIP_TEXT = (
-    "Trip: Oslo. It started three days ago and ended yesterday, paid in two weeks."
+    "Trip: Oslo. It started three days ago and ended yesterday, payment is due in "
+    "two weeks."
 )
 
 
